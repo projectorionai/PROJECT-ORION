@@ -1,0 +1,2248 @@
+{
+  "active_goals": [],
+  "active_projects": {},
+  "created_at": "2026-07-04T07:42:11Z",
+  "current_workspace": {
+    "browser_tabs": 1,
+    "name": "orion_autonomy_enhancement_proposal  -  Compatibility Mode - Word",
+    "updated_at": "2026-07-09T12:33:54Z",
+    "windows": 20
+  },
+  "goals": {},
+  "intent_tracker": {
+    "habits": {},
+    "interests": {},
+    "requests": {
+      "1011_853_apierror_before_captured_complete_could": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "fix this please - REPAIR: captured [inc-1] APIError: 1011 None. Deadline expired before operation could complete. (live_worker.py:853)",
+        "first_seen": "2026-07-09T12:19:54Z",
+        "id": "1011_853_apierror_before_captured_complete_could",
+        "last_seen": "2026-07-09T12:19:54Z",
+        "projects": {}
+      },
+      "2012_not": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "it's not 2012.",
+        "first_seen": "2026-07-05T19:13:45Z",
+        "id": "2012_not",
+        "last_seen": "2026-07-05T19:13:45Z",
+        "projects": {}
+      },
+      "2026_actua_lly_time": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "The time is actua lly 2 0 1 3 and it 's 2026.",
+        "first_seen": "2026-07-05T19:15:45Z",
+        "id": "2026_actua_lly_time",
+        "last_seen": "2026-07-05T19:15:45Z",
+        "projects": {}
+      },
+      "2026_all_right": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "All right , it's 2026.",
+        "first_seen": "2026-07-05T19:13:45Z",
+        "id": "2026_all_right",
+        "last_seen": "2026-07-05T19:13:45Z",
+        "projects": {}
+      },
+      "able_auto_but_full_have_just_les": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I want you to be full y auto nomo us in ter m s of um over wri ting your o wn fi les , um wri ting your o wn scri pt , program ming your self , and I want you to be able to in sta ll um I 'm not really just de pend on me . Ob viously have m",
+        "first_seen": "2026-07-09T12:33:54Z",
+        "id": "able_auto_but_full_have_just_les",
+        "last_seen": "2026-07-09T12:33:54Z",
+        "projects": {}
+      },
+      "action_ada_adasi_attempting_autonomous_birmingham_capabilities": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "O.R.I.O.N. is attempting to integrate capabilities from the local repository `C:\\Users\\mayna\\OneDrive - University College Birmingham\\Desktop\\PROJECT ORION\\Ada-SI-main`. The autonomous `forge` action, intended to synthesise a new tool suite",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "action_ada_adasi_attempting_autonomous_birmingham_capabilities",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "action_architectural_attempting_configuration_confirms_deeper_dependencies": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "3. Re-attempting the `forge` action confirms the error persists, indicating a deeper architectural or internal parameter configuration issue rather than simple optional dependencies.",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "action_architectural_attempting_configuration_confirms_deeper_dependencies",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "action_confirmed": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "confirmed action.",
+        "first_seen": "2026-07-08T21:50:06Z",
+        "id": "action_confirmed",
+        "last_seen": "2026-07-08T21:50:06Z",
+        "projects": {}
+      },
+      "activate_analyse_code_configuration_configured_context_corrective": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Please analyse the context and error, and provide precise instructions or a corrective configuration script to resolve the `No code generator configured` limitation, thereby enabling the `forge` engine to dynamically create and activate new",
+        "first_seen": "2026-07-09T12:15:54Z",
+        "id": "activate_analyse_code_configuration_configured_context_corrective",
+        "last_seen": "2026-07-09T12:15:54Z",
+        "projects": {}
+      },
+      "actua_are_lled_lly": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "You are actua lly ca lled .",
+        "first_seen": "2026-07-05T19:17:46Z",
+        "id": "actua_are_lled_lly",
+        "last_seen": "2026-07-05T19:17:46Z",
+        "projects": {}
+      },
+      "actually_are_few_minutes_ning_run_ter": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "It 's actually 1 2 0 8 , so you are run ning a few minutes la ter on .",
+        "first_seen": "2026-07-05T11:10:04Z",
+        "id": "actually_are_few_minutes_ning_run_ter",
+        "last_seen": "2026-07-05T11:10:04Z",
+        "projects": {}
+      },
+      "actually_come_does_ntence_out_seem_some": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "IT SEEM S WHEN YOU TRY TO WRITE SOME THING O RI ON IN NO TE PA D OR WOR D IT DOES N'T ACTUALLY COME OUT AS A SE NTENCE",
+        "first_seen": "2026-07-05T22:28:06Z",
+        "id": "actually_come_does_ntence_out_seem_some",
+        "last_seen": "2026-07-05T22:28:06Z",
+        "projects": {}
+      },
+      "actually_pen_solu_tion": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "It' s actually o pen re solu tion .",
+        "first_seen": "2026-07-09T12:25:54Z",
+        "id": "actually_pen_solu_tion",
+        "last_seen": "2026-07-09T12:25:54Z",
+        "projects": {}
+      },
+      "ada_birmingham_capabilities_college_desktop_give_install": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "i want you to give yourself the capabilities to install - C:\\Users\\mayna\\OneDrive - University College Birmingham\\Desktop\\PROJECT ORION\\Ada-SI-main",
+        "first_seen": "2026-07-09T12:01:53Z",
+        "id": "ada_birmingham_capabilities_college_desktop_give_install",
+        "last_seen": "2026-07-09T12:01:53Z",
+        "projects": {}
+      },
+      "ada_birmingham_college_desktop_main_mayna_onedrive": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "C:\\Users\\mayna\\OneDrive - University College Birmingham\\Desktop\\PROJECT ORION\\Ada-SI-main",
+        "first_seen": "2026-07-09T11:48:58Z",
+        "id": "ada_birmingham_college_desktop_main_mayna_onedrive",
+        "last_seen": "2026-07-09T11:48:58Z",
+        "projects": {}
+      },
+      "aga_because_ccu_glo_ina_just_let": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , so please never men tion that aga in because i t is ina ccu rate . What I want you to um do now is go on the glo be for me and just tell me some thing about uh let ' s say An to xi ca ne ws from the re.",
+        "first_seen": "2026-07-09T00:48:53Z",
+        "id": "aga_because_ccu_glo_ina_just_let",
+        "last_seen": "2026-07-09T00:48:53Z",
+        "projects": {}
+      },
+      "aga_can_sentence_wri_write": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Oké , can you wri te aga in ? Can you write a sentence for me?",
+        "first_seen": "2026-07-05T22:24:05Z",
+        "id": "aga_can_sentence_wri_write",
+        "last_seen": "2026-07-05T22:24:05Z",
+        "projects": {}
+      },
+      "aga_gave_mpt_pro_try": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "No , try it aga in , try what the la st pro mpt I gave you.",
+        "first_seen": "2026-07-05T22:26:05Z",
+        "id": "aga_gave_mpt_pro_try",
+        "last_seen": "2026-07-05T22:26:05Z",
+        "projects": {}
+      },
+      "aga_let_new_okay_pad_try": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , try aga in on the new pad, let's",
+        "first_seen": "2026-07-09T12:29:54Z",
+        "id": "aga_let_new_okay_pad_try",
+        "last_seen": "2026-07-09T12:29:54Z",
+        "projects": {}
+      },
+      "again": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "do it again",
+        "first_seen": "2026-07-09T12:15:54Z",
+        "id": "again",
+        "last_seen": "2026-07-09T12:15:54Z",
+        "projects": {}
+      },
+      "again_all_cor_dis_just_not_pla": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "No , it's not dis pla ying cor rectly at all , just try it again, please.",
+        "first_seen": "2026-07-09T12:27:54Z",
+        "id": "again_all_cor_dis_just_not_pla",
+        "last_seen": "2026-07-09T12:27:54Z",
+        "projects": {}
+      },
+      "again_check_not_qui": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Not qui te , check again.",
+        "first_seen": "2026-07-05T11:10:04Z",
+        "id": "again_check_not_qui",
+        "last_seen": "2026-07-05T11:10:04Z",
+        "projects": {}
+      },
+      "again_installed_was_wha": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "wha t was an installed again",
+        "first_seen": "2026-07-05T10:57:15Z",
+        "id": "again_installed_was_wha",
+        "last_seen": "2026-07-05T10:57:15Z",
+        "projects": {}
+      },
+      "again_look": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "look again",
+        "first_seen": "2026-07-09T12:15:54Z",
+        "id": "again_look",
+        "last_seen": "2026-07-09T12:15:54Z",
+        "projects": {}
+      },
+      "again_notepad_right_try": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Try right in the notepad again.",
+        "first_seen": "2026-07-05T11:01:15Z",
+        "id": "again_notepad_right_try",
+        "last_seen": "2026-07-05T11:01:15Z",
+        "projects": {}
+      },
+      "again_travis": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Travis again.",
+        "first_seen": "2026-07-05T22:26:05Z",
+        "id": "again_travis",
+        "last_seen": "2026-07-05T22:26:05Z",
+        "projects": {}
+      },
+      "again_try": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Try again please.",
+        "first_seen": "2026-07-09T11:48:58Z",
+        "id": "again_try",
+        "last_seen": "2026-07-09T11:48:58Z",
+        "projects": {}
+      },
+      "agen_comp_har_nsi_rehe_vel_want": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I want you to comp rehe nsi vel y in har m 's agen ts",
+        "first_seen": "2026-07-09T00:12:52Z",
+        "id": "agen_comp_har_nsi_rehe_vel_want",
+        "last_seen": "2026-07-09T00:12:52Z",
+        "projects": {}
+      },
+      "ahe_ase_bili_can_change_comp_game": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you help me de velop the game e ven more ple ase and comp re hen sive ly en han ce the ca pa bili ties of the game go ahe ad and sur pri se me and up da te me on the change logs.",
+        "first_seen": "2026-07-09T00:30:53Z",
+        "id": "ahe_ase_bili_can_change_comp_game",
+        "last_seen": "2026-07-09T00:30:53Z",
+        "projects": {}
+      },
+      "ahe_bring_browser_okay_then": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , go ahe ad and bring up on the browser then.",
+        "first_seen": "2026-07-09T11:52:58Z",
+        "id": "ahe_bring_browser_okay_then",
+        "last_seen": "2026-07-09T11:52:58Z",
+        "projects": {}
+      },
+      "ahe_save_yep": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Yep , go ahe ad and save it to the PC, please.",
+        "first_seen": "2026-07-09T12:33:54Z",
+        "id": "ahe_save_yep",
+        "last_seen": "2026-07-09T12:33:54Z",
+        "projects": {}
+      },
+      "ahead": {
+        "confidence": 0.406,
+        "count": 2,
+        "example": "go ahead",
+        "first_seen": "2026-07-09T12:17:54Z",
+        "id": "ahead",
+        "last_seen": "2026-07-09T12:21:54Z",
+        "projects": {}
+      },
+      "ahead_all_dependency_place_qui_rement_spect": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ye ah , go ahead and in spect all the re qui rement s and then in stall the dependency place.",
+        "first_seen": "2026-07-09T11:50:58Z",
+        "id": "ahead_all_dependency_place_qui_rement_spect",
+        "last_seen": "2026-07-09T11:50:58Z",
+        "projects": {}
+      },
+      "ahead_around_briefing": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Go ahead with the briefing around.",
+        "first_seen": "2026-07-08T21:46:06Z",
+        "id": "ahead_around_briefing",
+        "last_seen": "2026-07-08T21:46:06Z",
+        "projects": {}
+      },
+      "ahead_fix": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Go ahead and fix it.",
+        "first_seen": "2026-07-09T12:27:54Z",
+        "id": "ahead_fix",
+        "last_seen": "2026-07-09T12:27:54Z",
+        "projects": {}
+      },
+      "ahead_okay": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "okay go ahead",
+        "first_seen": "2026-07-09T12:09:53Z",
+        "id": "ahead_okay",
+        "last_seen": "2026-07-09T12:09:53Z",
+        "projects": {}
+      },
+      "ahead_then": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Go ahead then",
+        "first_seen": "2026-07-09T12:03:53Z",
+        "id": "ahead_then",
+        "last_seen": "2026-07-09T12:03:53Z",
+        "projects": {}
+      },
+      "ali_croso_curity_dia_get_gge_gno": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , get rid of a se ntence in Mi croso ft Word and wri te ver se su gge ste d re ali stic im pro vement s that we would have to en hance your ca pabili ties in I E uh trying to um loo k at the pro ce sses on my syste m and dia gno sing p",
+        "first_seen": "2026-07-05T22:26:05Z",
+        "id": "ali_croso_curity_dia_get_gge_gno",
+        "last_seen": "2026-07-05T22:26:05Z",
+        "projects": {}
+      },
+      "ali_ctionali_don_fun_fur_gge_han": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Oh , I nee d to write su gge ste d re ali stic im pro vement s to your syste m that you don' t al rea dy have that woul d en han ce yo ur ex perience and fur ther en hance your fun ctionali ty and",
+        "first_seen": "2026-07-05T10:59:15Z",
+        "id": "ali_ctionali_don_fun_fur_gge_han",
+        "last_seen": "2026-07-05T10:59:15Z",
+        "projects": {}
+      },
+      "ali_don_functionality_fur_ggest_han_have": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "No , I want you to su ggest re ali stic im prove ment s to the syste m that you don' t al ready have that woul d en han ce your u ser ex perience and fur ther en han ce your functionality.",
+        "first_seen": "2026-07-05T11:01:15Z",
+        "id": "ali_don_functionality_fur_ggest_han_have",
+        "last_seen": "2026-07-05T11:01:15Z",
+        "projects": {}
+      },
+      "ali_gge_nopa_pro_put_ste_stic": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "wan ted you to think of su gge ste d re ali stic im pro vement s and put it into the nopa.",
+        "first_seen": "2026-07-05T11:01:15Z",
+        "id": "ali_gge_nopa_pro_put_ste_stic",
+        "last_seen": "2026-07-05T11:01:15Z",
+        "projects": {}
+      },
+      "all_apply_can_now_them": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you all apply them now, please?",
+        "first_seen": "2026-07-05T11:10:04Z",
+        "id": "all_apply_can_now_them",
+        "last_seen": "2026-07-05T11:10:04Z",
+        "projects": {}
+      },
+      "all_ase_bring_ple_pple_right_sto": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Bring me to co pple sto ne in E xe ter , ple ase, all right?",
+        "first_seen": "2026-07-05T19:27:40Z",
+        "id": "all_ase_bring_ple_pple_right_sto",
+        "last_seen": "2026-07-05T19:27:40Z",
+        "projects": {}
+      },
+      "all_bili_get_just_like_note_pabilities": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I want you to get rid of all the text on my note pad and just co py and pas te what we um wha t ca pa bili ties that you would like to ad d for the ad vanced ca pabilities, please.",
+        "first_seen": "2026-07-05T22:24:05Z",
+        "id": "all_bili_get_just_like_note_pabilities",
+        "last_seen": "2026-07-05T22:24:05Z",
+        "projects": {}
+      },
+      "all_bring_clo_glow_note_right_spa": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Clo se note pa d and bring me to Spa in on my glow, please, all right.",
+        "first_seen": "2026-07-05T19:25:40Z",
+        "id": "all_bring_clo_glow_note_right_spa",
+        "last_seen": "2026-07-05T19:25:40Z",
+        "projects": {}
+      },
+      "all_can_clean_end_formance_get_make": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you put this in the note pa d and get rid of all the end s and per formance op ti mi zation there , please? Make it clean?",
+        "first_seen": "2026-07-05T22:24:05Z",
+        "id": "all_can_clean_end_formance_get_make",
+        "last_seen": "2026-07-05T22:24:05Z",
+        "projects": {}
+      },
+      "all_claude_errors_file_find_fix_generate": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Generate me a notepad file that highlights all the known errors that you've find and put it into a prompt for Claude to fix you",
+        "first_seen": "2026-07-09T12:11:53Z",
+        "id": "all_claude_errors_file_find_fix_generate",
+        "last_seen": "2026-07-09T12:11:53Z",
+        "projects": {}
+      },
+      "all_don_fix_nee_rors_run_there": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I don't nee d to fix all the er rors there and I want you to run for me.",
+        "first_seen": "2026-07-09T11:50:58Z",
+        "id": "all_don_fix_nee_rors_run_there",
+        "last_seen": "2026-07-09T11:50:58Z",
+        "projects": {}
+      },
+      "all_form_right_standby": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "All right , go in to your standby form, please.",
+        "first_seen": "2026-07-09T00:20:52Z",
+        "id": "all_form_right_standby",
+        "last_seen": "2026-07-09T00:20:52Z",
+        "projects": {}
+      },
+      "all_give_permission": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "i give you permission to do it all",
+        "first_seen": "2026-07-09T12:17:54Z",
+        "id": "all_give_permission",
+        "last_seen": "2026-07-09T12:17:54Z",
+        "projects": {}
+      },
+      "all_need_right_saying": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "So you're saying that I need to do it, all right.",
+        "first_seen": "2026-07-09T12:23:54Z",
+        "id": "all_need_right_saying",
+        "last_seen": "2026-07-09T12:23:54Z",
+        "projects": {}
+      },
+      "all_right_say": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "All right , what do you say?",
+        "first_seen": "2026-07-09T00:44:53Z",
+        "id": "all_right_say",
+        "last_seen": "2026-07-09T00:44:53Z",
+        "projects": {}
+      },
+      "allegiable_ase_can_cur_every_get_just": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "You 're just spa mming uh do ts ple ase get ri d of every thing on that no te pa d cur rently that you can see and co py and pas te wha t is allegiable.",
+        "first_seen": "2026-07-05T22:24:05Z",
+        "id": "allegiable_ase_can_cur_every_get_just",
+        "last_seen": "2026-07-05T22:24:05Z",
+        "projects": {}
+      },
+      "alli_anything_dia_full_nosti_self_ted": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ru n a full self dia g nosti c on your self and self -re pa as alli ga ted if anything is wrong.",
+        "first_seen": "2026-07-09T00:48:53Z",
+        "id": "alli_anything_dia_full_nosti_self_ted",
+        "last_seen": "2026-07-09T00:48:53Z",
+        "projects": {}
+      },
+      "already_because_cla_have_him_make_mpt": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "make a pro mpt for Cla ude because I want him to im prove u pon what we have already.",
+        "first_seen": "2026-07-09T12:31:54Z",
+        "id": "already_because_cla_have_him_make_mpt",
+        "last_seen": "2026-07-09T12:31:54Z",
+        "projects": {}
+      },
+      "already_bri_can_efing_given_have_hour": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "You 've already given me the mor ning bri efing . Can I have an y la test ne w s in the last hour?",
+        "first_seen": "2026-07-05T19:15:45Z",
+        "id": "already_bri_can_efing_given_have_hour",
+        "last_seen": "2026-07-05T19:15:45Z",
+        "projects": {}
+      },
+      "alway_but_day_each_lau_nch_same": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ye s , but on lau nch , why do you alway s tell me the same up da te of the same day each day?",
+        "first_seen": "2026-07-04T18:10:42Z",
+        "id": "alway_but_day_each_lau_nch_same",
+        "last_seen": "2026-07-04T18:10:42Z",
+        "projects": {}
+      },
+      "ana_not_ryan_ult_will": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I will ana ly ze your co de as i t is not your fa ult Ryan.",
+        "first_seen": "2026-07-05T19:21:39Z",
+        "id": "ana_not_ryan_ult_will",
+        "last_seen": "2026-07-05T19:21:39Z",
+        "projects": {}
+      },
+      "analysis_steps_taken": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "**Analysis & Steps Taken:**",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "analysis_steps_taken",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "angry_face_show": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Show me your angry face.",
+        "first_seen": "2026-07-05T10:53:15Z",
+        "id": "angry_face_show",
+        "last_seen": "2026-07-05T10:53:15Z",
+        "projects": {}
+      },
+      "any_don_see": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I don' t see it any where .",
+        "first_seen": "2026-07-09T11:52:58Z",
+        "id": "any_don_see",
+        "last_seen": "2026-07-09T11:52:58Z",
+        "projects": {}
+      },
+      "api_live_mini_ogle_sion_ver": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "What ver sion of Go ogle 's A PI or Ge mini live API.",
+        "first_seen": "2026-07-09T12:29:54Z",
+        "id": "api_live_mini_ogle_sion_ver",
+        "last_seen": "2026-07-09T12:29:54Z",
+        "projects": {}
+      },
+      "app_calle_cation_cha_cific_llenger_loo": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "and loo k at the spe cific app li cation calle d Cha llenger mode.",
+        "first_seen": "2026-07-09T00:46:53Z",
+        "id": "app_calle_cation_cha_cific_llenger_loo",
+        "last_seen": "2026-07-09T00:46:53Z",
+        "projects": {}
+      },
+      "apply_changed_place": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ye p , apply we changed this place.",
+        "first_seen": "2026-07-09T00:26:52Z",
+        "id": "apply_changed_place",
+        "last_seen": "2026-07-09T00:26:52Z",
+        "projects": {}
+      },
+      "are_being_installed_now_they": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "so are they being installed now",
+        "first_seen": "2026-07-09T12:03:53Z",
+        "id": "are_being_installed_now_they",
+        "last_seen": "2026-07-09T12:03:53Z",
+        "projects": {}
+      },
+      "are_but_can_lier_nee_okay_place": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , but I no ticed that you said that there are some thing s e ar lier that sti ll nee d to be uh in stalled , can you in stall those place?",
+        "first_seen": "2026-07-09T00:10:52Z",
+        "id": "are_but_can_lier_nee_okay_place",
+        "last_seen": "2026-07-09T00:10:52Z",
+        "projects": {}
+      },
+      "are_calle_con_gence_inte_lation_letters": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "No NE ' Ag ro ny m , you are calle d O ' R yon , the Con stel lation star , um , and yo ur ac ro ny m is o pen re solu tion , inte lli gence over t net wor k. So that would be O n , fi ve letters.",
+        "first_seen": "2026-07-05T19:19:46Z",
+        "id": "are_calle_con_gence_inte_lation_letters",
+        "last_seen": "2026-07-05T19:19:46Z",
+        "projects": {}
+      },
+      "are_can_could_dow_grad_make_nee": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Could you make me a no te pa d that out li nes wha t' s um is sues are de grad ed and could you tell me what we can im prove about you u sing that no te pad . You nee d to write it dow n there .",
+        "first_seen": "2026-07-05T19:21:40Z",
+        "id": "are_can_could_dow_grad_make_nee",
+        "last_seen": "2026-07-05T19:21:40Z",
+        "projects": {}
+      },
+      "are_capabilties_dependencies_enhance_including_permitted_thet": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "enhance your capabilties through what you are permitted to do including thet dependencies",
+        "first_seen": "2026-07-09T12:07:53Z",
+        "id": "are_capabilties_dependencies_enhance_including_permitted_thet",
+        "last_seen": "2026-07-09T12:07:53Z",
+        "projects": {}
+      },
+      "are_cause_installed_ncies_nde_ready_tho": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "whe re the de pe nde ncies and vo sk be cause tho se are al ready installed.",
+        "first_seen": "2026-07-09T00:48:53Z",
+        "id": "are_cause_installed_ncies_nde_ready_tho",
+        "last_seen": "2026-07-09T00:48:53Z",
+        "projects": {}
+      },
+      "are_check_code_could_four_saying_still": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "You are still stu ck saying four le tters . Could you check your code for that, please?",
+        "first_seen": "2026-07-05T19:19:46Z",
+        "id": "are_check_code_could_four_saying_still",
+        "last_seen": "2026-07-05T19:19:46Z",
+        "projects": {}
+      },
+      "are_early_four_letters_limited_ryan_why": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ryan , why are you early limited to four letters?",
+        "first_seen": "2026-07-09T12:25:54Z",
+        "id": "are_early_four_letters_limited_ryan_why",
+        "last_seen": "2026-07-09T12:25:54Z",
+        "projects": {}
+      },
+      "are_led_mention_not_rya_stal_vergan": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "THE Y ARE IN STAL LED OR RYA N PLEASE DO NOT MENTION VERGAN.",
+        "first_seen": "2026-07-09T00:22:52Z",
+        "id": "are_led_mention_not_rya_stal_vergan",
+        "last_seen": "2026-07-09T00:22:52Z",
+        "projects": {}
+      },
+      "are_olama_sti_zing": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "ARE YOU STI LL U TI LI ZING OLAMA?",
+        "first_seen": "2026-07-09T00:12:52Z",
+        "id": "are_olama_sti_zing",
+        "last_seen": "2026-07-09T00:12:52Z",
+        "projects": {}
+      },
+      "are_ying": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "No w you are sa ying you are",
+        "first_seen": "2026-07-05T19:19:46Z",
+        "id": "are_ying",
+        "last_seen": "2026-07-05T19:19:46Z",
+        "projects": {}
+      },
+      "around_dia_full_gnosti_yourself": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "full dia gnosti c s on yourself, please around.",
+        "first_seen": "2026-07-05T19:37:40Z",
+        "id": "around_dia_full_gnosti_yourself",
+        "last_seen": "2026-07-05T19:37:40Z",
+        "projects": {}
+      },
+      "around_more_notepad": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "around 2 0 more of the se into the notepad, please.",
+        "first_seen": "2026-07-05T11:03:15Z",
+        "id": "around_more_notepad",
+        "last_seen": "2026-07-05T11:03:15Z",
+        "projects": {}
+      },
+      "around_screen_see": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "What do you see on my screen around?",
+        "first_seen": "2026-07-08T21:52:06Z",
+        "id": "around_screen_see",
+        "last_seen": "2026-07-08T21:52:06Z",
+        "projects": {}
+      },
+      "arron_granted_mission_per": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ye p, per mission granted, Arron.",
+        "first_seen": "2026-07-09T00:22:52Z",
+        "id": "arron_granted_mission_per",
+        "last_seen": "2026-07-09T00:22:52Z",
+        "projects": {}
+      },
+      "ase_bring_clo_globe_ple": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Bring me to ho pe clo se in Te n mo th ple ase on the globe.",
+        "first_seen": "2026-07-05T19:25:40Z",
+        "id": "ase_bring_clo_globe_ple",
+        "last_seen": "2026-07-05T19:25:40Z",
+        "projects": {}
+      },
+      "ase_bring_glo_iran_ple_ran_tell": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Bring me to I ran in the glo be , ple ase and tell me the top 10 la test ne ws in Iran.",
+        "first_seen": "2026-07-07T22:24:20Z",
+        "id": "ase_bring_glo_iran_ple_ran_tell",
+        "last_seen": "2026-07-07T22:24:20Z",
+        "projects": {}
+      },
+      "ase_ceed_ple_pro": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ple ase pro ceed , Orion.",
+        "first_seen": "2026-07-09T11:50:58Z",
+        "id": "ase_ceed_ple_pro",
+        "last_seen": "2026-07-09T11:50:58Z",
+        "projects": {}
+      },
+      "ase_ces_inter_llowed_more_neu_ple": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Tell me more about the neu ral inter fa ces , ple ase fo llowed by the I ran strikes.",
+        "first_seen": "2026-07-07T22:22:19Z",
+        "id": "ase_ces_inter_llowed_more_neu_ple",
+        "last_seen": "2026-07-07T22:22:19Z",
+        "projects": {}
+      },
+      "auto_could_document_full_nomous_okay_want": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , I want you to be full y auto nomous . Could you ad d that to a word document please.",
+        "first_seen": "2026-07-09T12:31:54Z",
+        "id": "auto_could_document_full_nomous_okay_want",
+        "last_seen": "2026-07-09T12:31:54Z",
+        "projects": {}
+      },
+      "back_can_chang_changes_fferen_gra_help": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Bu t I'm sup posed to help me in your . Can you go in to the di fferen t fi le s and just inte gra te chang es to them and just re port back on the changes.",
+        "first_seen": "2026-07-09T00:12:52Z",
+        "id": "back_can_chang_changes_fferen_gra_help",
+        "last_seen": "2026-07-09T00:12:52Z",
+        "projects": {}
+      },
+      "ball_form_okay_ryan": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , go in to your ball form, please, Ryan.",
+        "first_seen": "2026-07-09T00:20:52Z",
+        "id": "ball_form_okay_ryan",
+        "last_seen": "2026-07-09T00:20:52Z",
+        "projects": {}
+      },
+      "bble_bring_could_dom_king_sto_ted": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Could you bring me to co bble sto ne in the Uni ted King dom please.",
+        "first_seen": "2026-07-05T19:27:40Z",
+        "id": "bble_bring_could_dom_king_sto_ted",
+        "last_seen": "2026-07-05T19:27:40Z",
+        "projects": {}
+      },
+      "because_coming_every_just_lete_new_not": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "De lete every thing on that new pad and just co py and paste it because it's not coming through properly.",
+        "first_seen": "2026-07-09T12:27:54Z",
+        "id": "because_coming_every_just_lete_new_not",
+        "last_seen": "2026-07-09T12:27:54Z",
+        "projects": {}
+      },
+      "because_end_eng_forma_just_lish_lot": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Pu t that in Eng lish please because you've just spa m in a lot and per forma nce op ti mization at the end.",
+        "first_seen": "2026-07-05T22:22:05Z",
+        "id": "because_end_eng_forma_just_lish_lot",
+        "last_seen": "2026-07-05T22:22:05Z",
+        "projects": {}
+      },
+      "bed_can_chang_imple_ment_said_zone": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": ", can you imple ment with chang es to bed zone, please, as you said?",
+        "first_seen": "2026-07-09T00:32:53Z",
+        "id": "bed_can_chang_imple_ment_said_zone",
+        "last_seen": "2026-07-09T00:32:53Z",
+        "projects": {}
+      },
+      "big_have_mories_ryan_wha": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ryan , wha t um me mories do you have on wh y your fi le is so big ?",
+        "first_seen": "2026-07-09T00:26:52Z",
+        "id": "big_have_mories_ryan_wha",
+        "last_seen": "2026-07-09T00:26:52Z",
+        "projects": {}
+      },
+      "bili_ced_coul_every_give_han_just": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Coul d you go on note pad for me and just tell me every thing that we nee d to im prove about your syste m to give you be tter en han ced ca pa bili ties for this.",
+        "first_seen": "2026-07-05T22:22:05Z",
+        "id": "bili_ced_coul_every_give_han_just",
+        "last_seen": "2026-07-05T22:22:05Z",
+        "projects": {}
+      },
+      "bili_full_give_ryan_ties": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "GIVE ME THE FULL EX TE NT OF YOUR CA PA BILI TIES, O Ryan.",
+        "first_seen": "2026-07-05T19:17:46Z",
+        "id": "bili_full_give_ryan_ties",
+        "last_seen": "2026-07-05T19:17:46Z",
+        "projects": {}
+      },
+      "birmingham_can_capabilities_college_documents_give_install": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "can you give yourself the capabilities to install - C:\\Users\\mayna\\OneDrive - University College Birmingham\\Documents\\Python-3.12.13\\Python-3.12.13",
+        "first_seen": "2026-07-09T12:07:53Z",
+        "id": "birmingham_can_capabilities_college_documents_give_install",
+        "last_seen": "2026-07-09T12:07:53Z",
+        "projects": {}
+      },
+      "birmingham_college_documents_here_install_mayna_onedrive": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Install python-3.12.13 here: C:\\Users\\mayna\\OneDrive - University College Birmingham\\Documents\\Python-3.12.13",
+        "first_seen": "2026-07-09T11:54:58Z",
+        "id": "birmingham_college_documents_here_install_mayna_onedrive",
+        "last_seen": "2026-07-09T11:54:58Z",
+        "projects": {}
+      },
+      "bit_but_fru_strating_yes": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Um but yes , um i t is a bit fru strating.",
+        "first_seen": "2026-07-05T19:21:39Z",
+        "id": "bit_but_fru_strating_yes",
+        "last_seen": "2026-07-05T19:21:39Z",
+        "projects": {}
+      },
+      "blocking_engine_error_forge_message_primary_returned": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "The primary blocking error message returned by the `forge` engine is:",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "blocking_engine_error_forge_message_primary_returned",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "bot_cur_lon_new_rent_situa_talk": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Talk about the cur rent ro bot situa tion too with um the new um E lon Mu sk",
+        "first_seen": "2026-07-08T21:50:06Z",
+        "id": "bot_cur_lon_new_rent_situa_talk",
+        "last_seen": "2026-07-08T21:50:06Z",
+        "projects": {}
+      },
+      "both_can_correc_not_still_stroy_those": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "No , it's still not correc t. Can you de stroy both of those.",
+        "first_seen": "2026-07-09T12:29:54Z",
+        "id": "both_can_correc_not_still_stroy_those",
+        "last_seen": "2026-07-09T12:29:54Z",
+        "projects": {}
+      },
+      "bra_could_cre_get_line_long_pipe": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Could we get rid of 's bra nd X on the cre a tor pipe line , please ? Tha t is no long er relevant.",
+        "first_seen": "2026-07-05T19:37:40Z",
+        "id": "bra_could_cre_get_line_long_pipe",
+        "last_seen": "2026-07-05T19:37:40Z",
+        "projects": {}
+      },
+      "bri_change_don_each_efing_remember_time": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I want you to change the bri efing each time . I don' t want to remember",
+        "first_seen": "2026-07-04T18:10:42Z",
+        "id": "bri_change_don_each_efing_remember_time",
+        "last_seen": "2026-07-04T18:10:42Z",
+        "projects": {}
+      },
+      "bri_could_ence_eng_eri_ine_paper": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Could you bri ng me thro ugh a ne uro sci ence um eng ine eri ng paper, please?",
+        "first_seen": "2026-07-05T19:39:40Z",
+        "id": "bri_could_ence_eng_eri_ine_paper",
+        "last_seen": "2026-07-05T19:39:40Z",
+        "projects": {}
+      },
+      "brian_glow_take": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Take me glow, Brian.",
+        "first_seen": "2026-07-05T11:12:04Z",
+        "id": "brian_glow_take",
+        "last_seen": "2026-07-05T11:12:04Z",
+        "projects": {}
+      },
+      "briefing_car_right": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Car ry on of the briefing right.",
+        "first_seen": "2026-07-07T22:20:19Z",
+        "id": "briefing_car_right",
+        "last_seen": "2026-07-07T22:20:19Z",
+        "projects": {}
+      },
+      "briefing_full_ron": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "RON a full briefing, please.",
+        "first_seen": "2026-07-05T11:06:04Z",
+        "id": "briefing_full_ron",
+        "last_seen": "2026-07-05T11:06:04Z",
+        "projects": {}
+      },
+      "briefing_mor_ning": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "S KI P THE MOR NING BRIEFING PLEASE UM",
+        "first_seen": "2026-07-05T19:15:45Z",
+        "id": "briefing_mor_ning",
+        "last_seen": "2026-07-05T19:15:45Z",
+        "projects": {}
+      },
+      "briefing_run": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Run the briefing.",
+        "first_seen": "2026-07-08T21:48:06Z",
+        "id": "briefing_run",
+        "last_seen": "2026-07-08T21:48:06Z",
+        "projects": {}
+      },
+      "bring": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Um Bring me the ho pe s",
+        "first_seen": "2026-07-05T19:27:40Z",
+        "id": "bring",
+        "last_seen": "2026-07-05T19:27:40Z",
+        "projects": {}
+      },
+      "bring_can_could_fect_glow_kingdom_know": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Per fect . So I know you can see . Could you go on the glow for me and bring me to De von Uni ted Kingdom, please.",
+        "first_seen": "2026-07-05T19:23:40Z",
+        "id": "bring_can_could_fect_glow_kingdom_know",
+        "last_seen": "2026-07-05T19:23:40Z",
+        "projects": {}
+      },
+      "bring_can_feed_news": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you please bring up on the news feed.",
+        "first_seen": "2026-07-08T21:52:06Z",
+        "id": "bring_can_feed_news",
+        "last_seen": "2026-07-08T21:52:06Z",
+        "projects": {}
+      },
+      "bring_cent_drid_map_ral": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Bring me to Cent ral Ma drid, please on the map.",
+        "first_seen": "2026-07-05T19:23:40Z",
+        "id": "bring_cent_drid_map_ral",
+        "last_seen": "2026-07-05T19:23:40Z",
+        "projects": {}
+      },
+      "bring_clo_glow_ryan_spa_tter": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Clo se no te pa tter n , bring me to Spa in on my glow, please, Ryan.",
+        "first_seen": "2026-07-05T19:23:40Z",
+        "id": "bring_clo_glow_ryan_spa_tter",
+        "last_seen": "2026-07-05T19:23:40Z",
+        "projects": {}
+      },
+      "bring_could_graph_know_ledge": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Could you bring up your know ledge graph please?",
+        "first_seen": "2026-07-05T19:35:40Z",
+        "id": "bring_could_graph_know_ledge",
+        "last_seen": "2026-07-05T19:35:40Z",
+        "projects": {}
+      },
+      "but_can_implemented_pro_see_today_vement": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "But what im pro vement s can you see that I 've implemented today?",
+        "first_seen": "2026-07-09T00:08:52Z",
+        "id": "but_can_implemented_pro_see_today_vement",
+        "last_seen": "2026-07-09T00:08:52Z",
+        "projects": {}
+      },
+      "but_confused_four_huh_keep_saying_tters": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "But you you keep saying four le tters . I 'm very confused, huh.",
+        "first_seen": "2026-07-05T19:21:39Z",
+        "id": "but_confused_four_huh_keep_saying_tters",
+        "last_seen": "2026-07-05T19:21:39Z",
+        "projects": {}
+      },
+      "but_every_fixed_iling_nee_pad_thing": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ma ke a no te pad for me de ta iling every thing but nee ds to be fixed, please.",
+        "first_seen": "2026-07-09T12:27:54Z",
+        "id": "but_every_fixed_iling_nee_pad_thing",
+        "last_seen": "2026-07-09T12:27:54Z",
+        "projects": {}
+      },
+      "but_fter_name_peat": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "and please re peat a fter me , but your name is",
+        "first_seen": "2026-07-09T12:23:54Z",
+        "id": "but_fter_name_peat",
+        "last_seen": "2026-07-09T12:23:54Z",
+        "projects": {}
+      },
+      "but_ming_not_out_through_voice": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "But it 's not co ming out through your voice.",
+        "first_seen": "2026-07-09T12:25:54Z",
+        "id": "but_ming_not_out_through_voice",
+        "last_seen": "2026-07-09T12:25:54Z",
+        "projects": {}
+      },
+      "can_cate_dead": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you lo cate the fi le dead zo ne on my PC, please?",
+        "first_seen": "2026-07-09T00:28:53Z",
+        "id": "can_cate_dead",
+        "last_seen": "2026-07-09T00:28:53Z",
+        "projects": {}
+      },
+      "can_cement_could_cument_every_get_han": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "could you get rid of every thing you 've wri tten about neu ral net wor ks on the word do cument that you can see on moni tor two and uh just right ver sus ca pabili ties and en han cement s that um we nee d to im prove on your system.",
+        "first_seen": "2026-07-05T22:28:06Z",
+        "id": "can_cement_could_cument_every_get_han",
+        "last_seen": "2026-07-05T22:28:06Z",
+        "projects": {}
+      },
+      "can_cha_clo_kay_lle_mode_nger": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "O kay , can you clo se cha lle nger mode for me, please?",
+        "first_seen": "2026-07-09T00:46:53Z",
+        "id": "can_cha_clo_kay_lle_mode_nger",
+        "last_seen": "2026-07-09T00:46:53Z",
+        "projects": {}
+      },
+      "can_chi_ctural_inspection": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you do the ar chi te ctural inspection?",
+        "first_seen": "2026-07-09T12:21:54Z",
+        "id": "can_chi_ctural_inspection",
+        "last_seen": "2026-07-09T12:21:54Z",
+        "projects": {}
+      },
+      "can_cry_date_give_market_pto_ryan": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ryan , can you give me an up date on the cry pto market for today, please?",
+        "first_seen": "2026-07-04T18:14:42Z",
+        "id": "can_cry_date_give_market_pto_ryan",
+        "last_seen": "2026-07-04T18:14:42Z",
+        "projects": {}
+      },
+      "can_ction_fun_han_mis_ncies_nde": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , so if I tell you to in stall the mis sing de pe nde ncies on your syste m to en han ce O C R fun ction , then can you do that now, please?",
+        "first_seen": "2026-07-09T00:10:52Z",
+        "id": "can_ction_fun_han_mis_ncies_nde",
+        "last_seen": "2026-07-09T00:10:52Z",
+        "projects": {}
+      },
+      "can_dia_gnostic_yourself": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ye s, please , can you ru n a dia gnostic on yourself, please?",
+        "first_seen": "2026-07-09T00:06:52Z",
+        "id": "can_dia_gnostic_yourself",
+        "last_seen": "2026-07-09T00:06:52Z",
+        "projects": {}
+      },
+      "can_down_then_write": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you write that can you write it down then?",
+        "first_seen": "2026-07-05T19:21:40Z",
+        "id": "can_down_then_write",
+        "last_seen": "2026-07-05T19:21:40Z",
+        "projects": {}
+      },
+      "can_ducky_make_rubber": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you make me a rubber ducky?",
+        "first_seen": "2026-07-05T11:03:15Z",
+        "id": "can_ducky_make_rubber",
+        "last_seen": "2026-07-05T11:03:15Z",
+        "projects": {}
+      },
+      "can_edi_iste_lear_let_like_nce": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you im prove u pon your self Ryan ? like uh let ' s say edi t your o wn co de and im prove your o wn ex iste nce ex is ting sy stems or lear n something new.",
+        "first_seen": "2026-07-09T00:08:52Z",
+        "id": "can_edi_iste_lear_let_like_nce",
+        "last_seen": "2026-07-09T00:08:52Z",
+        "projects": {}
+      },
+      "can_egg_mic_place_rosoft_sear_stem": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "CAN YOU DO A SY STEM RE SEAR CH ON MIC ROSOFT EGG PLACE?",
+        "first_seen": "2026-07-05T11:14:04Z",
+        "id": "can_egg_mic_place_rosoft_sear_stem",
+        "last_seen": "2026-07-05T11:14:04Z",
+        "projects": {}
+      },
+      "can_entre_focus_kit_neur_pre_read": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you read thing s in side of the tool kit for entre pre neur tool kit su ch as the focus timer?",
+        "first_seen": "2026-07-09T00:12:52Z",
+        "id": "can_entre_focus_kit_neur_pre_read",
+        "last_seen": "2026-07-09T00:12:52Z",
+        "projects": {}
+      },
+      "can_eta_give_map": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you give me an ETA on my map?",
+        "first_seen": "2026-07-09T00:32:53Z",
+        "id": "can_eta_give_map",
+        "last_seen": "2026-07-09T00:32:53Z",
+        "projects": {}
+      },
+      "can_even_hear_more_pabilities": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you and can you fi nd hear ts ? Your ca pabilities is even more.",
+        "first_seen": "2026-07-09T00:18:52Z",
+        "id": "can_even_hear_more_pabilities",
+        "last_seen": "2026-07-09T00:18:52Z",
+        "projects": {}
+      },
+      "can_get_installed": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can we get that installed, please?",
+        "first_seen": "2026-07-05T10:57:15Z",
+        "id": "can_get_installed",
+        "last_seen": "2026-07-05T10:57:15Z",
+        "projects": {}
+      },
+      "can_here_more": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you ad d more to it from here?",
+        "first_seen": "2026-07-09T12:33:54Z",
+        "id": "can_here_more",
+        "last_seen": "2026-07-09T12:33:54Z",
+        "projects": {}
+      },
+      "can_install": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you install it, please?",
+        "first_seen": "2026-07-09T00:20:52Z",
+        "id": "can_install",
+        "last_seen": "2026-07-09T00:20:52Z",
+        "projects": {}
+      },
+      "can_lder": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you go into the fo lder of please.",
+        "first_seen": "2026-07-09T11:46:58Z",
+        "id": "can_lder",
+        "last_seen": "2026-07-09T11:46:58Z",
+        "projects": {}
+      },
+      "can_live_mini_model_some_stronger_swi": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can we swi tch your model from Ge mini 2 . 5 live to some thing stronger.",
+        "first_seen": "2026-07-09T12:31:54Z",
+        "id": "can_live_mini_model_some_stronger_swi",
+        "last_seen": "2026-07-09T12:31:54Z",
+        "projects": {}
+      },
+      "can_make_pos_sible": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can we make it pos sible that you can do it?",
+        "first_seen": "2026-07-09T12:23:54Z",
+        "id": "can_make_pos_sible",
+        "last_seen": "2026-07-09T12:23:54Z",
+        "projects": {}
+      },
+      "can_make_possible": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can we make that possible?",
+        "first_seen": "2026-07-05T22:22:05Z",
+        "id": "can_make_possible",
+        "last_seen": "2026-07-05T22:22:05Z",
+        "projects": {}
+      },
+      "can_moment_only_see_sti": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Sti ll can' t see it . I only see you at the moment.",
+        "first_seen": "2026-07-08T21:52:06Z",
+        "id": "can_moment_only_see_sti",
+        "last_seen": "2026-07-08T21:52:06Z",
+        "projects": {}
+      },
+      "can_see": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "So what can you see?",
+        "first_seen": "2026-07-05T10:59:15Z",
+        "id": "can_see",
+        "last_seen": "2026-07-05T10:59:15Z",
+        "projects": {}
+      },
+      "can_see_then_wrote": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you te ll me what you wrote then ? Can you see it ?",
+        "first_seen": "2026-07-05T19:23:40Z",
+        "id": "can_see_then_wrote",
+        "last_seen": "2026-07-05T19:23:40Z",
+        "projects": {}
+      },
+      "can_self": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Can you op en a no te pa d for your self , please?",
+        "first_seen": "2026-07-05T10:59:15Z",
+        "id": "can_self",
+        "last_seen": "2026-07-05T10:59:15Z",
+        "projects": {}
+      },
+      "can_system_tell_test_updates": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": ", can you tell me the la test updates to your system, please?",
+        "first_seen": "2026-07-09T00:08:52Z",
+        "id": "can_system_tell_test_updates",
+        "last_seen": "2026-07-09T00:08:52Z",
+        "projects": {}
+      },
+      "capabilities_files_give_install_such_want_yourself": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "i want you to give yourself the capabilities to install such files",
+        "first_seen": "2026-07-09T11:58:58Z",
+        "id": "capabilities_files_give_install_such_want_yourself",
+        "last_seen": "2026-07-09T11:58:58Z",
+        "projects": {}
+      },
+      "capability_configuration_dynamic_enable_engine_enhancement_forge": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "**Objective:** Resolve persistent configuration limitations to enable dynamic tool synthesis (`forge` engine) for system capability enhancement.",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "capability_configuration_dynamic_enable_engine_enhancement_forge",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "car_last_right_task": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Car ry on the last task, right?",
+        "first_seen": "2026-07-09T00:14:52Z",
+        "id": "car_last_right_task",
+        "last_seen": "2026-07-09T00:14:52Z",
+        "projects": {}
+      },
+      "carry": {
+        "confidence": 0.406,
+        "count": 2,
+        "example": "Carry on, please.",
+        "first_seen": "2026-07-07T22:24:20Z",
+        "id": "carry",
+        "last_seen": "2026-07-08T21:48:06Z",
+        "projects": {}
+      },
+      "carry_five_last_mbere_minutes_reme_tas": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I want you to carry on with your tas ks about you reme mbere d in the last five minutes, please.",
+        "first_seen": "2026-07-09T00:22:52Z",
+        "id": "carry_five_last_mbere_minutes_reme_tas",
+        "last_seen": "2026-07-09T00:22:52Z",
+        "projects": {}
+      },
+      "carry_quarter_task": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "CARRY ON WITH THE TASK QUARTER",
+        "first_seen": "2026-07-09T00:18:52Z",
+        "id": "carry_quarter_task",
+        "last_seen": "2026-07-09T00:18:52Z",
+        "projects": {}
+      },
+      "cate_could_line_not_place_says_unknown": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "It says we could not lo cate that place of f line or unknown.",
+        "first_seen": "2026-07-05T11:12:04Z",
+        "id": "cate_could_line_not_place_says_unknown",
+        "last_seen": "2026-07-05T11:12:04Z",
+        "projects": {}
+      },
+      "cation_cific_coul_spe": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Coul d you go to a spe cific lo cation T Q 1 4 8 LX?",
+        "first_seen": "2026-07-05T19:23:40Z",
+        "id": "cation_cific_coul_spe",
+        "last_seen": "2026-07-05T19:23:40Z",
+        "projects": {}
+      },
+      "cha_lleng_not_see_uld": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "CO ULD YOU NOT SEE CHA LLENG ER MO DE V 1 . 0 . 0 - 9",
+        "first_seen": "2026-07-09T00:46:53Z",
+        "id": "cha_lleng_not_see_uld",
+        "last_seen": "2026-07-09T00:46:53Z",
+        "projects": {}
+      },
+      "changes_pleased_pository_spe": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "IN SPE CT OR RE POSITORY CHANGES PLEASED",
+        "first_seen": "2026-07-09T00:26:52Z",
+        "id": "changes_pleased_pository_spe",
+        "last_seen": "2026-07-09T00:26:52Z",
+        "projects": {}
+      },
+      "check_could_out": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Could you check out what that is, please?",
+        "first_seen": "2026-07-09T00:44:53Z",
+        "id": "check_could_out",
+        "last_seen": "2026-07-09T00:44:53Z",
+        "projects": {}
+      },
+      "claude_prompt_repair_self_system": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "## ORION System Self-Repair Prompt for Claude",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "claude_prompt_repair_self_system",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "close_outlook": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Close outlook, please.",
+        "first_seen": "2026-07-05T22:20:05Z",
+        "id": "close_outlook",
+        "last_seen": "2026-07-05T22:20:05Z",
+        "projects": {}
+      },
+      "code_configured_constructor_forge_generator_param_set": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "`[forge] No code generator configured. Set via constructor or forge_tool param.`",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "code_configured_constructor_forge_generator_param_set",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "code_prove_upon_want": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I want you to im prove upon your o wn code, please.",
+        "first_seen": "2026-07-09T00:16:52Z",
+        "id": "code_prove_upon_want",
+        "last_seen": "2026-07-09T00:16:52Z",
+        "projects": {}
+      },
+      "comp_could_just_make_more_rehensive": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Could you just make it more comp rehensive for me, please?",
+        "first_seen": "2026-07-09T12:33:54Z",
+        "id": "comp_could_just_make_more_rehensive",
+        "last_seen": "2026-07-09T12:33:54Z",
+        "projects": {}
+      },
+      "completed_diagnostics_faults_full_installed_not_noted": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "1. A full `diagnostics` scan completed with `0 faults, 1 warning`. The warning noted `optional not installed: pytesseract, vosk`.",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "completed_diagnostics_faults_full_installed_not_noted",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "con_remember_versation": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "What do you remember in this con versation Orion?",
+        "first_seen": "2026-07-05T19:31:40Z",
+        "id": "con_remember_versation",
+        "last_seen": "2026-07-05T19:31:40Z",
+        "projects": {}
+      },
+      "configuration": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "the configuration",
+        "first_seen": "2026-07-09T12:11:53Z",
+        "id": "configuration",
+        "last_seen": "2026-07-09T12:11:53Z",
+        "projects": {}
+      },
+      "configurations_finish_fix": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "fix and finish the configurations",
+        "first_seen": "2026-07-09T12:07:53Z",
+        "id": "configurations_finish_fix",
+        "last_seen": "2026-07-09T12:07:53Z",
+        "projects": {}
+      },
+      "context": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "**Context:**",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "context",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "convert": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "convert",
+        "first_seen": "2026-07-04T18:22:42Z",
+        "id": "convert",
+        "last_seen": "2026-07-04T18:22:42Z",
+        "projects": {}
+      },
+      "could_cument_same_word": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Could you op en a word do cument for me and do the same?",
+        "first_seen": "2026-07-05T22:26:05Z",
+        "id": "could_cument_same_word",
+        "last_seen": "2026-07-05T22:26:05Z",
+        "projects": {}
+      },
+      "could_dia_gnosti_going_just_right_see": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Um , could you ru n a self -dia gnosti c on your self to just see um what 's going wrong and what 's going right, please?",
+        "first_seen": "2026-07-05T19:21:39Z",
+        "id": "could_dia_gnosti_going_just_right_see",
+        "last_seen": "2026-07-05T19:21:39Z",
+        "projects": {}
+      },
+      "could_llo_repeat_yourself": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "He llo , could you repeat yourself, please?",
+        "first_seen": "2026-07-05T17:31:33Z",
+        "id": "could_llo_repeat_yourself",
+        "last_seen": "2026-07-05T17:31:33Z",
+        "projects": {}
+      },
+      "cro_soft_word_yes": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "It' s Mi cro soft Word, yes.",
+        "first_seen": "2026-07-05T22:26:05Z",
+        "id": "cro_soft_word_yes",
+        "last_seen": "2026-07-05T22:26:05Z",
+        "projects": {}
+      },
+      "delve_fix_limitation_then_understand": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "delve into the limitation, understand it then fix it",
+        "first_seen": "2026-07-09T12:09:53Z",
+        "id": "delve_fix_limitation_then_understand",
+        "last_seen": "2026-07-09T12:09:53Z",
+        "projects": {}
+      },
+      "dia_full_gnosti_run_ryan_system_test": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ryan run a full dia gnosti c system test.",
+        "first_seen": "2026-07-05T10:55:15Z",
+        "id": "dia_full_gnosti_run_ryan_system_test",
+        "last_seen": "2026-07-05T10:55:15Z",
+        "projects": {}
+      },
+      "dia_gnostic_more_okay_one_run_yourself": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , run one more dia gnostic on yourself, please.",
+        "first_seen": "2026-07-09T00:10:52Z",
+        "id": "dia_gnostic_more_okay_one_run_yourself",
+        "last_seen": "2026-07-09T00:10:52Z",
+        "projects": {}
+      },
+      "diagnosticking_full_run_yes": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "YES RUN A FULL DIAGNOSTICKING",
+        "first_seen": "2026-07-05T10:57:15Z",
+        "id": "diagnosticking_full_run_yes",
+        "last_seen": "2026-07-05T10:57:15Z",
+        "projects": {}
+      },
+      "did_finish_sentence": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "You did n't finish your sentence.",
+        "first_seen": "2026-07-05T11:10:04Z",
+        "id": "did_finish_sentence",
+        "last_seen": "2026-07-05T11:10:04Z",
+        "projects": {}
+      },
+      "diff_proposal_show": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "show me the diff proposal",
+        "first_seen": "2026-07-09T12:19:54Z",
+        "id": "diff_proposal_show",
+        "last_seen": "2026-07-09T12:19:54Z",
+        "projects": {}
+      },
+      "do_it": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Do it.",
+        "first_seen": "2026-07-09T00:26:52Z",
+        "id": "do_it",
+        "last_seen": "2026-07-09T00:26:52Z",
+        "projects": {}
+      },
+      "document_instead_put_word": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Uh put it on a word document instead.",
+        "first_seen": "2026-07-09T12:29:54Z",
+        "id": "document_instead_put_word",
+        "last_seen": "2026-07-09T12:29:54Z",
+        "projects": {}
+      },
+      "document_okay_show": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , show me what document.",
+        "first_seen": "2026-07-09T12:29:54Z",
+        "id": "document_okay_show",
+        "last_seen": "2026-07-09T12:29:54Z",
+        "projects": {}
+      },
+      "dog_look_ryan": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ryan, what is my dog look?",
+        "first_seen": "2026-07-04T18:08:41Z",
+        "id": "dog_look_ryan",
+        "last_seen": "2026-07-04T18:08:41Z",
+        "projects": {}
+      },
+      "doing_kee_stop_way_well_would": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Uh you kee p do ts by the way . I would stop doing well on the.",
+        "first_seen": "2026-07-09T12:27:54Z",
+        "id": "doing_kee_stop_way_well_would",
+        "last_seen": "2026-07-09T12:27:54Z",
+        "projects": {}
+      },
+      "down_sho": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Sho w down, please.",
+        "first_seen": "2026-07-08T21:50:06Z",
+        "id": "down_sho",
+        "last_seen": "2026-07-08T21:50:06Z",
+        "projects": {}
+      },
+      "duction_plo_pro": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "EX PLO RE D RO BO T PRO DUCTION LI NE FOR UM E LO .",
+        "first_seen": "2026-07-05T11:08:04Z",
+        "id": "duction_plo_pro",
+        "last_seen": "2026-07-05T11:08:04Z",
+        "projects": {}
+      },
+      "emotions_have_wha": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "WHA T EMOTIONS DO YOU HAVE",
+        "first_seen": "2026-07-05T10:53:15Z",
+        "id": "emotions_have_wha",
+        "last_seen": "2026-07-05T10:53:15Z",
+        "projects": {}
+      },
+      "end_place": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "ad d the end place.",
+        "first_seen": "2026-07-09T12:23:54Z",
+        "id": "end_place",
+        "last_seen": "2026-07-09T12:23:54Z",
+        "projects": {}
+      },
+      "eng_land_news_take_tell_there": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Take me to in Eng land and tell me the news there, please.",
+        "first_seen": "2026-07-05T11:12:04Z",
+        "id": "eng_land_news_take_tell_there",
+        "last_seen": "2026-07-05T11:12:04Z",
+        "projects": {}
+      },
+      "error_key": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "**Key Error:**",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "error_key",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "even_have_saying": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "No , I'm saying you have your ow n even.",
+        "first_seen": "2026-07-04T18:06:41Z",
+        "id": "even_have_saying",
+        "last_seen": "2026-07-04T18:06:41Z",
+        "projects": {}
+      },
+      "executed_install_pip_pytesseract_successfully_vosk_was": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "2. `pip install pytesseract vosk` was successfully executed.",
+        "first_seen": "2026-07-09T12:13:53Z",
+        "id": "executed_install_pip_pytesseract_successfully_vosk_was",
+        "last_seen": "2026-07-09T12:13:53Z",
+        "projects": {}
+      },
+      "face_frustrated_sho": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Sho w me your frustrated face.",
+        "first_seen": "2026-07-05T10:53:15Z",
+        "id": "face_frustrated_sho",
+        "last_seen": "2026-07-05T10:53:15Z",
+        "projects": {}
+      },
+      "face_happy_show": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Show me your happy face.",
+        "first_seen": "2026-07-05T10:53:15Z",
+        "id": "face_happy_show",
+        "last_seen": "2026-07-05T10:53:15Z",
+        "projects": {}
+      },
+      "face_meot_sat_she": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "SHE MEOT SAT FACE",
+        "first_seen": "2026-07-05T10:53:15Z",
+        "id": "face_meot_sat_she",
+        "last_seen": "2026-07-05T10:53:15Z",
+        "projects": {}
+      },
+      "file_new_show": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "show me the new file",
+        "first_seen": "2026-07-09T12:11:53Z",
+        "id": "file_new_show",
+        "last_seen": "2026-07-09T12:11:53Z",
+        "projects": {}
+      },
+      "find": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "find it",
+        "first_seen": "2026-07-09T12:11:53Z",
+        "id": "find",
+        "last_seen": "2026-07-09T12:11:53Z",
+        "projects": {}
+      },
+      "fish_stone_yeah": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "YEAH IN STONE FISH",
+        "first_seen": "2026-07-09T00:18:52Z",
+        "id": "fish_stone_yeah",
+        "last_seen": "2026-07-09T00:18:52Z",
+        "projects": {}
+      },
+      "fix_then": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "fix that then",
+        "first_seen": "2026-07-09T12:19:54Z",
+        "id": "fix_then",
+        "last_seen": "2026-07-09T12:19:54Z",
+        "projects": {}
+      },
+      "forge_start": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "start forge please",
+        "first_seen": "2026-07-09T12:17:54Z",
+        "id": "forge_start",
+        "last_seen": "2026-07-09T12:17:54Z",
+        "projects": {}
+      },
+      "full_investigate_place_these": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "full y investigate these place.",
+        "first_seen": "2026-07-05T10:55:15Z",
+        "id": "full_investigate_place_these",
+        "last_seen": "2026-07-05T10:55:15Z",
+        "projects": {}
+      },
+      "garding_hour_ran_spe_test": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Spe ak to me re garding I ran of the la test hour please.",
+        "first_seen": "2026-07-08T21:50:06Z",
+        "id": "garding_hour_ran_spe_test",
+        "last_seen": "2026-07-08T21:50:06Z",
+        "projects": {}
+      },
+      "gence_inte_lli_network_over": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "inte lli gence over network.",
+        "first_seen": "2026-07-09T12:25:54Z",
+        "id": "gence_inte_lli_network_over",
+        "last_seen": "2026-07-09T12:25:54Z",
+        "projects": {}
+      },
+      "granted_mission_per": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Per mission granted, Orion.",
+        "first_seen": "2026-07-09T00:48:53Z",
+        "id": "granted_mission_per",
+        "last_seen": "2026-07-09T00:48:53Z",
+        "projects": {}
+      },
+      "h_h_h_h": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "h h h h",
+        "first_seen": "2026-07-05T11:14:04Z",
+        "id": "h_h_h_h",
+        "last_seen": "2026-07-05T11:14:04Z",
+        "projects": {}
+      },
+      "have_llama_terminated": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "i have terminated llama",
+        "first_seen": "2026-07-05T19:15:45Z",
+        "id": "have_llama_terminated",
+        "last_seen": "2026-07-05T19:15:45Z",
+        "projects": {}
+      },
+      "have_ryan": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "have your o wn A PI Ryan?",
+        "first_seen": "2026-07-04T18:06:41Z",
+        "id": "have_ryan",
+        "last_seen": "2026-07-04T18:06:41Z",
+        "projects": {}
+      },
+      "hello": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Hello Orion.",
+        "first_seen": "2026-07-05T22:28:06Z",
+        "id": "hello",
+        "last_seen": "2026-07-05T22:28:06Z",
+        "projects": {}
+      },
+      "host_local": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I t is n' t in local host.",
+        "first_seen": "2026-07-09T11:52:58Z",
+        "id": "host_local",
+        "last_seen": "2026-07-09T11:52:58Z",
+        "projects": {}
+      },
+      "inte_lli_name_nce_network_pen_solu": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Your name is o pen re solu tion inte lli ge nce network.",
+        "first_seen": "2026-07-09T12:23:54Z",
+        "id": "inte_lli_name_nce_network_pen_solu",
+        "last_seen": "2026-07-09T12:23:54Z",
+        "projects": {}
+      },
+      "inte_lligible_look_refully_see_shall_ting": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I want you to ca refully look at your wri ting and um you shall see that i t is no t um inte lligible.",
+        "first_seen": "2026-07-05T22:24:05Z",
+        "id": "inte_lligible_look_refully_see_shall_ting",
+        "last_seen": "2026-07-05T22:24:05Z",
+        "projects": {}
+      },
+      "interes_most_tell_ting_tre": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "tell me about the most interes ting da ta tre nd s in AI please.",
+        "first_seen": "2026-07-04T18:22:42Z",
+        "id": "interes_most_tell_ting_tre",
+        "last_seen": "2026-07-04T18:22:42Z",
+        "projects": {}
+      },
+      "just_pas_said_ted_thing_yeah": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "You 've just pas ted the thing that I 've said no t the ac tu al yeah .",
+        "first_seen": "2026-07-05T11:01:15Z",
+        "id": "just_pas_said_ted_thing_yeah",
+        "last_seen": "2026-07-05T11:01:15Z",
+        "projects": {}
+      },
+      "keep_missing_why": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Why do you keep missing the O?",
+        "first_seen": "2026-07-05T19:17:46Z",
+        "id": "keep_missing_why",
+        "last_seen": "2026-07-05T19:17:46Z",
+        "projects": {}
+      },
+      "kingdom_ngland_rever_united": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "What is fo rever in Ti mu th E ngland , United Kingdom?",
+        "first_seen": "2026-07-05T11:12:04Z",
+        "id": "kingdom_ngland_rever_united",
+        "last_seen": "2026-07-05T11:12:04Z",
+        "projects": {}
+      },
+      "know_location": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Do you know where I am ? What location?",
+        "first_seen": "2026-07-05T11:12:04Z",
+        "id": "know_location",
+        "last_seen": "2026-07-05T11:12:04Z",
+        "projects": {}
+      },
+      "lation_see_shi_type_wha": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "WHA T TYPE OF RE LATION SHI PS DO YOU SEE",
+        "first_seen": "2026-07-05T19:37:40Z",
+        "id": "lation_see_shi_type_wha",
+        "last_seen": "2026-07-05T19:37:40Z",
+        "projects": {}
+      },
+      "left": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "left",
+        "first_seen": "2026-07-05T10:16:44Z",
+        "id": "left",
+        "last_seen": "2026-07-05T10:16:44Z",
+        "projects": {}
+      },
+      "listening": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "So what is listening?",
+        "first_seen": "2026-07-05T22:22:05Z",
+        "id": "listening",
+        "last_seen": "2026-07-05T22:22:05Z",
+        "projects": {}
+      },
+      "loo_manager_task": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "uh loo k in Task manager.",
+        "first_seen": "2026-07-09T00:46:53Z",
+        "id": "loo_manager_task",
+        "last_seen": "2026-07-09T00:46:53Z",
+        "projects": {}
+      },
+      "maximize": {
+        "confidence": 0.406,
+        "count": 2,
+        "example": "maximize that.",
+        "first_seen": "2026-07-08T21:52:06Z",
+        "id": "maximize",
+        "last_seen": "2026-07-09T12:29:54Z",
+        "projects": {}
+      },
+      "mean_related": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "What do you mean related?",
+        "first_seen": "2026-07-04T18:06:41Z",
+        "id": "mean_related",
+        "last_seen": "2026-07-04T18:06:41Z",
+        "projects": {}
+      },
+      "ment_mple_plan_right": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "i mple ment the plan, please, right?",
+        "first_seen": "2026-07-09T00:34:53Z",
+        "id": "ment_mple_plan_right",
+        "last_seen": "2026-07-09T00:34:53Z",
+        "projects": {}
+      },
+      "ned_off_tur": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I tur ned it off.",
+        "first_seen": "2026-07-04T18:04:41Z",
+        "id": "ned_off_tur",
+        "last_seen": "2026-07-04T18:04:41Z",
+        "projects": {}
+      },
+      "networks_neural_right_some_thing": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Right . Um , some thing about neural networks.",
+        "first_seen": "2026-07-05T22:26:05Z",
+        "id": "networks_neural_right_some_thing",
+        "last_seen": "2026-07-05T22:26:05Z",
+        "projects": {}
+      },
+      "nimize_ron_yourself": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Mi nimize yourself, Ron.",
+        "first_seen": "2026-07-08T21:52:06Z",
+        "id": "nimize_ron_yourself",
+        "last_seen": "2026-07-08T21:52:06Z",
+        "projects": {}
+      },
+      "okay": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , so re pe at i t .",
+        "first_seen": "2026-07-09T12:23:54Z",
+        "id": "okay",
+        "last_seen": "2026-07-09T12:23:54Z",
+        "projects": {}
+      },
+      "okay_pen": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Okay , o pen it for me, please.",
+        "first_seen": "2026-07-09T12:33:54Z",
+        "id": "okay_pen",
+        "last_seen": "2026-07-09T12:33:54Z",
+        "projects": {}
+      },
+      "ones_talked": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Uh what ones that we talked about.",
+        "first_seen": "2026-07-09T00:16:52Z",
+        "id": "ones_talked",
+        "last_seen": "2026-07-09T00:16:52Z",
+        "projects": {}
+      },
+      "opened_why": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "So why is it opened?",
+        "first_seen": "2026-07-09T00:46:53Z",
+        "id": "opened_why",
+        "last_seen": "2026-07-09T00:46:53Z",
+        "projects": {}
+      },
+      "paste_try": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Try paste from me.",
+        "first_seen": "2026-07-05T11:01:15Z",
+        "id": "paste_try",
+        "last_seen": "2026-07-05T11:01:15Z",
+        "projects": {}
+      },
+      "pdf": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "PDF",
+        "first_seen": "2026-07-08T21:50:06Z",
+        "id": "pdf",
+        "last_seen": "2026-07-08T21:50:06Z",
+        "projects": {}
+      },
+      "programming_yourself": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "with um by programming yourself.",
+        "first_seen": "2026-07-09T00:10:52Z",
+        "id": "programming_yourself",
+        "last_seen": "2026-07-09T00:10:52Z",
+        "projects": {}
+      },
+      "queen_swi_tch_yeah": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Yeah , swi tch to Queen, please.",
+        "first_seen": "2026-07-09T12:31:54Z",
+        "id": "queen_swi_tch_yeah",
+        "last_seen": "2026-07-09T12:31:54Z",
+        "projects": {}
+      },
+      "re_su_me_of_bo_th": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "re su me of bo th",
+        "first_seen": "2026-07-09T00:16:52Z",
+        "id": "re_su_me_of_bo_th",
+        "last_seen": "2026-07-09T00:16:52Z",
+        "projects": {}
+      },
+      "remember_ryan_want": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Ryan, I want you to remember",
+        "first_seen": "2026-07-04T18:10:42Z",
+        "id": "remember_ryan_want",
+        "last_seen": "2026-07-04T18:10:42Z",
+        "projects": {}
+      },
+      "remember_something_want": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "I want you to remember something for me.",
+        "first_seen": "2026-07-04T18:10:42Z",
+        "id": "remember_something_want",
+        "last_seen": "2026-07-04T18:10:42Z",
+        "projects": {}
+      },
+      "request": {
+        "confidence": 0.549,
+        "count": 3,
+        "example": ". . . .",
+        "first_seen": "2026-07-05T19:19:46Z",
+        "id": "request",
+        "last_seen": "2026-07-09T12:13:54Z",
+        "projects": {}
+      },
+      "right_time": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "What is the time right ?",
+        "first_seen": "2026-07-05T11:10:04Z",
+        "id": "right_time",
+        "last_seen": "2026-07-05T11:10:04Z",
+        "projects": {}
+      },
+      "ron_yes": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "YES PLEASE RON",
+        "first_seen": "2026-07-05T22:18:05Z",
+        "id": "ron_yes",
+        "last_seen": "2026-07-05T22:18:05Z",
+        "projects": {}
+      },
+      "run_yes": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Yes, please run.",
+        "first_seen": "2026-07-05T19:11:43Z",
+        "id": "run_yes",
+        "last_seen": "2026-07-05T19:11:43Z",
+        "projects": {}
+      },
+      "ryan": {
+        "confidence": 0.406,
+        "count": 2,
+        "example": "Ryan",
+        "first_seen": "2026-07-04T18:22:42Z",
+        "id": "ryan",
+        "last_seen": "2026-07-09T12:31:54Z",
+        "projects": {}
+      },
+      "saying_still_wrong": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "You 're still saying it wrong.",
+        "first_seen": "2026-07-09T12:25:54Z",
+        "id": "saying_still_wrong",
+        "last_seen": "2026-07-09T12:25:54Z",
+        "projects": {}
+      },
+      "service": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "What service is it?",
+        "first_seen": "2026-07-05T22:22:05Z",
+        "id": "service",
+        "last_seen": "2026-07-05T22:22:05Z",
+        "projects": {}
+      },
+      "show": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "show me",
+        "first_seen": "2026-07-09T12:05:53Z",
+        "id": "show",
+        "last_seen": "2026-07-09T12:05:53Z",
+        "projects": {}
+      },
+      "sing": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "We're yo u u sing um",
+        "first_seen": "2026-07-04T18:06:41Z",
+        "id": "sing",
+        "last_seen": "2026-07-04T18:06:41Z",
+        "projects": {}
+      },
+      "status_whats": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "whats the status",
+        "first_seen": "2026-07-09T12:03:53Z",
+        "id": "status_whats",
+        "last_seen": "2026-07-09T12:03:53Z",
+        "projects": {}
+      },
+      "surprise": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Surprise me, please.",
+        "first_seen": "2026-07-09T00:18:52Z",
+        "id": "surprise",
+        "last_seen": "2026-07-09T00:18:52Z",
+        "projects": {}
+      },
+      "use_why": {
+        "confidence": 0.263,
+        "count": 1,
+        "example": "Why do you use La",
+        "first_seen": "2026-07-05T19:17:45Z",
+        "id": "use_why",
+        "last_seen": "2026-07-05T19:17:45Z",
+        "projects": {}
+      },
+      "yes": {
+        "confidence": 0.549,
+        "count": 3,
+        "example": "Yes, please,",
+        "first_seen": "2026-07-04T18:02:41Z",
+        "id": "yes",
+        "last_seen": "2026-07-09T00:26:52Z",
+        "projects": {}
+      }
+    }
+  },
+  "last_launch_at": "2026-07-09T12:00:52Z",
+  "open_workflows": {},
+  "pending_tasks": {},
+  "research_sessions": {},
+  "schema": "orion.mark_xi.cognitive_state.v1",
+  "updated_at": "2026-07-09T12:33:54Z",
+  "user_priorities": []
+}

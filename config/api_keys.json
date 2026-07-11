@@ -1,0 +1,141 @@
+{
+    "schema": "orion.mark_viii.providers.v1",
+    "active_provider": "gemini",
+    "provider_order": [
+        "gemini",
+        "openrouter",
+        "groq",
+        "openai",
+        "together",
+        "local_lm_studio",
+        "local_ollama"
+    ],
+    "providers": {
+        "gemini": {
+            "kind": "gemini_live",
+            "enabled": true,
+            "api_key": "",
+            "model": "models/gemini-2.5-flash-native-audio-preview-12-2025",
+            "base_url": "",
+            "priority": 10,
+            "timeout_s": 30.0,
+            "strengths": [
+                "live_information"
+            ]
+        },
+        "anthropic": {
+            "kind": "openai_compatible",
+            "enabled": false,
+            "api_key": "",
+            "model": "claude-sonnet-5",
+            "base_url": "https://api.anthropic.com/v1",
+            "priority": 15,
+            "timeout_s": 45.0,
+            "strengths": [
+                "coding",
+                "reasoning",
+                "writing"
+            ]
+        },
+        "xai_grok": {
+            "kind": "openai_compatible",
+            "enabled": false,
+            "api_key": "",
+            "model": "grok-4",
+            "base_url": "https://api.x.ai/v1",
+            "priority": 25,
+            "timeout_s": 45.0,
+            "strengths": [
+                "live_information",
+                "reasoning"
+            ]
+        },
+        "openrouter": {
+            "kind": "openai_compatible",
+            "enabled": false,
+            "api_key": "",
+            "model": "openai/gpt-4o-mini",
+            "base_url": "https://openrouter.ai/api/v1",
+            "priority": 20,
+            "timeout_s": 30.0,
+            "strengths": [
+                "general",
+                "reasoning"
+            ]
+        },
+        "groq": {
+            "kind": "openai_compatible",
+            "enabled": false,
+            "api_key": "",
+            "model": "llama-3.1-8b-instant",
+            "base_url": "https://api.groq.com/openai/v1",
+            "priority": 30,
+            "timeout_s": 24.0,
+            "strengths": [
+                "fast"
+            ]
+        },
+        "openai": {
+            "kind": "openai_compatible",
+            "enabled": false,
+            "api_key": "",
+            "model": "gpt-4o-mini",
+            "base_url": "https://api.openai.com/v1",
+            "priority": 40,
+            "timeout_s": 30.0,
+            "strengths": [
+                "reasoning",
+                "general"
+            ]
+        },
+        "together": {
+            "kind": "openai_compatible",
+            "enabled": false,
+            "api_key": "",
+            "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+            "base_url": "https://api.together.xyz/v1",
+            "priority": 50,
+            "timeout_s": 30.0,
+            "strengths": [
+                "fast"
+            ]
+        },
+        "local_lm_studio": {
+            "kind": "openai_compatible",
+            "enabled": false,
+            "api_key": "local",
+            "model": "local-model",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "priority": 80,
+            "timeout_s": 120.0,
+            "strengths": [
+                "fast",
+                "local"
+            ]
+        },
+        "local_ollama": {
+            "kind": "openai_compatible",
+            "enabled": false,
+            "api_key": "local",
+            "model": "llama3.1",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "priority": 90,
+            "timeout_s": 120.0,
+            "strengths": [
+                "fast",
+                "local"
+            ]
+        }
+    },
+    "integrations": {
+        "notion": {
+            "token": "",
+            "tasks_database_id": "",
+            "calendar_database_id": "",
+            "projects_database_id": ""
+        },
+        "outlook": {
+            "enabled": true
+        }
+    }
+}

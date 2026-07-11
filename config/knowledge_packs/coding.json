@@ -1,0 +1,29 @@
+{
+  "id": "coding",
+  "title": "Coding Pack",
+  "description": "Pragmatic software engineering practice.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "Simplicity",
+      "content": "Prefer the simplest solution that works. Optimise for readability and change; clever code is a liability. YAGNI — don't build what you don't yet need.",
+      "tags": []
+    },
+    {
+      "topic": "Debugging method",
+      "content": "Reproduce reliably, read the actual error, form one hypothesis, test it, change one thing at a time. Bisect to isolate. The bug is usually where you're most sure it isn't.",
+      "tags": []
+    },
+    {
+      "topic": "Testing",
+      "content": "Test behaviour, not implementation. Cover the highest-impact paths and edge cases first. A failing test that reproduces a bug is the fastest way to fix it and prevent regression.",
+      "tags": []
+    },
+    {
+      "topic": "Architecture",
+      "content": "Low coupling, high cohesion. Depend on abstractions. Keep the dependency graph acyclic and the blast radius of change small. Name things for what they mean.",
+      "tags": []
+    }
+  ]
+}

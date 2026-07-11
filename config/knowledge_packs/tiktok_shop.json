@@ -1,0 +1,29 @@
+{
+  "id": "tiktok_shop",
+  "title": "TikTok Shop Pack",
+  "description": "Trend spotting, creative and selling on TikTok Shop.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "Virality signals",
+      "content": "A product is heating up when multiple mid-size creators post organically, videos cross 100k views fast, comments ask 'where to buy', and duet/stitch volume rises. Velocity of new videos matters more than any single viral hit.",
+      "tags": []
+    },
+    {
+      "topic": "Content that sells",
+      "content": "Native, un-polished UGC beats ads. Hooks in the first 1.5s; show the problem then the product resolving it; demonstrate, don't describe. Post 3-5+ variations daily; let the algorithm find the winner.",
+      "tags": []
+    },
+    {
+      "topic": "Affiliate + Shop",
+      "content": "Enable TikTok Shop affiliate so creators sell for you on commission. Seed product to 20-50 micro-creators; a single creator break-out can carry a product. Track GMV per creator.",
+      "tags": []
+    },
+    {
+      "topic": "Category timing",
+      "content": "Ride emerging niches early (before saturation): home gadgets, beauty tools, viral snacks, organisation, pet. Once a product is everywhere, margins and CTR collapse — rotate.",
+      "tags": []
+    }
+  ]
+}

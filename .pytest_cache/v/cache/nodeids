@@ -1,0 +1,3 @@
+[
+  "tests/test_markx_services.py::test_service_types_and_graceful_fallbacks"
+]

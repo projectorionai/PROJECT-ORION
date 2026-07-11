@@ -1,0 +1,37 @@
+# systemd unit for the O.R.I.O.N. headless node (bare-metal, no Docker).
+# Install on the Oracle Cloud VM:
+#   sudo cp deploy/orion-node.service /etc/systemd/system/orion-node.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now orion-node
+#   journalctl -u orion-node -f          # follow the log
+#
+# Assumes the repo lives at /opt/orion with a venv at /opt/orion/.venv.
+
+[Unit]
+Description=O.R.I.O.N. headless AI node (remote uplink)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orion
+Group=orion
+WorkingDirectory=/opt/orion
+Environment=ORION_HEADLESS=1
+Environment=QT_QPA_PLATFORM=offscreen
+Environment=ORION_REMOTE_HOST=127.0.0.1
+Environment=ORION_REMOTE_PORT=8765
+# Put provider keys in /opt/orion/config/api_keys.json, or add them here:
+# Environment=ORION_MODE=auto
+ExecStart=/opt/orion/.venv/bin/python /opt/orion/orion.py --headless
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/orion/config
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

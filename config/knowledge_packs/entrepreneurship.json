@@ -1,0 +1,29 @@
+{
+  "id": "entrepreneurship",
+  "title": "Entrepreneurship Pack",
+  "description": "Foundational frameworks for starting and growing ventures.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "Lean startup loop",
+      "content": "Build–Measure–Learn: ship a minimum viable product, measure real user behaviour, learn, iterate. Validate demand before scaling spend. Prefer pre-selling and landing-page smoke tests over building the full product.",
+      "tags": []
+    },
+    {
+      "topic": "Problem-solution fit",
+      "content": "Confirm a painful, frequent, expensive problem for a specific segment before product-market fit. Interview 20+ target customers; look for pull (they ask to buy) not politeness.",
+      "tags": []
+    },
+    {
+      "topic": "Unit economics",
+      "content": "Track CAC (cost to acquire a customer), LTV (lifetime value), contribution margin, and payback period. A healthy LTV:CAC is >=3:1 with payback under 3 months for e-commerce.",
+      "tags": []
+    },
+    {
+      "topic": "Moats",
+      "content": "Durable advantage comes from brand, network effects, switching costs, proprietary data, or economies of scale. In dropshipping the moat is usually brand + operations + creative velocity, not the product itself.",
+      "tags": []
+    }
+  ]
+}

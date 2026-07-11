@@ -1,0 +1,29 @@
+{
+  "id": "ai",
+  "title": "Artificial Intelligence Pack",
+  "description": "Practical LLM and AI product knowledge.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "LLM basics",
+      "content": "Large language models predict the next token from context. Quality depends on the prompt, the context provided (retrieval), and the model. They don't 'know' facts reliably — ground them with data.",
+      "tags": []
+    },
+    {
+      "topic": "RAG",
+      "content": "Retrieval-Augmented Generation: fetch relevant documents and put them in the prompt so the model answers from your data, reducing hallucination. ORION uses this via its knowledge packs and memory.",
+      "tags": []
+    },
+    {
+      "topic": "Local vs cloud",
+      "content": "Local models (Ollama: Qwen, Llama, DeepSeek, Mistral) run offline, free and private, at lower peak capability. Cloud models are stronger for hard reasoning. Route by task complexity and connectivity.",
+      "tags": []
+    },
+    {
+      "topic": "Prompt engineering",
+      "content": "Be specific about role, task, format and constraints. Give examples (few-shot). Ask for step-by-step reasoning on hard tasks. Provide grounding context rather than relying on model memory.",
+      "tags": []
+    }
+  ]
+}

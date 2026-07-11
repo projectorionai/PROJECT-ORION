@@ -1,0 +1,48 @@
+# ── O.R.I.O.N. runtime requirements ────────────────────────────────────────
+# Install everything with:  python -m pip install -r requirements.txt
+
+# Core runtime (required — ORION will not start without these)
+PyQt6
+PyQt6-WebEngine          # the in-GUI Three.js globe
+qasync                   # asyncio ↔ Qt event-loop unification
+aiohttp                  # async HTTP for news/markets/geocoding/providers
+sounddevice              # microphone + speaker I/O
+google-genai             # Gemini Live native-audio channel
+pillow                   # image handling (screen frames, OCR input)
+mss                      # fast screen capture
+psutil                   # telemetry, process/security monitoring
+
+# Voice (recommended)
+pyttsx3                  # offline male voice (SAPI5)
+faster-whisper           # offline dictation — preferred engine (ctranslate2, int8 CPU, no torch)
+openai-whisper           # offline dictation — alternative engine (pulls torch; heavier)
+# vosk                   # offline wake-word / streaming STT (optional; downloads a model on first use)
+# OfflineTranscriber (speech_offline.py) auto-selects: faster-whisper → openai-whisper → vosk.
+# Model size via ORION_WHISPER_MODEL (default base.en); models download on first use.
+
+# Autonomous desktop control (required for voice-driven PC navigation)
+pyautogui                # cursor + keyboard + screenshots
+pywinauto                # UIA accessibility tree (buttons/menus/dialogs)
+pygetwindow              # window management
+screeninfo               # multi-monitor topology
+keyboard                 # Unicode typing + hotkeys
+opencv-python            # visual verification (before/after diff)
+numpy                    # arrays for vision + charts
+
+# Vision / OCR (installed: comprehensive offline screen reading)
+rapidocr-onnxruntime     # local OCR — pip-only, bundles ONNX models, no system binary
+onnxruntime              # OCR inference backend (pulled by rapidocr)
+# pytesseract            # alternative OCR (needs the Tesseract system binary)
+
+# Documents / data-viz (installed)
+python-docx              # DOCX report export
+matplotlib               # charts (ReportDrafter also has a pure-Python SVG fallback)
+
+# Windows integration
+pywin32                  # Outlook COM, window/DPI helpers (Windows only)
+
+# Documents / files (optional but recommended)
+pypdf                    # PDF text extraction (literature vault, file scans)
+
+# Local LLM (optional — enables MODE B fully-offline intelligence)
+# Install the Ollama app from https://ollama.com then:  ollama pull qwen2.5

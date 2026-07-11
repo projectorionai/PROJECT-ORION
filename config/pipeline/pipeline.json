@@ -1,0 +1,25 @@
+{
+  "schema": "orion.pipeline.v1",
+  "saved": "2026-07-03T19:34:38Z",
+  "campaigns": [
+    {
+      "id": "hausables_x_brandx",
+      "name": "Hausables x BrandX",
+      "brand": "BrandX",
+      "stage": "Negotiation",
+      "value": 1500.0,
+      "deadline": "",
+      "notes": "",
+      "content": [],
+      "performance": [
+        {
+          "metric": "views",
+          "value": 48000.0,
+          "at": "2026-07-03T19:34:38Z"
+        }
+      ],
+      "engagement_total": 48000.0,
+      "updated": "2026-07-03T19:34:38Z"
+    }
+  ]
+}

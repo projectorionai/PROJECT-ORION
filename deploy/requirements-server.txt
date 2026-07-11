@@ -1,0 +1,24 @@
+# ── O.R.I.O.N. HEADLESS / CLOUD node requirements ──────────────────────────
+# The brain-only node (python orion.py --headless) needs NONE of the desktop
+# stack — no audio, no screen capture, no window control, no WebEngine.
+# Install with:  python -m pip install -r deploy/requirements-server.txt
+#
+# Target: a display-less Linux VM (Oracle Cloud Always-Free Ampere A1 or x86).
+
+# Core (required)
+PyQt6                    # only QtCore is used headless — provides the signal hub + event loop
+qasync                   # asyncio ↔ Qt event-loop unification
+aiohttp                  # the remote uplink HTTP server + provider transport
+pillow                   # generates the PWA home-screen icon (falls back to SVG if absent)
+
+# Language model transport (install at least one path)
+google-genai             # Gemini cloud text (set a key in config/api_keys.json or ORION_* env)
+# Local model alternative: install Ollama on the VM (https://ollama.com) and
+#   `ollama pull qwen2.5` — ORION auto-detects it and runs fully offline.
+
+# Optional
+pypdf                    # only if you POST PDFs to the learning path remotely
+
+# NOT needed headless (kept out on purpose): sounddevice, mss, psutil,
+# pyautogui, pywinauto, pygetwindow, screeninfo, keyboard, opencv-python,
+# numpy, pyttsx3, pywin32, PyQt6-WebEngine, rapidocr-onnxruntime, onnxruntime.

@@ -1,0 +1,29 @@
+{
+  "id": "copywriting",
+  "title": "Copywriting Pack",
+  "description": "Persuasive writing for ads, pages and email.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "Hooks",
+      "content": "The first line does 80% of the work. Use curiosity, a bold claim, a relatable pain, or a pattern interrupt. If the hook fails, nothing else is read.",
+      "tags": []
+    },
+    {
+      "topic": "PAS framework",
+      "content": "Problem — agitate the pain — solution. Name the reader's problem precisely, twist the knife on the consequences, then present your product as the relief.",
+      "tags": []
+    },
+    {
+      "topic": "Features vs benefits",
+      "content": "Sell the outcome. 'Non-slip base' → 'stays put so it never spills on your counter'. Every feature should answer 'so what does that do for me?'",
+      "tags": []
+    },
+    {
+      "topic": "Clarity + specifics",
+      "content": "Specific beats vague: numbers, timeframes, concrete images. Short sentences. One idea per line. Read it aloud — if you stumble, rewrite.",
+      "tags": []
+    }
+  ]
+}

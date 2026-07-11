@@ -1,0 +1,22 @@
+{
+  "target": "C:\\Users\\mayna\\Downloads",
+  "at": "2026-07-09T00:26:26Z",
+  "moves": [
+    {
+      "src": "C:\\Users\\mayna\\Downloads\\deadzone.zip",
+      "dest": "C:\\Users\\mayna\\Downloads\\Archives\\deadzone.zip"
+    },
+    {
+      "src": "C:\\Users\\mayna\\Downloads\\desktop.ini",
+      "dest": "C:\\Users\\mayna\\Downloads\\Other\\desktop.ini"
+    },
+    {
+      "src": "C:\\Users\\mayna\\Downloads\\Unconfirmed 395341.crdownload",
+      "dest": "C:\\Users\\mayna\\Downloads\\Other\\Unconfirmed 395341.crdownload"
+    },
+    {
+      "src": "C:\\Users\\mayna\\Downloads\\weapons.js",
+      "dest": "C:\\Users\\mayna\\Downloads\\Code\\weapons.js"
+    }
+  ]
+}
