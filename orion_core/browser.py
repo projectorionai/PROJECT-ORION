@@ -39,7 +39,7 @@ import subprocess
 import sys
 import webbrowser
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 #: Set ORION_BROWSER_PATH to override everything below — an explicit
 #: instruction from the user always outranks anything inferred.
@@ -153,7 +153,9 @@ def browser_name() -> str:
     path = browser_path()
     if not path:
         return "your default browser"
-    stem = Path(path).stem.lower()
+    # PureWindowsPath splits on both separators, so the name is right for a
+    # Windows path wherever this runs (the registry hands back C:\...).
+    stem = PureWindowsPath(path).stem
     return {
         "msedge": "Microsoft Edge",
         "chrome": "Chrome",
@@ -161,7 +163,7 @@ def browser_name() -> str:
         "brave": "Brave",
         "opera": "Opera",
         "vivaldi": "Vivaldi",
-    }.get(stem, Path(path).stem)
+    }.get(stem.lower(), stem)
 
 
 def open_url(url: str) -> bool:

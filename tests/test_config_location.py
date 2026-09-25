@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import importlib
 import sys
+
+import pytest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -138,6 +140,7 @@ def test_it_refuses_while_orion_is_running(tmp_path, monkeypatch):
     assert not (app / move_config.CONFIG_POINTER_NAME).exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the probe runs cmd.exe")
 def test_a_real_move_verifies_then_points(tmp_path, monkeypatch):
     import sqlite3
 
@@ -206,6 +209,7 @@ def test_appdata_local_is_refused_under_the_store_python(tmp_path, monkeypatch):
     assert not (app / move_config.CONFIG_POINTER_NAME).exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the probe runs cmd.exe")
 def test_the_copy_is_confirmed_visible_to_another_process(tmp_path):
     """Verifying a copy from inside the process that made it proves nothing
     when that process's view of the filesystem is redirected. cmd.exe has no

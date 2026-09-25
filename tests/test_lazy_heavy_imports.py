@@ -36,6 +36,9 @@ def test_cv2_available_reports_false_when_the_spec_is_missing(monkeypatch):
 
 
 def test_mediapipe_available_reports_true_when_the_spec_resolves():
+    if importlib.util.find_spec("mediapipe") is None:
+        import pytest
+        pytest.skip("mediapipe is not installed")
     assert _mediapipe_available() is True
 
 

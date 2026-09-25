@@ -790,6 +790,13 @@ _LITE_ORB = (
 )
 
 
+def _on_windows() -> bool:
+    """Whether Windows-only facilities (the firewall rule) apply. A function so
+    tests can say "Windows" without rewriting os.name for the whole process,
+    which makes pathlib build WindowsPath objects on Linux."""
+    return os.name == "nt"
+
+
 class _BodyTooLarge(ValueError):
     """A request body over the endpoint's size limit (answered with 413)."""
 
@@ -1007,7 +1014,7 @@ class RemoteGateway:
         the same Wi-Fi seeing 'refused to connect' even though the server is up.
         Scoped to private/domain networks only (never public) for safety.
         Idempotent, admin-aware, and never raises."""
-        if os.name != "nt" or os.getenv("ORION_REMOTE_FIREWALL", "1").strip().lower() in {
+        if not _on_windows() or os.getenv("ORION_REMOTE_FIREWALL", "1").strip().lower() in {
                 "0", "false", "no", "off"}:
             return
         rule = "ORION Remote Uplink"

@@ -136,7 +136,10 @@ def _probe_ocr(tools: set[str], deep: bool) -> CapabilityHealth:
         avail = bool(_val(eng.available))
         name = _val(eng.engine_name) or "none"
         if not avail:
-            return CapabilityHealth("OCR", True, False, True,
+            # Nothing installed to read with: MISSING (install something), not
+            # DEGRADED (something installed is failing) — the two call for
+            # different fixes.
+            return CapabilityHealth("OCR", False, False, True,
                                     "no backend (pip install rapidocr-onnxruntime)", registered)
         detail = f"engine: {name}"
         if deep:

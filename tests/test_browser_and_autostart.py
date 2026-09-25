@@ -240,6 +240,7 @@ def test_a_registered_entry_matches_what_would_be_registered_now(monkeypatch):
     assert autostart.is_stale()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only facility")
 def test_enable_refuses_an_interpreter_that_cannot_run_orion(monkeypatch, tmp_path):
     """Better to register nothing than to register something that fails
     silently at every sign-in.
@@ -255,6 +256,7 @@ def test_enable_refuses_an_interpreter_that_cannot_run_orion(monkeypatch, tmp_pa
     assert "PyQt6" in state.detail
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only facility")
 def test_enable_refuses_when_the_entry_point_is_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(autostart, "entry_script", lambda: tmp_path / "gone.py")
     state = autostart.enable()

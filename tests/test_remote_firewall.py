@@ -50,7 +50,7 @@ def _fake_run_factory(calls, *, show_stdout="", show_rc=0, add_rc=0):
 
 
 def test_rule_added_when_absent(tmp_path, monkeypatch):
-    monkeypatch.setattr(remote.os, "name", "nt")
+    monkeypatch.setattr(remote, "_on_windows", lambda: True)
     monkeypatch.delenv("ORION_REMOTE_FIREWALL", raising=False)
     calls: list[list[str]] = []
     monkeypatch.setattr(
@@ -67,7 +67,7 @@ def test_rule_added_when_absent(tmp_path, monkeypatch):
 
 
 def test_rule_not_re_added_when_present(tmp_path, monkeypatch):
-    monkeypatch.setattr(remote.os, "name", "nt")
+    monkeypatch.setattr(remote, "_on_windows", lambda: True)
     calls: list[list[str]] = []
     monkeypatch.setattr(
         remote.subprocess, "run",
@@ -85,7 +85,7 @@ def test_skipped_off_windows(tmp_path, monkeypatch):
     gw = _gateway(tmp_path)
     calls: list[list[str]] = []
     monkeypatch.setattr(remote.subprocess, "run", _fake_run_factory(calls))
-    monkeypatch.setattr(remote.os, "name", "posix")
+    monkeypatch.setattr(remote, "_on_windows", lambda: False)
 
     asyncio.run(gw._ensure_firewall_access())
 
@@ -93,7 +93,7 @@ def test_skipped_off_windows(tmp_path, monkeypatch):
 
 
 def test_disable_flag_respected(tmp_path, monkeypatch):
-    monkeypatch.setattr(remote.os, "name", "nt")
+    monkeypatch.setattr(remote, "_on_windows", lambda: True)
     monkeypatch.setenv("ORION_REMOTE_FIREWALL", "0")
     calls: list[list[str]] = []
     monkeypatch.setattr(remote.subprocess, "run", _fake_run_factory(calls))
