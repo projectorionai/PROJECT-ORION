@@ -36,6 +36,12 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The action's default list still names the retired 'tools' package,
+          # which current sdkmanager rejects ("Failed to find package 'tools'"),
+          # failing the job before anything is built. The runner's preinstalled
+          # SDK has the platforms; Gradle fetches anything else it needs.
+          packages: platform-tools
 
       - name: Generate the Gradle wrapper
         # The wrapper jar is intentionally not committed; the runner's system
