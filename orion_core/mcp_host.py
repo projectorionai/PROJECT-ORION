@@ -621,6 +621,44 @@ def load_config() -> dict[str, Any]:
 _EXIT_GRACE_S = 2.0
 
 
+class MCPProtocolError(RuntimeError):
+    """A JSON-RPC error reply: the server refused the request itself (unknown
+    method, invalid params), as opposed to a tool that ran and reported an
+    error in its result."""
+
+    def __init__(self, error: Any) -> None:
+        err = error if isinstance(error, dict) else {"message": str(error)}
+        self.code = err.get("code")
+        self.message = str(err.get("message") or "request rejected")
+        self.data = err.get("data")
+        detail = self.message if self.code is None else f"{self.message} (JSON-RPC {self.code})"
+        if self.data:
+            detail += f": {str(self.data)[:300]}"
+        super().__init__(detail)
+
+
+class MCPReply(str):
+    """What ``MCPHost.call`` returns: the reply text, plus how it failed.
+
+    A ``str`` so every caller that treats replies as text keeps working, but
+    one that carries its outcome, so failure is not guessed from wording (a
+    successful read of a file that happens to begin "(tool error)" is not a
+    failure). ``kind`` is "" on success, else one of ``ERROR_KINDS``.
+    """
+
+    ERROR_KINDS = ("tool", "protocol", "timeout", "unavailable")
+    kind: str
+
+    def __new__(cls, text: str, kind: str = "") -> "MCPReply":
+        reply = super().__new__(cls, text)
+        reply.kind = kind
+        return reply
+
+    @property
+    def is_error(self) -> bool:
+        return bool(self.kind)
+
+
 async def _kill_tree(proc: Any) -> None:
     """Force a server down together with anything it started.
 
@@ -843,14 +881,14 @@ class MCPServerConn:
                     continue
                 if obj.get("id") == req_id:
                     if "error" in obj:
-                        raise RuntimeError(str(obj["error"]))
+                        raise MCPProtocolError(obj["error"])
                     return obj.get("result")
 
     def busy(self) -> bool:
         """A request is in flight, so the process must not be stopped."""
         return self._lock.locked()
 
-    async def call_tool(self, tool: str, arguments: dict[str, Any]) -> str:
+    async def call_tool(self, tool: str, arguments: dict[str, Any]) -> "MCPReply":
         self.last_used = time.monotonic()
         result = await asyncio.wait_for(
             self._request("tools/call", {"name": tool, "arguments": arguments or {}}),
@@ -859,10 +897,10 @@ class MCPServerConn:
         return self._render(result)
 
     @staticmethod
-    def _render(result: Any) -> str:
+    def _render(result: Any) -> "MCPReply":
         """Flatten an MCP tool result's content blocks to text."""
         if not isinstance(result, dict):
-            return str(result)
+            return MCPReply(str(result))
         parts: list[str] = []
         for block in result.get("content") or []:
             if not isinstance(block, dict):
@@ -873,8 +911,10 @@ class MCPServerConn:
                 parts.append(f"[{block.get('type', 'content')}]")
         text = "\n".join(p for p in parts if p).strip()
         if result.get("isError"):
-            return f"(tool error) {text or 'the MCP server reported an error'}"
-        return text or "(the tool returned no content)"
+            # The tool ran and failed: its own message is what lets the model
+            # correct the arguments, so it is kept whole.
+            return MCPReply(f"(tool error) {text or 'the MCP server reported an error'}", "tool")
+        return MCPReply(text or "(the tool returned no content)")
 
     def _log(self, message: str) -> None:
         try:
@@ -1276,7 +1316,7 @@ class MCPHost:
             return f"'{server}' acts at your expense"
         return ""
 
-    async def call(self, server: str, tool: str, arguments: dict[str, Any]) -> str:
+    async def call(self, server: str, tool: str, arguments: dict[str, Any]) -> MCPReply:
         startup = self._startup_task
         if (server not in self.servers and server not in self.parked
                 and startup is not None and not startup.done()):
@@ -1293,21 +1333,31 @@ class MCPHost:
             except Exception:
                 pass
         if server in self.parked and not await self._wake(server):
-            return (f"MCP server '{server}' was paused to save memory and could "
-                    f"not restart: {self.status.get(server) or 'unknown error'}.")
+            return MCPReply(
+                f"MCP server '{server}' was paused to save memory and could "
+                f"not restart: {self.status.get(server) or 'unknown error'}.", "unavailable")
         conn = self.servers.get(server)
         if conn is None:
             avail = ", ".join(self.servers) or "none"
-            return f"No connected MCP server named '{server}'. Available: {avail}."
+            return MCPReply(
+                f"No connected MCP server named '{server}'. Available: {avail}.", "unavailable")
         if not any(t.get("name") == tool for t in conn.tools):
             names = ", ".join(t.get("name", "?") for t in conn.tools) or "none"
-            return f"Server '{server}' has no tool '{tool}'. Its tools: {names}."
+            return MCPReply(
+                f"Server '{server}' has no tool '{tool}'. Its tools: {names}.", "protocol")
         try:
             return await conn.call_tool(tool, arguments)
         except asyncio.TimeoutError:
-            return f"MCP tool '{server}.{tool}' timed out."
+            return MCPReply(f"MCP tool '{server}.{tool}' timed out.", "timeout")
+        except MCPProtocolError as exc:
+            # The server refused the call itself — almost always arguments
+            # that do not match the tool's input schema. Say so, so the model
+            # fixes the arguments rather than retrying the same call.
+            return MCPReply(
+                f"MCP tool '{server}.{tool}' failed: the server rejected the request "
+                f"- {exc}. Check the arguments against the tool's input schema.", "protocol")
         except Exception as exc:
-            return f"MCP tool '{server}.{tool}' failed: {exc}"
+            return MCPReply(f"MCP tool '{server}.{tool}' failed: {exc}", "unavailable")
 
     # ── runtime server management ───────────────────────────────────────────
     # Enabling a server used to mean editing config/mcp_servers.json by hand

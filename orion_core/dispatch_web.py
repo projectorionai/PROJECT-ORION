@@ -640,7 +640,12 @@ def mcp_call_failed(text: str) -> bool:
     """Whether an MCPHost.call() reply is one of its own failure messages.
 
     It returns plain strings for success and failure alike; reporting every
-    one as ok=True told the model a timed-out call had worked."""
+    one as ok=True told the model a timed-out call had worked. Its replies
+    now carry their outcome (``MCPReply.kind``), which is authoritative; the
+    wording checks below remain for plain strings (stubs, older callers)."""
+    kind = getattr(text, "kind", None)
+    if isinstance(kind, str):
+        return bool(kind)
     text = str(text or "")
     head = text[:200]
     return (head.startswith(_MCP_FAILURE_PREFIXES)
