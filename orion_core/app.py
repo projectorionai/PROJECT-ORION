@@ -252,7 +252,8 @@ def _settings_from_key(key: str) -> "OrionProviderSettings":
 
 def ensure_provider_settings(window: Optional[QWidget] = None) -> "OrionProviderSettings":
     """Blocking form, for callers outside the event loop. Inside a coroutine
-    use ``ensure_provider_settings_async``: ``exec()`` there nests a Qt loop."""
+    use ``ensure_provider_settings_async``: a modal dialog's own loop nests
+    inside the coroutine there."""
     settings = _configured_provider_settings()
     if settings is not None:
         return settings
