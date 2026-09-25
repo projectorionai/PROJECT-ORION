@@ -193,10 +193,11 @@ class OfflineTranscriber:
         try:
             from . import voiceprint
 
-            verdict = voiceprint.should_listen(pcm, sample_rate)
+            # judge() also records the verdict for the sensitive-action guard.
+            verdict = voiceprint.judge(pcm, sample_rate)
+            if verdict.is_owner or not voiceprint.store().only_owner:
+                return True
         except Exception:
-            return True
-        if verdict.is_owner:
             return True
         # Logged, but not once per sentence: someone else talking nearby is
         # normal, and a line per utterance would bury everything else.

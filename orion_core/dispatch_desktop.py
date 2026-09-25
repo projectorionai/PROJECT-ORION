@@ -791,7 +791,9 @@ class DesktopDispatchMixin:
             prints = voiceprint.store()
             gate = ("He is answering ONLY your voice."
                     if prints.only_owner else "He answers anyone who speaks.")
-            return ToolResult(f"{service.describe()} {gate}")
+            guard = (" A spoken go-ahead for a sensitive action must be in your voice."
+                     if prints.guard_actions else "")
+            return ToolResult(f"{service.describe()} {gate}{guard}")
         # ── acting on who spoke, rather than only noting it ───────────────────
         if action in {"owner", "set_owner", "this_is_me"}:
             from . import voiceprint
@@ -809,9 +811,20 @@ class DesktopDispatchMixin:
 
             ok, message = voiceprint.store().set_only_owner(False)
             return ToolResult(message, ok=ok)
+        if action in {"guard_actions", "protect_actions", "my_voice_for_actions"}:
+            from . import voiceprint
+
+            ok, message = voiceprint.store().set_guard_actions(True)
+            return ToolResult(message, ok=ok)
+        if action in {"unguard_actions", "anyone_can_confirm"}:
+            from . import voiceprint
+
+            ok, message = voiceprint.store().set_guard_actions(False)
+            return ToolResult(message, ok=ok)
         return ToolResult(
             f"Unsupported voice_speaker_id action: {action}. Use enroll, list, "
-            "remove, status, owner, only_me, or anyone.",
+            "remove, status, owner, only_me, anyone, guard_actions or "
+            "unguard_actions.",
             ok=False,
         )
 

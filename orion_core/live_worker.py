@@ -3284,8 +3284,11 @@ class GenAILiveWorker:
 
     async def _dispatch_live_tool(self, name: str, args: dict[str, Any]
                                   ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        from . import speaker_gate
+
         try:
-            result = await self.dispatcher.dispatch_chain(name, args)
+            with speaker_gate.voice_turn():
+                result = await self.dispatcher.dispatch_chain(name, args)
             return result.response_payload(), result.media
         except asyncio.CancelledError:
             raise

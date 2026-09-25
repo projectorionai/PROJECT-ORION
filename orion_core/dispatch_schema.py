@@ -1711,11 +1711,11 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
     },
     {
         "name": "voice_speaker_id",
-        "description": "Real speaker recognition — remembers a SPECIFIC named individual's voice permanently, not just their gender, so ORION can tell the user apart from other people talking nearby, from the television or from someone on a phone call. 'enroll' records a short clip from the live microphone and requires the person's explicit consent=true; 'list' shows who's enrolled; 'remove' deletes someone's profile; 'status' reports who is enrolled and whether ORION is currently answering everyone. 'owner' marks whose voice is the user's own. 'only_me' makes ORION ignore any voice that is not the user's; 'anyone' turns that off again. Works on BOTH the live session and offline transcription: the live capture path assembles each complete utterance and reads it the same way.",
+        "description": "Real speaker recognition — remembers a SPECIFIC named individual's voice permanently, not just their gender, so ORION can tell the user apart from other people talking nearby, from the television or from someone on a phone call. 'enroll' records a short clip from the live microphone and requires the person's explicit consent=true; 'list' shows who's enrolled; 'remove' deletes someone's profile; 'status' reports who is enrolled and whether ORION is currently answering everyone. 'owner' marks whose voice is the user's own. 'only_me' makes ORION ignore any voice that is not the user's; 'anyone' turns that off again. 'guard_actions' keeps ORION listening to everyone but refuses a SPOKEN go-ahead (confirm/consent/submit) for a sensitive action unless it is in the user's own voice; 'unguard_actions' turns that off. Works on BOTH the live session and offline transcription: the live capture path assembles each complete utterance and reads it the same way.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":  {"type": "STRING", "description": "enroll, list, remove, status, owner, only_me, or anyone."},
+                "action":  {"type": "STRING", "description": "enroll, list, remove, status, owner, only_me, anyone, guard_actions, or unguard_actions."},
                 "name":    {"type": "STRING", "description": "The person's name, for enroll/remove."},
                 "consent": {"type": "BOOLEAN", "description": "Must be true for enroll — only after the person has explicitly agreed."},
                 "seconds": {"type": "NUMBER", "description": "Recording length for enroll, 2-10 seconds (default 5)."},

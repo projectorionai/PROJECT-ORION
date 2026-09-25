@@ -52,7 +52,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from .constants import CONFIG_DIR, resource_path
 
@@ -362,27 +362,45 @@ class Voiceprints:
     genuinely what this is — a handful of 256-float vectors read once at
     start-up. The heavier stores exist for data that grows.
 
-    Nothing is cached across calls: the profile file is small, and another
-    part of ORION enrolling a voice must be visible to the gate immediately
-    rather than after a restart.
+    Each file is parsed once per change, keyed on its modification time and
+    size: the audio loop asks whether a gate is on for every chunk of speech,
+    and re-reading both files each time was dozens of reads a second on the
+    capture thread. Another part of ORION enrolling a voice still shows at
+    once, because writing a file changes its stamp.
     """
 
     path: Path = field(default_factory=lambda: SETTINGS_PATH)
     profiles_path: Path = field(default_factory=lambda: PROFILES_PATH)
 
+    #: path -> ((mtime_ns, size), parsed contents). Shared by every instance.
+    _parsed: ClassVar[dict[Path, tuple[tuple[int, int], dict]]] = {}
+
     # -- persistence ---------------------------------------------------------
-    @staticmethod
-    def _read(path: Path) -> dict:
+    @classmethod
+    def _read(cls, path: Path) -> dict:
+        """The file's JSON object, as a fresh top-level copy (callers add
+        and delete entries; records inside are replaced, never edited)."""
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+            info = path.stat()
+        except OSError:
+            cls._parsed.pop(path, None)
             return {}
-        return data if isinstance(data, dict) else {}
+        stamp = (info.st_mtime_ns, info.st_size)
+        cached = cls._parsed.get(path)
+        if cached is None or cached[0] != stamp:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+            cached = (stamp, data if isinstance(data, dict) else {})
+            cls._parsed[path] = cached
+        return dict(cached[1])
 
     def _load(self) -> dict:
         settings = self._read(self.path)
         settings.setdefault("owner", "")
         settings.setdefault("only_owner", False)
+        settings.setdefault("guard_actions", False)
         settings["profiles"] = self._read(self.profiles_path)
         return settings
 
@@ -390,9 +408,11 @@ class Voiceprints:
         """Write the preferences. The embeddings are not ours to rewrite."""
         payload = {k: v for k, v in data.items() if k != "profiles"}
         _write_json(self.path, payload)
+        self._parsed.pop(self.path, None)
 
     def _save_profiles(self, profiles: dict) -> None:
         _write_json(self.profiles_path, profiles)
+        self._parsed.pop(self.profiles_path, None)
 
     # -- reading -------------------------------------------------------------
     @property
@@ -443,6 +463,29 @@ class Voiceprints:
         return True, ("ORION will now answer only your voice."
                       if enabled else
                       "ORION will answer anyone again.")
+
+    @property
+    def guard_actions(self) -> bool:
+        """Whether a SPOKEN go-ahead for a sensitive action (send, call,
+        delete, pay) must come in the owner's voice. See speaker_gate."""
+        return bool(self._load().get("guard_actions"))
+
+    def set_guard_actions(self, enabled: bool) -> tuple[bool, str]:
+        data = self._load()
+        if enabled and not self.enrolled(self.owner):
+            return False, ("no voice is enrolled yet, so there is nothing to "
+                           "check a go-ahead against. Enrol a voice first.")
+        data["guard_actions"] = bool(enabled)
+        self._save(data)
+        return True, ("Sensitive actions confirmed by voice now need your voice."
+                      if enabled else
+                      "Anyone's spoken go-ahead is accepted again.")
+
+    @property
+    def judging(self) -> bool:
+        """Whether any gate needs each utterance's speaker judged."""
+        data = self._load()
+        return bool(data.get("only_owner") or data.get("guard_actions"))
 
     def set_owner(self, name: str) -> tuple[bool, str]:
         data = self._load()
@@ -627,6 +670,29 @@ def is_owner(wav: Any, sample_rate: int = SAMPLE_RATE) -> Verdict:
     return store().is_owner(wav, sample_rate)
 
 
+def judge(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> Verdict:
+    """Whose voice this 16-bit mono PCM is, while any gate needs to know.
+
+    Unlike ``should_listen`` this answers for the action guard too, and it
+    records the verdict for ``speaker_gate``. With every gate off nothing is
+    computed and the verdict is a plain yes.
+    """
+    import numpy as np
+
+    from . import speaker_gate
+
+    prints = store()
+    if not prints.judging:
+        return Verdict(True, reason="no voice gate is on")
+    try:
+        wav = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    except Exception:
+        return Verdict(True, reason="the audio could not be read")
+    verdict = prints.is_owner(wav, sample_rate)
+    speaker_gate.note_verdict(verdict)
+    return verdict
+
+
 def should_listen(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> Verdict:
     """Whether ORION should act on this utterance, given 16-bit mono PCM.
 
@@ -650,6 +716,6 @@ __all__ = [
     "DEFAULT_THRESHOLD", "MIN_SECONDS", "N_MELS", "PARTIAL_FRAMES",
     "PROFILE_PATH", "SAMPLE_RATE",
     "Verdict", "Voiceprints",
-    "available", "embed", "is_owner", "mel_spectrogram", "model_path",
+    "available", "embed", "is_owner", "judge", "mel_spectrogram", "model_path",
     "should_listen", "similarity", "store",
 ]

@@ -56,6 +56,7 @@ from .data import ToolResult
 from .memory import MemoryAgent
 from .notion import NotionService
 from .outlook import OutlookService
+from . import speaker_gate
 from .security import SecuritySanitiser, SecurityViolation
 from .utils import first_line
 from .vision import LocalFileIntelligence, VisionAgent, VolatileScreenGrabber
@@ -71,6 +72,13 @@ from .dispatch_productivity import ProductivityDispatchMixin
 from .dispatch_schema import TOOL_DECLARATIONS  # re-exported for existing import sites
 from .dispatch_vision import VisionDispatchMixin
 from .dispatch_web import WebDispatchMixin
+
+
+def _action_guard_on() -> bool:
+    """Whether spoken go-aheads for sensitive actions must be the owner's."""
+    from . import voiceprint
+
+    return voiceprint.store().guard_actions
 
 
 class OrionDispatcher(
@@ -666,6 +674,16 @@ class OrionDispatcher(
     async def dispatch(self, name: str, args: dict[str, Any] | None) -> ToolResult:
         name = SecuritySanitiser.guard_text(str(name or ""), "tool.name")
         args = SecuritySanitiser.guard_payload(dict(args or {}), f"tool.{name}")
+        # A spoken go-ahead for a sensitive action must be the owner's when
+        # the guard is on. Checked before any route (native, forged, MCP).
+        refused = speaker_gate.refusal(name, args, _action_guard_on)
+        if refused is not None:
+            try:
+                self.bus.log.emit(
+                    f"GUARD: {name} refused - spoken go-ahead was not the owner's voice.")
+            except Exception:
+                pass
+            return ToolResult(refused, ok=False)
         handler = self.handler_table().get(name)
         if handler is None:
             # Forged tools: the ReflectiveModuleLoader registers each verified

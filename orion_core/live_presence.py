@@ -179,7 +179,7 @@ class LivePresenceBridge:
         def work() -> None:
             from . import voiceprint
 
-            on_verdict(voiceprint.should_listen(pcm, self.sample_rate))
+            on_verdict(voiceprint.judge(pcm, self.sample_rate))
 
         self._hand_off(work)
 

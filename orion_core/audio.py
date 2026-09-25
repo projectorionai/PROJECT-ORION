@@ -2170,7 +2170,7 @@ class AudioGateThread(Thread):
                 presence = self._presence
                 if presence is not None and own_voice:
                     presence.utterance.feed(chunk)
-                    if (self._owner_gate_on()
+                    if (self._speaker_judged()
                             and presence.utterance.ready_to_decide()):
                         # Asked once, part-way through: a stranger is cut off
                         # early rather than answered. Nobody can be identified
@@ -2343,6 +2343,16 @@ class AudioGateThread(Thread):
         except Exception:
             return False
 
+    def _speaker_judged(self) -> bool:
+        """Whether any voice gate needs this utterance's speaker judged:
+        answering only the owner, or guarding sensitive actions."""
+        try:
+            from . import voiceprint
+
+            return voiceprint.store().judging
+        except Exception:
+            return False
+
     def _on_speaker_verdict(self, verdict: Any) -> None:
         """Act on who is talking. Called off the capture thread.
 
@@ -2353,6 +2363,10 @@ class AudioGateThread(Thread):
         """
         try:
             if getattr(verdict, "is_owner", True) or self._presence is None:
+                return
+            # The action guard only needed the verdict recorded (voiceprint
+            # did that); muting belongs to the answer-only-the-owner gate.
+            if not self._owner_gate_on():
                 return
             self._presence.utterance.muted = True
             self.drain()
