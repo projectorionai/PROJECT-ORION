@@ -75,7 +75,7 @@ SOURCE_DIRECTORIES = frozenset({
 })
 ROOT_FILES = frozenset({
     ".env.example", ".gitignore", ".dockerignore", "README.md", "SECURITY.md",
-    "LICENSE", "LICENSE.md", "ARCHITECTURE.md", "JARVIS_SUBSYSTEMS.md",
+    "LICENSE", "LICENSE.md", "ARCHITECTURE.md", "EXECUTION_PLAN.md", "JARVIS_SUBSYSTEMS.md",
     "ORION_CAPABILITIES.md", "orion.py", "requirements.txt", "conftest.py",
     "test_jarvis_subsystems.py", "build_exe.py", "build_setup.py",
     "build_standalone.py",
