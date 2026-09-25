@@ -18,8 +18,10 @@ Mark VIII changes:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -309,6 +311,13 @@ class ProviderRouter:
     #: of magnitude more than any real answer has ever used.
     DEFAULT_MAX_OUTPUT_TOKENS = 2048
 
+    #: Transient faults (HTTP 5xx, timeouts, refused connections, empty
+    #: replies) back off exponentially from the base to the ceiling. A flat
+    #: 45 s retried an endpoint that was simply not running for the rest of
+    #: the session, paying its full timeout every 45 seconds.
+    TRANSIENT_BASE_S = 45.0
+    TRANSIENT_MAX_S = 600.0
+
     #: Below this, a provider's "affordable" ceiling is not a ceiling, it is an
     #: empty account. Capping replies to 256 tokens is what truncated the
     #: research outline mid-line ("the outline could not be parsed"): better
@@ -394,6 +403,13 @@ class ProviderRouter:
         # Unknown 429 reset times need a bounded exponential cooldown. A
         # successful response clears the streak for that provider.
         self._rate_strikes: dict[str, int] = {}
+        # Consecutive transient faults per provider (escalating cooldown).
+        self._fault_strikes: dict[str, int] = {}
+        # Circuit-breaker bookkeeping: providers whose last call failed, and
+        # those whose recovery probe (the first call after a cooldown) is in
+        # flight right now.
+        self._unhealthy: set[str] = set()
+        self._probing: set[str] = set()
         # Active backup-key / alternate-model index per provider (rotation on
         # auth/quota or retired-model failures respectively).
         self._key_index: dict[str, int] = {}
@@ -811,6 +827,7 @@ class ProviderRouter:
                 "model": profile.model,
                 "is_local": profile.is_local,
                 "available": self.is_available(profile),
+                "breaker": self.breaker_state(profile),
                 "cooldown_s": round(max(0.0, self._cooldowns.get(profile.name, 0.0) - now), 1),
                 "capabilities": sorted(c.value for c in provider_capabilities(profile)),
                 "config": config.as_dict(),
@@ -1035,7 +1052,43 @@ class ProviderRouter:
     RETRY_RE = re.compile(r"(?i)(?:retry.?delay\W{0,6}|try again in\s*)(\d+(?:\.\d+)?)\s*s")
 
     def _record_success(self, profile: AIProviderProfile) -> None:
+        # A success closes the breaker: every escalation starts again from
+        # its first step (a GPU that fitted a model has since had room).
         self._rate_strikes.pop(profile.name, None)
+        self._fault_strikes.pop(profile.name, None)
+        self._oom_strikes.pop(profile.name, None)
+        self._unhealthy.discard(profile.name)
+
+    def _transient_cooldown(self, strikes: int) -> float:
+        """Cooldown after the (strikes + 1)th consecutive transient fault:
+        doubling from TRANSIENT_BASE_S up to TRANSIENT_MAX_S, less up to 20%
+        jitter so instances sharing an endpoint do not retry in lockstep."""
+        ceiling = min(self.TRANSIENT_MAX_S,
+                      self.TRANSIENT_BASE_S * (2 ** min(strikes, 8)))
+        return ceiling * random.uniform(0.8, 1.0)
+
+    def breaker_state(self, profile: AIProviderProfile) -> str:
+        """Circuit-breaker view of a provider: ``open`` while it cools down,
+        ``half_open`` once the cooldown has passed but its last call failed
+        (its next call is a probe), ``closed`` when healthy."""
+        if not self.is_available(profile):
+            return "open"
+        if profile.name in self._unhealthy or profile.name in self._probing:
+            return "half_open"
+        return "closed"
+
+    @contextlib.contextmanager
+    def _admit(self, profile: AIProviderProfile):
+        """Mark a recovering provider's call as its half-open probe while it
+        runs, so concurrent turns try healthy providers first."""
+        probe = profile.name in self._unhealthy and profile.name not in self._probing
+        if probe:
+            self._probing.add(profile.name)
+        try:
+            yield
+        finally:
+            if probe:
+                self._probing.discard(profile.name)
 
     def mark_failure(self, profile: AIProviderProfile, exc: BaseException | str) -> None:
         # Never let telemetry maths raise inside an except handler — an empty
@@ -1055,6 +1108,7 @@ class ProviderRouter:
                 message = f"{exc_type}: {message or 'generic connection failure'}"
         
         self._failures[profile.name] = message
+        self._unhealthy.add(profile.name)
         cooldown = 45.0
         rotated = ""
         if self.OOM_RE.search(message):
@@ -1169,6 +1223,12 @@ class ProviderRouter:
                 # No configured alternate: ask the provider what it has now.
                 self._needs_heal[profile.name] = "model"
                 cooldown = 2.0
+        else:
+            # Transient: the endpoint is down, slow or erroring. Each fault in
+            # a row doubles the wait, so a dead server is probed rarely.
+            strikes = self._fault_strikes.get(profile.name, 0)
+            self._fault_strikes[profile.name] = strikes + 1
+            cooldown = self._transient_cooldown(strikes)
         self._cooldowns[profile.name] = time.monotonic() + cooldown
         if rotated == "key":
             self.bus.log.emit(
@@ -1181,8 +1241,10 @@ class ProviderRouter:
                 f"'{self.active_model(profile)}' and retrying immediately."
             )
         else:
+            streak = self._fault_strikes.get(profile.name, 0)
+            repeat = f" (fault {streak} in a row)" if streak > 1 else ""
             self.bus.log.emit(
-                f"NET: provider {profile.name} cooled for {cooldown:.0f}s - {message[:160]}"
+                f"NET: provider {profile.name} cooled for {cooldown:.0f}s{repeat} - {message[:160]}"
             )
         # Classify and persist the fault so the diagnostics UI can show WHAT went
         # wrong and HOW to fix it (Section 5).  Never raises into this handler.
@@ -1209,6 +1271,8 @@ class ProviderRouter:
             "available_local": [p.name for p in self.local_text_profiles()],
             "last_failures": dict(self._failures),
             "latency_ema_s": {k: round(v, 2) for k, v in self._latency_ema.items()},
+            "breakers": {p.name: self.breaker_state(p)
+                         for p in self.settings.ordered_profiles()},
             "identity_signature": (
                 self._identity.signature() if self._identity is not None else "unattached"
             ),
@@ -1230,7 +1294,7 @@ class ProviderRouter:
         local = self.local_text_profiles()
         cloud = self.cloud_text_profiles() if online else []
         if not online:
-            return local
+            return self._probes_last(local)
         # Cloud-first policy (user choice, 2026-07-14): the cloud models LEAD
         # every online turn; the local models stay in the list purely as an
         # instant failover if the cloud call errors.  This keeps Ollama off the
@@ -1258,7 +1322,14 @@ class ProviderRouter:
 
         cloud.sort(key=_rank)
         local.sort(key=_rank)
-        return (cloud + local) if lead_cloud else (local + cloud)
+        return self._probes_last((cloud + local) if lead_cloud else (local + cloud))
+
+    def _probes_last(self, profiles: list[AIProviderProfile]) -> list[AIProviderProfile]:
+        """Half-open routing: a provider whose recovery probe is still in
+        flight moves to the back (stable), so a concurrent turn is not stacked
+        behind it — but it is still tried if nothing else answers. Excluding
+        it outright would report a one-provider setup as having none."""
+        return sorted(profiles, key=lambda p: p.name in self._probing)
 
     async def generate_text_offline(self, prompt: str, system_extra: str = "") -> tuple[AIProviderProfile, str]:
         """Force local-only inference regardless of connectivity (MODE B)."""
@@ -1850,36 +1921,37 @@ class ProviderRouter:
         timeout = ClientTimeout(total=max(12.0, float(profile.timeout_s or 30.0)))
         started = time.monotonic()
         parts: list[str] = []
-        async with ClientSession(timeout=timeout) as session:
-            async with session.post(endpoint, headers=headers, json=payload) as response:
-                if response.status >= 400:
-                    body = (await response.text())[:500]
-                    raise RuntimeError(f"HTTP {response.status}: {body}")
-                async for raw_line in response.content:
-                    line = raw_line.decode("utf-8", "ignore").strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                    except Exception:
-                        continue
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    piece = delta.get("content")
-                    if piece is None:  # some servers echo the whole message once
-                        piece = (choices[0].get("message") or {}).get("content")
-                    if piece:
-                        parts.append(str(piece))
-                        if on_delta is not None:
-                            try:
-                                on_delta(str(piece))
-                            except Exception:
-                                pass
+        with self._admit(profile):
+            async with ClientSession(timeout=timeout) as session:
+                async with session.post(endpoint, headers=headers, json=payload) as response:
+                    if response.status >= 400:
+                        body = (await response.text())[:500]
+                        raise RuntimeError(f"HTTP {response.status}: {body}")
+                    async for raw_line in response.content:
+                        line = raw_line.decode("utf-8", "ignore").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except Exception:
+                            continue
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        piece = delta.get("content")
+                        if piece is None:  # some servers echo the whole message once
+                            piece = (choices[0].get("message") or {}).get("content")
+                        if piece:
+                            parts.append(str(piece))
+                            if on_delta is not None:
+                                try:
+                                    on_delta(str(piece))
+                                except Exception:
+                                    pass
         self.note_latency(profile, time.monotonic() - started)
         content = clean_transcript("".join(parts))
         if not content:
@@ -1984,22 +2056,23 @@ class ProviderRouter:
             seconds = max(seconds, 20.0 + int(max_tokens) / 30.0)
         timeout = ClientTimeout(total=seconds)
         started = time.monotonic()
-        async with ClientSession(timeout=timeout) as session:
-            async with session.post(endpoint, headers=headers, json=payload) as response:
-                if image_jpeg is not None:
-                    chunks = bytearray()
-                    async for chunk in response.content.iter_chunked(16_384):
-                        chunks.extend(chunk)
-                        if len(chunks) > 262_144:
-                            raise RuntimeError("Vision provider response exceeded the size limit")
-                    raw = chunks.decode("utf-8")
-                else:
-                    raw = await response.text()
-                if response.status >= 400:
+        with self._admit(profile):
+            async with ClientSession(timeout=timeout) as session:
+                async with session.post(endpoint, headers=headers, json=payload) as response:
                     if image_jpeg is not None:
-                        raise RuntimeError(f"Vision provider HTTP {response.status}")
-                    raise RuntimeError(f"HTTP {response.status}: {raw[:500]}")
-                data = json.loads(raw)
+                        chunks = bytearray()
+                        async for chunk in response.content.iter_chunked(16_384):
+                            chunks.extend(chunk)
+                            if len(chunks) > 262_144:
+                                raise RuntimeError("Vision provider response exceeded the size limit")
+                        raw = chunks.decode("utf-8")
+                    else:
+                        raw = await response.text()
+                    if response.status >= 400:
+                        if image_jpeg is not None:
+                            raise RuntimeError(f"Vision provider HTTP {response.status}")
+                        raise RuntimeError(f"HTTP {response.status}: {raw[:500]}")
+                    data = json.loads(raw)
         # Observed latency feeds the orchestration ordering for future turns.
         self.note_latency(profile, time.monotonic() - started)
         # Record authoritative token usage (Section 6) — deduped by response id.
