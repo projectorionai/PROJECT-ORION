@@ -116,6 +116,28 @@ def _stub_out_sections(service, monkeypatch, captured: dict) -> None:
     monkeypatch.setattr(service, "_email_section", _empty)
 
 
+def test_the_header_reads_orions_clock_not_the_machines(tmp_path, monkeypatch):
+    """ORION's clock and the machine's can be in different zones (a UTC cloud
+    node, ORION on UK time). The header's part of the day and spoken time must
+    come from ORION's clock, like the greeting does: at 18:11 in London the
+    header once said "afternoon" and "five eleven" on a UTC machine."""
+    from datetime import datetime, timezone, timedelta
+
+    from orion_core.time_service import TIME
+
+    service = _service(tmp_path, monkeypatch)
+    _stub_out_sections(service, monkeypatch, {})
+    fixed = datetime(2026, 9, 25, 18, 11, tzinfo=timezone(timedelta(hours=1)))
+    TIME.set_clock(lambda: fixed)
+    try:
+        result = asyncio.run(service.compose_source_material(period="general"))
+        assert "Your evening briefing" in result
+        assert "six eleven" in result
+        assert service.already_briefed_today() is True
+    finally:
+        TIME.set_clock(None)
+
+
 def test_compose_source_material_general_period_uses_generic_header(tmp_path, monkeypatch):
     service = _service(tmp_path, monkeypatch)
     captured: dict = {}

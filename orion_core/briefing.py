@@ -271,7 +271,8 @@ class MorningBriefingService:
         """True once a briefing has actually been DELIVERED today (local
         date) — checked before offering another, so a restart or a new
         session the same day never re-asks for no reason."""
-        today = (moment or datetime.now()).strftime("%Y-%m-%d")
+        from .time_service import TIME
+        today = (moment or TIME.now()).strftime("%Y-%m-%d")
         return self._briefing_state.get("last_briefed_date") == today
 
     def mark_briefed(self, moment: datetime | None = None) -> None:
@@ -284,7 +285,8 @@ class MorningBriefingService:
         hour" and "you had it first thing this morning" are different
         sentences, and only a timestamp can tell them apart.
         """
-        stamp = moment or datetime.now()
+        from .time_service import TIME
+        stamp = moment or TIME.now()
         self._briefing_state["last_briefed_date"] = stamp.strftime("%Y-%m-%d")
         self._briefing_state["last_briefed_at"] = stamp.isoformat(timespec="seconds")
         self._save_briefing_state()
@@ -415,7 +417,12 @@ class MorningBriefingService:
         MORNING_FRESHNESS_LADDER) and frames the header accordingly, instead
         of running byte-for-byte the same composition regardless of when or
         why it was asked for."""
-        now = datetime.now()
+        # The shared clock, not the machine's: TimeService reads ORION's own
+        # zone, and on a machine set to another one (a UTC cloud node) the
+        # header said "afternoon" and the wrong local time while the greeting
+        # said "evening".
+        from .time_service import TIME
+        now = TIME.now()
         is_morning = period.strip().lower() == "morning"
         # Times and years in words — if the digits never reach the voice
         # channel, they can never be misread aloud (22:27 → "20:27").
