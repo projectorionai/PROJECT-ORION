@@ -33,6 +33,14 @@ Order is the order of implementation. Every item has regression tests.
 | 9 | The Command Deck did not show which text model answered, its latency, GPU load (already in each telemetry sample) or sound alerts. | `orion_core/providers.py`, `orion_core/gui/command_overview.py` | feat(deck): show the text model, its latency, GPU load and sound alerts |
 | 10 | One live-research question failing (a search backend fault) failed the whole run while its sibling kept working as an orphan. | `orion_core/live_research.py` | fix(research): contain a failing question instead of sinking the run |
 | 11 | Gateway fields were `str()`-coerced, so an object sent as a chat message or a boolean sent as a pairing code was processed. | `orion_core/remote.py` | feat(remote): validate gateway request fields against per-endpoint schemas |
+| 12 | With no OCR backend installed the capability matrix said DEGRADED (installed but failing) instead of MISSING; the spoken browser name broke on a Windows path read on another OS; several Windows-only tests failed rather than skipped elsewhere. | `orion_core/capability_health.py`, `orion_core/browser.py`, `orion_core/remote.py`, four test files | fix: report a missing OCR backend as MISSING and make tests portable |
+| 13 | The headless node discarded its whole log, including the first-run pairing code, so a fresh cloud node could not be paired; the Oracle guide still described the retired static token. Found by booting the node. | `orion_core/server.py`, `orion_core/remote.py`, `deploy/README_ORACLE_CLOUD.md` | fix(server): print the headless node's log so a fresh node can be paired |
+| 14 | Every single-instance test claimed the machine-global lock, so parallel test workers (and a running ORION) broke them. | `tests/test_single_instance.py` | test(single-instance): give each test a private lock name |
+| 15 | The Android app accepted any certificate a known host name presented, so anyone on the same network could impersonate ORION and collect the pairing token. | `android/.../MainActivity.kt`, `Prefs.kt`, `SetupActivity.kt`, `strings.xml` | fix(android): pin ORION's certificate instead of trusting any for his hosts |
+| 16 | The Android APK workflow could not build: it requested the retired SDK `tools` package, then regenerated the Gradle wrapper at 8.7 over the committed 9.5.0 pin that AGP 9.3 requires. It now builds, including #15. | `.github/workflows/android.yml` | ci(android): two commits |
+| 17 | On every first run the API-key dialog's `exec()` nested a Qt event loop inside the boot coroutine; qasync then killed the event-loop stall detector and the metrics sampler at boot. Found by booting the desktop app offscreen with asyncio debug on. | `orion_core/app.py` | fix(boot): await the first-run API-key dialog instead of nesting a Qt loop |
+| 18 | The briefing header read the machine's clock while the greeting read ORION's, so on a machine in another zone they named different parts of the day and the wrong local time. | `orion_core/briefing.py` | fix(briefing): read ORION's clock, not the machine's, for the header |
+| 19 | The same mismatch elsewhere: "remind me at 3pm" fired an hour out on a machine in another zone; briefing-engine headers mixed both clocks in one line; the late-night farewell checked the machine's hour. | `orion_core/reminders.py`, `orion_core/briefing_engine.py`, `orion_core/live_worker.py` | fix(time): tell the time from ORION's clock in reminders, briefings and farewells |
 
 Housekeeping: an agent prompt file and tool-specific ignore entries were
 removed; the publication checker's generic dot-directory rule covers them.
@@ -51,19 +59,18 @@ removed; the publication checker's generic dot-directory rule covers them.
 
 ## Findings not changed here
 
-1. **Android certificate trust (security).** `MainActivity.onReceivedSslError`
-   proceeds for any certificate presented by a known host name, so an attacker
-   on the same network could intercept the pairing token. Pin the desktop's
-   certificate fingerprint: report its SHA-256 in the `/v1/auth/pair` response,
-   store it in `Prefs`, and compare `SslError.certificate` against it. Needs an
-   Android build to verify.
+1. **First contact on Android.** Pinning (#15) trusts the first certificate
+   the phone sees, so an attacker present at that very first connection is
+   still accepted. Closing that needs the fingerprint delivered out of band,
+   for example shown beside the pairing code on the desktop.
 2. **Refresh token at rest (Android).** Stored in plain SharedPreferences.
    Backups and device transfer are already excluded; consider wrapping it with
    an Android Keystore key.
-3. **Windows-only tests on Linux.** In a Linux run, 3 firewall tests (they
-   build a `WindowsPath`), 3 autostart tests, 2 config-move tests (they call
-   `cmd`), and the OCR/mediapipe availability tests fail for platform or
-   optional-package reasons. CI runs on Windows, where they apply.
+3. **Boot-time loop stalls.** Under asyncio debug in this container, several
+   boot steps and background tasks exceeded 100 ms. The largest were trivial
+   steps (the stall detector's own heartbeat) waiting for the GIL while the
+   import-warming thread runs, so they are not evidence of blocking code; judge
+   them on real hardware with ORION's own stall detector.
 4. **Timing tests.** `test_gui_hot_paths::test_cursor_pos_is_cheap_enough_for_33_hz`
    and `test_holo_head::test_paint_stays_within_the_frame_budget` measure wall
    time and fail on a loaded machine.
@@ -75,11 +82,12 @@ Linux, Python 3.13, Qt offscreen, before and after this work:
 | Run | Passed | Failed | Skipped |
 | --- | ---: | ---: | ---: |
 | Before | 6,787 | 22 | 33 |
-| After | 6,882 | 11 | 33 |
+| After | 6,894 | 2 | 39 |
 
-The 11 remaining failures are exactly the platform and timing cases listed
-above; 11 telephony failures were fixed by the `audioop-lts` requirement, and
-the new work added 95 tests. The publication check, byte-compilation and the
+The 2 remaining failures are the wall-clock timing tests listed above. Eleven
+telephony failures were fixed by the `audioop-lts` requirement; Windows-only
+tests now skip elsewhere (hence 6 more skips); the work added 107 tests. The
+Android APK builds in GitHub Actions, including the pinning change. The publication check, byte-compilation and the
 capability gate pass. No real microphone, camera, phone, provider account or
 Twilio call was exercised.
 
