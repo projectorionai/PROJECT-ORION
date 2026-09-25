@@ -73,6 +73,9 @@ class _FixedDatetime(datetime):
 def _at_hour(monkeypatch, hour: int) -> None:
     fixed = type("_F", (_FixedDatetime,), {"_fixed_hour": hour})
     monkeypatch.setattr(lw, "datetime", fixed)
+    # The farewell reads ORION's clock (TimeService), like his greetings.
+    from orion_core.time_service import TIME
+    monkeypatch.setattr(TIME, "_clock", lambda: datetime(2026, 1, 1, hour, 0, 0))
 
 
 # ── compose_farewell() ───────────────────────────────────────────────────────

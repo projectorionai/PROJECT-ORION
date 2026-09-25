@@ -31,6 +31,14 @@ from .bus import OrionBus
 from .data import ToolResult
 from .executive_core import _age_days, _parse_stamp
 
+def _clock_now() -> datetime:
+    """ORION's clock (TimeService), which also decides the briefing's part of
+    the day: on a machine set to another zone the header's period and time
+    otherwise came from two different clocks."""
+    from .time_service import TIME
+    return TIME.now()
+
+
 _EVENT_LIMIT = 60
 _DEADLINE_HOURS = 24.0
 
@@ -192,7 +200,7 @@ class DynamicBriefingEngine:
         state = await asyncio.to_thread(self.cognition.snapshot)
         delta = await asyncio.to_thread(self.context.delta)
         events = self.events.drain()
-        lines = [f"{period.title()} briefing — {datetime.now():%A %d %B, %H:%M}"]
+        lines = [f"{period.title()} briefing — {_clock_now():%A %d %B, %H:%M}"]
         away = self._away_section(events)
         if away:
             lines.extend(away)
@@ -234,7 +242,7 @@ class DynamicBriefingEngine:
     # ── specialist briefings ──────────────────────────────────────────────────
 
     async def _research_brief(self) -> ToolResult:
-        lines = [f"Research briefing — {datetime.now():%A %d %B, %H:%M}"]
+        lines = [f"Research briefing — {_clock_now():%A %d %B, %H:%M}"]
         state = await asyncio.to_thread(self.cognition.snapshot)
         sessions = {k: v for k, v in (state.get("research_sessions") or {}).items()
                     if isinstance(v, dict)}
@@ -259,7 +267,7 @@ class DynamicBriefingEngine:
         return ToolResult("\n".join(lines))
 
     async def _mission_brief(self) -> ToolResult:
-        lines = [f"Mission briefing — {datetime.now():%A %d %B, %H:%M}"]
+        lines = [f"Mission briefing — {_clock_now():%A %d %B, %H:%M}"]
         if self.missions is None:
             return ToolResult("Mission engine offline — no mission briefing "
                               "available.", ok=False)
@@ -280,7 +288,7 @@ class DynamicBriefingEngine:
         return ToolResult("\n".join(lines))
 
     async def _security_brief(self) -> ToolResult:
-        lines = [f"Security briefing — {datetime.now():%A %d %B, %H:%M}"]
+        lines = [f"Security briefing — {_clock_now():%A %d %B, %H:%M}"]
         security_events = [e for e in self.events.events
                            if e.get("kind") == "security"]
         if security_events:
@@ -303,7 +311,7 @@ class DynamicBriefingEngine:
         return ToolResult("\n".join(lines))
 
     async def _opportunity_brief(self) -> ToolResult:
-        lines = [f"Opportunity briefing — {datetime.now():%A %d %B, %H:%M}"]
+        lines = [f"Opportunity briefing — {_clock_now():%A %d %B, %H:%M}"]
         if self.research_director is not None:
             try:
                 result = await self.research_director.opportunities()

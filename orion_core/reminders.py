@@ -88,7 +88,10 @@ class ReminderService:
         if delay <= 0:
             return ToolResult("That time has already passed.", ok=False)
         self._counter += 1
-        due_wall = (datetime.now() + timedelta(seconds=delay)).strftime("%H:%M")
+        # Said back to the user, so ORION's clock: the machine's can be in
+        # another zone (a cloud node on UTC).
+        from .time_service import TIME
+        due_wall = (TIME.now() + timedelta(seconds=delay)).strftime("%H:%M")
         reminder = Reminder(text=body or "your reminder", due_at=time.monotonic() + delay,
                             wall_due=due_wall, id=self._counter,
                             channel=wanted.value, recipient=recipient)
@@ -178,7 +181,11 @@ class ReminderService:
             hour += 12
         elif meridiem == "am" and hour == 12:
             hour = 0
-        now = datetime.now()
+        # "At 3pm" means 3pm on ORION's clock, the one he tells the time by.
+        # The machine's can be in another zone (a UTC cloud node), where this
+        # used to fire an hour out.
+        from .time_service import TIME
+        now = TIME.now()
         target = now.replace(hour=hour % 24, minute=minute, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)   # next occurrence

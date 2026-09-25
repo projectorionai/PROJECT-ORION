@@ -1335,7 +1335,8 @@ class GenAILiveWorker:
                     honorific = f", {identity.preferences.get('honorific') or 'sir'}"
             except Exception:
                 pass
-        hour = datetime.now().hour
+        from .time_service import TIME
+        hour = TIME.now().hour           # ORION's clock, like his greetings
         pool = _FAREWELLS_LATE if (hour >= 22 or hour < 5) else _FAREWELLS_DAY
         options = [line for line in pool if line != getattr(self, "_last_farewell", "")]
         chosen = random.choice(options or list(pool))

@@ -239,6 +239,8 @@ def test_late_night_gets_a_night_farewell(h, monkeypatch):
             return module.datetime(2026, 8, 9, 23, 30)
 
     monkeypatch.setattr(module, "datetime", _Late)
+    from orion_core.time_service import TIME
+    monkeypatch.setattr(TIME, "_clock", lambda: module.datetime(2026, 8, 9, 23, 30))
     for _ in range(8):
         # Once per iteration: compose_farewell() is stateful (it avoids
         # repeating the previous line), so calling it twice in one expression
