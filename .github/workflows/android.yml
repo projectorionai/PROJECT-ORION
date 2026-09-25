@@ -44,9 +44,21 @@ jobs:
           packages: platform-tools
 
       - name: Generate the Gradle wrapper
-        # The wrapper jar is intentionally not committed; the runner's system
-        # Gradle regenerates it pinned to the version the project targets.
-        run: gradle wrapper --gradle-version 8.7
+        # The wrapper jar is intentionally not committed. It is generated in an
+        # empty directory and only the script and jar copied in: running
+        # `gradle wrapper` here would configure this build with the runner's
+        # Gradle, and it used to rewrite the committed
+        # gradle/wrapper/gradle-wrapper.properties to 8.7 - too old for the
+        # Android Gradle Plugin the project uses. That file stays the one
+        # place the Gradle version is pinned.
+        run: |
+          scratch="$(mktemp -d)"
+          touch "$scratch/settings.gradle"
+          (cd "$scratch" && gradle wrapper --gradle-version 9.5.0 --no-daemon -q)
+          cp "$scratch/gradlew" ./gradlew
+          cp "$scratch/gradle/wrapper/gradle-wrapper.jar" gradle/wrapper/
+          chmod +x ./gradlew
+          grep distributionUrl gradle/wrapper/gradle-wrapper.properties
 
       - name: Build the debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
