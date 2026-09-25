@@ -1,0 +1,41 @@
+{
+  "name": "emotional_insight_generator",
+  "description": "Analyzes user emotions over time and provides actionable insights.",
+  "module": "emotional_insight_generator_tool.py",
+  "tier": "confirm",
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "user_emotions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "timestamp": {
+              "type": "string"
+            },
+            "emotion": {
+              "type": "string"
+            },
+            "intensity": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "timestamp",
+            "emotion",
+            "intensity"
+          ]
+        }
+      },
+      "threshold": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "user_emotions",
+      "threshold"
+    ]
+  }
+}

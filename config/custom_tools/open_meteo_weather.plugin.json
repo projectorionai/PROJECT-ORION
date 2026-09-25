@@ -1,0 +1,24 @@
+{
+  "name": "open_meteo_weather",
+  "description": "Current weather and a short forecast for any town, city or UK postcode. Free and needs no account or API key.",
+  "module": "open_meteo_weather_tool.py",
+  "version": "1.0.0",
+  "tier": "allow",
+  "permissions": ["network"],
+  "events": [],
+  "requires": [],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "place": {
+        "type": "STRING",
+        "description": "Town, city or UK postcode, e.g. 'Birmingham' or 'B1 1AA'."
+      },
+      "days": {
+        "type": "INTEGER",
+        "description": "How many days of forecast to add, 0-7. Omit for current conditions only."
+      }
+    },
+    "required": ["place"]
+  }
+}

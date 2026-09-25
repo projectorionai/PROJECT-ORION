@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ORION lives on the local network and may serve plain HTTP (text + voice
+  output) or self-signed HTTPS (adds voice input). Cleartext is allowed so the
+  LAN address connects, and user-added certificates are trusted so importing
+  ORION's cert (config/remote_tls/cert.pem) makes HTTPS "just work". The app
+  also handles the self-signed certificate at the WebView layer for the host
+  the user configured.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

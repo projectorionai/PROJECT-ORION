@@ -1,0 +1,28 @@
+{
+  "name": "emotional_monitor",
+  "description": "Estimate lexical sentiment from supplied text; not a verified emotional state.",
+  "module": "emotional_monitor_tool.py",
+  "tier": "confirm",
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "user_input": {
+        "type": "string"
+      },
+      "emotional_threshold": {
+        "type": "number"
+      },
+      "max_results": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "user_input",
+      "emotional_threshold",
+      "max_results"
+    ]
+  },
+  "permissions": [],
+  "version": "1.1.0"
+}

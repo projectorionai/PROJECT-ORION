@@ -1,0 +1,23 @@
+{
+  "name": "dependency_manager",
+  "description": "Automates the identification and installation of dependencies for module forging.",
+  "module": "dependency_manager_tool.py",
+  "tier": "confirm",
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "module_name": {
+        "type": "string",
+        "description": "The name of the module to check dependencies for."
+      },
+      "install": {
+        "type": "boolean",
+        "description": "Whether to install the dependencies if they are missing."
+      }
+    },
+    "required": [
+      "module_name"
+    ]
+  }
+}

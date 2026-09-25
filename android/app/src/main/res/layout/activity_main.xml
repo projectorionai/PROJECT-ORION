@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/orion_bg">
+
+    <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+        android:id="@+id/swipeRefresh"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <WebView
+            android:id="@+id/webView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+    </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+
+    <!-- Connection-error overlay (hidden until every endpoint has failed). -->
+    <LinearLayout
+        android:id="@+id/errorView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="28dp"
+        android:background="@color/orion_bg"
+        android:visibility="gone">
+
+        <ImageView
+            android:layout_width="96dp"
+            android:layout_height="96dp"
+            android:alpha="0.45"
+            android:importantForAccessibility="no"
+            android:src="@drawable/ic_launcher_foreground" />
+
+        <TextView
+            android:id="@+id/errorText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:text="@string/error_connect"
+            android:textColor="@color/orion_text"
+            android:textSize="15sp" />
+
+        <TextView
+            android:id="@+id/errorDetail"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:textColor="@color/orion_muted"
+            android:textIsSelectable="true"
+            android:textSize="12sp"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/retryButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:minWidth="160dp"
+            android:backgroundTint="@color/orion_accent"
+            android:text="@string/retry"
+            android:textColor="@color/orion_on_accent" />
+
+        <Button
+            android:id="@+id/changeServerButton"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/change_server"
+            android:textColor="@color/orion_muted" />
+    </LinearLayout>
+
+    <!-- Shown while the app finds which of ORION's addresses answers. -->
+    <LinearLayout
+        android:id="@+id/connectingView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="28dp"
+        android:background="@color/orion_bg"
+        android:clickable="true"
+        android:focusable="false"
+        android:visibility="gone">
+
+        <ImageView
+            android:layout_width="120dp"
+            android:layout_height="120dp"
+            android:importantForAccessibility="no"
+            android:src="@drawable/ic_launcher_foreground" />
+
+        <com.google.android.material.progressindicator.LinearProgressIndicator
+            android:layout_width="140dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:indeterminate="true"
+            app:indicatorColor="@color/orion_accent"
+            app:trackColor="@color/orion_surface"
+            app:trackCornerRadius="2dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="@string/connecting"
+            android:textColor="@color/orion_text"
+            android:textSize="15sp" />
+
+        <TextView
+            android:id="@+id/connectingDetail"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:gravity="center"
+            android:textColor="@color/orion_muted"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- Settings handle to change the PC address. It sits in the top-right of
+         the orb stage, just below the page's header, so it no longer covers
+         the page's "● online" status; always on top so a stuck connect can
+         still be escaped. -->
+    <ImageButton
+        android:id="@+id/settingsButton"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="50dp"
+        android:layout_marginEnd="4dp"
+        android:padding="12dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:src="@drawable/ic_settings"
+        android:alpha="0.75"
+        android:contentDescription="@string/change_server" />
+</FrameLayout>

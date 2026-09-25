@@ -1,0 +1,28 @@
+{
+  "name": "synthesis_enhancer",
+  "description": "Persist and verify a draft tool specification. Use forge to implement it; this does not create executable tools.",
+  "module": "synthesis_enhancer_tool.py",
+  "tier": "confirm",
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "tool_name": {
+        "type": "string",
+        "description": "The name of the tool to be synthesized."
+      },
+      "capability_plan": {
+        "type": "string",
+        "description": "A brief description of the capability plan for the tool."
+      }
+    },
+    "required": [
+      "tool_name",
+      "capability_plan"
+    ]
+  },
+  "permissions": [
+    "filesystem"
+  ],
+  "version": "1.1.0"
+}

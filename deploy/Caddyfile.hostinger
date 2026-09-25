@@ -1,0 +1,84 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# O.R.I.O.N. — HTTPS front door for a Hostinger VPS
+#
+#   sudo cp deploy/Caddyfile.hostinger /etc/caddy/Caddyfile
+#   sudo sed -i 's/orion.example.com/yourdomain/' /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# (hostinger_setup.sh does the substitution for you if you pass a domain.)
+#
+# Caddy gets and renews a real certificate on its own, which matters for two
+# reasons beyond the usual: the phone PWA's service worker refuses to install
+# over plain HTTP, and Twilio will not fetch TwiML or open a media stream
+# against a self-signed certificate.
+#
+# ORION himself listens only on 127.0.0.1. Everything below is the only route
+# in, which is why the authentication lives here rather than being left to
+# each endpoint to remember.
+# ─────────────────────────────────────────────────────────────────────────────
+
+orion.example.com {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# ── Twilio's endpoints ───────────────────────────────────────────────────
+	# Twilio fetches TwiML here and opens the media-stream socket here. These
+	# cannot carry a bearer token — Twilio decides what it sends — so they are
+	# authenticated at the application layer instead, by verifying Twilio's
+	# X-Twilio-Signature against the auth token. That check lives in
+	# orion_core/telephony_bridge.py and is the reason these paths are allowed
+	# through unauthenticated at this layer.
+	@telephony path /twilio/* /media/*
+	handle @telephony {
+		reverse_proxy 127.0.0.1:8790 {
+			# Media Streams is a long-lived WebSocket carrying live audio.
+			# The default 30s read timeout would cut every call at half a
+			# minute, which looks exactly like the far end hanging up.
+			transport http {
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+
+	# ── the phone / PWA uplink ───────────────────────────────────────────────
+	# Everything else is ORION's own gateway, which does its own pairing-token
+	# authentication. Rate-limited at the edge so a leaked URL cannot be used
+	# to grind at the pairing code.
+	handle {
+		reverse_proxy 127.0.0.1:8765 {
+			transport http {
+				read_timeout 300s
+			}
+		}
+	}
+
+	log {
+		output file /var/log/caddy/orion.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+		# The uplink carries pairing codes in query strings on one endpoint.
+		# Logging full URIs would put them in a file that outlives the pairing
+		# window, so only the path is kept.
+		format filter {
+			request>uri query {
+				delete code
+				delete token
+			}
+		}
+	}
+}
+
+# Anything that arrives on the IP address rather than the hostname is not a
+# client of ours — it is a scanner. Answering it at all invites a second look.
+:80, :443 {
+	respond 404
+}

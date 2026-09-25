@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ORION</string>
+    <string name="setup_subtitle">Connect to your ORION — at home or away</string>
+    <string name="label_host">PC address</string>
+    <string name="hint_host">e.g. orion-pc.tailXXXX.ts.net</string>
+    <string name="host_help">Your Tailscale name works everywhere (home and mobile data); a LAN IP works on your home Wi-Fi only. Pasting a full address such as https://192.168.1.182:8765 is fine.</string>
+    <string name="label_port">Port</string>
+    <string name="default_port">8765</string>
+    <string name="label_https">Use HTTPS (required for talking to ORION by voice)</string>
+    <string name="https_help">Enable ORION_REMOTE_TLS=1 on the PC for voice input. If ORION isn\'t serving HTTPS, switch this off or the connection will fail.</string>
+    <string name="connect">Connect</string>
+    <string name="setup_footer">1. On the PC, ask ORION to \"turn on phone access\" (or start him with ORION_REMOTE_ACCESS=1).\n2. Install Tailscale (free) on the PC and this phone and sign in to both, then enter the PC\'s Tailscale name above: ORION is then reachable from anywhere, encrypted, with no port-forwarding.\n3. Pair once with the code ORION shows in his Security Centre. After that the app finds him by itself, on your home Wi-Fi or over Tailscale.</string>
+    <string name="need_host">Enter the PC address ORION shows in his log</string>
+    <string name="invalid_host">That isn\'t an address — try something like 192.168.1.182</string>
+    <string name="invalid_port">Port must be a number from 1 to 65535</string>
+    <string name="change_server">Change server</string>
+    <string name="connecting">Connecting to ORION…</string>
+    <string name="error_connect">Couldn\'t reach ORION.\nCheck he\'s running with phone access on, and that this phone is on his Wi-Fi or on Tailscale.</string>
+    <string name="error_no_answer">Nothing answered at:\n%1$s</string>
+    <string name="hint_not_https">ORION answered, but not over HTTPS. Switch off \"Use HTTPS\" under Change server, or start ORION with ORION_REMOTE_TLS=1.</string>
+    <string name="hint_is_https">ORION may be serving HTTPS. Switch on \"Use HTTPS\" under Change server.</string>
+    <string name="error_cert_changed">ORION presented a different security certificate from the one this phone trusts, so it was not opened. Someone on this network may be impersonating him. If you reset ORION\'s phone access on the PC, use Change server to trust his new certificate.</string>
+    <string name="retry">Retry</string>
+    <string name="pair_title">Pair this phone</string>
+    <string name="pair_message">Enter the one-time pairing code shown on the ORION desktop.</string>
+    <string name="pair_hint">ABCD-1234</string>
+    <string name="pair_action">Pair</string>
+    <string name="mic_denied">Microphone is off for ORION. Allow it in Settings › Apps › ORION › Permissions to talk to him.</string>
+    <string name="cancel">Cancel</string>
+</resources>

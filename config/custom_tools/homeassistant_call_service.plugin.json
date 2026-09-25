@@ -1,0 +1,22 @@
+{
+  "name": "homeassistant_call_service",
+  "description": "Control Home Assistant over its REST API \u2014 lights, switches, scenes, locks, anything it exposes. Needs HASS_URL and a long-lived access token. 'entities' lists what exists, 'state' reads one, 'call' acts.",
+  "module": "homeassistant_call_service_tool.py",
+  "version": "1.0.0",
+  "tier": "confirm",
+  "permissions": ["network", "filesystem"],
+  "events": [],
+  "requires": [],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "action": { "type": "STRING", "description": "call (default), state, entities or status." },
+      "domain": { "type": "STRING", "description": "Service domain for 'call', e.g. light, switch, scene, lock." },
+      "service": { "type": "STRING", "description": "Service name for 'call', e.g. turn_on, turn_off, toggle." },
+      "entity_id": { "type": "STRING", "description": "The entity to act on or read, e.g. light.kitchen." },
+      "match": { "type": "STRING", "description": "Filter for 'entities', matched against the whole record." },
+      "data": { "type": "STRING", "description": "Extra service data as a JSON object, e.g. {\"brightness_pct\": 40}." }
+    },
+    "required": []
+  }
+}

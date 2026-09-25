@@ -1,0 +1,31 @@
+{
+  "name": "telegram_message",
+  "description": "Send a Telegram message directly through the Bot API.",
+  "module": "telegram_message_tool.py",
+  "version": "1.0.0",
+  "tier": "confirm",
+  "permissions": [
+    "filesystem",
+    "network"
+  ],
+  "events": [],
+  "requires": [],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "action": {
+        "type": "STRING",
+        "description": "send (default), contacts, or status."
+      },
+      "to": {
+        "type": "STRING",
+        "description": "Saved contact name or numeric chat id."
+      },
+      "message": {
+        "type": "STRING",
+        "description": "What to say."
+      }
+    },
+    "required": []
+  }
+}

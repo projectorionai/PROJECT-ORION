@@ -1,0 +1,29 @@
+{
+  "id": "business",
+  "title": "Business Pack",
+  "description": "Operations, finance and strategy for small businesses.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "Cash flow is king",
+      "content": "Profit is opinion, cash is fact. Track runway, receivables and inventory tied-up cash. Many growing e-commerce brands die from cash starvation while 'profitable' on paper.",
+      "tags": []
+    },
+    {
+      "topic": "Pricing strategy",
+      "content": "Price on value and positioning, not cost-plus. Test price points; premium pricing can increase perceived quality and margin. Bundles raise average order value.",
+      "tags": []
+    },
+    {
+      "topic": "Systems + SOPs",
+      "content": "Document repeatable processes so the business runs without you. What gets measured and documented can be delegated and scaled. Dashboards over gut feel.",
+      "tags": []
+    },
+    {
+      "topic": "Focus",
+      "content": "One product line, one channel, one avatar until it works. Diversification before traction dilutes energy. Do fewer things, better, first.",
+      "tags": []
+    }
+  ]
+}

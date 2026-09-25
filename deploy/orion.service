@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# O.R.I.O.N. — headless node (Hostinger / any Ubuntu 24.04 or Debian 12 VPS)
+#
+#   sudo cp deploy/orion.service /etc/systemd/system/orion.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now orion
+#   journalctl -u orion -f
+#
+# Assumes deploy/hostinger_setup.sh has run: /opt/orion owned by the `orion`
+# user, a virtualenv at /opt/orion/.venv, and /opt/orion/config populated.
+#
+# This supersedes orion-node.service, which is kept for existing Oracle Cloud
+# installs. The differences are deliberate and listed against each setting.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[Unit]
+Description=O.R.I.O.N. headless AI node
+Documentation=file:/opt/orion/deploy/README_HOSTINGER.md
+# network-online rather than network: ORION dials out to a provider within
+# seconds of starting, and "an interface exists" is not "routing works".
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orion
+Group=orion
+WorkingDirectory=/opt/orion
+
+# ── environment ──────────────────────────────────────────────────────────────
+Environment=ORION_HEADLESS=1
+# Qt is still imported (the bus is a QObject) but must never look for a
+# display. Without this it probes X11, fails, and takes the boot with it.
+Environment=QT_QPA_PLATFORM=offscreen
+# No GUI means no face to rasterise; the render thread would be paying for
+# frames nobody can see.
+Environment=ORION_FACE_THREAD=0
+Environment=ORION_REMOTE_HOST=127.0.0.1
+Environment=ORION_REMOTE_PORT=8765
+Environment=PYTHONUNBUFFERED=1
+# Keys and numbers live in files, not in this unit — a systemd unit is
+# world-readable and ends up in support pastes.
+EnvironmentFile=-/opt/orion/config/orion.env
+
+ExecStart=/opt/orion/.venv/bin/python /opt/orion/orion.py --headless
+
+# ── restarts ─────────────────────────────────────────────────────────────────
+# `always`, not `on-failure`: a 24/7 node that exits cleanly because a
+# provider dropped it should still come back. Ten seconds is long enough that
+# a genuine crash loop is visible in the journal rather than scrolling past.
+Restart=always
+RestartSec=10
+# ...but a true crash loop must not hammer the box for ever. Five starts in
+# five minutes and systemd gives up until someone looks.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# ── resource limits ──────────────────────────────────────────────────────────
+# A VPS has no headroom to absorb a runaway. MemoryMax is a hard ceiling —
+# ORION is killed rather than the box swapping itself to death; MemoryHigh
+# throttles before that as a warning shot. CPUQuota=200% means two cores'
+# worth, so a runaway leaves something for sshd.
+MemoryHigh=3G
+MemoryMax=4G
+CPUQuota=200%
+TasksMax=512
+
+# ── hardening ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# ProtectSystem=strict makes everything read-only, so the paths ORION
+# genuinely writes are named explicitly. Anything not here is a bug in ORION,
+# not a reason to widen this.
+ReadWritePaths=/opt/orion/config
+ReadWritePaths=/opt/orion/research
+ReadWritePaths=/opt/orion/reports
+ReadWritePaths=/opt/orion/logs
+
+[Install]
+WantedBy=multi-user.target

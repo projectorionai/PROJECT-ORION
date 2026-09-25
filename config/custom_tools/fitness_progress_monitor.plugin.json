@@ -1,0 +1,40 @@
+{
+  "name": "fitness_progress_monitor",
+  "description": "Persist and verify supplied workout data and requested reminders. Does not schedule reminders or measure workouts.",
+  "module": "fitness_progress_monitor_tool.py",
+  "tier": "confirm",
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "user_id": {
+        "type": "string"
+      },
+      "workout_data": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "reminders": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "performance_metrics": {
+        "type": "object"
+      }
+    },
+    "required": [
+      "user_id",
+      "workout_data",
+      "reminders",
+      "performance_metrics"
+    ]
+  },
+  "permissions": [
+    "filesystem"
+  ],
+  "version": "1.1.0"
+}

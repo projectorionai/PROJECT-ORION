@@ -1,0 +1,12 @@
+{
+  "name": "live_camera_analysis",
+  "description": "Live camera analysis tool (forged).",
+  "module": "live_camera_analysis_tool.py",
+  "tier": "confirm",
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+  }
+}

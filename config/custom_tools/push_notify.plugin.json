@@ -1,0 +1,22 @@
+{
+  "name": "push_notify",
+  "description": "Send a notification to the user's phone via ntfy, Gotify or Pushover \u2014 whichever is configured. Use when they ask ORION to 'send that to my phone', 'notify me', or 'remind me on my phone'. ntfy needs no account at all.",
+  "module": "push_notify_tool.py",
+  "version": "1.0.0",
+  "tier": "confirm",
+  "permissions": ["network", "filesystem"],
+  "events": [],
+  "requires": [],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "action":   { "type": "STRING", "description": "send (default) or status." },
+      "message":  { "type": "STRING", "description": "What the notification should say." },
+      "title":    { "type": "STRING", "description": "Optional heading." },
+      "priority": { "type": "STRING", "description": "min, low, default, high or urgent." },
+      "tags":     { "type": "STRING", "description": "Comma-separated ntfy tags, e.g. 'warning,skull'." },
+      "service":  { "type": "STRING", "description": "Force one of ntfy, gotify or pushover. Omit to use whichever is set up." }
+    },
+    "required": []
+  }
+}

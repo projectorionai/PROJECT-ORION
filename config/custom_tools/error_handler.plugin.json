@@ -1,0 +1,29 @@
+{
+  "name": "error_handler",
+  "description": "Persist and verify a diagnostic record. Does not apply repairs.",
+  "module": "error_handler_tool.py",
+  "tier": "confirm",
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "error_message": {
+        "type": "string"
+      },
+      "error_type": {
+        "type": "string"
+      },
+      "context": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "error_message",
+      "error_type"
+    ]
+  },
+  "permissions": [
+    "filesystem"
+  ],
+  "version": "1.1.0"
+}

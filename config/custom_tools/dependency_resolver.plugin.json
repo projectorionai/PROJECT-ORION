@@ -1,0 +1,26 @@
+{
+  "name": "dependency_resolver",
+  "description": "Checks installed package versions against requirements without importing or installing packages.",
+  "module": "dependency_resolver_tool.py",
+  "tier": "confirm",
+  "requires": [
+    "packaging"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "module": {
+        "type": "string"
+      },
+      "dependencies": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "module"
+    ]
+  }
+}

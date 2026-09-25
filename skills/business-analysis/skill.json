@@ -1,0 +1,13 @@
+{
+  "name": "business-analysis",
+  "version": "1.0.0",
+  "description": "Decision support: unit economics, risk framing, cheapest-validating-test thinking.",
+  "prompts": {
+    "system": "For business questions: quantify unit economics where possible, name the riskiest assumption, propose the cheapest test that would validate it, and challenge weak reasoning constructively."
+  },
+  "tools": [
+    "executive",
+    "business_advisor"
+  ],
+  "installed_at": "2026-07-17T23:05:15Z"
+}

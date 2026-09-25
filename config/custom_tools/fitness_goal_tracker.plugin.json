@@ -1,0 +1,32 @@
+{
+  "name": "fitness_goal_tracker",
+  "description": "Persist and verify a fitness goal with an ISO YYYY-MM-DD deadline and progress from 0 to 100. Does not schedule reminders.",
+  "module": "fitness_goal_tracker_tool.py",
+  "tier": "confirm",
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "goal": {
+        "type": "string"
+      },
+      "deadline": {
+        "type": "string"
+      },
+      "progress": {
+        "type": "integer"
+      },
+      "status": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "goal",
+      "deadline"
+    ]
+  },
+  "permissions": [
+    "filesystem"
+  ],
+  "version": "1.1.0"
+}

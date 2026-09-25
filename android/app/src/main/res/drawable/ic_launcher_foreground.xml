@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ORION mark: a crimson core with two silver orbital rings — the "orbiting
+  network" identity. Kept inside the adaptive-icon safe zone (centre ~66dp of
+  108dp) so no launcher mask clips it.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Soft crimson halo behind the core. -->
+    <path
+        android:pathData="M54,54m-33,0a33,33 0,1 1,66 0a33,33 0,1 1,-66 0"
+        android:fillColor="#2A0810" />
+
+    <!-- Orbital ring 1 (silver), tilted +28°. -->
+    <group android:pivotX="54" android:pivotY="54" android:rotation="28">
+        <path
+            android:pathData="M20,54 a34,13 0,1 1,68 0 a34,13 0,1 1,-68 0"
+            android:strokeColor="#DFE6EE"
+            android:strokeWidth="2"
+            android:fillColor="#00000000" />
+        <!-- node on ring 1 -->
+        <path
+            android:pathData="M88,54m-3,0a3,3 0,1 1,6 0a3,3 0,1 1,-6 0"
+            android:fillColor="#FFFFFF" />
+    </group>
+
+    <!-- Orbital ring 2 (silver, dimmer), tilted -34°. -->
+    <group android:pivotX="54" android:pivotY="54" android:rotation="-34">
+        <path
+            android:pathData="M22,54 a32,12 0,1 1,64 0 a32,12 0,1 1,-64 0"
+            android:strokeColor="#8D97A3"
+            android:strokeWidth="2"
+            android:fillColor="#00000000" />
+        <!-- node on ring 2 -->
+        <path
+            android:pathData="M22,54m-2.5,0a2.5,2.5 0,1 1,5 0a2.5,2.5 0,1 1,-5 0"
+            android:fillColor="#DFE6EE" />
+    </group>
+
+    <!-- Crimson core. -->
+    <path
+        android:pathData="M54,54m-14,0a14,14 0,1 1,28 0a14,14 0,1 1,-28 0"
+        android:fillColor="#8A1526" />
+    <path
+        android:pathData="M54,54m-11,0a11,11 0,1 1,22 0a11,11 0,1 1,-22 0"
+        android:fillColor="#FF2A44" />
+    <!-- Bright silver-white centre highlight. -->
+    <path
+        android:pathData="M54,54m-4.5,0a4.5,4.5 0,1 1,9 0a4.5,4.5 0,1 1,-9 0"
+        android:fillColor="#FFE9EC" />
+</vector>

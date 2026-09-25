@@ -1,0 +1,104 @@
+O.R.I.O.N. — third-party notices
+================================
+
+This file lists third-party material redistributed as part of this repository,
+together with the licence each is used under. It does not cover packages that
+are merely depended upon and installed separately by pip; see requirements.txt
+and docs/DEPENDENCY_AUDIT.md for those.
+
+
+assets/canonical_face_model.obj
+-------------------------------
+MediaPipe canonical face model geometry (468 vertices, 898 triangles).
+
+    Source    : https://github.com/google-ai-edge/mediapipe
+    Copyright : Copyright 2019-2023 The MediaPipe Authors
+    Licence   : Apache License, Version 2.0
+
+    Licensed under the Apache License, Version 2.0 (the "License"); you may
+    not use this file except in compliance with the License. You may obtain a
+    copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+    License for the specific language governing permissions and limitations
+    under the License.
+
+Modifications: texture coordinates and material references were removed; only
+the vertex and face data is retained. The surrounding cranium, neck and rigs in
+orion_core/gui/head_mesh.py are original work and are not part of this asset.
+
+
+assets/three/
+--------------
+three.js — the WebGL library ORION's quantum-orb avatar is rendered with,
+vendored so his face works without an internet connection.
+
+    Source    : https://github.com/mrdoob/three.js  (v0.160.0)
+    Copyright : Copyright 2010-2024 three.js authors
+    Licence   : MIT
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+Unmodified. Only the core module and the four post-processing addons the
+avatar imports are included, in the upstream directory layout, because the
+addons resolve each other by relative path.
+
+
+Acknowledgement — MARK LIV (JARVIS)
+-----------------------------------
+ORION's software-rendered avatar, viseme lip-sync, acoustic echo guard and
+measured audio-device probing were informed by the approach described in the
+MARK LIV release notes by FatihMakes (https://github.com/FatihMakes/Mark-LIV),
+which is published under CC BY-NC 4.0.
+
+No code from that project is included here. ORION's implementations were
+written independently for this codebase; what was taken is the engineering
+*approach* — reading mouth openness and width from formant bands rather than a
+volume meter, supplying lip closures from the transcript because no spectrum
+reveals them, reducing characters to bare Latin letters so articulation needs
+no per-language table, subtracting band energies to tell an assistant's own
+voice from a user's, and measuring audio devices instead of trusting their
+capability flags. Techniques are not subject to copyright; the acknowledgement
+is offered because the ideas were genuinely useful and deserve credit.
+
+assets/face/face_detection_yunet_2023mar.onnx
+------------------------------------------
+YuNet face detector from OpenCV Zoo. MIT licence; see assets/face/LICENSE.txt.
+Source: https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet
+The model is retained as supplied in ORION's existing source tree.
+
+assets/voiceprint/encoder.onnx
+----------------------------
+Resemblyzer pretrained encoder, converted to ONNX for ORION (a modification).
+Copyright 2019 Resemble.AI. Apache-2.0; see assets/voiceprint/LICENSE.txt.
+Upstream source: https://github.com/resemble-ai/Resemblyzer
+The converted weights are retained as supplied in ORION's existing source tree.
+
+assets/yamnet/yamnet.onnx, yamnet.data, labels.txt
+--------------------------------------------------
+YAMNet sound-event classifier (521 AudioSet classes), as exported to ONNX by
+Qualcomm AI Hub (qai-hub-models v0.63.0, "yamnet-onnx-float"). The export is
+MIT-licensed (https://huggingface.co/qualcomm/YamNet); the original YAMNet
+model and AudioSet class map are Copyright Google LLC, Apache-2.0
+(https://github.com/tensorflow/models/tree/master/research/audioset/yamnet).
+Retained unmodified.

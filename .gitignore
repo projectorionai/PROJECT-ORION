@@ -1,0 +1,168 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# O.R.I.O.N. — what must never leave this machine.
+#
+# The rule here is DENY BY DEFAULT for anything ORION writes at runtime.
+# An earlier version of this file named each offender individually, which meant
+# every new kind of runtime artefact (a browser profile, a crash report, a
+# research dossier) arrived un-ignored and one `git add .` away from being
+# published. `config/` is now ignored wholesale with a short allowlist of the
+# few files that are genuinely source.
+#
+# NOTE: .gitignore does NOT apply to files git already tracks. If something
+# personal is still tracked, `git rm --cached <path>` it — the pattern alone
+# will not remove it from the current index or from older commits.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1. Secrets and credentials
+**/*api_keys*.json
+config/messaging.json
+config/remote_secret.key
+config/remote_devices.json
+*.env
+**/.env*
+!.env.example
+*.pem
+*.key
+*.jks
+*.keystore
+
+# 2. Runtime config — deny by default, then allow back the source files.
+#    (Covers databases, identity, cognitive state, browser profile, crash
+#    reports, self-repair proposals, forged-tool output, caches and anything
+#    added in future.)
+config/*
+!config/knowledge_packs/
+config/knowledge_packs/*
+!config/knowledge_packs/ai.json
+!config/knowledge_packs/business.json
+!config/knowledge_packs/coding.json
+!config/knowledge_packs/copywriting.json
+!config/knowledge_packs/dropshipping.json
+!config/knowledge_packs/entrepreneurship.json
+!config/knowledge_packs/marketing.json
+!config/knowledge_packs/personal_development.json
+!config/knowledge_packs/sales_psychology.json
+!config/knowledge_packs/tiktok_shop.json
+!config/custom_tools/
+config/custom_tools/*
+# The numbers ORION is allowed to dial. The TEMPLATE is published so a
+# fresh checkout knows the shape; the filled-in copy never is, because
+# `config/*` above already excludes everything not named here.
+!config/telephony_contacts.example.json
+!config/custom_tools/__init__.py
+!config/custom_tools/discord_message_tool.py
+!config/custom_tools/discord_message.plugin.json
+!config/custom_tools/telegram_message_tool.py
+!config/custom_tools/telegram_message.plugin.json
+!config/custom_tools/json_validator_tool.py
+!config/custom_tools/json_validator.plugin.json
+!config/custom_tools/live_camera_analysis_tool.py
+!config/custom_tools/live_camera_analysis.plugin.json
+# Plugins that SHIP with ORION, as opposed to ones he forged or the user
+# wrote. Everything under config/custom_tools is excluded above because that
+# directory is mostly generated; these are part of the application and
+# a fresh checkout is missing capabilities without them.
+!config/custom_tools/open_meteo_weather_tool.py
+!config/custom_tools/open_meteo_weather.plugin.json
+!config/custom_tools/push_notify_tool.py
+!config/custom_tools/push_notify.plugin.json
+!config/custom_tools/philips_hue_tool.py
+!config/custom_tools/philips_hue.plugin.json
+!config/custom_tools/ifttt_webhook_tool.py
+!config/custom_tools/ifttt_webhook.plugin.json
+!config/custom_tools/homeassistant_call_service_tool.py
+!config/custom_tools/homeassistant_call_service.plugin.json
+
+# 3. Private conversation, research and generated output
+conversations/
+research/
+exports/
+reports/
+*log*.txt
+conversation_log.txt
+**/*.jsonl
+
+# 4. Databases and knowledge graphs (memory, location history)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# 5. Voice recordings and audio
+audio_studio/raw/
+audio_studio/processed/
+audio_studio/packages/
+**/*.wav
+
+# 6. Build output and packaged applications
+#    Installed copies may contain private runtime configuration.
+dist/
+# Root only. Unanchored, this matched ANY directory named 'build' at any
+# depth — including assets/three/build/, which silently kept the vendored
+# WebGL library out of the repository and left ORION streaming his own
+# face from a CDN.
+/build/
+# Whole projects ORION has written for himself. His output,
+# not his source.
+/projects/
+ORION.exe
+release/
+*.exe
+*.dll
+*.pyd
+*.apk
+*.aab
+*.spec
+
+# 7. Python environment and caches
+venv/
+.venv/
+env/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+/.test-tmp*/
+
+# 8. Editor, OS and tooling artefacts
+#    Every root-level dot-folder is local tooling or environment state (editor
+#    settings carry absolute home paths); .github is the one shared folder.
+/.*/
+!/.github/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+*.rej
+*.orig
+*.bak
+*.utf16.bak
+*.log
+recursive_file_list.txt
+/PLANS.md
+
+# 9. Office lock/temp files and generated documents
+~$*
+*.docx
+!docs/**/*.docx
+
+# 10. Reviewed plugins that ship with ORION (see PUBLIC_CONFIG_FILES in
+#     tools/prepare_public_source.py). They sit under the ignored
+#     config/custom_tools/ like forged tools, but are part of the application.
+!config/custom_tools/emotional_monitor_tool.py
+!config/custom_tools/emotional_monitor.plugin.json
+!config/custom_tools/error_handler_tool.py
+!config/custom_tools/error_handler.plugin.json
+!config/custom_tools/synthesis_enhancer_tool.py
+!config/custom_tools/synthesis_enhancer.plugin.json
+!config/custom_tools/fitness_goal_tracker_tool.py
+!config/custom_tools/fitness_goal_tracker.plugin.json
+!config/custom_tools/fitness_progress_monitor_tool.py
+!config/custom_tools/fitness_progress_monitor.plugin.json
+!config/custom_tools/dependency_manager_tool.py
+!config/custom_tools/dependency_manager.plugin.json
+!config/custom_tools/dependency_resolver_tool.py
+!config/custom_tools/dependency_resolver.plugin.json
+!config/custom_tools/emotional_insight_generator_tool.py
+!config/custom_tools/emotional_insight_generator.plugin.json
+!config/custom_tools/self_repair_agent_tool.py
+!config/custom_tools/self_repair_agent.plugin.json

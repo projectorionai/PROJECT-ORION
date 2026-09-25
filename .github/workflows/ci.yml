@@ -1,0 +1,59 @@
+# O.R.I.O.N. continuous integration (Improvement Pass, Priority 1.2).
+#
+# Every push and pull request must byte-compile the full package and pass the
+# test suite before it can be considered done — this replaces the manual
+# end-of-session "verified: package byte-compiles, tests pass" note with an
+# enforced gate. The runner is Windows because ORION is a Windows-native
+# system (pywin32, SAPI voice, UIA automation, Win32 window control).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Check public source boundaries and credential patterns
+        run: python tools/prepare_public_source.py
+
+      - name: Byte-compile the full package
+        run: python -m compileall -q orion_core orion.py
+
+      - name: Preserve registered capabilities
+        run: python tools/check_capabilities.py
+
+      - name: Run the test suite
+        # Discover from the repo root, not just ``tests/`` — the root-level
+        # ``test_jarvis_subsystems.py`` integration test lives outside the
+        # package directory (it doubles as a standalone ``python
+        # test_jarvis_subsystems.py`` script), and a path-scoped ``pytest
+        # tests`` silently excluded it from the gate. Bare ``pytest`` collects
+        # both ``tests/`` and any root-level ``test_*.py`` so nothing can escape
+        # CI unnoticed again. The root ``conftest.py`` async hook is loaded
+        # either way.
+        run: python -m pytest -q
