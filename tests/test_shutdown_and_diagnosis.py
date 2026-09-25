@@ -202,7 +202,15 @@ def test_standby_collapses_him_to_the_orb():
     assert "STANDBY" in worker.bus.state.lines
 
 
-def test_the_wake_phrase_the_user_actually_uses_releases_him():
+def test_the_wake_phrase_the_user_actually_uses_releases_him(monkeypatch):
+    from orion_core import audio_devices
+    ready = audio_devices.DeviceCheck(
+        "output", "test", True, True, 1, "test output", "output verified")
+    ready_in = audio_devices.DeviceCheck(
+        "input", "test", True, True, 2, "test input", "input verified")
+    monkeypatch.setattr(audio_devices, "verify",
+                        lambda kind, spec="", **_k: ready if kind == "output" else ready_in)
+    monkeypatch.setattr(audio_devices, "preferred_index", lambda kind: 1 if kind == "output" else 2)
     worker = _worker()
     worker._handle_quiet_command("go into standby")
     assert worker._handle_quiet_command("orion i need you") is True

@@ -18,6 +18,25 @@ from orion_core.audio_recovery import AudioRecovery, RecoveryReport
 from orion_core.audio_state import AudioStateMachine, SpeechState
 
 
+@pytest.fixture(autouse=True)
+def _verified_test_devices(monkeypatch):
+    """Exercise recovery order without depending on the runner's sound cards."""
+    output = audio_devices.DeviceCheck(
+        "output", "xrocker", True, True, 42, "[42] XRocker",
+        "output verified on XRocker")
+    input_ = audio_devices.DeviceCheck(
+        "input", "fifine", True, True, 7, "[7] Fifine",
+        "input verified on Fifine")
+    monkeypatch.setattr(audio_devices, "verify",
+                        lambda kind, spec="", **_k: output if kind == "output" else input_)
+    monkeypatch.setattr(audio_devices, "preferred_index",
+                        lambda kind: 42 if kind == "output" else 7)
+    monkeypatch.setattr(audio_devices, "note_live_device", lambda *_a, **_k: None)
+    monkeypatch.setattr(audio_devices, "resolve_effective", lambda _kind: None)
+    monkeypatch.setattr(audio_devices, "device_name",
+                        lambda kind: output.name if kind == "output" else input_.name)
+
+
 class FakeSignal:
     def __init__(self):
         self.emitted = []

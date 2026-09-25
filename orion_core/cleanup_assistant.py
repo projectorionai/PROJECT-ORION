@@ -338,14 +338,15 @@ class CleanupAssistant:
     def _validate_path(self, raw: str) -> Path:
         """Resolve *raw* and confirm it lives inside an approved root, blocking
         path traversal and symlink escapes."""
-        resolved = Path(raw).resolve()
+        candidate = Path(raw)
+        # resolve() follows a link, so checking the resolved path afterwards
+        # cannot detect a link whose target is still inside an approved root.
+        if candidate.is_symlink():
+            raise CleanupError(f"refused: '{raw}' is a symlink")
+        resolved = candidate.resolve()
         real = Path(os.path.realpath(resolved))
         if not any(_is_within(real, r) or real == r for r in self.roots):
             raise CleanupError(f"refused: '{raw}' is outside the approved project roots")
-        # A symlink whose real target escapes the roots is rejected above; a
-        # symlink pointing inside is still not something we delete blindly.
-        if resolved.is_symlink():
-            raise CleanupError(f"refused: '{raw}' is a symlink")
         return resolved
 
     @staticmethod
