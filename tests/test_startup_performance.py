@@ -227,10 +227,17 @@ def test_warm_survives_a_logger_that_raises():
 
 
 def test_warm_is_idempotent_while_running():
-    first = warm("zoneinfo")
-    second = warm("zoneinfo")
-    first.join(timeout=60)
-    assert second is first or not second.is_alive()
+    # Hold the first warm-up open, so the second call deterministically lands
+    # while it is running (a fast import could otherwise finish in between).
+    import threading
+    release = threading.Event()
+    first = warm("zoneinfo", log=lambda _line: release.wait(timeout=60))
+    try:
+        assert first.is_alive()
+        assert warm("zoneinfo") is first
+    finally:
+        release.set()
+        first.join(timeout=60)
 
 
 def test_the_startup_deferred_list_matches_what_is_actually_deferred():
