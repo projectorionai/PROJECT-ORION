@@ -213,3 +213,35 @@ def test_a_real_transport_failure_then_recovery_closes_the_breaker():
     assert seen_probing == [False, True]
     assert router.breaker_state(profile) == "closed"
     assert router._probing == set()
+
+
+def test_routing_and_breaker_events_reach_the_dashboard_feed():
+    """The Command Deck shows the provider answering, its latency, and a
+    breaker opening, from structured events rather than log text."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    async def handler(request):
+        return web.json_response({"choices": [{"message": {"content": "fine"}}]})
+
+    async def flow():
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", handler)
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            profile.base_url = str(server.make_url("/v1"))
+            router.set_connectivity(type("C", (), {"is_online": lambda self: True})())
+            await router.generate_text("hello", instruction="be brief")
+        finally:
+            await server.close()
+
+    profile = _profile()
+    router = _router(profile)
+    asyncio.run(flow())
+    routes = [p for n, p in router.bus.events if n == "dashboard_event" and p[0] == "provider_route"]
+    assert routes and routes[-1][1]["provider"] == "p" and routes[-1][1]["fallbacks"] == 0
+    assert routes[-1][1]["latency_s"] >= 0.0
+    router.mark_failure(profile, RuntimeError("HTTP 500: internal error"))
+    breakers = [p for n, p in router.bus.events if n == "dashboard_event" and p[0] == "provider_breaker"]
+    assert breakers[-1][1]["provider"] == "p" and breakers[-1][1]["state"] == "open"

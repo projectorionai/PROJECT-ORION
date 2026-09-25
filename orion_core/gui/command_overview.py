@@ -13,6 +13,7 @@ renderer; the face and the orb are untouched.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from typing import Any, Callable
 
@@ -71,8 +72,10 @@ class CommandOverview(QWidget):
         facts = QVBoxLayout()
         facts.setSpacing(10)
         self.link = self._card(facts, "LIVE CHANNEL", "Waiting for connection")
+        self.model_route = self._card(facts, "TEXT MODEL", "No text turn yet")
         self.host = self._card(facts, "HOST LOAD", "CPU —   ·   RAM —")
         self.route = self._card(facts, "LATEST ROUTE", "No tool activity yet")
+        self.hearing = self._card(facts, "HEARING", "No sound alerts")
         activity = QFrame()
         activity.setObjectName("panelFrame")
         activity_box = QVBoxLayout(activity)
@@ -193,7 +196,10 @@ class CommandOverview(QWidget):
             gpu = float(gpu_raw) if gpu_raw is not None else None
         except (TypeError, ValueError):
             return
-        self._set(self.host, f"CPU {cpu:.0f}%   ·   RAM {ram:.0f}%")
+        load = f"CPU {cpu:.0f}%   ·   RAM {ram:.0f}%"
+        if gpu is not None:
+            load += f"   ·   GPU {gpu:.0f}%"
+        self._set(self.host, load)
         self.model.set_telemetry(cpu, ram, gpu)
 
     def _on_activity(self, agent: str, summary: str) -> None:
@@ -210,12 +216,35 @@ class CommandOverview(QWidget):
                 names = text.split(" — ", 1)[1] if " — " in text else ""
                 self.model.tool_started(names)
             return
-        if text.startswith(("NET:", "TOOL:", "AUDIO:")):
+        if text.startswith(("NET:", "TOOL:", "AUDIO:", "GUARD:")):
             self._add_activity(text)
 
-    def _on_dashboard_event(self, channel: str, _payload: Any) -> None:
+    def _on_dashboard_event(self, channel: str, payload: Any) -> None:
         if channel == "voice_heard":
             self.model.heard()
+        elif channel == "provider_route" and isinstance(payload, dict):
+            where = "local" if payload.get("local") else "cloud"
+            text = f"{payload.get('provider', '?')}  ·  {where}"
+            try:
+                text += f"  ·  {float(payload.get('latency_s')):.1f} s"
+            except (TypeError, ValueError):
+                pass
+            if payload.get("fallbacks"):
+                text += f"  ·  after {int(payload['fallbacks'])} fallback(s)"
+            self._set(self.model_route, text)
+        elif channel == "provider_breaker" and isinstance(payload, dict):
+            name = str(payload.get("provider") or "?")
+            if self.model_route.text().startswith(name + "  "):
+                try:
+                    wait = f" {float(payload.get('cooldown_s')):.0f} s"
+                except (TypeError, ValueError):
+                    wait = ""
+                self._set(self.model_route, f"{name}  ·  cooling{wait}")
+        elif channel == "sound_alert" and isinstance(payload, dict):
+            category = str(payload.get("category") or "sound").capitalize()
+            stamp = time.strftime("%H:%M:%S")
+            self._set(self.hearing, f"{category}  ·  {stamp}")
+            self._add_activity(f"SOUND: {category.lower()} heard at {stamp}")
 
     def _add_activity(self, message: str) -> None:
         item = " ".join(str(message).split())[:180]

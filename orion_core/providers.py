@@ -1059,6 +1059,13 @@ class ProviderRouter:
         self._oom_strikes.pop(profile.name, None)
         self._unhealthy.discard(profile.name)
 
+    def _announce(self, channel: str, payload: dict[str, Any]) -> None:
+        """A structured dashboard event; never raises into routing."""
+        try:
+            self.bus.dashboard_event.emit(channel, payload)
+        except Exception:
+            pass
+
     def _transient_cooldown(self, strikes: int) -> float:
         """Cooldown after the (strikes + 1)th consecutive transient fault:
         doubling from TRANSIENT_BASE_S up to TRANSIENT_MAX_S, less up to 20%
@@ -1230,6 +1237,9 @@ class ProviderRouter:
             self._fault_strikes[profile.name] = strikes + 1
             cooldown = self._transient_cooldown(strikes)
         self._cooldowns[profile.name] = time.monotonic() + cooldown
+        self._announce("provider_breaker", {
+            "provider": profile.name, "state": "open",
+            "cooldown_s": round(cooldown, 1), "rotated": rotated})
         if rotated == "key":
             self.bus.log.emit(
                 f"NET: provider {profile.name} credential failed — rotating to backup "
@@ -1654,6 +1664,7 @@ class ProviderRouter:
                 # the research outline broke; another provider will do.
                 continue
             attempted.append(profile.name)
+            started = time.monotonic()
             try:
                 text = await self._call_with_heal(
                     profile,
@@ -1662,6 +1673,10 @@ class ProviderRouter:
                         task=task, max_tokens=max_tokens))
                 self._broadcast_sentiment(text)
                 self._exit_degraded()   # a success clears any degraded state
+                self._announce("provider_route", {
+                    "provider": profile.name, "local": profile.is_local,
+                    "latency_s": round(time.monotonic() - started, 2),
+                    "fallbacks": len(attempted) - 1})
                 return profile, text
             except Exception as exc:
                 last_error = exc
