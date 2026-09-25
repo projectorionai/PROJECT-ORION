@@ -790,6 +790,10 @@ _LITE_ORB = (
 )
 
 
+class _BodyTooLarge(ValueError):
+    """A request body over the endpoint's size limit (answered with 413)."""
+
+
 class RemoteGateway:
     """Pairing-authenticated aiohttp uplink answering through ORION's full brain."""
 
@@ -799,6 +803,11 @@ class RemoteGateway:
     # Voice-input upload ceiling: ~4 min of 16 kHz mono 16-bit PCM WAV. Guards
     # the desktop against a phone streaming a huge blob at the transcriber.
     _MAX_AUDIO_BYTES = 8 * 1024 * 1024
+    # JSON request ceiling. The app-wide limit above is sized for audio, so
+    # without this every JSON endpoint — including the unauthenticated pairing
+    # and token doors — would parse an 8 MB body. The largest real payload is
+    # a 4,000-character chat message.
+    _MAX_JSON_BYTES = 64 * 1024
     _UNSET = object()       # "transcriber not built yet" sentinel
     # How long teardown lets an in-flight request (a phone's chat turn, a
     # transcription) finish before aiohttp cancels it. aiohttp's own default is
@@ -1484,12 +1493,34 @@ class RemoteGateway:
 
     # ── authentication endpoints ───────────────────────────────────────────────
 
-    @staticmethod
-    async def _json_object(request: Any) -> dict[str, Any]:
-        payload = await request.json()
+    @classmethod
+    async def _json_object(cls, request: Any) -> dict[str, Any]:
+        """Parse a JSON object body no larger than ``_MAX_JSON_BYTES``.
+
+        Raises ``_BodyTooLarge`` for an oversized body (declared or streamed)
+        and ``ValueError`` for anything that is not a JSON object."""
+        limit = cls._MAX_JSON_BYTES
+        declared = request.content_length
+        if declared is not None and declared > limit:
+            raise _BodyTooLarge(declared)
+        # read(n) returns whatever is buffered, so collect until EOF — and stop
+        # as soon as the body passes the limit rather than buffering the rest.
+        raw = bytearray()
+        while chunk := await request.content.read(limit + 1 - len(raw)):
+            raw += chunk
+            if len(raw) > limit:
+                raise _BodyTooLarge(len(raw))
+        payload = json.loads(raw.decode("utf-8")) if raw else None
         if not isinstance(payload, dict):
             raise ValueError("JSON body must be an object")
         return payload
+
+    def _bad_body(self, exc: Exception) -> Any:
+        """The error response for a body ``_json_object`` refused."""
+        if isinstance(exc, _BodyTooLarge):
+            return self._web.json_response(
+                {"ok": False, "error": "request body too large"}, status=413)
+        return self._web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
 
     def _auth_rate_ok(self, key: str) -> bool:
         """Tighter limiter for credential endpoints (brute-force resistance)."""
@@ -1512,8 +1543,8 @@ class RemoteGateway:
                 {"ok": False, "error": "rate limited"}, status=429)
         try:
             payload = await self._json_object(request)
-        except Exception:
-            return self._web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+        except Exception as exc:
+            return self._bad_body(exc)
         paired = self.auth.complete_pairing(
             str(payload.get("code") or ""), str(payload.get("device_name") or ""))
         if paired is None:
@@ -1534,8 +1565,8 @@ class RemoteGateway:
                 {"ok": False, "error": "rate limited"}, status=429)
         try:
             payload = await self._json_object(request)
-        except Exception:
-            return self._web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+        except Exception as exc:
+            return self._bad_body(exc)
         issued = self.auth.issue_access(
             str(payload.get("device_id") or ""), str(payload.get("refresh_token") or ""))
         if issued is None:
@@ -1565,8 +1596,8 @@ class RemoteGateway:
                 {"ok": False, "error": "rate limited"}, status=429)
         try:
             payload = await self._json_object(request)
-        except Exception:
-            return self._web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+        except Exception as exc:
+            return self._bad_body(exc)
         device_id = self._authenticated_device(request, payload)
         if device_id is None:
             return self._web.json_response(
@@ -1599,8 +1630,8 @@ class RemoteGateway:
                 {"ok": False, "error": "rate limited"}, status=429)
         try:
             payload = await self._json_object(request)
-        except Exception:
-            return self._web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+        except Exception as exc:
+            return self._bad_body(exc)
         device_id = self._authenticated_device(request, payload)
         if device_id is None:
             return self._web.json_response(
@@ -1750,8 +1781,8 @@ class RemoteGateway:
             return self._web.json_response({"ok": False, "error": "rate limited"}, status=429)
         try:
             payload = await self._json_object(request)
-        except Exception:
-            return self._web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+        except Exception as exc:
+            return self._bad_body(exc)
         device_id = self._authenticated_device(request, payload)
         if device_id is None:
             return self._web.json_response(
