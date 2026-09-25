@@ -227,6 +227,7 @@ def _point_user_data_at_a_temp_dir(_test_data_dir):
 
 def _redirect_user_data(monkeypatch, _test_data_dir):
     import orion_core.chess_brain as chess_brain
+    import orion_core.chess_sound as chess_sound
     import orion_core.commerce as commerce
     import orion_core.decisions as decisions
     import orion_core.finance as finance
@@ -244,6 +245,7 @@ def _redirect_user_data(monkeypatch, _test_data_dir):
     monkeypatch.setattr(standing_questions, "STORE_PATH", data / "standing_questions.db")
     monkeypatch.setattr(language_tutor, "DECK_PATH", data / "language_deck.db")
     monkeypatch.setattr(chess_brain, "BRAIN_PATH", data / "chess_brain.json")
+    monkeypatch.setattr(chess_sound, "SOUND_DIR", data / "sounds")
     monkeypatch.setattr(identity, "IDENTITY_PATH", data / "identity.json")
     monkeypatch.setattr(provider_diagnostics, "DIAGNOSTICS_JOURNAL",
                         data / "diagnostics" / "provider_events.jsonl")
@@ -252,6 +254,7 @@ def _redirect_user_data(monkeypatch, _test_data_dir):
     import orion_core.live_worker as live_worker
     import orion_core.mcp_host as mcp_host
     monkeypatch.setattr(mcp_host, "MCP_CATALOGUE_PATH", data / "mcp_catalogue.json")
+    monkeypatch.setattr(mcp_host, "MCP_CONFIG_PATH", data / "mcp_servers.json")
     monkeypatch.setattr(live_worker, "LIVE_DIAG_PATH",
                         data / "diagnostics" / "live_sessions.jsonl")
     # The learning brain and the resolver's evidence. observe_async is stubbed
