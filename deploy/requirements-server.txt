@@ -10,6 +10,7 @@ PyQt6                    # only QtCore is used headless — provides the signal 
 qasync                   # asyncio ↔ Qt event-loop unification
 aiohttp                  # the remote uplink HTTP server + provider transport
 pillow                   # generates the PWA home-screen icon (falls back to SVG if absent)
+audioop-lts; python_version >= "3.13"  # telephony bridge audio conversion (audioop left the stdlib in 3.13)
 
 # Language model transport (install at least one path)
 google-genai             # Gemini cloud text (set a key in config/api_keys.json or ORION_* env)

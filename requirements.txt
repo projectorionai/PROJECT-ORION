@@ -11,6 +11,7 @@ google-genai>=2.8,<3                     # Gemini Live native-audio channel
 pillow>=10,<13                           # image handling (screen frames, OCR input)
 mss>=9,<11                               # fast screen capture
 psutil>=5.9,<8                           # telemetry, process/security monitoring
+audioop-lts>=0.2,<1; python_version >= "3.13"  # mu-law/resampling for the phone bridge; audioop left the stdlib in 3.13
 nvidia-ml-py>=12,<14                     # GPU meters in-process (NVML); no nvidia-smi process per sample
 
 # Voice (recommended)

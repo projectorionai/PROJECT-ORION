@@ -66,12 +66,12 @@ MAX_CALL_SECONDS = 900.0
 # ── audio conversion ──────────────────────────────────────────────────────────
 
 def _audioop() -> Any:
-    """``audioop``, or the pure-Python stand-in on 3.13+.
+    """``audioop`` from the standard library, or ``audioop-lts`` on 3.13+.
 
     ``audioop`` was removed from the standard library in Python 3.13. The
     replacement package is ``audioop-lts``, which installs under the same
-    name; this reports the absence clearly rather than failing later inside a
-    live call.
+    name (both requirements files list it); this reports the absence clearly
+    rather than failing later inside a live call.
     """
     try:
         import audioop  # type: ignore
