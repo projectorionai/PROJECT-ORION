@@ -232,19 +232,57 @@ def _apply_startup_layout(
 # CONFIGURATION BOOTSTRAP (GUI-assisted)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def ensure_provider_settings(window: Optional[QWidget] = None) -> "OrionProviderSettings":
-    from .providers import (_default_provider_payload, _settings_from_payload,
-                            read_provider_settings, write_provider_settings)
+def _configured_provider_settings() -> "OrionProviderSettings | None":
+    """The saved provider settings if any provider is usable, else None."""
+    from .providers import read_provider_settings, write_provider_settings
     settings = read_provider_settings()
     if any(profile.enabled and (profile.api_key or profile.base_url) for profile in settings.providers.values()):
         write_provider_settings(settings)
         return settings
+    return None
+
+
+def _settings_from_key(key: str) -> "OrionProviderSettings":
+    from .providers import (_default_provider_payload, _settings_from_payload,
+                            write_provider_settings)
+    settings = _settings_from_payload(_default_provider_payload(key))
+    write_provider_settings(settings)
+    return settings
+
+
+def ensure_provider_settings(window: Optional[QWidget] = None) -> "OrionProviderSettings":
+    """Blocking form, for callers outside the event loop. Inside a coroutine
+    use ``ensure_provider_settings_async``: ``exec()`` there nests a Qt loop."""
+    settings = _configured_provider_settings()
+    if settings is not None:
+        return settings
     dialog = ApiKeyDialog(window)
     if dialog.exec() != QDialog.DialogCode.Accepted:
         raise SystemExit(0)
-    settings = _settings_from_payload(_default_provider_payload(dialog.key()))
-    write_provider_settings(settings)
-    return settings
+    return _settings_from_key(dialog.key())
+
+
+async def ensure_provider_settings_async(window: Optional[QWidget] = None) -> "OrionProviderSettings":
+    """As ``ensure_provider_settings``, but the key dialog is awaited.
+
+    ``QDialog.exec()`` runs a second Qt event loop inside the boot coroutine.
+    qasync then steps other tasks from inside that coroutine's step, which
+    Python refuses ("Cannot enter into task ... while another task ... is
+    being executed"): on every first run, before a key was saved, the stall
+    detector and the metrics-history sampler started just before this died on
+    the spot. ``open()`` is still modal to the window but returns at once.
+    """
+    settings = _configured_provider_settings()
+    if settings is not None:
+        return settings
+    dialog = ApiKeyDialog(window)
+    answered: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+    dialog.finished.connect(
+        lambda result: answered.done() or answered.set_result(int(result)))
+    dialog.open()
+    if await answered != QDialog.DialogCode.Accepted:
+        raise SystemExit(0)
+    return _settings_from_key(dialog.key())
 
 
 def ensure_api_key(window: Optional[QWidget] = None) -> str:
@@ -691,7 +729,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
 
     bus.log.emit(f"SYS: {APP_NAME} autonomous AI operating system initialised.")
 
-    settings = ensure_provider_settings(window)
+    settings = await ensure_provider_settings_async(window)
 
     await _boot_phase(budget, "identity")
     # ── personality consistency engine: one persona across every channel ─────
