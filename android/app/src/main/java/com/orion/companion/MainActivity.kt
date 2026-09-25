@@ -6,7 +6,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Uri
+import android.net.http.SslCertificate
 import android.net.http.SslError
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.view.MotionEvent
@@ -43,6 +45,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicIntegerArray
 
 /**
@@ -461,11 +464,26 @@ class MainActivity : AppCompatActivity() {
                 view: WebView, handler: SslErrorHandler, error: SslError
             ) {
                 // ORION serves a self-signed certificate. Proceed only for one
-                // of his known hosts (LAN or Tailscale); reject anything else.
-                if (isTrustedHost(hostOf(error.url ?: ""))) {
-                    handler.proceed()
-                } else {
+                // of his known hosts (LAN or Tailscale), and only for the
+                // certificate first accepted from them: the host name alone is
+                // something anyone on the same network can answer for.
+                if (!isTrustedHost(hostOf(error.url ?: ""))) {
                     handler.cancel()
+                    return
+                }
+                val presented = sha256Of(error.certificate)
+                val pinned = Prefs.certPin(this@MainActivity)
+                when {
+                    presented == null -> handler.cancel()
+                    pinned.isEmpty() -> {
+                        Prefs.setCertPin(this@MainActivity, presented)
+                        handler.proceed()
+                    }
+                    pinned.equals(presented, ignoreCase = true) -> handler.proceed()
+                    else -> {
+                        handler.cancel()
+                        showError(getString(R.string.error_cert_changed))
+                    }
                 }
             }
 
@@ -514,6 +532,24 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
         }
+    }
+
+    /** SHA-256 of a certificate's DER encoding, as lowercase hex. */
+    private fun sha256Of(certificate: SslCertificate?): String? {
+        if (certificate == null) return null
+        val der = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                certificate.x509Certificate?.encoded
+            } else {
+                // Before API 29 the encoded certificate is only reachable
+                // through the state bundle SslCertificate saves itself to.
+                SslCertificate.saveState(certificate).getByteArray("x509-certificate")
+            }
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        return MessageDigest.getInstance("SHA-256").digest(der)
+            .joinToString("") { "%02x".format(it) }
     }
 
     private fun showPairingDialog(message: String?, defaultValue: String?, result: JsPromptResult) {

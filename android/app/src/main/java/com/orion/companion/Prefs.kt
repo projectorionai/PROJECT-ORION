@@ -23,6 +23,7 @@ object Prefs {
     const val DEVICE = "device_id"
     const val REFRESH = "refresh_token"
     const val LITE = "lite"               // "auto" (metered-driven) | "on" | "off"
+    const val CERT_PIN = "cert_sha256"    // SHA-256 of ORION's self-signed certificate
     const val DEFAULT_PORT = 8765
 
     private fun sp(context: Context) =
@@ -163,6 +164,26 @@ object Prefs {
 
     fun saveCredentials(context: Context, deviceId: String, refreshToken: String) {
         sp(context).edit().putString(DEVICE, deviceId).putString(REFRESH, refreshToken).apply()
+    }
+
+    /**
+     * The certificate ORION's uplink presented the first time this phone
+     * accepted it. His certificate is self-signed and lasts for years, so
+     * trusting "whatever a known host name presents" let anyone on the same
+     * network impersonate him and collect the pairing token. After the first
+     * acceptance only this exact certificate is trusted. Empty until then.
+     */
+    fun certPin(context: Context): String =
+        sp(context).getString(CERT_PIN, "").orEmpty()
+
+    fun setCertPin(context: Context, sha256: String) {
+        sp(context).edit().putString(CERT_PIN, sha256).apply()
+    }
+
+    /** Forget the pin — a deliberate reconfiguration, e.g. after ORION's
+     *  certificate was regenerated. */
+    fun clearCertPin(context: Context) {
+        sp(context).edit().remove(CERT_PIN).apply()
     }
 
     fun litePreference(context: Context): String =

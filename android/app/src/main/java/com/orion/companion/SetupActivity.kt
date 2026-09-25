@@ -66,6 +66,8 @@ class SetupActivity : AppCompatActivity() {
             // A manual entry is a deliberate override — drop any endpoints learned
             // from a previous pairing so this host is used until we re-pair.
             Prefs.clearEndpoints(this)
+            // A new server may present a new certificate; pin it afresh.
+            Prefs.clearCertPin(this)
             startActivity(
                 Intent(this, MainActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)

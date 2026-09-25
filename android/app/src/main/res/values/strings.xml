@@ -20,6 +20,7 @@
     <string name="error_no_answer">Nothing answered at:\n%1$s</string>
     <string name="hint_not_https">ORION answered, but not over HTTPS. Switch off \"Use HTTPS\" under Change server, or start ORION with ORION_REMOTE_TLS=1.</string>
     <string name="hint_is_https">ORION may be serving HTTPS. Switch on \"Use HTTPS\" under Change server.</string>
+    <string name="error_cert_changed">ORION presented a different security certificate from the one this phone trusts, so it was not opened. Someone on this network may be impersonating him. If you reset ORION\'s phone access on the PC, use Change server to trust his new certificate.</string>
     <string name="retry">Retry</string>
     <string name="pair_title">Pair this phone</string>
     <string name="pair_message">Enter the one-time pairing code shown on the ORION desktop.</string>
