@@ -27,11 +27,40 @@ sys.path.insert(0, str(ROOT))
 
 from orion_core.single_instance import Claim, claim  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _private_lock_name(monkeypatch):
+    """A lock name of this test's own. The real one is machine-global, so
+    tests run in parallel workers (pytest -n) took it from each other, and a
+    running ORION would take it from every test. Child processes apply the
+    same suffix from ORION_TEST_LOCK_TAG."""
+    import uuid
+
+    from orion_core import single_instance as si
+
+    tag = "-test-" + uuid.uuid4().hex[:12]
+    monkeypatch.setattr(si, "MUTEX_NAME", si.MUTEX_NAME + tag)
+    monkeypatch.setattr(si, "SOCKET_NAME", si.SOCKET_NAME + tag)
+    monkeypatch.setenv("ORION_TEST_LOCK_TAG", tag)
+    yield
+    si.release()
+
+
+#: Prepended to every child script so it claims the same private name.
+_TAGGED = '''
+import os
+import orion_core.single_instance as _si
+_tag = os.environ.get("ORION_TEST_LOCK_TAG", "")
+_si.MUTEX_NAME += _tag
+_si.SOCKET_NAME += _tag
+'''
+
 #: Run in a child process, so the lock is claimed by a genuinely separate
 #: process rather than by a second call in this one.
 _CHILD = '''
 import sys
 sys.path.insert(0, r"{root}")
+{tagged}
 from orion_core.single_instance import claim
 result = claim()
 print("GRANTED" if result.granted else "REFUSED")
@@ -40,7 +69,7 @@ print("GRANTED" if result.granted else "REFUSED")
 
 def _child_claim() -> str:
     proc = subprocess.run(
-        [sys.executable, "-c", _CHILD.format(root=str(ROOT).replace("\\", "/"))],
+        [sys.executable, "-c", _CHILD.format(root=str(ROOT).replace("\\", "/"), tagged=_TAGGED)],
         capture_output=True, text=True, timeout=120)
     return (proc.stdout or proc.stderr).strip().splitlines()[-1] if (
         proc.stdout or proc.stderr) else ""
@@ -339,6 +368,7 @@ def test_release_works_through_enforce_not_just_claim():
 _ENFORCE_CHILD = """
 import json, sys
 sys.path.insert(0, r"{root}")
+{tagged}
 from orion_core.single_instance import enforce
 got = enforce()
 print(json.dumps({{"granted": got.granted}}))
@@ -362,7 +392,7 @@ def test_a_refused_launch_leaves_stdout_clean():
     try:
         child = subprocess.run(
             [sys.executable, "-c",
-             _ENFORCE_CHILD.format(root=str(ROOT).replace("\\", "/"))],
+             _ENFORCE_CHILD.format(root=str(ROOT).replace("\\", "/"), tagged=_TAGGED)],
             capture_output=True, text=True, timeout=120)
         # The child was refused, and said so -- on stderr.
         assert json.loads(child.stdout.strip()) == {"granted": False}, (
