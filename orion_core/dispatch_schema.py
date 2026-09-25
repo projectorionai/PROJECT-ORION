@@ -121,11 +121,11 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
     },
     {
         "name": "sound_sense",
-        "description": "ORION's HEARING beyond words: identifies what sounds are present (music, instruments, singing, speech, laughter, applause, alarms, sirens, doorbells, phones, dogs, birds, vehicles, typing, appliances, water... 521 kinds) with a timeline of when each occurred, analyses music (tempo in BPM, musical key), voice pitch, and tones or hums in Hz, and transcribes any speech in the clip. action 'recent' analyses what the microphone ALREADY heard in the last N seconds — use it for 'what was that noise?', 'what song is this?', 'what's making that sound?', 'is that music or talking?'. 'listen' waits N seconds, then analyses that. 'file' analyses an audio file or a video's soundtrack at 'path'.",
+        "description": "ORION's HEARING beyond words: identifies what sounds are present (music, instruments, singing, speech, laughter, applause, alarms, sirens, doorbells, phones, dogs, birds, vehicles, typing, appliances, water... 521 kinds) with a timeline of when each occurred, analyses music (tempo in BPM, musical key), voice pitch, and tones or hums in Hz, and transcribes any speech in the clip. action 'recent' analyses what the microphone ALREADY heard in the last N seconds — use it for 'what was that noise?', 'what song is this?', 'what's making that sound?', 'is that music or talking?'. 'listen' waits N seconds, then analyses that. 'file' analyses an audio file or a video's soundtrack at 'path'. 'watch' keeps listening in the background, locally, and speaks up on its own about a smoke or fire alarm, siren, alarm, breaking glass, a crying baby, screaming, the doorbell or knocking; 'watch_off' stops it and 'watch_status' reports it.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":  {"type": "STRING", "description": "recent (default), listen, or file."},
+                "action":  {"type": "STRING", "description": "recent (default), listen, file, watch, watch_off, or watch_status."},
                 "seconds": {"type": "NUMBER", "description": "How many seconds to analyse (1-30, default 8)."},
                 "path":    {"type": "STRING", "description": "For 'file': an audio file, or a video whose soundtrack to analyse."},
                 "transcribe": {"type": "BOOLEAN", "description": "Transcribe speech found in the clip (default true)."},

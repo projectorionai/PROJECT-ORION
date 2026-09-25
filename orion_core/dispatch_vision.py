@@ -202,6 +202,9 @@ class VisionDispatchMixin:
         from .audio import RECENT_AUDIO
 
         action = str(args.get("action") or "recent").lower().strip()
+        if action in {"watch", "watch_on", "start_watch", "watch_off", "stop_watch",
+                      "watch_status"}:
+            return await self._sound_watch_action(action)
         try:
             seconds = max(1.0, min(30.0, float(args.get("seconds") or 8.0)))
         except (TypeError, ValueError):
@@ -238,6 +241,31 @@ class VisionDispatchMixin:
             if words:
                 text += f' Words heard: "{words[:600]}"'
         return ToolResult(text)
+
+    async def _sound_watch_action(self, action: str) -> ToolResult:
+        """Start, stop or report the background sound watch (sound_watch)."""
+        from . import sound_watch
+
+        bus = getattr(self, "bus", None)
+
+        def announce(alert: "sound_watch.Alert") -> None:
+            # Called on the watch thread: Qt queues each emit to its receivers.
+            if bus is None:
+                return
+            bus.log.emit(f"SOUND: {alert.category} ({alert.label}, {alert.score:.2f})")
+            bus.dashboard_event.emit("sound_alert", alert.as_dict())
+            bus.speak_request.emit(alert.sentence())
+
+        log = bus.log.emit if bus is not None else None
+        watcher = sound_watch.watch(announce, log)
+        if action in {"watch_off", "stop_watch"}:
+            await asyncio.to_thread(watcher.stop)
+            return ToolResult("Stopped listening for alarms and the door.")
+        if action == "watch_status":
+            return ToolResult(watcher.describe())
+        ok, message = await asyncio.to_thread(watcher.start)
+        return ToolResult(("Now " if ok and "already" not in message else "") + message
+                          if ok else f"I can't watch for sounds: {message}", ok=ok)
 
     async def vision_analyse(self, args: dict[str, Any]) -> ToolResult:
         action = str(args.get("action") or "describe").lower().strip()
