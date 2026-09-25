@@ -1,0 +1,53 @@
+# Build the ORION Companion Android APK in the cloud.
+#
+# This produces a real, installable APK as a downloadable artifact on every
+# push that touches the app — so you get a compiled ORION on your phone WITHOUT
+# needing Android Studio or an SDK on your PC. Grab it from the run's
+# "Artifacts" section (Actions tab ▸ this run ▸ orion-companion-apk).
+#
+# Trigger it by hand any time from Actions ▸ "Android APK" ▸ Run workflow.
+
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Generate the Gradle wrapper
+        # The wrapper jar is intentionally not committed; the runner's system
+        # Gradle regenerates it pinned to the version the project targets.
+        run: gradle wrapper --gradle-version 8.7
+
+      - name: Build the debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: orion-companion-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

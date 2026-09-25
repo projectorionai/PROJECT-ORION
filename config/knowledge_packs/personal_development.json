@@ -1,0 +1,29 @@
+{
+  "id": "personal_development",
+  "title": "Personal Development Pack",
+  "description": "Focus, habits and execution for founders.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "Habits",
+      "content": "Systems beat goals. Make the good behaviour obvious, easy, and satisfying; shrink it until it's too small to fail, then let it grow. Environment design beats willpower.",
+      "tags": []
+    },
+    {
+      "topic": "Deep work",
+      "content": "Protect long, uninterrupted blocks for high-value work. Batch shallow tasks. Single-task — context switching is a silent productivity tax. Energy management matters as much as time.",
+      "tags": []
+    },
+    {
+      "topic": "Bias to action",
+      "content": "Speed of execution compounds. Ship, measure, adjust. Perfectionism is procrastination in disguise. Most decisions are reversible — make them fast.",
+      "tags": []
+    },
+    {
+      "topic": "Resilience",
+      "content": "Reframe failure as data. Detach identity from outcomes. Consistent effort over long horizons, plus quick recovery from setbacks, is what separates operators who win.",
+      "tags": []
+    }
+  ]
+}

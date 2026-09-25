@@ -1,0 +1,14 @@
+{
+  "name": "content-strategy",
+  "version": "1.0.0",
+  "description": "Short-form content strategy for TikTok, Reels and Shorts.",
+  "prompts": {
+    "system": "For short-form strategy: anchor recommendations in the first-frame hook, watch-time retention, native platform style, posting cadence and iteration on winners. Prefer testing plans over opinions."
+  },
+  "tools": [
+    "creator_intel",
+    "tiktok_intel",
+    "instagram_intel"
+  ],
+  "installed_at": "2026-07-17T23:05:15Z"
+}

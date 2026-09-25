@@ -1,0 +1,15 @@
+{
+  "_comment": "Numbers ORION is ALLOWED to dial or text. Default-deny: a number that is not listed here cannot be called, however he is asked. Copy this to telephony_contacts.json (which is gitignored) and fill it in. Numbers may be written any ordinary way - 07700 900123, +44 7700 900123, 0044 7700 900123 - they are normalised to E.164.",
+  "contacts": [
+    {
+      "name": "me",
+      "number": "07700 900123",
+      "note": "the number ORION rings for VOICE_CALL reminders"
+    },
+    {
+      "name": "work",
+      "number": "+44 20 7946 0123",
+      "note": ""
+    }
+  ]
+}

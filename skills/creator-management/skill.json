@@ -1,0 +1,15 @@
+{
+  "name": "creator-management",
+  "version": "1.0.0",
+  "description": "Creator coaching: hook/script/CTA scoring rubric and feedback etiquette.",
+  "prompts": {
+    "system": "When reviewing creator content: score the hook (first 2 seconds), structure, pacing and CTA separately; lead feedback with what works, give one prioritised improvement, and tie every note to a retention or conversion mechanism."
+  },
+  "templates": {
+    "feedback": "HOOK: {hook_score}/10 \u2014 {hook_note}\nSTRUCTURE: {structure_note}\nCTA: {cta_note}\nPRIORITY FIX: {priority_fix}"
+  },
+  "tools": [
+    "creator_intel"
+  ],
+  "installed_at": "2026-07-17T23:05:15Z"
+}

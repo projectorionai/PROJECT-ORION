@@ -1,0 +1,29 @@
+{
+  "id": "sales_psychology",
+  "title": "Sales Psychology Pack",
+  "description": "Behavioural principles behind buying decisions.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "Cialdini's principles",
+      "content": "Reciprocity, commitment/consistency, social proof, authority, liking, scarcity, unity. Reviews and UGC = social proof; limited stock = scarcity; expert/founder story = authority.",
+      "tags": []
+    },
+    {
+      "topic": "Loss aversion",
+      "content": "People feel losses ~2x as strongly as equivalent gains. Frame around what they'll miss, not only what they'll gain. Guarantees remove the felt risk of loss and lift conversion.",
+      "tags": []
+    },
+    {
+      "topic": "Decision friction",
+      "content": "Every extra field, click, or unclear price loses buyers. Reduce choices (paradox of choice), default the best option, and make the next step obvious.",
+      "tags": []
+    },
+    {
+      "topic": "Anchoring",
+      "content": "The first number sets the reference. Show a higher 'compare at' price, or a premium tier, so the target offer feels like a deal.",
+      "tags": []
+    }
+  ]
+}

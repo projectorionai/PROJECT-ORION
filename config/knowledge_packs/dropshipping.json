@@ -1,0 +1,29 @@
+{
+  "id": "dropshipping",
+  "title": "Dropshipping Pack",
+  "description": "Product research, validation and operations for dropshipping.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "Winning product criteria",
+      "content": "Solves a clear problem or has strong wow factor; hard to find in local shops; 2.5-4x markup possible; light and durable (cheap shipping, low breakage); broad or passionate audience; not restricted by ad platforms.",
+      "tags": []
+    },
+    {
+      "topic": "Validation before scale",
+      "content": "Test with a small ad budget or organic video first. Look for saturation on TikTok/Meta, existing sellers' review counts, and Google Trends direction. Kill fast if CTR and CVR are weak.",
+      "tags": []
+    },
+    {
+      "topic": "Margin maths",
+      "content": "Selling price - product cost - shipping - transaction fees - ad cost per sale = profit. Aim for product cost <= 30% of selling price so ad spend has room. Break-even ROAS = 1 / margin fraction.",
+      "tags": []
+    },
+    {
+      "topic": "Fulfilment risk",
+      "content": "Long shipping times and returns erode trust. Prefer suppliers with tracked 7-12 day shipping, or local/agent fulfilment for scaling winners. Track return rate as a core health metric.",
+      "tags": []
+    }
+  ]
+}

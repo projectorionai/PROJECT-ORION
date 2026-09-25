@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Full-screen, dark, no action bar — the ORION orb owns the screen. -->
+    <style name="Theme.OrionCompanion" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:statusBarColor">@color/orion_bg</item>
+        <item name="android:navigationBarColor">@color/orion_bg</item>
+        <item name="android:windowBackground">@color/orion_bg</item>
+        <item name="colorPrimary">@color/orion_accent</item>
+        <item name="colorOnPrimary">@color/orion_on_accent</item>
+        <!-- Keep Material 3's dialogs (the pairing prompt) on ORION's palette
+             instead of its default purple-grey surfaces. -->
+        <item name="colorSurfaceContainerHigh">@color/orion_surface</item>
+        <item name="colorOnSurface">@color/orion_text</item>
+        <item name="colorOnSurfaceVariant">@color/orion_text_dim</item>
+    </style>
+</resources>

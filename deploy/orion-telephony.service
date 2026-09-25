@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# O.R.I.O.N. — telephony bridge
+#
+# Twilio needs a public HTTPS endpoint to fetch TwiML from, and a public WSS
+# endpoint for two-way Media Streams. This runs that bridge as its own unit,
+# separate from the brain, for three reasons:
+#
+#   * It is the only part of ORION with a port open to the internet (behind
+#     Caddy). Its blast radius should not include the knowledge graph.
+#   * A call in progress must not be dropped because the brain restarted
+#     after a provider error, and vice versa.
+#   * It can be stopped on its own. `systemctl stop orion-telephony` disables
+#     ORION's ability to place or receive calls without taking him offline —
+#     which is the thing you want at two in the morning, quickly.
+#
+#   sudo cp deploy/orion-telephony.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now orion-telephony
+# ─────────────────────────────────────────────────────────────────────────────
+
+[Unit]
+Description=O.R.I.O.N. telephony bridge (TwiML + Media Streams)
+Documentation=file:/opt/orion/deploy/README_HOSTINGER.md
+After=network-online.target orion.service
+Wants=network-online.target
+# Not Requires=: the bridge starting before the brain is fine — it answers
+# Twilio's fetch and waits. Requires= would take the bridge down every time
+# the brain restarted, dropping live calls.
+After=orion.service
+
+[Service]
+Type=simple
+User=orion
+Group=orion
+WorkingDirectory=/opt/orion
+
+Environment=ORION_HEADLESS=1
+Environment=QT_QPA_PLATFORM=offscreen
+Environment=ORION_FACE_THREAD=0
+Environment=PYTHONUNBUFFERED=1
+# Loopback only. Caddy terminates TLS and proxies to it; nothing reaches this
+# port from outside without passing through there first.
+Environment=ORION_TELEPHONY_HOST=127.0.0.1
+Environment=ORION_TELEPHONY_PORT=8790
+EnvironmentFile=-/opt/orion/config/orion.env
+
+ExecStart=/opt/orion/.venv/bin/python -m orion_core.telephony_server
+
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Smaller than the brain's: this holds audio buffers for live calls, not a
+# knowledge graph. If it needs a gigabyte something is wrong.
+MemoryHigh=768M
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=256
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/opt/orion/config
+ReadWritePaths=/opt/orion/logs
+
+[Install]
+WantedBy=multi-user.target

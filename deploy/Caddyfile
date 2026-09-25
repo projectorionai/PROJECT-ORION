@@ -1,0 +1,21 @@
+# HTTPS reverse proxy for the O.R.I.O.N. node — Caddy gets you a real,
+# auto-renewing TLS certificate in one line, so the phone talks to ORION over
+# https:// (required for the PWA service worker + safe token transport).
+#
+# 1. Point a domain (or a free DuckDNS/Cloudflare subdomain) at the VM's public IP.
+# 2. Replace orion.example.com below with that hostname.
+# 3. sudo apt install caddy   (or the official Caddy repo)
+#    sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#    sudo systemctl restart caddy
+# 4. Open the Oracle ingress + host firewall for 80 and 443 (see README).
+#
+# ORION itself then only needs to listen on localhost (ORION_REMOTE_HOST=127.0.0.1).
+
+orion.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8765
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -Server
+    }
+}

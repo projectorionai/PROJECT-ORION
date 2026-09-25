@@ -1,0 +1,21 @@
+{
+  "name": "ifttt_webhook",
+  "description": "Trigger an IFTTT applet by name, reaching devices and services ORION has no dedicated tool for. Fire-and-forget: IFTTT acknowledges the request, not the outcome, so this cannot confirm the applet actually ran.",
+  "module": "ifttt_webhook_tool.py",
+  "version": "1.0.0",
+  "tier": "confirm",
+  "permissions": ["network", "filesystem"],
+  "events": [],
+  "requires": [],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "action": { "type": "STRING", "description": "trigger (default) or status." },
+      "event":  { "type": "STRING", "description": "The event name from the IFTTT Webhooks trigger, e.g. 'kettle_on'." },
+      "value1": { "type": "STRING", "description": "Optional value passed to the applet." },
+      "value2": { "type": "STRING", "description": "Optional second value." },
+      "value3": { "type": "STRING", "description": "Optional third value." }
+    },
+    "required": []
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "name": "self_repair_agent",
+  "description": "A tool to enhance self-repair efficiency and predict failures using machine learning.",
+  "module": "self_repair_agent_tool.py",
+  "tier": "confirm",
+  "requires": [
+    "sklearn"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "training_data": {
+        "type": "array",
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        }
+      },
+      "training_labels": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        }
+      },
+      "input_data": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        }
+      }
+    },
+    "required": [
+      "training_data",
+      "training_labels",
+      "input_data"
+    ]
+  }
+}

@@ -1,0 +1,107 @@
+# ── O.R.I.O.N. runtime requirements ────────────────────────────────────────
+# Install everything with:  python -m pip install -r requirements.txt
+
+# Core runtime (required — ORION will not start without these)
+PyQt6>=6.6,<7
+PyQt6-WebEngine>=6.6,<7                  # the in-GUI Three.js globe
+qasync>=0.27,<1                          # asyncio ↔ Qt event-loop unification
+aiohttp>=3.9,<4                          # async HTTP for news/markets/geocoding/providers
+sounddevice>=0.4,<1                      # microphone + speaker I/O
+google-genai>=2.8,<3                     # Gemini Live native-audio channel
+pillow>=10,<13                           # image handling (screen frames, OCR input)
+mss>=9,<11                               # fast screen capture
+psutil>=5.9,<8                           # telemetry, process/security monitoring
+nvidia-ml-py>=12,<14                     # GPU meters in-process (NVML); no nvidia-smi process per sample
+
+# Voice (recommended)
+pyttsx3>=2.90,<3                         # offline male voice (SAPI5)
+faster-whisper>=1.0,<2                   # offline dictation — preferred engine (ctranslate2, int8 CPU, no torch)
+openai-whisper           # offline dictation — alternative engine (pulls torch; heavier)
+# vosk                   # offline wake-word / streaming STT (optional; downloads a model on first use)
+# OfflineTranscriber (speech_offline.py) auto-selects: faster-whisper → openai-whisper → vosk.
+# Model size via ORION_WHISPER_MODEL (default base.en); models download on first use.
+
+# Autonomous desktop control (required for voice-driven PC navigation)
+pyautogui>=0.9.54,<1                     # cursor + keyboard + screenshots
+pywinauto>=0.6.8,<1                      # UIA accessibility tree (buttons/menus/dialogs)
+pygetwindow>=0.0.9,<1                    # window management
+screeninfo>=0.8,<1                       # multi-monitor topology
+keyboard>=0.13,<1                        # Unicode typing + hotkeys
+opencv-python>=4.8,<6                    # visual verification (before/after diff)
+numpy>=1.24,<3                           # arrays for vision + charts
+
+# Vision / OCR (installed: comprehensive offline screen reading)
+rapidocr-onnxruntime>=1.2,<2             # local OCR — pip-only, bundles ONNX models, no system binary
+onnxruntime>=1.16,<2                     # runs the speaker-voiceprint encoder and OCR, without torch
+tokenizers>=0.15,<1                      # semantic.py: the sentence encoder's tokenizer (meaning-based recall)
+# pytesseract            # alternative OCR (needs the Tesseract system binary)
+# Mark XXXI sight: exact window text, Windows' own OCR, game capture, cameras
+uiautomation>=2.0.20,<3                  # exact text from Notepad/Word/Edge/Chrome via UI Automation
+winrt-runtime>=3,<4                      # Windows.Media.Ocr — the most accurate local OCR here
+winrt-Windows.Media.Ocr>=3,<4            # the OCR engine itself (imported by name in ocr_engine.py)
+winrt-Windows.Graphics.Imaging>=3,<4     # SoftwareBitmap the OCR engine reads from
+winrt-Windows.Storage.Streams>=3,<4      # in-memory stream the frame is decoded through
+winrt-Windows.Globalization>=3,<4        # OCR language selection
+winrt-Windows.Foundation>=3,<4           # async operations every winrt call returns
+winrt-Windows.Foundation.Collections>=3,<4  # the OCR result's line/word collections
+dxcam>=0.0.5,<1                          # DXGI desktop duplication: reads full-screen games
+cv2_enumerate_cameras>=1.1,<2            # camera NAMES per backend, so a camera survives renumbering
+
+# Research
+curl_cffi>=0.7,<1                        # Chrome-fingerprint retry for sites that refuse plain HTTP clients
+
+# Documents / data-viz (installed)
+python-docx>=1.1,<2                      # DOCX report export
+matplotlib>=3.7,<4                       # TEST FIXTURE ONLY — builds a real PDF for the
+                         # flashcard reader test. ORION itself never imports it:
+                         # reports.py renders charts as pure-Python inline SVG so
+                         # visualisation works offline with no plotting library.
+
+# Windows integration
+pywin32                  # Outlook COM, window/DPI helpers (Windows only)
+
+# Documents / files (optional but recommended)
+pypdf>=4,<7                              # PDF text extraction (literature vault, file scans)
+jsonschema>=4,<5                         # reviewed JSON-validation plugin
+packaging>=23,<27                        # installed requirement/version checks
+scikit-learn>=1.5,<2                     # optional-on-use repair prediction plugin
+
+# Social automation (real TikTok/Instagram account, opt-in — accepts ban/ToS risk)
+playwright>=1.40,<2                      # channel="chrome" drives the user's real installed Chrome via a
+                          # dedicated persistent profile (orion_core/social_automation.py),
+                          # never the OS-default profile (Chrome refuses CDP attach on that
+                          # since ~M136/March 2025). Run once after installing:
+                          # `playwright install chrome`
+
+# Gesture control (opt-in, webcam hand-tracking)
+mediapipe>=0.10,<2                       # hand-tracking for PC-native gesture control (volume, brightness,
+                          # media) — orion_core/gesture_control.py. Uses the Tasks API
+                          # (HandLandmarker), not the deprecated mp.solutions.hands.
+
+# Cybersecurity / pentesting (opt-in — for the user's own authorized targets/labs/CTFs only)
+scapy>=2.5,<3                            # packet crafting/analysis/capture — on Windows needs the Npcap driver
+                          # (npcap.com) for raw sockets; degrades to an actionable message without it.
+python-nmap>=0.7,<1                      # wraps the `nmap` CLI for port/service scans — needs nmap itself
+                          # installed separately (nmap.org); degrades to an actionable message
+                          # without it (checked via shutil.which("nmap")).
+
+# Chess (built into the Command Deck — play, adjustable ELO, analysis)
+python-chess>=1.9,<2                     # board/rules/PGN/UCI client — orion_core/chess_engine.py. The actual
+                          # Stockfish engine binary is a separate download (not pip-installable);
+                          # auto-fetched into config/engines/stockfish.exe on first use, degrading
+                          # to an actionable message if that fails — same pattern as nmap/Npcap.
+
+# Voice speaker recognition (Mark XX architectural-audit pass, Track J) —
+# identifies a SPECIFIC known individual by voice, not just gender.
+# orion_core/voice_speaker_id.py. webrtcvad-wheels is a prebuilt-wheel fork
+# of webrtcvad (the source package needs an MSVC compiler that isn't
+# assumed to be installed); resemblyzer depends on the "webrtcvad" import
+# name, which the wheel fork also provides, so pip's resolver flags a
+# (harmless) unmet "webrtcvad>=2.0.10" requirement — ignore it.
+webrtcvad-wheels>=2.0,<3
+resemblyzer>=0.1,<1                      # pretrained 256-dim speaker-embedding encoder, bundled weights
+librosa>=0.10,<1                         # resemblyzer's audio preprocessing dependency
+scipy>=1.11,<2
+
+# Local LLM (optional — enables MODE B fully-offline intelligence)
+# Install the Ollama app from https://ollama.com then:  ollama pull qwen2.5

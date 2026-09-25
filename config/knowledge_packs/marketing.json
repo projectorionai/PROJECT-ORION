@@ -1,0 +1,29 @@
+{
+  "id": "marketing",
+  "title": "Marketing Pack",
+  "description": "Positioning, channels, funnels and growth.",
+  "version": "1.0.0",
+  "installed_at": "2026-07-03T07:20:32Z",
+  "entries": [
+    {
+      "topic": "Positioning",
+      "content": "Own a specific position in the customer's mind: who it's for, the one problem it solves, why it's different. Confused buyers don't buy. Lead with the transformation, not the features.",
+      "tags": []
+    },
+    {
+      "topic": "AIDA + funnel",
+      "content": "Attention, Interest, Desire, Action. Map content to funnel stage: top (reach/hook), middle (value/proof), bottom (offer/urgency). Retarget warm audiences — they convert cheapest.",
+      "tags": []
+    },
+    {
+      "topic": "Creative testing",
+      "content": "Ads are won at the creative level, not the settings. Test hooks, angles and formats broadly; scale winners; kill losers within 2-3 days. 80% of results come from ~20% of creatives.",
+      "tags": []
+    },
+    {
+      "topic": "Offer > everything",
+      "content": "A strong offer (bundle, guarantee, urgency, bonus) beats clever targeting. Reduce risk (money-back), increase value (free gift), add urgency (limited) — the offer is the biggest lever on conversion.",
+      "tags": []
+    }
+  ]
+}

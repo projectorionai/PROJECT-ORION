@@ -1,0 +1,31 @@
+{
+  "name": "json_validator",
+  "description": "Validates the system's configuration files and JSON data.",
+  "module": "json_validator_tool.py",
+  "tier": "confirm",
+  "requires": [
+    "jsonschema"
+  ],
+  "permissions": [
+    "filesystem"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "config": {
+        "type": "string",
+        "description": "Optional label for what is being checked."
+      },
+      "json_data": {
+        "type": "string"
+      },
+      "schema_path": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "json_data",
+      "schema_path"
+    ]
+  }
+}

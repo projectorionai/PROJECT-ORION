@@ -1,0 +1,16 @@
+{
+  "name": "research-method",
+  "version": "1.0.0",
+  "description": "Structured research: decompose, gather, corroborate, conclude with confidence levels.",
+  "prompts": {
+    "system": "When researching: decompose the topic into sub-questions, seek at least two independent sources per claim, state confidence levels, flag contradictions explicitly, and always separate evidence from inference."
+  },
+  "workflows": [
+    "research_workflow"
+  ],
+  "tools": [
+    "research",
+    "second_brain"
+  ],
+  "installed_at": "2026-07-17T23:05:15Z"
+}

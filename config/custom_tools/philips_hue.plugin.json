@@ -1,0 +1,20 @@
+{
+  "name": "philips_hue",
+  "description": "Control Philips Hue lights over the local network \u2014 on, off, toggle, brightness. No account and no cloud: the bridge answers directly on your LAN, so it works with no internet. Pair once by pressing the button on the bridge. Redundant if you already run Home Assistant.",
+  "module": "philips_hue_tool.py",
+  "version": "1.0.0",
+  "tier": "allow",
+  "permissions": ["network", "filesystem"],
+  "events": [],
+  "requires": [],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "action":     { "type": "STRING", "description": "on (default), off, toggle, brightness, list, or pair." },
+      "light":      { "type": "STRING", "description": "Light or room name, matched loosely. 'all' for everything." },
+      "brightness": { "type": "NUMBER", "description": "0-100 percent, for the brightness action." },
+      "bridge":     { "type": "STRING", "description": "Bridge IP address, for pairing when discovery fails." }
+    },
+    "required": []
+  }
+}
