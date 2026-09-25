@@ -252,3 +252,19 @@ def test_the_model_is_told_which_mode_actually_reads():
     tool = next(t for t in TOOL_DECLARATIONS if t["name"] == "research")
     assert "browse" in tool["description"]
     assert "genuinely opened" in tool["description"]
+
+
+async def test_one_failing_question_does_not_sink_the_run(researcher, monkeypatch):
+    """A search fault on one question is recorded; the others still finish,
+    and the run is written up rather than raising."""
+    from orion_core.web_search_backends import Hit
+
+    async def flaky_search(query, limit=8, say=None):
+        if "effect" in query:
+            raise RuntimeError("backend exploded")
+        return [Hit(title="Good page", url="https://good.example/a", backend="stub")]
+
+    monkeypatch.setattr("orion_core.web_search_backends.search", flaky_search)
+    run = await researcher.investigate("spacing", questions=2, per_question=1, rounds=1)
+    assert any("backend exploded" in reason for _q, reason in run.failed)
+    assert run.notes, "the healthy question should still have produced a note"

@@ -493,7 +493,16 @@ class LiveResearcher:
                 async with gate:
                     if ends_at and time.monotonic() >= ends_at:
                         return
-                    await self._work_question(run, question, per_question, ends_at)
+                    try:
+                        await self._work_question(run, question, per_question, ends_at)
+                    except Exception as exc:
+                        # One question's failure (a search backend fault, the
+                        # ranking encoder) must not sink the run: the other
+                        # question was still reading, orphaned, while the whole
+                        # investigation reported failure.
+                        reason = str(exc).splitlines()[0][:160] if str(exc) else type(exc).__name__
+                        run.failed.append((question, f"failed: {reason}"))
+                        self._say("failed", f"could not work on '{question}': {reason}")
 
             await asyncio.gather(*(_one(q) for q in pending))
 
