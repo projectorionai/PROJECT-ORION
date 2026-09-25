@@ -87,11 +87,15 @@ Pick **either** path (or both — it prefers cloud when online, falls back to lo
 sudo cp /opt/orion/deploy/orion-node.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now orion-node
-journalctl -u orion-node -f            # watch it boot; note the token line
+journalctl -u orion-node -f            # watch it boot; note the pairing code
 ```
 
-The first line of the log prints where the access token lives:
-`/opt/orion/config/remote_token.txt`. **Copy that token** — the phone needs it.
+On first start, with no phone paired yet, the log prints a one-time pairing
+code (`REMOTE: no paired devices yet — enter pairing code ABCD-1234 …`). Open
+the node's address on the phone and enter that code within 10 minutes. Missed
+the window? `sudo systemctl restart orion-node` prints a fresh code. (Older
+releases used a static token in `config/remote_token.txt`; it is no longer
+accepted and can be deleted.)
 
 ## 5. HTTPS (needed for the phone app)
 

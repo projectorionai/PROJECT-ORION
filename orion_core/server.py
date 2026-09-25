@@ -28,6 +28,7 @@ import asyncio
 import os
 import signal
 import sys
+import time
 from typing import Any
 
 import qasync
@@ -55,9 +56,28 @@ from .remote import RemoteGateway
 from .telemetry import Telemetry
 
 
+def attach_console_log(bus: Any, stream: Any = None) -> None:
+    """Print every log line to stdout, timestamped.
+
+    The desktop shows the log in its window; a headless node has no window,
+    and nothing else listened to ``bus.log`` — so every line went nowhere,
+    including the first-run pairing code, which made a fresh node impossible
+    to pair. systemd (journalctl) and Docker (docker logs) read stdout.
+    """
+    def _print(message: Any) -> None:
+        try:
+            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}",
+                  file=stream or sys.stdout, flush=True)
+        except Exception:
+            pass
+
+    bus.log.connect(_print)
+
+
 async def run_headless() -> None:
     """Compose and run the brain-only node until interrupted."""
     bus       = OrionBus()
+    attach_console_log(bus)
     telemetry = Telemetry(bus)
     telemetry.enable_history(CONFIG_DIR / "metrics_history.db")   # rolling trends
     for component in ("connectivity", "ollama", "remote", "identity"):

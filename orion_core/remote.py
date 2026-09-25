@@ -1206,11 +1206,12 @@ class RemoteGateway:
             f"REMOTE: on your phone (same Wi-Fi) open {scheme}://{self._lan_ip()}:{self.port} "
             "— add to home screen for the full-screen ORION app."
         )
-        self.bus.log.emit(
-            "REMOTE: if the phone still shows 'refused to connect', make sure this "
-            "Wi-Fi is set to a Private network in Windows (Settings ▸ Network) and "
-            "that the phone is on the same network — not a guest/5GHz-isolated SSID."
-        )
+        if _on_windows():
+            self.bus.log.emit(
+                "REMOTE: if the phone still shows 'refused to connect', make sure this "
+                "Wi-Fi is set to a Private network in Windows (Settings ▸ Network) and "
+                "that the phone is on the same network — not a guest/5GHz-isolated SSID."
+            )
         if ssl_context is None:
             self.bus.log.emit(
                 "REMOTE: phone voice INPUT needs a secure context — set "
