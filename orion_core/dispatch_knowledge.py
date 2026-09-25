@@ -1093,7 +1093,9 @@ class KnowledgeDispatchMixin:
                 directory = BASE_DIR / "conversations"
             timeline = RewindTimeline(directory)
             self._rewind = timeline
-        timeline.reload()       # transcripts grow during the session
+        # Transcripts grow during the session, so every call re-reads them —
+        # off the event loop: parsing months of history stalled voice replies.
+        await asyncio.to_thread(timeline.refresh)
         action = str(args.get("action") or "recap").strip().lower()
         query = str(args.get("query") or args.get("text") or args.get("topic") or "").strip()
         day = args.get("day") or args.get("when")
@@ -1101,10 +1103,12 @@ class KnowledgeDispatchMixin:
         if action in {"search", "find", "when_did"}:
             if not query:
                 return ToolResult("What should I search the history for?", ok=False)
-            hits = timeline.search(query, limit=int(args.get("limit") or 12))
+            hits = await asyncio.to_thread(
+                timeline.search, query, limit=int(args.get("limit") or 12))
             if not hits:
                 # Fall back to relevance ranking so a near-miss still surfaces.
-                hits = timeline.relevant(query, limit=int(args.get("limit") or 12))
+                hits = await asyncio.to_thread(
+                    timeline.relevant, query, limit=int(args.get("limit") or 12))
             if not hits:
                 return ToolResult(f"I found nothing in our history about '{query}'.")
             return ToolResult(f"Found {len(hits)} mention(s) of '{query}':\n"
@@ -1112,7 +1116,8 @@ class KnowledgeDispatchMixin:
         if action in {"recall", "relevant", "what_did_we_say"}:
             if not query:
                 return ToolResult("What should I recall from our history?", ok=False)
-            hits = timeline.relevant(query, limit=int(args.get("limit") or 10))
+            hits = await asyncio.to_thread(
+                timeline.relevant, query, limit=int(args.get("limit") or 10))
             if not hits:
                 return ToolResult(f"I don't recall anything about '{query}'.")
             return ToolResult(f"Most relevant to '{query}' in our history:\n"

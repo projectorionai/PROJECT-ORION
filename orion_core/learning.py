@@ -234,6 +234,28 @@ class LearningService:
 
     # ── bulk ingestion — the practical path to "gigabytes" of knowledge ────────
 
+    @staticmethod
+    def _collect_files(root: Path, recursive: bool, supported: set[str],
+                       limit: int) -> list[Path]:
+        """The first *limit* readable documents under *root*.
+
+        Walked lazily and stopped at the cap: listing a whole tree and slicing
+        afterwards enumerated every file under a home folder to keep 200.
+        The suffix is checked before the stat, which is the expensive part."""
+        if limit <= 0:
+            return []
+        walker = root.rglob("*") if recursive else root.glob("*")
+        found: list[Path] = []
+        for path in walker:
+            try:
+                if path.suffix.lower() in supported and path.is_file():
+                    found.append(path)
+            except OSError:
+                continue
+            if len(found) >= limit:
+                break
+        return found
+
     async def learn_folder(self, folder: str, topic: str = "", recursive: bool = True,
                            deep: bool = False, max_files: int = 4000) -> ToolResult:
         """
@@ -261,8 +283,7 @@ class LearningService:
         self.bus.log.emit(f"LEARN: ingesting folder {root} as '{base_topic}' (deep={deep}).")
 
         supported = self.TEXT_SUFFIXES | self.DOC_SUFFIXES
-        walker = root.rglob("*") if recursive else root.glob("*")
-        files = [p for p in walker if p.is_file() and p.suffix.lower() in supported][:max_files]
+        files = await run_bulk(self._collect_files, root, recursive, supported, max_files)
         if not files:
             return ToolResult(f"No readable documents found in {root}.", ok=False)
 

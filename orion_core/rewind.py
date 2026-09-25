@@ -125,6 +125,12 @@ class RewindTimeline:
     def reload(self) -> None:
         self._turns = None
 
+    def refresh(self) -> int:
+        """Re-read the transcripts now; returns how many turns were loaded.
+        Blocking file I/O — async callers run it in a worker thread."""
+        self.reload()
+        return len(self._load())
+
     # ── views ─────────────────────────────────────────────────────────────────
 
     def days(self) -> list[date]:
