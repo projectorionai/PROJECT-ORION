@@ -794,6 +794,42 @@ class _BodyTooLarge(ValueError):
     """A request body over the endpoint's size limit (answered with 413)."""
 
 
+class _BadField(ValueError):
+    """A request field of the wrong type or size (answered with 400)."""
+
+
+#: Accepted JSON fields per endpoint: name -> (allowed types, max string length
+#: or 0 for none). Unknown fields are ignored so an older or newer phone app
+#: keeps working; a known field of the wrong type is refused rather than
+#: str()-ed into something the handler never expected. Limits are several
+#: times the real sizes (pairing code 9 chars, device id 32, refresh token 43).
+_ACCESS = ((str,), 1024)
+_REQUEST_SCHEMAS: dict[str, dict[str, tuple[tuple[type, ...], int]]] = {
+    "pair": {"code": ((str,), 32), "device_name": ((str,), 200)},
+    "token": {"device_id": ((str,), 64), "refresh_token": ((str,), 256)},
+    "task": {"tool": ((str,), 128), "args": ((dict,), 0), "access_token": _ACCESS},
+    "chat": {"message": ((str,), 0), "access_token": _ACCESS},
+    "confirm": {"id": ((str,), 64), "token": ((str,), 128), "decision": ((str, bool), 16),
+                "approve": ((str, bool), 16), "access_token": _ACCESS},
+}
+_TYPE_NAMES = {str: "a string", bool: "true or false", dict: "an object"}
+
+
+def _check_fields(payload: dict[str, Any], schema: dict[str, tuple[tuple[type, ...], int]]) -> None:
+    """Raise _BadField for the first known field of the wrong type or size."""
+    for name, (kinds, limit) in schema.items():
+        value = payload.get(name)
+        if value is None:
+            continue
+        # bool is an int subclass, and no field here is numeric, so an exact
+        # check is right: {"code": true} is not a pairing code.
+        if type(value) not in kinds:
+            wanted = " or ".join(_TYPE_NAMES.get(k, k.__name__) for k in kinds)
+            raise _BadField(f"'{name}' must be {wanted}")
+        if limit and isinstance(value, str) and len(value) > limit:
+            raise _BadField(f"'{name}' is too long")
+
+
 class RemoteGateway:
     """Pairing-authenticated aiohttp uplink answering through ORION's full brain."""
 
@@ -1494,11 +1530,12 @@ class RemoteGateway:
     # ── authentication endpoints ───────────────────────────────────────────────
 
     @classmethod
-    async def _json_object(cls, request: Any) -> dict[str, Any]:
+    async def _json_object(cls, request: Any, schema: str = "") -> dict[str, Any]:
         """Parse a JSON object body no larger than ``_MAX_JSON_BYTES``.
 
-        Raises ``_BodyTooLarge`` for an oversized body (declared or streamed)
-        and ``ValueError`` for anything that is not a JSON object."""
+        Raises ``_BodyTooLarge`` for an oversized body (declared or streamed),
+        ``_BadField`` for a field that breaks the endpoint's *schema*, and
+        ``ValueError`` for anything that is not a JSON object."""
         limit = cls._MAX_JSON_BYTES
         declared = request.content_length
         if declared is not None and declared > limit:
@@ -1513,6 +1550,8 @@ class RemoteGateway:
         payload = json.loads(raw.decode("utf-8")) if raw else None
         if not isinstance(payload, dict):
             raise ValueError("JSON body must be an object")
+        if schema:
+            _check_fields(payload, _REQUEST_SCHEMAS[schema])
         return payload
 
     def _bad_body(self, exc: Exception) -> Any:
@@ -1520,6 +1559,8 @@ class RemoteGateway:
         if isinstance(exc, _BodyTooLarge):
             return self._web.json_response(
                 {"ok": False, "error": "request body too large"}, status=413)
+        if isinstance(exc, _BadField):
+            return self._web.json_response({"ok": False, "error": str(exc)}, status=400)
         return self._web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
 
     def _auth_rate_ok(self, key: str) -> bool:
@@ -1542,7 +1583,7 @@ class RemoteGateway:
             return self._web.json_response(
                 {"ok": False, "error": "rate limited"}, status=429)
         try:
-            payload = await self._json_object(request)
+            payload = await self._json_object(request, "pair")
         except Exception as exc:
             return self._bad_body(exc)
         paired = self.auth.complete_pairing(
@@ -1564,7 +1605,7 @@ class RemoteGateway:
             return self._web.json_response(
                 {"ok": False, "error": "rate limited"}, status=429)
         try:
-            payload = await self._json_object(request)
+            payload = await self._json_object(request, "token")
         except Exception as exc:
             return self._bad_body(exc)
         issued = self.auth.issue_access(
@@ -1595,7 +1636,7 @@ class RemoteGateway:
             return self._web.json_response(
                 {"ok": False, "error": "rate limited"}, status=429)
         try:
-            payload = await self._json_object(request)
+            payload = await self._json_object(request, "task")
         except Exception as exc:
             return self._bad_body(exc)
         device_id = self._authenticated_device(request, payload)
@@ -1629,7 +1670,7 @@ class RemoteGateway:
             return self._web.json_response(
                 {"ok": False, "error": "rate limited"}, status=429)
         try:
-            payload = await self._json_object(request)
+            payload = await self._json_object(request, "chat")
         except Exception as exc:
             return self._bad_body(exc)
         device_id = self._authenticated_device(request, payload)
@@ -1780,7 +1821,7 @@ class RemoteGateway:
         if not self._rate_ok(key):
             return self._web.json_response({"ok": False, "error": "rate limited"}, status=429)
         try:
-            payload = await self._json_object(request)
+            payload = await self._json_object(request, "confirm")
         except Exception as exc:
             return self._bad_body(exc)
         device_id = self._authenticated_device(request, payload)

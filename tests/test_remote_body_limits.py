@@ -102,7 +102,9 @@ def test_body_at_the_limit_is_parsed(tmp_path):
     async def flow():
         gateway = _gateway(tmp_path)
         client = await _client(gateway)
-        prefix, suffix = b'{"code": "', b'"}'
+        # The padding rides in a field the endpoint ignores; the code itself
+        # is well-formed (and wrong).
+        prefix, suffix = b'{"code": "NOPE-0000", "pad": "', b'"}'
         pad = RemoteGateway._MAX_JSON_BYTES - len(prefix) - len(suffix)
         data = prefix + b"x" * pad + suffix
         assert len(data) == RemoteGateway._MAX_JSON_BYTES
@@ -145,6 +147,62 @@ def test_pairing_still_works_with_a_normal_body(tmp_path):
                 "refresh_token": creds["refresh_token"]})
             assert r.status == 200
             assert (await r.json())["access_token"]
+        finally:
+            await client.close()
+
+    asyncio.run(flow())
+
+
+# ── field schemas ────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("path, body, message", [
+    ("/v1/auth/pair", {"code": 1234}, "'code' must be a string"),
+    ("/v1/auth/pair", {"code": True}, "'code' must be a string"),
+    ("/v1/auth/pair", {"code": "ABCD-1234", "device_name": ["phone"]},
+     "'device_name' must be a string"),
+    ("/v1/auth/token", {"device_id": "d", "refresh_token": "x" * 300},
+     "'refresh_token' is too long"),
+    ("/api/chat", {"message": {"text": "hi"}}, "'message' must be a string"),
+    ("/api/confirm", {"id": "c", "token": "t", "decision": ["yes"]},
+     "'decision' must be a string or true or false"),
+    ("/v1/agent/tasks", {"tool": "web_search", "args": ["q"]}, "'args' must be an object"),
+])
+def test_a_field_of_the_wrong_type_or_size_is_a_400_naming_it(tmp_path, path, body, message):
+    async def flow():
+        client = await _client(_gateway(tmp_path))
+        try:
+            r = await client.post(path, json=body)
+            assert r.status == 400
+            assert (await r.json())["error"] == message
+        finally:
+            await client.close()
+
+    asyncio.run(flow())
+
+
+def test_unknown_fields_and_nulls_are_ignored(tmp_path):
+    """An older or newer phone app sending extra or empty fields still pairs."""
+    async def flow():
+        gateway = _gateway(tmp_path)
+        client = await _client(gateway)
+        try:
+            code = gateway.begin_pairing()
+            r = await client.post("/v1/auth/pair", json={
+                "code": code, "device_name": None, "app_version": 7})
+            assert r.status == 200
+        finally:
+            await client.close()
+
+    asyncio.run(flow())
+
+
+def test_a_boolean_decision_is_still_accepted(tmp_path):
+    async def flow():
+        client = await _client(_gateway(tmp_path))
+        try:
+            r = await client.post("/api/confirm", json={"id": "c", "token": "t", "decision": True})
+            # Past validation: refused only because no device is paired.
+            assert r.status == 401
         finally:
             await client.close()
 
