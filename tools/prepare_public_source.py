@@ -74,7 +74,7 @@ SOURCE_DIRECTORIES = frozenset({
     "orion_core", "skills", "tests", "tools",
 })
 ROOT_FILES = frozenset({
-    ".agent.md", ".env.example", ".gitignore", ".dockerignore", "README.md", "SECURITY.md",
+    ".env.example", ".gitignore", ".dockerignore", "README.md", "SECURITY.md",
     "LICENSE", "LICENSE.md", "ARCHITECTURE.md", "JARVIS_SUBSYSTEMS.md",
     "ORION_CAPABILITIES.md", "orion.py", "requirements.txt", "conftest.py",
     "test_jarvis_subsystems.py", "build_exe.py", "build_setup.py",
@@ -88,7 +88,7 @@ TEXT_SUFFIXES = frozenset({
     ".html", ".css", ".js", ".sh", ".ps1", ".bat",
 })
 FORBIDDEN_PARTS = frozenset({
-    ".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".claude",
+    ".git", ".venv", "venv", "__pycache__", ".pytest_cache",
     ".idea", ".gradle", "build", "dist", "release", "node_modules",
     "conversations", "browser_profile", "exports", "reports",
 })

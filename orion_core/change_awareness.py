@@ -1,7 +1,7 @@
 """
 Source change-awareness — ORION knowing which of his own files changed.
 
-Whenever Claude (or anyone) edits ORION's source between runs, ORION should be
+Whenever anyone edits ORION's source between runs, ORION should be
 able to say *exactly* which of his "mains folder" modules changed, were added
 or removed.  This is not the curated patch-notes prose (that is ``changelog``)
 — it is the ground truth, computed from the code itself at the file level.

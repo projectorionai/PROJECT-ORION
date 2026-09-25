@@ -10,7 +10,7 @@ conversations, recordings, location information, research and generated reports
 are runtime data. Most settings/databases are under `config/`; other private
 directories include `conversations/`, `research/`, `exports/`, `reports/` and
 audio-studio output. An installed `dist/ORION` can contain its own private state.
-`.claude/`, virtual environments and local IDE files are excluded from source.
+Local tool folders, virtual environments and IDE files are excluded from source.
 
 `.gitignore` prevents ordinary staging of new matching files. It does not remove
 tracked files or clean old commits. Deleting a secret from source does not

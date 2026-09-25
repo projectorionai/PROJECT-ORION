@@ -124,10 +124,10 @@ env/
 /.test-tmp*/
 
 # 8. Editor, OS and tooling artefacts
-#    .claude/ holds local agent tooling config (launch.json carries absolute
-#    home paths and other projects' locations) — it was deliberately removed
-#    from this repo once already.
-.claude/
+#    Every root-level dot-folder is local tooling or environment state (editor
+#    settings carry absolute home paths); .github is the one shared folder.
+/.*/
+!/.github/
 .vscode/
 .idea/
 Thumbs.db

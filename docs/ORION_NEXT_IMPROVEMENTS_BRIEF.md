@@ -1,8 +1,7 @@
 # O.R.I.O.N. — Next Improvements Brief (Mark X.12 candidate)
 
-**Purpose of this document:** a single, comprehensive working prompt to hand to
-the `orion-principal-architect` agent (or work through manually) for the next
-development pass. It is organised the same way the existing `docs/*_AUDIT.md`
+**Purpose of this document:** a single, comprehensive working brief for the
+next development pass. It is organised the same way the existing `docs/*_AUDIT.md`
 files are — audit → gap → phased roadmap — but consolidates **UI, new
 capability, mobile, cloud and optimisation** work into one brief instead of
 five separate ones, because several items touch more than one axis (e.g. the
@@ -10,11 +9,10 @@ Command Deck redesign is both a UI and a performance item).
 
 Read alongside, before starting: `ARCHITECTURE.md`, `docs/ORION_CLOUD_ROADMAP.md`,
 `docs/ORION_PHASE_UPGRADE_AUDIT.md`, `docs/ORION_REMOTE_ACCESS.md`,
-`docs/ULTRON_ANALYSIS.md`, `docs/DEPENDENCY_AUDIT.md`, `android/README.md`,
-`.agent.md`. Do not re-derive what those already establish — extend it.
+`docs/ULTRON_ANALYSIS.md`, `docs/DEPENDENCY_AUDIT.md`, `android/README.md`.
+Do not re-derive what those already establish — extend it.
 
-**Non-negotiable invariants (repeat of `.agent.md`, kept here so this document
-is self-contained for a fresh session):** strict downward dependency
+**Non-negotiable invariants (kept here so this document is self-contained):** strict downward dependency
 (`gui`/`app` → services → `bus`/`security`/`constants`, never upward); all
 cross-subsystem communication over `OrionBus` signals, never direct widget
 access; every blocking call wrapped in `asyncio.to_thread()`; every OS-bound
