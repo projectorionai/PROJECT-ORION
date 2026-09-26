@@ -68,6 +68,8 @@ CONFIG_REVISION = "mark31"
 #: failed, retried and reported as broken every thirty seconds.
 _SECRET_RE = __import__("re").compile(
     r"(?i)(key|token|secret|sid|password|credential|auth)")
+#: Shortest env value under a secret-looking key that is treated as a secret.
+_MIN_SECRET_LEN = 6
 
 # Per-tool confirmation lists for the shipped entries (see requires_confirmation).
 # Exact tool names, so a tool a server adds later is judged when it is added
@@ -706,10 +708,12 @@ class MCPServerConn:
         self.command = str(spec.get("command") or "")
         self.args = [str(a) for a in (spec.get("args") or [])]
         self.env = {str(k): str(v) for k, v in (spec.get("env") or {}).items()}
+        # Short values are settings, not secrets (AUTH_ENABLED=on): replacing
+        # "on" wherever it appears would garble every message ("c[redacted]
+        # necti[redacted]"). Real credentials are far longer than this.
         self._credential_values = sorted({
             value for key, value in self.env.items()
-            if _SECRET_RE.search(key) and value.strip()
-            and value.strip().lower() not in {"0", "1", "true", "false"}
+            if _SECRET_RE.search(key) and len(value.strip()) >= _MIN_SECRET_LEN
         }, key=len, reverse=True)
         self.description = str(spec.get("description") or "")
         self.bus = bus
@@ -941,10 +945,17 @@ class MCPServerConn:
             pass
 
     def _redact(self, message: str) -> str:
-        """Keep configured credentials out of server errors and log tails."""
+        """Keep configured credentials out of server errors and log tails.
+
+        An MCPReply stays an MCPReply: str.replace returns a plain str, which
+        dropped the reply's outcome for every server with a credential, and
+        failure was guessed from the wording again."""
+        redacted = message
         for value in self._credential_values:
-            message = message.replace(value, "[redacted]")
-        return message
+            redacted = redacted.replace(value, "[redacted]")
+        if isinstance(message, MCPReply) and not isinstance(redacted, MCPReply):
+            return MCPReply(redacted, message.kind)
+        return redacted
 
 
 def _spec_fingerprint(spec: dict[str, Any]) -> str:

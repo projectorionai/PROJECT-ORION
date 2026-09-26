@@ -142,6 +142,42 @@ def test_server_tool_reply_does_not_echo_a_configured_credential():
     assert "[redacted]" in reply
 
 
+def test_short_settings_under_secret_looking_keys_are_not_redacted():
+    conn = MCPServerConn("x", {"command": "npx", "env": {
+        "AUTH_ENABLED": "on", "USE_AUTH": "true", "API_KEY": "sk-long-enough-secret",
+    }}, _StubBus())
+    text = conn._redact("connection ok; key sk-long-enough-secret")
+    assert text == "connection ok; key [redacted]"
+
+
+def test_redaction_keeps_the_replys_outcome():
+    """Redacting must not turn an MCPReply back into a plain string: the
+    outcome it carries is what says whether the call failed."""
+    from orion_core.dispatch_web import mcp_call_failed
+    from orion_core.mcp_host import MCPReply
+
+    secret = "example-private-token-12345"
+    conn = MCPServerConn("gmail", {"command": "npx", "env": {
+        "GMAIL_AUTH_TOKEN": secret,
+    }}, _StubBus())
+
+    async def _looks_like_an_error(*_args):
+        return {"content": [{"type": "text", "text": "(tool error) is this subject line"}]}
+
+    async def _is_an_error(*_args):
+        return {"isError": True, "content": [{"type": "text", "text": f"bad {secret}"}]}
+
+    conn._request = _looks_like_an_error
+    ok = asyncio.run(conn.call_tool("read_email", {}))
+    assert isinstance(ok, MCPReply) and ok.kind == ""
+    assert mcp_call_failed(ok) is False
+
+    conn._request = _is_an_error
+    failed = asyncio.run(conn.call_tool("read_email", {}))
+    assert isinstance(failed, MCPReply) and failed.kind == "tool"
+    assert secret not in failed and "[redacted]" in failed
+
+
 def test_server_tool_failure_does_not_echo_a_configured_credential():
     secret = "example-private-token-12345"
     host = MCPHost(_StubBus())
