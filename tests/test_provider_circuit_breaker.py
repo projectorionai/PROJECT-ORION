@@ -2,8 +2,10 @@
 The provider router's circuit breaker.
 
 * Transient faults (HTTP 5xx, timeouts, refused connections) escalate: each
-  fault in a row doubles the cooldown from 45 s to a 10 minute ceiling, with
+  fault in a row triples the cooldown from 5 s to a 10 minute ceiling, with
   downward jitter. A flat 45 s retried a dead endpoint for the whole session.
+* The first transient fault is retried once after a short pause (not a
+  timeout), so one overload blip does not fail the turn.
 * A success closes the breaker and resets every escalation, including the
   out-of-GPU-memory one, which previously never reset.
 * After a cooldown the provider is half-open: its next call is a probe, and
@@ -77,7 +79,7 @@ def _expire(router, name):
 def test_transient_faults_escalate_to_a_ceiling():
     profile = _profile()
     router = _router(profile)
-    expected = [45.0, 90.0, 180.0, 360.0, 600.0, 600.0]
+    expected = [5.0, 15.0, 45.0, 135.0, 405.0, 600.0, 600.0]
     for ceiling in expected:
         router.mark_failure(profile, RuntimeError("HTTP 503: upstream unavailable"))
         remaining = _remaining(router, "p")
@@ -109,7 +111,7 @@ def test_success_resets_every_escalation():
     assert router._fault_strikes.get("p") is None
     assert router._oom_strikes.get("p") is None
     router.mark_failure(profile, RuntimeError("HTTP 502: bad gateway"))
-    assert _remaining(router, "p") <= 45.0
+    assert _remaining(router, "p") <= 5.0
 
 
 def test_classified_failures_keep_their_own_cooldowns():
@@ -245,3 +247,66 @@ def test_routing_and_breaker_events_reach_the_dashboard_feed():
     router.mark_failure(profile, RuntimeError("HTTP 500: internal error"))
     breakers = [p for n, p in router.bus.events if n == "dashboard_event" and p[0] == "provider_breaker"]
     assert breakers[-1][1]["provider"] == "p" and breakers[-1][1]["state"] == "open"
+
+
+# ── one quick retry after a first blip ─────────────────────────────────────
+
+def _counting_call(outcomes):
+    calls = []
+
+    async def call():
+        calls.append(1)
+        outcome = outcomes[len(calls) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+    return call, calls
+
+
+def test_a_first_blip_is_retried_once_and_the_turn_succeeds():
+    profile = _profile()
+    router = _router(profile)
+    call, calls = _counting_call([RuntimeError("HTTP 503: overloaded"), "answer"])
+    assert asyncio.run(router._call_with_heal(profile, call)) == "answer"
+    assert len(calls) == 2
+    router._record_success(profile)        # the transport records it on success
+    assert router.breaker_state(profile) == "closed"
+    assert router.is_available(profile), "a provider that just answered is still cooling"
+
+
+def test_a_timeout_is_not_retried():
+    """Retrying a timeout would double an already long wait."""
+    profile = _profile()
+    router = _router(profile)
+    call, calls = _counting_call([asyncio.TimeoutError(), "never"])
+    try:
+        asyncio.run(router._call_with_heal(profile, call))
+    except asyncio.TimeoutError:
+        pass
+    assert len(calls) == 1
+
+
+def test_a_provider_already_failing_is_not_retried_again():
+    profile = _profile()
+    router = _router(profile)
+    router.mark_failure(profile, RuntimeError("HTTP 500: internal error"))
+    _expire(router, "p")
+    call, calls = _counting_call([RuntimeError("HTTP 500: internal error"), "never"])
+    try:
+        asyncio.run(router._call_with_heal(profile, call))
+    except RuntimeError:
+        pass
+    assert len(calls) == 1
+
+
+def test_a_quota_failure_is_not_given_the_blip_retry():
+    """429s have their own rotation and cooldown; the blip retry is for
+    transient faults only."""
+    profile = _profile()
+    router = _router(profile)
+    call, calls = _counting_call([RuntimeError("HTTP 429: rate limit exceeded"), "never"])
+    try:
+        asyncio.run(router._call_with_heal(profile, call))
+    except RuntimeError:
+        pass
+    assert len(calls) == 1

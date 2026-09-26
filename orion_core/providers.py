@@ -312,10 +312,13 @@ class ProviderRouter:
     DEFAULT_MAX_OUTPUT_TOKENS = 2048
 
     #: Transient faults (HTTP 5xx, timeouts, refused connections, empty
-    #: replies) back off exponentially from the base to the ceiling. A flat
-    #: 45 s retried an endpoint that was simply not running for the rest of
-    #: the session, paying its full timeout every 45 seconds.
-    TRANSIENT_BASE_S = 45.0
+    #: replies) back off from a short first wait, tripling to the ceiling:
+    #: 5, 15, 45, 135, 405, then 600 s. A flat 45 s retried an endpoint that
+    #: was simply not running for the rest of the session, paying its full
+    #: timeout every 45 seconds; starting at 45 s instead turned one overload
+    #: blip on the only provider into a 45-second outage for the user.
+    TRANSIENT_BASE_S = 5.0
+    TRANSIENT_GROWTH = 3.0
     TRANSIENT_MAX_S = 600.0
 
     #: Below this, a provider's "affordable" ceiling is not a ceiling, it is an
@@ -1033,12 +1036,23 @@ class ProviderRouter:
             return False
 
     async def _call_with_heal(self, profile: AIProviderProfile, call: Callable[[], Any]) -> str:
-        """Run one provider call; on a model/credit failure, heal and retry once."""
+        """Run one provider call and retry it once when that can help: after a
+        model/credit failure a model change fixes, or after a FIRST transient
+        fault (an overload blip, a dropped connection), following a short
+        jittered pause. Without the second, one 503 on the only configured
+        provider failed the user's turn although the next request succeeded.
+        Timeouts are not retried here: that would double an already long wait.
+        """
         try:
             return await call()
         except Exception as exc:
+            strikes = self._fault_strikes.get(profile.name, 0)
             self.mark_failure(profile, exc)
-            if not await self._heal_after_failure(profile):
+            first_blip = (strikes == 0 and self._fault_strikes.get(profile.name, 0) == 1
+                          and not self._is_timeout(exc))
+            if first_blip:
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+            elif not await self._heal_after_failure(profile):
                 raise
         try:
             return await call()
@@ -1051,9 +1065,17 @@ class ProviderRouter:
     #: "retryDelay": "37s" (Gemini), "try again in 12.5s" (Groq/OpenAI).
     RETRY_RE = re.compile(r"(?i)(?:retry.?delay\W{0,6}|try again in\s*)(\d+(?:\.\d+)?)\s*s")
 
+    @staticmethod
+    def _is_timeout(exc: BaseException) -> bool:
+        return (isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                or "timeout" in type(exc).__name__.lower()
+                or "timed out" in str(exc).lower())
+
     def _record_success(self, profile: AIProviderProfile) -> None:
         # A success closes the breaker: every escalation starts again from
-        # its first step (a GPU that fitted a model has since had room).
+        # its first step (a GPU that fitted a model has since had room), and
+        # a provider that has just answered is not left cooling down.
+        self._cooldowns.pop(profile.name, None)
         self._rate_strikes.pop(profile.name, None)
         self._fault_strikes.pop(profile.name, None)
         self._oom_strikes.pop(profile.name, None)
@@ -1068,10 +1090,11 @@ class ProviderRouter:
 
     def _transient_cooldown(self, strikes: int) -> float:
         """Cooldown after the (strikes + 1)th consecutive transient fault:
-        doubling from TRANSIENT_BASE_S up to TRANSIENT_MAX_S, less up to 20%
-        jitter so instances sharing an endpoint do not retry in lockstep."""
+        growing from TRANSIENT_BASE_S by TRANSIENT_GROWTH up to TRANSIENT_MAX_S,
+        less up to 20% jitter so instances sharing an endpoint do not retry in
+        lockstep."""
         ceiling = min(self.TRANSIENT_MAX_S,
-                      self.TRANSIENT_BASE_S * (2 ** min(strikes, 8)))
+                      self.TRANSIENT_BASE_S * (self.TRANSIENT_GROWTH ** min(strikes, 8)))
         return ceiling * random.uniform(0.8, 1.0)
 
     def breaker_state(self, profile: AIProviderProfile) -> str:
