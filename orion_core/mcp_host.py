@@ -96,6 +96,18 @@ _FILESYSTEM_CONFIRM_TOOLS = ("write_file", "edit_file", "move_file")
 _HOME_ASSISTANT_READ_TOOLS = ("GetLiveContext", "GetDateTime", "HassTimerStatus",
                               "todo_get_items", "calendar_get_events")
 
+# The shipped Gmail and Calendar servers can send messages and change the
+# user's account. Older local configs have no confirm rules, so enforce these
+# read-only exceptions in code as well. Unknown tools ask by default: a server
+# update must not silently gain permission to act on the user's behalf.
+_ACCOUNT_READ_TOOLS = {
+    "gmail": frozenset({"read-email", "search-emails", "list-email-labels"}),
+    "google_calendar": frozenset({
+        "list-calendars", "list-events", "search-events", "get-event",
+        "list-colors", "get-freebusy", "get-current-time",
+    }),
+}
+
 
 def _default_config() -> dict[str, Any]:
     """The starting configuration. The recommended servers (fetch, DuckDuckGo,
@@ -557,8 +569,8 @@ _RECOMMENDED: dict[str, dict[str, Any]] = {
 
 def migrate_config(data: dict[str, Any]) -> bool:
     """Repair known-broken entries and add the recommended servers. Returns
-    whether anything changed. Runs once per CONFIG_REVISION, so a server the
-    user switches off afterwards stays off."""
+    whether anything changed. Preserve explicit enabled choices across
+    revisions so a server the user switched off stays off."""
     servers = data.setdefault("servers", {})
     if not isinstance(servers, dict):
         return False
@@ -587,7 +599,7 @@ def migrate_config(data: dict[str, Any]) -> bool:
             if not isinstance(existing, dict):
                 servers[name] = json.loads(json.dumps(spec))
             else:
-                existing["enabled"] = True
+                existing.setdefault("enabled", spec["enabled"])
                 existing.setdefault("description", spec["description"])
         data["_revision"] = CONFIG_REVISION
         changed = True
@@ -694,6 +706,11 @@ class MCPServerConn:
         self.command = str(spec.get("command") or "")
         self.args = [str(a) for a in (spec.get("args") or [])]
         self.env = {str(k): str(v) for k, v in (spec.get("env") or {}).items()}
+        self._credential_values = sorted({
+            value for key, value in self.env.items()
+            if _SECRET_RE.search(key) and value.strip()
+            and value.strip().lower() not in {"0", "1", "true", "false"}
+        }, key=len, reverse=True)
         self.description = str(spec.get("description") or "")
         self.bus = bus
         self.proc: asyncio.subprocess.Process | None = None
@@ -737,7 +754,7 @@ class MCPServerConn:
                 limit=4 * 1024 * 1024,
             )
         except Exception as exc:
-            self.last_error = f"failed to launch - {exc}"
+            self.last_error = self._redact(f"failed to launch - {exc}")
             self._log(self.last_error)
             return False
         self._drain_stderr()
@@ -745,8 +762,9 @@ class MCPServerConn:
             await asyncio.wait_for(self._handshake(), timeout=_HANDSHAKE_TIMEOUT)
         except Exception as exc:
             tail = " | ".join(self._stderr_tail[-3:])
-            self.last_error = f"handshake failed - {exc or type(exc).__name__}" + (
+            self.last_error = self._redact(f"handshake failed - {exc or type(exc).__name__}" + (
                 f" ({tail[:200]})" if tail else "")
+            )
             self._log(self.last_error)
             await self.stop()
             return False
@@ -774,7 +792,7 @@ class MCPServerConn:
                     line = await proc.stderr.readline()
                     if not line:
                         return
-                    text = line.decode("utf-8", "replace").strip()
+                    text = self._redact(line.decode("utf-8", "replace").strip())
                     if text:
                         self._stderr_tail.append(text[:240])
                         del self._stderr_tail[:-12]
@@ -894,7 +912,7 @@ class MCPServerConn:
             self._request("tools/call", {"name": tool, "arguments": arguments or {}}),
             timeout=_CALL_TIMEOUT,
         )
-        return self._render(result)
+        return self._redact(self._render(result))
 
     @staticmethod
     def _render(result: Any) -> "MCPReply":
@@ -918,9 +936,15 @@ class MCPServerConn:
 
     def _log(self, message: str) -> None:
         try:
-            self.bus.log.emit(f"MCP[{self.name}]: {message}")
+            self.bus.log.emit(f"MCP[{self.name}]: {self._redact(message)}")
         except Exception:
             pass
+
+    def _redact(self, message: str) -> str:
+        """Keep configured credentials out of server errors and log tails."""
+        for value in self._credential_values:
+            message = message.replace(value, "[redacted]")
+        return message
 
 
 def _spec_fingerprint(spec: dict[str, Any]) -> str:
@@ -1106,6 +1130,10 @@ class MCPHost:
         last-known enabled spec — re-reading config/mcp_servers.json first,
         so a credential/command fix the user just made takes effect without
         a full app restart. Returns whether it's alive afterwards."""
+        # A manual reconnect also wakes a parked server. Clear its parked
+        # state before either the live or failed outcome is reported; otherwise
+        # health_snapshot says IDLE and the next call starts it a second time.
+        self.parked.discard(name)
         config = load_config()
         spec = (config.get("servers") or {}).get(name)
         if not isinstance(spec, dict) or not spec.get("enabled"):
@@ -1299,6 +1327,11 @@ class MCPHost:
         server = str(server or "").strip().lower()
         shown = str(tool or "").strip()
         tool = shown.lower()
+        if (server in _ACCOUNT_READ_TOOLS
+                and tool.replace("_", "-") not in _ACCOUNT_READ_TOOLS[server]):
+            action = ("send email or change the mailbox" if server == "gmail"
+                      else "change the calendar or its connected accounts")
+            return f"{server}.{shown} may {action}"
         spec = (load_config().get("servers") or {}).get(server)
         reason = configured_confirmation(server, shown, spec)
         if reason:
@@ -1357,7 +1390,8 @@ class MCPHost:
                 f"MCP tool '{server}.{tool}' failed: the server rejected the request "
                 f"- {exc}. Check the arguments against the tool's input schema.", "protocol")
         except Exception as exc:
-            return MCPReply(f"MCP tool '{server}.{tool}' failed: {exc}", "unavailable")
+            return MCPReply(f"MCP tool '{server}.{tool}' failed: {conn._redact(str(exc))}",
+                            "unavailable")
 
     # ── runtime server management ───────────────────────────────────────────
     # Enabling a server used to mean editing config/mcp_servers.json by hand
@@ -1438,6 +1472,7 @@ class MCPHost:
             except Exception:
                 pass
         self._specs.pop(server, None)
+        self.parked.discard(server)
         self._beat(server, "DOWN", "disabled by the user")
         return f"MCP server '{server}' disabled and disconnected."
 

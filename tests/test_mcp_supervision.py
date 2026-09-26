@@ -21,6 +21,18 @@ from orion_core.mcp_host import MCPHost, MCPServerConn
 import pytest
 
 
+def test_config_migration_preserves_explicitly_disabled_servers():
+    config = {"_revision": "earlier", "servers": {
+        "fetch": {"enabled": False, "command": "uvx", "args": ["mcp-server-fetch"]},
+        "notion": {"enabled": False, "command": "npx", "args": ["notion"]},
+    }}
+
+    assert mh.migrate_config(config)
+    assert config["servers"]["fetch"]["enabled"] is False
+    assert config["servers"]["notion"]["enabled"] is False
+    assert config["servers"]["duckduckgo"]["enabled"] is True
+
+
 @pytest.fixture(autouse=True)
 def _own_tool_cache(tmp_path, monkeypatch):
     """Each test gets its own tool-list cache, so one test's successful start
@@ -89,6 +101,63 @@ def test_is_alive_false_when_process_has_exited():
 
     conn.proc = _FakeProc()
     assert conn.is_alive() is False
+
+
+def test_server_stderr_does_not_echo_a_configured_credential():
+    secret = "example-private-token-12345"
+    conn = MCPServerConn("gmail", {"command": "npx", "env": {
+        "GMAIL_AUTH_TOKEN": secret,
+    }}, _StubBus())
+
+    class _Reader:
+        def __init__(self):
+            self.lines = [f"server error: {secret}\n".encode(), b""]
+
+        async def readline(self):
+            return self.lines.pop(0)
+
+    conn.proc = type("Proc", (), {"stderr": _Reader()})()
+
+    async def _capture():
+        conn._drain_stderr()
+        await conn._stderr_task
+
+    asyncio.run(_capture())
+    assert secret not in " ".join(conn._stderr_tail)
+    assert "[redacted]" in " ".join(conn._stderr_tail)
+
+
+def test_server_tool_reply_does_not_echo_a_configured_credential():
+    secret = "example-private-token-12345"
+    conn = MCPServerConn("gmail", {"command": "npx", "env": {
+        "GMAIL_AUTH_TOKEN": secret,
+    }}, _StubBus())
+
+    async def _reply(*_args):
+        return {"content": [{"type": "text", "text": f"bad token: {secret}"}]}
+
+    conn._request = _reply
+    reply = asyncio.run(conn.call_tool("search_emails", {}))
+    assert secret not in reply
+    assert "[redacted]" in reply
+
+
+def test_server_tool_failure_does_not_echo_a_configured_credential():
+    secret = "example-private-token-12345"
+    host = MCPHost(_StubBus())
+    conn = MCPServerConn("gmail", {"command": "npx", "env": {
+        "GMAIL_AUTH_TOKEN": secret,
+    }}, _StubBus())
+    conn.tools = [{"name": "search_emails"}]
+
+    async def _fail(*_args):
+        raise RuntimeError(f"bad token: {secret}")
+
+    conn.call_tool = _fail
+    host.servers["gmail"] = conn
+    reply = asyncio.run(host.call("gmail", "search_emails", {}))
+    assert secret not in reply
+    assert "[redacted]" in reply
 
 
 # ── connect_all(): health beats ──────────────────────────────────────────────
@@ -360,6 +429,19 @@ def test_a_call_wakes_a_parked_server_first(monkeypatch):
     assert asyncio.run(host.call("gmail", "send_email", {})) == "gmail:send_email"
     assert starts == ["gmail", "gmail"] and woken == ["gmail"]
     assert "gmail" not in host.parked and host.servers["gmail"].is_alive()
+
+
+def test_manual_reconnect_clears_a_parked_server(monkeypatch):
+    host, starts = _live_host(monkeypatch)
+    host.idle_park_s = 60.0
+    host.servers["gmail"].last_used -= 120.0
+    asyncio.run(host.park_idle())
+
+    assert asyncio.run(host.reconnect("gmail")) is True
+    assert host.health_snapshot() == {"gmail": "OK"}
+    assert "gmail" not in host.parked
+    assert asyncio.run(host.call("gmail", "send_email", {})) == "gmail:send_email"
+    assert starts == ["gmail", "gmail"]
 
 
 def test_a_busy_or_recent_server_is_never_parked(monkeypatch):

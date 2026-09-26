@@ -386,7 +386,8 @@ class OrionDispatcher(
                               "the on-screen prompt.", ok=False)
         guard = getattr(self, "system_guard", None)
         if guard is None:
-            return None
+            return ToolResult(f"{reason}. Human confirmation is unavailable "
+                              "in this session.", ok=False)
         from .system_guard import ActionIntent, DecisionKind
 
         decision = guard.request_confirmation(
@@ -452,16 +453,20 @@ class OrionDispatcher(
             self.TOOL_DECLARATIONS = list(TOOL_DECLARATIONS)
         if not hasattr(self, "_mcp_routes"):
             self._mcp_routes = {}
-        prefix = f"mcp__{server}__"
-        self.TOOL_DECLARATIONS[:] = [
-            d for d in self.TOOL_DECLARATIONS if not str(d.get("name", "")).startswith(prefix)
-        ]
         if not hasattr(self, "_mcp_schemas"):
             self._mcp_schemas = {}
-        for name in list(self._mcp_routes):
-            if name.startswith(prefix):
-                del self._mcp_routes[name]
-                self._mcp_schemas.pop(name, None)
+        # A custom server name may be sanitised for Gemini ("my server" ->
+        # "my_server"). Remove the routes owned by this server, rather than
+        # comparing declaration names with the unsanitised prefix.
+        old_names = {name for name, route in self._mcp_routes.items()
+                     if route[0] == server}
+        self.TOOL_DECLARATIONS[:] = [
+            d for d in self.TOOL_DECLARATIONS if d.get("name") not in old_names
+        ]
+        for name in old_names:
+            del self._mcp_routes[name]
+            self._mcp_schemas.pop(name, None)
+        prefix = f"mcp__{server}__"
         from .gemini_schema import to_gemini_parameters
         registered = 0
         for tool in tools:

@@ -216,3 +216,69 @@ def test_face_page_falls_back_without_webengine(tmp_path, monkeypatch):
     page = gateway._face_page()
     assert "canvas" in page                               # 2-D fallback orb
     assert "addEventListener('message'" in page           # same bridge contract
+
+
+# ── the phone's face: the same page the desktop shows, with its library ──────
+
+def test_face_page_fills_the_import_map_and_serves_its_library(tmp_path):
+    async def scenario():
+        gateway = _gateway(tmp_path)
+        client = await _client(gateway)
+        try:
+            body = await (await client.get("/face")).text()
+            assert "__THREE_BASE__" not in body and "__IDLE_FPS__" not in body
+            files, version = gateway._three_files()
+            if not files:                      # three.js not shipped: CDN fallback
+                assert "cdn.jsdelivr.net" in body
+                return
+            assert f"/three/{version}/build/three.module.js" in body
+            lib = await client.get(f"/three/{version}/build/three.module.js")
+            assert lib.status == 200
+            assert "javascript" in lib.headers.get("Content-Type", "")
+            for bad in (f"/three/{version}/../../orion_core/remote.py",
+                        f"/three/{version}/%2e%2e/%2e%2e/orion.py",
+                        "/three/0.0.0/build/three.module.js"):
+                assert (await client.get(bad)).status == 404, bad
+        finally:
+            await client.close()
+    asyncio.run(scenario())
+
+
+def test_the_catch_up_list_carries_the_owners_approval_token(tmp_path):
+    async def scenario():
+        gateway = _gateway(tmp_path)
+        token = _access_token(gateway)
+        device = gateway.auth.verify_access(token)
+        conf = gateway.confirmations.create("send_email", {"to": "x"}, device, "Email x")
+        client = await _client(gateway)
+        try:
+            res = await client.get("/api/confirmations",
+                                   headers={"Authorization": f"Bearer {token}"})
+            pending = (await res.json())["pending"]
+            assert pending and pending[0]["id"] == conf.id
+            assert pending[0]["token"] == conf.token
+        finally:
+            await client.close()
+    asyncio.run(scenario())
+
+
+def test_a_phone_action_goes_only_to_the_phone_that_asked(tmp_path):
+    gateway = _gateway(tmp_path)
+    mine, other = asyncio.Queue(), asyncio.Queue()
+    gateway._event_subs.update({mine, other})
+    gateway._event_devices.update({mine: "phone-a", other: "phone-b"})
+    gateway._wire_bus_events()
+    with gateway.tool_gate.for_device("phone-a"):
+        gateway.bus.phone_action.emit({"kind": "call", "number": "123"})
+    assert mine.qsize() == 1 and other.qsize() == 0
+    # An action ORION starts himself goes to the phone used last.
+    gateway._last_active_device = "phone-b"
+    gateway.bus.phone_action.emit({"kind": "sms", "number": "123"})
+    assert other.qsize() == 1 and mine.qsize() == 1
+
+
+def test_the_page_only_repairs_when_the_desktop_refuses_the_device():
+    assert "r.status===401||r.status===403" in REMOTE_PAGE_HTML
+    assert "got==='denied'&&await pair()" in REMOTE_PAGE_HTML
+    assert "new URLSearchParams(location.search).get('pair')" in REMOTE_PAGE_HTML
+    assert "catchUpConfirms" in REMOTE_PAGE_HTML and "resolvedHere[d.id]" in REMOTE_PAGE_HTML

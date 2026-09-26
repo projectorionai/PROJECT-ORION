@@ -7,8 +7,8 @@ your Google Calendar.
 
 Servers are declared in **`config/mcp_servers.json`** (a template is written on
 first run). Each entry is a command ORION launches. When ORION starts, it
-connects every server marked `"enabled": true`, discovers its tools, and makes
-them available through the `mcp` tool — just ask ORION and he'll use them.
+discovers tools for enabled servers; a server with a cached tool list can stay
+paused until its first call. Its tools remain available through the `mcp` tool.
 
 ---
 
@@ -91,8 +91,9 @@ Gmail and add it to your Google Calendar, or check your day and draft replies.
 
 > Package names above are popular community servers and may change. Any
 > Gmail/Calendar MCP server works — just set its `command`, `args` and `env`.
-> Sending email and creating events are real actions; ORION will confirm with
-> you before doing them, per his standing rules.
+> ORION allows the shipped servers' known read-only tools without a prompt.
+> Sending email, changing mail or calendar data, and newly added tools require
+> on-screen confirmation before ORION runs them.
 
 ---
 

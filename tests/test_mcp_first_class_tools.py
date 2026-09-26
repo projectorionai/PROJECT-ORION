@@ -118,6 +118,18 @@ def test_register_mcp_tools_is_idempotent_on_reconnect():
     assert any(t["name"] == "mcp__gmail__list_emails" for t in d.TOOL_DECLARATIONS)
 
 
+def test_reconnect_removes_stale_tools_for_a_sanitised_server_name():
+    d = _dispatcher()
+    d.TOOL_DECLARATIONS = list(TOOL_DECLARATIONS)
+    d.register_mcp_tools("my server", [{"name": "old_tool", "description": "old"}])
+    d.register_mcp_tools("my server", [{"name": "new_tool", "description": "new"}])
+
+    names = {t["name"] for t in d.TOOL_DECLARATIONS}
+    assert "mcp__my_server__old_tool" not in names
+    assert "mcp__my_server__old_tool" not in d._mcp_routes
+    assert "mcp__my_server__new_tool" in names
+
+
 def test_register_mcp_tools_for_one_server_does_not_touch_another():
     d = _dispatcher()
     d.TOOL_DECLARATIONS = list(TOOL_DECLARATIONS)

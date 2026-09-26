@@ -294,6 +294,17 @@ def test_a_clean_plugin_logs_nothing_at_load(registry):
     assert bus.messages == [], "a harmless plugin must not add log noise"
 
 
+def test_network_plugin_cannot_use_a_model_flag_when_human_guard_is_absent():
+    from types import SimpleNamespace
+    from orion_core.dispatcher import OrionDispatcher
+
+    dispatcher = OrionDispatcher.__new__(OrionDispatcher)
+    dispatcher.plugins = SimpleNamespace(get=lambda _name: SimpleNamespace(
+        tier="confirm", permissions={"network"}, undeclared=set()))
+    result = dispatcher._plugin_gate("notify", {"confirm": True})
+    assert result is not None and result.ok is False
+
+
 def test_the_load_path_calls_the_disclosure():
     src = (Path(__file__).resolve().parents[1] / "orion_core"
            / "plugin_manifest.py").read_text(encoding="utf-8")

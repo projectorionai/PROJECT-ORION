@@ -212,7 +212,17 @@ _MG_VALUE = (0, 100, 320, 330, 500, 900, 0)
 _EG_VALUE = (0, 115, 320, 330, 500, 900, 0)
 _PASSED_MG = (0, 5, 5, 10, 20, 35, 55, 0)          # by relative rank, 0 = own back rank
 _PASSED_EG = (0, 10, 15, 25, 45, 75, 120, 0)
-_PASSER_KING = (0, 0, 0, 1, 2, 3, 4, 0)             # weight of king distances to a passer
+#: Endgame weight per square of distance from each king to the square in front
+#: of a passer: the defender far away is good, our own king far away is bad.
+_PASSER_KING_ENEMY = (0, 0, 0, 5, 10, 15, 20, 0)
+_PASSER_KING_OWN = (0, 0, 0, -2, -4, -6, -8, 0)
+#: Taken off a passed pawn whose square in front is occupied.
+_BLOCKED_PASSER_MG = (0, 2, 2, 5, 10, 17, 27, 0)
+_BLOCKED_PASSER_EG = (0, 5, 7, 12, 22, 37, 60, 0)
+#: King shelter (middlegame): per pawn right in front, per pawn two ranks in
+#: front (each counted up to three), a base for a king on its first two ranks,
+#: and per file beside the king with none of our pawns / no pawns at all.
+_SHELTER = (12, 6, -30, -12, -10)
 _DOUBLED = (10, 20)
 _ISOLATED = (12, 15)
 _PROTECTED_PASSER_EG = 15
@@ -399,14 +409,14 @@ def _king_shelter(king: int, own_pawns: int, all_pawns: int, colour: int) -> int
     if rank <= 1:
         near = (own_pawns & _SHIELD1[colour][king]).bit_count()
         far = (own_pawns & _SHIELD2[colour][king]).bit_count()
-        score += 12 * min(3, near) + 6 * min(3, far) - 30
+        score += _SHELTER[0] * min(3, near) + _SHELTER[1] * min(3, far) + _SHELTER[2]
     f = king & 7
     for ff in range(max(0, f - 1), min(7, f + 1) + 1):
         file_bb = _FILES_BB[ff]
         if not own_pawns & file_bb:
-            score -= 12
+            score += _SHELTER[3]
             if not all_pawns & file_bb:
-                score -= 10
+                score += _SHELTER[4]
     return score
 
 
@@ -810,12 +820,11 @@ class ChessBrain:
                     stop = sq + 8 if colour else sq - 8
                     if not 0 <= stop < 64:
                         continue
-                    weight = _PASSER_KING[rank]
-                    if weight:
-                        eg += weight * (5 * _DIST[enemy_k][stop] - 2 * _DIST[own_k][stop]) * sign
+                    eg += (_PASSER_KING_ENEMY[rank] * _DIST[enemy_k][stop]
+                           + _PASSER_KING_OWN[rank] * _DIST[own_k][stop]) * sign
                     if occupied & (1 << stop):
-                        mg -= (_PASSED_MG[rank] // 2) * sign
-                        eg -= (_PASSED_EG[rank] // 2) * sign
+                        mg -= _BLOCKED_PASSER_MG[rank] * sign
+                        eg -= _BLOCKED_PASSER_EG[rank] * sign
 
         phase = (knights | bishops).bit_count() + 2 * rooks.bit_count() + 4 * queens.bit_count()
         if phase > 24:

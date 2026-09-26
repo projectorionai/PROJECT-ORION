@@ -146,8 +146,8 @@ function add(cls,text){const d=document.createElement('div');d.className='msg '+
  log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
 add('meta','Connected to ORION. Conversations sync into his memory.');
 function faceMsg(m){try{face.contentWindow.postMessage(m,'*');}catch(e){}}
-async function pair(){
- const code=(prompt('Enter the one-time pairing code shown on the ORION desktop')||'').trim();
+async function pair(given){
+ const code=(given||prompt('Enter the one-time pairing code shown on the ORION desktop')||'').trim();
  if(!code)return false;
  try{const r=await fetch('/v1/auth/pair',{method:'POST',headers:{'Content-Type':'application/json'},
    body:JSON.stringify({code,device_name:(navigator.userAgent||'device').slice(0,60)})});
@@ -161,20 +161,29 @@ async function pair(){
 function learnEndpoints(eps){
  if(eps&&window.OrionNative&&OrionNative.saveEndpoints){
   try{OrionNative.saveEndpoints(JSON.stringify(eps));}catch(e){}}}
+// 'ok', 'denied' (the desktop refused this device: pair again) or 'failed'
+// (busy, rate-limited, offline: try again later). Every failure used to pop the
+// pairing prompt, including a 429 from reconnecting too often.
 async function refreshAccess(){
- if(!dev||!refresh)return false;
+ if(!dev||!refresh)return 'denied';
  try{const r=await fetch('/v1/auth/token',{method:'POST',headers:{'Content-Type':'application/json'},
    body:JSON.stringify({device_id:dev,refresh_token:refresh})});
-  if(!r.ok)return false;const j=await r.json();
+  if(r.status===401||r.status===403)return 'denied';
+  if(!r.ok)return 'failed';const j=await r.json();
   access=j.access_token;accessExp=Date.now()+Math.max(30,(j.expires_in-60))*1000;
   localStorage.setItem('orion_access',access);localStorage.setItem('orion_access_exp',accessExp);
   learnEndpoints(j.endpoints);
-  return true;}catch(e){return false;}}
+  return 'ok';}catch(e){return 'failed';}}
 async function ensureAccess(){
  if(access&&Date.now()<accessExp)return true;
- if(await refreshAccess())return true;
- if(await pair())return await refreshAccess();
+ const got=await refreshAccess();
+ if(got==='ok')return true;
+ if(got==='denied'&&await pair())return (await refreshAccess())==='ok';
  return false;}
+// A QR code from the desktop's Security Centre carries ?pair=CODE.
+(async()=>{const q=new URLSearchParams(location.search).get('pair');
+ if(!q)return;history.replaceState(null,'',location.pathname);
+ if(await pair(q)&&(await refreshAccess())==='ok'){add('meta','Paired with ORION.');openEvents();}})();
 async function health(){try{const r=await fetch('/api/health');const j=await r.json();
  dot.textContent=(j.mode?('● '+j.mode.toLowerCase()):'● online');dot.style.color='#3ddc84';}
  catch(e){dot.textContent='○ offline';dot.style.color='#ffb020';}}
@@ -302,13 +311,13 @@ else{
   if(recording)stopRecord();else startRecord();});}
 
 // ── live state mirror: the phone orb tracks the desktop orb in real time ────
-let es=null,esBackoff=2000;
+let es=null,esBackoff=2000,esFails=0;
 function stateToMorph(s){return /STANDBY|OFFLINE|SHUTTING/i.test(s)?0:1;}
 async function openEvents(){
  if(es){es.close();es=null;}
  if(!(await ensureAccess()))return;
  try{es=new EventSource('/api/events?token='+encodeURIComponent(access));}catch(e){return;}
- es.onopen=()=>{esBackoff=2000;streamLive=true;scheduleHealth();};
+ es.onopen=()=>{esBackoff=2000;esFails=0;streamLive=true;scheduleHealth();catchUpConfirms();};
  es.addEventListener('error',()=>{streamLive=false;scheduleHealth();});
  es.onmessage=ev=>{let d;try{d=JSON.parse(ev.data);}catch(e){return;}
   if(d.type==='state'){stateEl.textContent=(d.value||'').toLowerCase();
@@ -319,9 +328,19 @@ async function openEvents(){
   else if(d.type==='thought'&&d.text){add('orion think','◈ '+d.text);}
   else if(d.type==='action'&&d.action){doAction(d.action);}
   else if(d.type==='confirm'&&d.id){showConfirm(d);}
-  else if(d.type==='confirm_result'&&d.id&&d.reply){add('orion',d.reply);}};
+  else if(d.type==='confirm_result'&&d.id&&d.reply&&!resolvedHere[d.id]){add('orion',d.reply);}};
+ // The desktop ends every stream on a timer and networks drop; neither makes
+ // the token invalid. Only repeated failures without a successful open do.
  es.onerror=()=>{if(es){es.close();es=null;}
-  access='';setTimeout(openEvents,esBackoff);esBackoff=Math.min(30000,esBackoff*1.7);};}
+  esFails++;if(esFails>=2){access='';}
+  setTimeout(openEvents,esBackoff);esBackoff=Math.min(30000,esBackoff*1.7);};}
+// Approval cards are sent only to this phone's live stream, so one raised
+// while it was reconnecting would be lost without this catch-up.
+async function catchUpConfirms(){
+ if(!access)return;
+ try{const r=await fetch('/api/confirmations',{headers:{'Authorization':'Bearer '+access}});
+  if(!r.ok)return;const j=await r.json();
+  (j.pending||[]).forEach(c=>{if(c&&c.id&&c.token)showConfirm(c);});}catch(e){}}
 refreshAccess().then(openEvents);
 
 // ── native phone hand-off ──────────────────────────────────────────────────
@@ -368,9 +387,10 @@ function doAction(a){
 // ORION runs read/benign actions at once; anything that sends, deletes, buys or
 // powers something off arrives here as a card you tap to approve — the desktop's
 // confirmation gate, where you actually are.
-const seenConfirms={};
+const seenConfirms={},resolvedHere={};
 async function sendConfirm(id,token,approve,card){
  if(card)card.remove();
+ resolvedHere[id]=1;
  if(!(await ensureAccess())){add('orion','I lost the link before I could act.');return;}
  try{const r=await fetch('/api/confirm',{method:'POST',
    headers:{'Content-Type':'application/json','Authorization':'Bearer '+access},
@@ -913,6 +933,9 @@ class RemoteGateway:
         # the same state/amplitude/emotion stream that drives the desktop orb.
         self._event_subs: set[Any] = set()
         self._event_devices: dict[Any, str] = {}
+        #: The phone that most recently spoke to ORION: where an action he
+        #: starts himself (a reminder's call) goes, instead of every phone.
+        self._last_active_device = ""
         self._closing = False               # set by stop(): SSE streams end
         self._amp_pending: float | None = None
         self._amp_task: Any = None
@@ -1156,11 +1179,27 @@ class RemoteGateway:
                                   "kind": str(payload.get("kind", ""))})
 
         def _on_phone_action(payload: Any) -> None:
-            # Hand a native action (call / text / navigate …) to connected
-            # phones.  Only meaningful for a device running the app bridge; a
-            # plain browser renders it as a tappable link fallback instead.
-            if isinstance(payload, dict) and payload.get("kind"):
-                self._push_event({"type": "action", "action": payload})
+            # Hand a native action (call / text / navigate …) to a phone. Only
+            # meaningful for a device running the app bridge; a plain browser
+            # renders it as a tappable link fallback instead.
+            #
+            # It went to EVERY connected phone, so two paired phones both
+            # opened the dialer. The phone whose request produced it gets it
+            # (the gate's per-request scope is still set here: the signal is
+            # delivered synchronously); failing that, the last one used.
+            if not (isinstance(payload, dict) and payload.get("kind")):
+                return
+            event = {"type": "action", "action": payload}
+            requester = str(payload.get("device_id") or "") or (
+                self.tool_gate.request_device() or "")
+            if requester:
+                self._push_device_event(requester, event)
+                return
+            last = self._last_active_device
+            if last and last in self._event_devices.values():
+                self._push_device_event(last, event)
+            else:
+                self._push_event(event)
 
         for signal, handler in (("state", _on_state), ("speaking", _on_speaking),
                                 ("emotion_changed", _on_emotion), ("amplitude", _on_amplitude),
@@ -1420,6 +1459,7 @@ class RemoteGateway:
         queue: asyncio.Queue = asyncio.Queue(maxsize=64)
         self._event_subs.add(queue)
         self._event_devices[queue] = device_id
+        self._last_active_device = device_id
 
         async def _send(payload: dict[str, Any]) -> None:
             await response.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
@@ -1699,6 +1739,7 @@ class RemoteGateway:
         except Exception:
             pass
         try:
+            self._last_active_device = device_id
             with self.tool_gate.for_device(device_id):
                 reply, provider = await self._answer(message, device_id=device_id)
         except Exception as exc:
@@ -1818,7 +1859,11 @@ class RemoteGateway:
         device_id = self.auth.verify_access(token) if token else None
         if device_id is None:
             return self._web.json_response({"ok": False, "error": "unauthorised"}, status=401)
-        pending = [c.public() for c in self.confirmations.pending_for(device_id)]
+        # Owner-only list, so it may carry the single-use token exactly as
+        # the owner's live stream does; without it the phone could see a
+        # pending approval it had missed but never act on it.
+        pending = [{**c.public(), "token": c.token}
+                   for c in self.confirmations.pending_for(device_id)]
         return self._web.json_response({"ok": True, "pending": pending})
 
     async def _handle_confirm(self, request: Any) -> Any:

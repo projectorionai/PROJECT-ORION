@@ -360,7 +360,10 @@ class SecurityCentrePanel(QFrame):
             return
         try:
             code = self.gateway.begin_pairing()
-            url = f"http://{self.gateway._lan_ip()}:{self.gateway.port}/?pair={code}"
+            # The phone page reads ?pair= and pairs itself; the scheme must
+            # match what the uplink serves or the link does not even load.
+            scheme = "https" if getattr(self.gateway, "_https_enabled", False) else "http"
+            url = f"{scheme}://{self.gateway._lan_ip()}:{self.gateway.port}/?pair={code}"
             image = _qr_image(url)
             if image is not None:
                 self.qr.setPixmap(QPixmap.fromImage(image).scaled(

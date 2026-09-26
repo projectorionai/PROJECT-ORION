@@ -42,8 +42,9 @@ Order is the order of implementation. Every item has regression tests.
 | 18 | The briefing header read the machine's clock while the greeting read ORION's, so on a machine in another zone they named different parts of the day and the wrong local time. | `orion_core/briefing.py` | fix(briefing): read ORION's clock, not the machine's, for the header |
 | 19 | The same mismatch elsewhere: "remind me at 3pm" fired an hour out on a machine in another zone; briefing-engine headers mixed both clocks in one line; the late-night farewell checked the machine's hour. | `orion_core/reminders.py`, `orion_core/briefing_engine.py`, `orion_core/live_worker.py` | fix(time): tell the time from ORION's clock in reminders, briefings and farewells |
 
-Housekeeping: an agent prompt file and tool-specific ignore entries were
-removed; the publication checker's generic dot-directory rule covers them.
+Housekeeping: a stray editor configuration file and its tool-specific ignore
+entries were removed; the publication checker's generic dot-directory rule
+covers them.
 
 ## Using the new behaviour
 

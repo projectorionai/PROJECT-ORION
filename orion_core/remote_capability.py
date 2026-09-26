@@ -346,6 +346,10 @@ class RemoteToolGate:
         self._request_device: ContextVar[str | None] = ContextVar(
             "remote_request_device", default=None)
 
+    def request_device(self) -> str | None:
+        """The device the current request belongs to, if any."""
+        return self._request_device.get()
+
     @contextmanager
     def for_device(self, device_id: str):
         """Scope tool ownership to one async request across awaited calls."""

@@ -48,9 +48,27 @@ def test_the_reason_says_what_will_happen(host):
 
 def test_reading_things_does_not_need_confirmation(host):
     for server, tool in (("gmail", "search_emails"),
+                         ("gmail", "read_email"),
+                         ("google_calendar", "list-events"),
+                         ("google_calendar", "get-freebusy"),
                          ("filesystem", "read_file"),
                          ("brave_search", "search")):
         assert host.requires_confirmation(server, tool) == ""
+
+
+@pytest.mark.parametrize("server,tool", [
+    ("gmail", "send_email"),
+    ("gmail", "delete_email"),
+    ("gmail", "get_or_create_label"),
+    ("gmail", "download_attachment"),
+    ("google_calendar", "create-event"),
+    ("google_calendar", "update-event"),
+    ("google_calendar", "delete-event"),
+    ("google_calendar", "respond-to-event"),
+    ("google_calendar", "manage-accounts"),
+])
+def test_email_and_calendar_changes_need_confirmation_even_with_old_config(host, server, tool):
+    assert host.requires_confirmation(server, tool)
 
 
 def test_any_server_can_be_marked_in_its_own_config(monkeypatch):
@@ -99,15 +117,6 @@ async def test_a_billable_call_without_confirmation_is_refused():
     assert result.ok is False
     assert "real phone call" in result.text
     assert host.calls == [], "the call was placed anyway"
-
-
-async def test_with_confirmation_it_goes_through():
-    host = _FakeHost("twilio.create_call places a real phone call")
-    result = await _dispatcher(host).mcp_tool(
-        {"action": "call", "server": "twilio", "tool": "create_call",
-         "arguments": {"to": "+44..."}, "confirm": True})
-    assert result.ok
-    assert len(host.calls) == 1
 
 
 async def test_an_ordinary_tool_is_not_made_to_ask():
@@ -204,15 +213,15 @@ async def test_the_armed_token_carries_which_tool_it_was_for():
     assert pending[0].payload["tool"] == "create_call"
 
 
-async def test_without_a_guard_it_falls_back_to_the_flag():
-    """A dispatcher with no guard must not become unable to act — the flag is
-    weaker, but it is what the older path had."""
+async def test_without_a_guard_a_confirmed_mcp_call_is_refused():
+    """Model-supplied confirm=true cannot replace human approval."""
     host = _FakeHost("twilio spends money")
     d = _dispatcher(host)
     result = await d.mcp_tool(
         {"action": "call", "server": "twilio", "tool": "create_call",
          "arguments": {}, "confirm": True})
-    assert result.ok
+    assert result.ok is False
+    assert host.calls == []
 
 
 # ── the third door: first-class mcp__<server>__<tool> names ─────────────────

@@ -430,7 +430,7 @@ class WebDispatchMixin:
                         confirmed: bool) -> ToolResult | None:
         """None when the MCP call may run now; otherwise the reply to give.
 
-        Real money and real world. The Twilio entry carried the warning from
+        Real world actions. The Twilio entry carried the warning from
         the day it was added and nothing enforced it; then the first-class
         ``mcp__twilio__*`` tools arrived and skipped even the check the
         generic ``mcp call`` had — a second, unbolted door to the same bill.
@@ -447,15 +447,13 @@ class WebDispatchMixin:
             return None
         if not confirmed:
             return ToolResult(
-                f"{reason}. Tell the user what this will do and what it will "
+                f"{reason}. Tell the user exactly what this will do and any "
                 f"cost; if they agree, call again with confirm=true and approve "
                 f"the on-screen prompt.", ok=False)
         guard = getattr(self, "system_guard", None)
         if guard is None:
-            # A bare dispatcher (no guard wired) keeps the older, weaker
-            # flag-only gate rather than becoming unable to act at all. The
-            # running app always has a guard (see OrionDispatcher.__init__).
-            return None
+            return ToolResult(f"{reason}. Human confirmation is unavailable "
+                              "in this session.", ok=False)
         from .system_guard import ActionIntent, DecisionKind
 
         decision = guard.request_confirmation(
