@@ -180,10 +180,12 @@ async function ensureAccess(){
  if(got==='ok')return true;
  if(got==='denied'&&await pair())return (await refreshAccess())==='ok';
  return false;}
-// A QR code from the desktop's Security Centre carries ?pair=CODE.
-(async()=>{const q=new URLSearchParams(location.search).get('pair');
- if(!q)return;history.replaceState(null,'',location.pathname);
- if(await pair(q)&&(await refreshAccess())==='ok'){add('meta','Paired with ORION.');openEvents();}})();
+// A QR code from the desktop's Security Centre carries ?pair=CODE. It is
+// redeemed at start-up BEFORE anything else asks for access: run alongside,
+// the start-up refresh found no pairing yet and popped the manual code prompt
+// while the scanned code was still on its way.
+const linkCode=new URLSearchParams(location.search).get('pair');
+if(linkCode)history.replaceState(null,'',location.pathname);
 async function health(){try{const r=await fetch('/api/health');const j=await r.json();
  dot.textContent=(j.mode?('● '+j.mode.toLowerCase()):'● online');dot.style.color='#3ddc84';}
  catch(e){dot.textContent='○ offline';dot.style.color='#ffb020';}}
@@ -341,7 +343,10 @@ async function catchUpConfirms(){
  try{const r=await fetch('/api/confirmations',{headers:{'Authorization':'Bearer '+access}});
   if(!r.ok)return;const j=await r.json();
   (j.pending||[]).forEach(c=>{if(c&&c.id&&c.token)showConfirm(c);});}catch(e){}}
-refreshAccess().then(openEvents);
+(async()=>{
+ if(linkCode&&await pair(linkCode)&&(await refreshAccess())==='ok')add('meta','Paired with ORION.');
+ else await refreshAccess();
+ openEvents();})();
 
 // ── native phone hand-off ──────────────────────────────────────────────────
 // When ORION asks the phone to call / text / navigate, use the app's native
