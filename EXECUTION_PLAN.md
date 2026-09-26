@@ -42,6 +42,24 @@ Order is the order of implementation. Every item has regression tests.
 | 18 | The briefing header read the machine's clock while the greeting read ORION's, so on a machine in another zone they named different parts of the day and the wrong local time. | `orion_core/briefing.py` | fix(briefing): read ORION's clock, not the machine's, for the header |
 | 19 | The same mismatch elsewhere: "remind me at 3pm" fired an hour out on a machine in another zone; briefing-engine headers mixed both clocks in one line; the late-night farewell checked the machine's hour. | `orion_core/reminders.py`, `orion_core/briefing_engine.py`, `orion_core/live_worker.py` | fix(time): tell the time from ORION's clock in reminders, briefings and farewells |
 
+### Second round: the desktop's Mark XXXII snapshot
+
+`main` was republished from the desktop as a single-commit snapshot holding
+everything above plus new work: MCP credential redaction and Gmail/Calendar
+confirmation rules, the parked-server reconnect fix, sanitised MCP route
+removal, refusing `confirm=true` without a human guard, QR pairing, phone
+reconnection and approval catch-up, per-device phone actions and chess
+evaluation tables. The branch merges it (tree identical to `main`); these were
+then found and fixed on top:
+
+| # | Defect | Files | Commit subject |
+| --- | --- | --- | --- |
+| 20 | Credential redaction turned MCP replies back into plain strings, losing their outcome for every server with a credential; short settings under secret-looking keys (`AUTH_ENABLED=on`) were redacted wherever the letters appeared. | `orion_core/mcp_host.py` | fix(mcp): keep each reply's outcome through credential redaction |
+| 21 | Scanning the pairing QR code also popped the manual pairing-code prompt: start-up refreshed access while the scanned code was still being redeemed. Found by driving the page in headless Chromium. | `orion_core/remote.py`, `tests/test_phone_page_browser.py` | fix(remote): redeem a QR pairing code before the start-up refresh |
+| 22 | Any phone reopening its event stream (every 15 minutes, and after any drop) became "last active", so an idle phone took ORION's own phone actions from the one in use. | `orion_core/remote.py` | fix(remote): count a phone as last active on use, not on reconnect |
+| 23 | The proactivity engine's task was never cancelled on shutdown; housekeeping and diagnostics were cancelled but never awaited. | `orion_core/app.py` | fix(shutdown): cancel and await every background task ORION starts |
+| 24 | One HTTP 503 benched the only provider for about 40 s and the phone was told no model was reachable. A first transient fault is now retried once after a short pause (not timeouts), the cooldown starts at 5 s, and a success clears it. Found by running a real headless node against a stand-in model. | `orion_core/providers.py`, `tests/test_headless_node_e2e.py` | fix(router): ride out a single overload blip instead of failing the turn |
+
 Housekeeping: a stray editor configuration file and its tool-specific ignore
 entries were removed; the publication checker's generic dot-directory rule
 covers them.
@@ -64,15 +82,21 @@ covers them.
    the phone sees, so an attacker present at that very first connection is
    still accepted. Closing that needs the fingerprint delivered out of band,
    for example shown beside the pairing code on the desktop.
-2. **Refresh token at rest (Android).** Stored in plain SharedPreferences.
+2. **Phone approvals and tools with their own confirmation.** An action
+   approved on the phone runs with the model's original arguments. A tool with
+   its own `confirm=true` step can then ask again, and an MCP tool that spends
+   money raises an on-screen prompt on the desktop, which the phone user
+   cannot see. Whether a phone tap should count as that confirmation is a
+   policy decision; it predates the snapshot and was left unchanged.
+3. **Refresh token at rest (Android).** Stored in plain SharedPreferences.
    Backups and device transfer are already excluded; consider wrapping it with
    an Android Keystore key.
-3. **Boot-time loop stalls.** Under asyncio debug in this container, several
+4. **Boot-time loop stalls.** Under asyncio debug in this container, several
    boot steps and background tasks exceeded 100 ms. The largest were trivial
    steps (the stall detector's own heartbeat) waiting for the GIL while the
    import-warming thread runs, so they are not evidence of blocking code; judge
    them on real hardware with ORION's own stall detector.
-4. **Timing tests.** `test_gui_hot_paths::test_cursor_pos_is_cheap_enough_for_33_hz`
+5. **Timing tests.** `test_gui_hot_paths::test_cursor_pos_is_cheap_enough_for_33_hz`
    and `test_holo_head::test_paint_stays_within_the_frame_budget` measure wall
    time and fail on a loaded machine.
 
@@ -84,6 +108,7 @@ Linux, Python 3.13, Qt offscreen, before and after this work:
 | --- | ---: | ---: | ---: |
 | Before | 6,787 | 22 | 33 |
 | After | 6,894 | 2 | 39 |
+| After the snapshot merge and round two | 6,923 | 2 | 39 |
 
 The 2 remaining failures are the wall-clock timing tests listed above. Eleven
 telephony failures were fixed by the `audioop-lts` requirement; Windows-only
