@@ -1464,7 +1464,9 @@ class RemoteGateway:
         queue: asyncio.Queue = asyncio.Queue(maxsize=64)
         self._event_subs.add(queue)
         self._event_devices[queue] = device_id
-        self._last_active_device = device_id
+        # Not "last active": every phone with the page open reopens this
+        # stream at least every ACCESS_TTL_S, so an idle phone in a drawer
+        # would take ORION's own phone actions from the one being used.
 
         async def _send(payload: dict[str, Any]) -> None:
             await response.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
@@ -1891,6 +1893,7 @@ class RemoteGateway:
         decision = payload.get("decision", payload.get("approve"))
         approve = (decision is True or str(decision).lower() in
                    {"approve", "approved", "yes", "true", "1", "confirm", "ok"})
+        self._last_active_device = device_id
         conf = self.confirmations.resolve(conf_id, token, approve, device_id=device_id)
         if conf is None:
             return self._web.json_response(

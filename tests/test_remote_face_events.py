@@ -282,3 +282,26 @@ def test_the_page_only_repairs_when_the_desktop_refuses_the_device():
     assert "got==='denied'&&await pair()" in REMOTE_PAGE_HTML
     assert "new URLSearchParams(location.search).get('pair')" in REMOTE_PAGE_HTML
     assert "catchUpConfirms" in REMOTE_PAGE_HTML and "resolvedHere[d.id]" in REMOTE_PAGE_HTML
+
+
+def test_reopening_the_event_stream_does_not_make_a_phone_the_last_active(tmp_path):
+    """Phones reopen the stream at least every access-token lifetime; an idle
+    one doing so must not take ORION's own phone actions from the phone in
+    use. Only a real turn (chat, an approval tap) counts."""
+    async def scenario():
+        gateway = _gateway(tmp_path)
+        client = await _client(gateway)
+        try:
+            in_use, idle = _access_token(gateway), _access_token(gateway)
+            in_use_id = gateway.auth.verify_access(in_use)
+            await client.post("/api/chat", json={"message": "hello"},
+                              headers={"Authorization": f"Bearer {in_use}"})
+            assert gateway._last_active_device == in_use_id
+            stream = await client.get(f"/api/events?token={idle}")
+            await stream.content.readline()
+            stream.close()
+            assert gateway._last_active_device == in_use_id
+        finally:
+            gateway._closing = True
+            await client.close()
+    asyncio.run(scenario())
