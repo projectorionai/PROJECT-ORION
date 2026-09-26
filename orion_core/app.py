@@ -1919,6 +1919,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # focus block or a review backlog aloud, gated by the shared speech policy.
     # Opt-in (ORION_PROACTIVE_ENGINE): off by default so runtime is unchanged.
     from .proactivity_engine import ProactivityEngine, engine_enabled as _proactive_engine_enabled
+    proactivity_engine_task: asyncio.Task | None = None
     if _proactive_engine_enabled():
         proactivity_engine = ProactivityEngine(
             bus, focus=getattr(dispatcher, "focus", None),
@@ -2158,7 +2159,9 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
                      connectivity_task, reminders_task, sentinel_task, presence_task,
                      audio_studio_task, pipeline_task, security_task,
                      cognitive_loop_task, thoughts_task, reporting_task, housekeeping_task,
-                     improvement_task):
+                     improvement_task, proactivity_engine_task):
+            if task is None:
+                continue
             _safe(f"cancel {getattr(task, 'get_name', lambda: 'task')()}", task.cancel)
         _safe("thought stream", thoughts.stop)
         await _safe_async("worker", worker.stop())
@@ -2174,7 +2177,10 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         for task in (wal_task, audio_task, telemetry_task, briefing_task, worker_task, proactive_task,
                      connectivity_task, reminders_task, sentinel_task, presence_task,
                      audio_studio_task, pipeline_task, security_task,
-                     cognitive_loop_task, thoughts_task, reporting_task, improvement_task):
+                     cognitive_loop_task, thoughts_task, reporting_task, improvement_task,
+                     housekeeping_task, diagnostics_task, proactivity_engine_task):
+            if task is None:
+                continue
             try:
                 await task
             except asyncio.CancelledError:
