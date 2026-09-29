@@ -17,7 +17,7 @@ import time
 import webbrowser
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote_plus, urlparse
 
 import psutil

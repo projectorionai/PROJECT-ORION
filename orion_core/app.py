@@ -35,7 +35,7 @@ import os
 import sys
 import time
 import traceback
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 _APP_IMPORT_STARTED_AT = time.perf_counter()
 
@@ -74,6 +74,9 @@ from .memory import MemoryAgent, OrionMemoryMatrix
 # deferred block in run_application. See tests/test_startup_imports.py.
 from .telemetry import Telemetry
 from .startup_budget import StartupBudget
+
+if TYPE_CHECKING:                       # annotations only; see the note above
+    from .providers import OrionProviderSettings
 
 
 # ──────────────────────────────────────────────────────────────────────────────
