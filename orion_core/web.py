@@ -248,8 +248,7 @@ class WebController:
     async def read_page(self) -> ToolResult:
         """Read visible page content via the accessibility tree, OCR as backup."""
         await self._focus_browser()
-        # Prefer the document control's text from the accessibility tree.
-        doc = await self.vision.find_element("", kinds="input")  # Document role lives in INPUT_ROLES
+        # Prefer the page's text from the accessibility tree.
         elements = await asyncio.to_thread(self.vision._detect_elements_sync, "all", 200)
         names = [e["name"] for e in elements if e["name"].strip()]
         text = "\n".join(dict.fromkeys(names))[:4000]

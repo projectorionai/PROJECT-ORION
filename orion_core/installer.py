@@ -57,7 +57,6 @@ def uninstall_command() -> str:
     Uses the same windowless interpreter the launcher prefers, invoking this
     module's ``--uninstall`` entry point. Quoted for paths with spaces.
     """
-    interp = desktop_app._launch_target()[0] if hasattr(desktop_app, "_launch_target") else sys.executable
     # Prefer a real pythonw so the uninstaller has no console flash.
     pyw = _pythonw()
     return f'"{pyw}" -m orion_core.installer --uninstall'

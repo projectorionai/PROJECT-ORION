@@ -673,7 +673,6 @@ class KnowledgeDispatchMixin:
             m = cur.module(int(args.get("module") or 0))
             if m is None:
                 return ToolResult("No such module.", ok=False)
-            d = m.as_dict()
             reminder = f"\n  ⚠ {m.legal_reminder}" if m.legal_reminder else ""
             return ToolResult(
                 f"Module {m.number}: {m.title} ({m.safety.value})\n"
