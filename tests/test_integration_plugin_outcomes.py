@@ -84,3 +84,34 @@ def test_homeassistant_rejected_token_and_invalid_service_data(monkeypatch):
     monkeypatch.setattr(plugin, "_request", rejected)
     assert not plugin.run(action="status").ok
     assert not plugin.run(domain="light", service="turn_on", data="[]").ok
+
+
+@pytest.mark.parametrize("args", [
+    {"domain": "../../hassio/backups/new", "service": "full"},
+    {"domain": "light", "service": "turn_on/../../../template"},
+    {"domain": "light%2F..", "service": "turn_on"},
+    {"action": "state", "entity_id": "../config"},
+    {"action": "state", "entity_id": "light.kitchen/../../services"},
+])
+def test_homeassistant_names_cannot_leave_the_service_api(monkeypatch, args):
+    """Domain, service and entity ids are slugs; anything else would send the
+    token's request to a different Home Assistant endpoint."""
+    plugin = load("homeassistant_call_service")
+    monkeypatch.setattr(plugin, "_config", lambda: {"url": "https://fixture.invalid", "token": "fixture"})
+    monkeypatch.setattr(plugin, "_request", lambda *a, **k: pytest.fail(f"request sent: {a[1:]}"))
+    assert not plugin.run(**args).ok
+
+
+def test_homeassistant_ordinary_names_still_reach_the_service_api(monkeypatch):
+    plugin = load("homeassistant_call_service")
+    monkeypatch.setattr(plugin, "_config", lambda: {"url": "https://fixture.invalid", "token": "fixture"})
+    sent = []
+    monkeypatch.setattr(plugin, "_request",
+                        lambda config, path, payload=None: sent.append(path) or [])
+    assert plugin.run(domain="Light", service="turn_on", entity_id="light.kitchen").ok
+    assert sent == ["/api/services/light/turn_on"]
+    sent.clear()
+    monkeypatch.setattr(plugin, "_request", lambda config, path, payload=None:
+                        sent.append(path) or {"entity_id": "light.kitchen", "state": "on"})
+    assert plugin.run(action="state", entity_id="light.kitchen").ok
+    assert sent == ["/api/states/light.kitchen"]

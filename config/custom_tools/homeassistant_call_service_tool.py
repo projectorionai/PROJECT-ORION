@@ -23,6 +23,7 @@ from orion_core.data import ToolResult
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,6 +38,12 @@ CONFIG_NAME = "homeassistant.json"
 #: the tier, this list is what the description warns about.
 PHYSICAL = {"lock", "cover", "alarm_control_panel", "climate", "vacuum",
             "water_heater", "humidifier", "valve"}
+
+#: Home Assistant domain, service and object ids are lowercase slugs. They are
+#: checked before they go into a URL: "../../hassio/backups/new/full" as a
+#: domain would otherwise send this token's request to another API entirely.
+_SLUG = re.compile(r"[a-z0-9_]+")
+_ENTITY = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+")
 
 
 def _config() -> dict:
@@ -113,21 +120,28 @@ def _run_impl(**kwargs) -> ToolResult:
                     + (f"\n…and {more} more." if more > 0 else ""), ok=True)
 
         if action in {"state", "states", "get"}:
-            entity = str(kwargs.get("entity_id") or "").strip()
+            entity = str(kwargs.get("entity_id") or "").strip().lower()
             if not entity:
                 return ToolResult("Which entity? Use action='entities' to see what exists.", ok=False)
+            if not _ENTITY.fullmatch(entity):
+                return ToolResult(f"'{entity}' is not an entity id (like light.kitchen). "
+                                  "Use action='entities' to see what exists.", ok=False)
             state = _request(config,
-                             f"/api/states/{urllib.parse.quote(entity)}")
+                             f"/api/states/{urllib.parse.quote(entity, safe='')}")
             return ToolResult(_friendly(state), ok=True)
 
         if action in {"call", "service", "do"}:
-            domain = str(kwargs.get("domain") or "").strip()
-            service = str(kwargs.get("service") or "").strip()
+            domain = str(kwargs.get("domain") or "").strip().lower()
+            service = str(kwargs.get("service") or "").strip().lower()
             entity = str(kwargs.get("entity_id") or "").strip()
             if not domain or not service:
                 return ToolResult("Both a domain and a service are needed, e.g. "
                         "domain='light', service='turn_on', "
                         "entity_id='light.kitchen'.", ok=False)
+            if not (_SLUG.fullmatch(domain) and _SLUG.fullmatch(service)):
+                return ToolResult("A domain and service are Home Assistant names such "
+                                  "as 'light' and 'turn_on' (letters, digits and _).",
+                                  ok=False)
             payload: dict = {}
             if entity:
                 payload["entity_id"] = entity
