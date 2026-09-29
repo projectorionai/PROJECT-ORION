@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -100,6 +99,11 @@ class _Router:
         self.delay_drafts_only = delay_drafts_only
         self.calls = []
         self._fallback = fallback
+        #: How many calls were waiting on the provider at once, at most. The
+        #: direct measure of concurrency: unlike elapsed time, a busy machine
+        #: cannot move it.
+        self.in_flight = 0
+        self.peak = 0
 
     def has_text_fallback(self):
         return self._fallback
@@ -108,7 +112,12 @@ class _Router:
         self.calls.append({"prompt": prompt, "system": system_extra,
                            "instruction": instruction, "task": task})
         if self.delay and not (self.delay_drafts_only and task in self._OVERHEAD):
-            await asyncio.sleep(self.delay)
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            try:
+                await asyncio.sleep(self.delay)
+            finally:
+                self.in_flight -= 1
         for key, queue in self.scripts.items():
             if task.startswith(key) and queue:
                 return _Profile(), queue.pop(0)
@@ -310,19 +319,24 @@ async def test_readings_beyond_the_budget_are_dropped_not_queued():
 
 
 async def test_readings_are_taken_concurrently():
+    load = {"now": 0, "peak": 0}
+
     async def _slow(_name, _args):
-        await asyncio.sleep(0.05)
+        load["now"] += 1
+        load["peak"] = max(load["peak"], load["now"])
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            load["now"] -= 1
         return ToolResult("done")
 
     belt = AgentToolbelt(dispatch=_slow, allowed={"query_intelligence": "m",
                                                   "recall_conversation": "c"},
                          budget=4)
-    started = time.perf_counter()
     readings = await belt.run_many([("query_intelligence", {"query": "a"}),
                                     ("recall_conversation", {"query": "b"})])
-    elapsed = time.perf_counter() - started
     assert len(readings) == 2 and all(r.ok for r in readings)
-    assert elapsed < 0.09, f"readings ran sequentially ({elapsed:.3f}s)"
+    assert load["peak"] == 2, "the readings ran one after the other"
 
 
 async def test_a_failing_instrument_reports_rather_than_raises():
@@ -513,15 +527,13 @@ async def test_panel_members_draft_concurrently():
     # not of the critic and chair that follow it sequentially either way.
     router = _Router(delay=0.05, delay_drafts_only=True,
                      scripts={"reason.chair": ["Synthesised."]})
-    started = time.perf_counter()
     outcome = await _engine(router).reason(
         "Should I refactor this Python code for performance, or redesign the "
         "database schema? Compare the trade-offs and explain why.")
-    elapsed = time.perf_counter() - started
     members = len(outcome.findings)
     assert members >= 2
-    assert elapsed < 0.05 * 1.8, (
-        f"{members} drafts took {elapsed:.3f}s — they ran sequentially")
+    assert router.peak == members, (
+        f"at most {router.peak} of {members} drafts were in flight together")
 
 
 async def test_the_parallel_kill_switch_reaches_the_panel():
@@ -530,12 +542,11 @@ async def test_the_parallel_kill_switch_reaches_the_panel():
     try:
         router = _Router(delay=0.05, delay_drafts_only=True,
                          scripts={"reason.chair": ["Synthesised."]})
-        started = time.perf_counter()
         outcome = await _engine(router).reason(
             "Should I refactor this Python code for performance, or redesign the "
             "database schema? Compare the trade-offs and explain why.")
-        elapsed = time.perf_counter() - started
-        assert elapsed >= 0.05 * len(outcome.findings) * 0.9
+        assert len(outcome.findings) >= 2
+        assert router.peak == 1, "drafts overlapped with parallelism switched off"
     finally:
         os.environ.pop("ORION_PARALLEL_TOOLS", None)
 
