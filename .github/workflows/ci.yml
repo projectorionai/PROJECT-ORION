@@ -12,6 +12,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run on any branch by hand (Actions > CI > Run workflow): a branch with no
+  # pull request was otherwise never tested on Windows at all.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -23,10 +26,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
