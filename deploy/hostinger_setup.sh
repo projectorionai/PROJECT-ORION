@@ -135,9 +135,9 @@ else
 # ORION_PUBLIC_HOST=orion.example.com
 
 # ── remote uplink ───────────────────────────────────────────────────────────
-# Shared secret for the phone/PWA pairing. Generate one with:
-#   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-# ORION_REMOTE_TOKEN=
+# Nothing to set: phones pair with a one-time code. The node prints it at
+# start-up (journalctl -u orion | grep 'pairing code'); enter it on the phone
+# within 10 minutes. Paired devices are kept in config/remote_devices.json.
 ENVEOF
   ok "wrote a template — fill it in before starting"
 fi
@@ -206,5 +206,5 @@ cat <<NEXT
 
   Check it:
     systemctl status orion --no-pager
-    curl -s localhost:8765/health || echo "(not answering yet)"
+    curl -fsS localhost:8765/api/health || echo "(not answering yet)"
 NEXT
