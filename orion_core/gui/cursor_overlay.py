@@ -54,6 +54,22 @@ if sys.platform == "win32":
     except Exception:               # no user32, or a locked-down host
         _CURSOR_PT = _CURSOR_REF = _GET_CURSOR_POS = None
 
+# The pyautogui fallback, imported on first need. A failed import is not cached
+# by Python, so without remembering the miss every tick would search sys.path
+# again for a module that is not there (about 9 ms, 33 times a second).
+_PYAUTOGUI: Any = None
+
+
+def _pyautogui() -> Any:
+    global _PYAUTOGUI
+    if _PYAUTOGUI is None:
+        try:
+            import pyautogui
+            _PYAUTOGUI = pyautogui
+        except Exception:           # not installed, or no display to attach to
+            _PYAUTOGUI = False
+    return _PYAUTOGUI or None
+
 def _to_logical_rect(region: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     """A rectangle in the PHYSICAL pixels Windows reports (GetWindowRect,
     pygetwindow, the screen grabber) as the LOGICAL pixels QWidget.setGeometry
@@ -194,12 +210,14 @@ class CursorOverlay(QWidget):
                 return (_CURSOR_PT.x, _CURSOR_PT.y)
             except Exception:
                 pass
-        try:
-            import pyautogui
-            pos = pyautogui.position()
-            return (int(pos.x), int(pos.y))
-        except Exception:
-            return (0, 0)
+        gui = _pyautogui()
+        if gui is not None:
+            try:
+                pos = gui.position()
+                return (int(pos.x), int(pos.y))
+            except Exception:
+                pass
+        return (0, 0)
 
     def _tick(self) -> None:
         x, y = self._cursor_pos()

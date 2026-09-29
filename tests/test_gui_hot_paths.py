@@ -95,6 +95,28 @@ def test_a_raising_win32_call_falls_through(monkeypatch):
     assert isinstance(result, tuple) and len(result) == 2
 
 
+
+def test_a_missing_pyautogui_is_looked_for_once(monkeypatch):
+    """Without the Win32 call the fallback is pyautogui. When that is not
+    installed, the miss is remembered instead of re-importing every tick."""
+    import builtins
+    monkeypatch.setattr(co, "_GET_CURSOR_POS", None)
+    monkeypatch.setattr(co, "_PYAUTOGUI", None)
+    monkeypatch.setattr(co, "_scaled_display", lambda: False)
+    real_import = builtins.__import__
+    attempts = []
+
+    def no_pyautogui(name, *args, **kwargs):
+        if name == "pyautogui":
+            attempts.append(name)
+            raise ImportError("No module named 'pyautogui'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_pyautogui)
+    for _ in range(5):
+        assert co.CursorOverlay._cursor_pos(None) == (0, 0)
+    assert attempts == ["pyautogui"]
+
 # ── redundant window moves ───────────────────────────────────────────────────
 
 def test_the_overlay_only_moves_when_the_cursor_moves(qapp, monkeypatch):
