@@ -163,7 +163,9 @@ different terms; the AGPL governs what everyone else may do with it. For a
 commercial licence, ask.
 
 Third-party material redistributed here — the MediaPipe canonical face mesh
-under Apache-2.0 — is listed in [NOTICE](NOTICE), along with an
+(Apache-2.0), three.js (MIT), and the YuNet face detector, Resemblyzer voice
+encoder and YAMNet sound classifier models (each with its licence beside it
+under `assets/`) — is listed in [NOTICE](NOTICE), along with an
 acknowledgement of the MARK LIV release notes, whose *approach* informed
 ORION's avatar, lip-sync, echo guard and audio-device probing. No code from
 that project is included; those subsystems were written independently for this
