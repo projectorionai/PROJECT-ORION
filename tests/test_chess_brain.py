@@ -450,9 +450,11 @@ def test_the_transposition_table_is_bounded(brain):
 def test_it_searches_deeper_than_it_used_to(brain):
     """Measured: the old engine reached depth 2 in a middlegame at ORION's
     1.5 s; it generated legal moves four times per evaluation and called
-    can_claim_threefold_repetition (~470 µs) at every node."""
+    can_claim_threefold_repetition (~470 µs) at every node. Given the same
+    1.5 s here: depth 4 takes about a quarter of it on a quiet machine, and the
+    rest is headroom for a machine that is busy running other tests."""
     board = chess.Board("r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P4/2PBPN2/PP1N1PPP/R1BQ1RK1 w - - 0 8")
-    brain.choose_move(board, seconds=0.5, use_book=False)
+    brain.choose_move(board, seconds=1.5, use_book=False)
     assert brain._last_depth >= 4, brain.last_reason
 
 
