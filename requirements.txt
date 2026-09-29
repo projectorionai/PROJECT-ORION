@@ -59,7 +59,7 @@ matplotlib>=3.7,<4                       # TEST FIXTURE ONLY — builds a real P
                          # visualisation works offline with no plotting library.
 
 # Windows integration
-pywin32                  # Outlook COM, window/DPI helpers (Windows only)
+pywin32; sys_platform == "win32"         # Outlook COM, window/DPI helpers; has no build for other systems
 
 # Documents / files (optional but recommended)
 pypdf>=4,<7                              # PDF text extraction (literature vault, file scans)
