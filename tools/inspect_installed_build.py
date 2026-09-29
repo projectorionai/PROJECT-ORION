@@ -36,6 +36,15 @@ def fingerprint(code: types.CodeType) -> bytes:
                                      separators=(",", ":")).encode()).digest()
 
 
+def _sha256(path: Path) -> str:
+    """Hash in blocks: a frozen build is hundreds of megabytes."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def inspect_build(executable: Path, root: Path) -> dict:
     from PyInstaller.archive.readers import CArchiveReader
     reader = CArchiveReader(str(executable))
@@ -58,9 +67,11 @@ def inspect_build(executable: Path, root: Path) -> dict:
             options = [fingerprint(compile(path.read_bytes(), "", "exec", optimize=level,
                                            dont_inherit=True)) for level in (0, 1, 2)]
             (matching if digest in options else different).append(module)
-        except (ValueError, TypeError, EOFError):
+        except (ValueError, TypeError, EOFError, SyntaxError):
+            # SyntaxError: source this interpreter cannot compile (a newer
+            # Python's syntax). One module unreadable, not the whole report.
             unreadable.append(module)
-    return {"executable": executable.name, "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+    return {"executable": executable.name, "sha256": _sha256(executable),
             "launched": False, "hardware_tested": False,
             "source_matches": not different and not missing and not unreadable,
             "matching_modules": matching, "different_modules": different,

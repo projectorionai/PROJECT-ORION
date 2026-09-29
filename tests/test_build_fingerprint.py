@@ -34,3 +34,25 @@ def test_comparison_ignores_constant_interning_and_object_sharing():
     before = code.replace(co_consts=(shared, shared))
     after = code.replace(co_consts=(shared, independent))
     assert fingerprint(before) == fingerprint(after)
+
+
+def test_a_module_this_python_cannot_compile_is_reported_not_fatal(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import hashlib
+    import sys
+    from tools.inspect_installed_build import inspect_build
+    (tmp_path / "orion_core").mkdir()
+    (tmp_path / "orion_core/__init__.py").write_bytes(b"value = 1\n")
+    (tmp_path / "orion_core/newer.py").write_bytes(b"def f(:\n    pass\n")
+    executable = tmp_path / "test.exe"
+    executable.write_bytes(b"fixture" * 1000)
+    archive = SimpleNamespace(toc={"orion_core": None, "orion_core.newer": None},
+        extract=lambda _: compile("value = 1\n", "x.py", "exec", dont_inherit=True))
+    readers = SimpleNamespace(CArchiveReader=lambda _: SimpleNamespace(
+        toc={"PYZ.pyz": None}, open_embedded_archive=lambda _: archive))
+    monkeypatch.setitem(sys.modules, "PyInstaller.archive.readers", readers)
+    result = inspect_build(executable, tmp_path)
+    assert result["unreadable_modules"] == ["orion_core.newer"]
+    assert result["matching_modules"] == ["orion_core"]
+    assert not result["source_matches"]
+    assert result["sha256"] == hashlib.sha256(b"fixture" * 1000).hexdigest()
