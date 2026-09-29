@@ -156,6 +156,58 @@ def test_the_interval_is_not_set_when_already_correct(budget):
     assert budget._timer.changes.count(round(1000 / IDLE_HZ)) == 1
 
 
+
+# ── channels that ease by elapsed time ───────────────────────────────────────
+
+def _time_eased_tail(budget, frames, speed_per_s):
+    """Feed a channel drifting at a constant speed, one real frame at a time:
+    each frame lasts as long as the timer's current interval."""
+    value = 0.5
+    rates = []
+    for _ in range(frames):
+        dt = budget._timer.interval() / 1000.0
+        value += speed_per_s * dt
+        budget.note((value,), dt)
+        rates.append(budget._timer.interval())
+    return rates
+
+
+def test_a_slow_time_eased_tail_settles_once_and_stays_settled(budget):
+    """0.04/s is 0.0013 per active frame, under the threshold. The same speed
+    is 0.005 per idle frame. Judged per frame, dropping the rate turned the
+    tail back into motion and the widget flipped between the two rates."""
+    rates = _time_eased_tail(budget, SETTLE_FRAMES + 40, speed_per_s=0.04)
+    idle_ms = round(1000 / IDLE_HZ)
+    first_idle = rates.index(idle_ms)
+    assert set(rates[first_idle:]) == {idle_ms}
+
+
+def test_without_a_frame_time_the_threshold_is_per_frame(budget):
+    """Widgets that ease a fixed step per frame keep the per-frame rule."""
+    for _ in range(SETTLE_FRAMES + 2):
+        budget.note((0.5,))
+    assert budget.idling is True
+    budget.note((0.505,))
+    assert budget.idling is False
+
+
+def test_real_motion_still_wakes_a_time_eased_widget(budget):
+    for _ in range(SETTLE_FRAMES + 2):
+        budget.note((0.5,), 1 / IDLE_HZ)
+    assert budget.idling is True
+    budget.note((0.56,), 1 / IDLE_HZ)
+    assert budget.idling is False
+
+
+def test_a_stalled_frame_cannot_hide_motion(budget):
+    """A two second hitch is not allowed to widen the threshold past one idle
+    frame's worth, or a real change during the stall would read as still."""
+    for _ in range(SETTLE_FRAMES + 2):
+        budget.note((0.5,), 1 / IDLE_HZ)
+    assert budget.idling is True
+    budget.note((0.51,), 2.0)
+    assert budget.idling is False
+
 # ── the widgets actually use it ──────────────────────────────────────────────
 
 def _gui(module: str) -> str:

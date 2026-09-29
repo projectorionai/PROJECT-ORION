@@ -87,14 +87,21 @@ class AnimationBudget:
     def still_frames(self) -> int:
         return self._still_for
 
-    def note(self, channels: tuple[float, ...]) -> bool:
+    def note(self, channels: tuple[float, ...], dt: float | None = None) -> bool:
         """Record this frame's channel values. Returns whether to repaint.
 
         A still frame while already idling does not need a repaint at all —
         the picture is identical to the one on screen. That is where most of
         the saving comes from: not a cheaper paint, but no paint.
+
+        *dt* is the time the frame covers, in seconds, for a widget whose
+        channels ease by elapsed time rather than by a fixed step per frame.
+        Such a channel moves further in one idle frame than in one active
+        frame at the same speed. Judged per frame, a slow easing tail reads
+        as still at the full rate, as motion the moment the rate drops, and
+        the widget flips between the two rates until the tail dies out.
         """
-        moved = self._moved(channels)
+        moved = self._moved(channels, self._epsilon(dt))
         self._previous = channels
         if moved:
             self._still_for = 0
@@ -110,12 +117,22 @@ class AnimationBudget:
         # painting that does not read from these channels stays alive.
         return not self._idling
 
-    def _moved(self, channels: tuple[float, ...]) -> bool:
+    def _epsilon(self, dt: float | None) -> float:
+        """The stillness threshold for a frame covering *dt* seconds: the same
+        speed whatever the rate. Bounded to one active and one idle frame, so
+        a stalled frame cannot hide real motion."""
+        if dt is None:
+            return STILL_EPSILON
+        span_ms = min(max(dt * 1000.0, self._active_ms), self._idle_ms)
+        return STILL_EPSILON * span_ms / self._active_ms
+
+    def _moved(self, channels: tuple[float, ...],
+               epsilon: float = STILL_EPSILON) -> bool:
         previous = self._previous
         if len(previous) != len(channels):
             return True
         for was, now in zip(previous, channels):
-            if abs(now - was) > STILL_EPSILON:
+            if abs(now - was) > epsilon:
                 return True
         return False
 

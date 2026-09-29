@@ -34,30 +34,44 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 _PROBE = r'''
-import json, os, sys
+import json, os, sys, time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# The head steps on this thread, so every frame below sees the time step a
+# real frame would, however fast or slow this machine runs the loop. With the
+# render thread on, a second clock steps it too and the result follows load.
+os.environ["ORION_FACE_THREAD"] = "0"
 sys.path.insert(0, r"{root}")
 from PyQt6.QtWidgets import QApplication
 app = QApplication([])
 from orion_core.gui.holo_head import HoloHeadPanel
 
 panel = HoloHeadPanel()
+# Blinks come on a random 2.4-6.5 s clock, and a blink landing in a settle
+# window reads as "never settled". The probe measures the budget, so it
+# schedules none; the last check below drives one by hand.
+panel._head._blink_at = float("inf")
 panel.resize(360, 420)
 panel.show()
 panel.set_state("LISTENING")
 panel.set_speaking(False)
 panel.set_amplitude(0.0)
 
+
+def tick():
+    panel._last = time.perf_counter() - panel.timer.interval() / 1000.0
+    panel._tick()
+
+
 out = {{"start_ms": panel.timer.interval()}}
 for _ in range(40):
-    panel._tick()
+    tick()
 out["idle_ms"] = panel.timer.interval()
 out["idling"] = bool(panel._budget.idling)
 
 panel.set_speaking(True)
 panel.set_amplitude(0.85)
 panel.set_viseme(0.9, 0.0, 0.0)
-panel._tick()
+tick()
 out["speaking_ms"] = panel.timer.interval()
 out["speaking_idling"] = bool(panel._budget.idling)
 
@@ -65,12 +79,12 @@ panel.set_speaking(False)
 panel.set_amplitude(0.0)
 panel.set_viseme(0.0, 0.0, 0.0)
 for _ in range(60):
-    panel._tick()
+    tick()
 out["resettled_ms"] = panel.timer.interval()
 
 # A blink is a meaningful channel: it must be able to wake the rate.
 panel._head._blink = 1.0
-panel._tick()
+tick()
 out["after_blink_ms"] = panel.timer.interval()
 
 print("@@" + json.dumps(out))

@@ -869,7 +869,7 @@ class HoloHeadPanel(QWidget):
             head._lids, head._blink, head._brow,
             self._amplitude, float(self._speaking),
             float(hash(self._state) & 0xFFFF),
-        ))
+        ), dt)
         # Painted either way. Unlike the voxel face there is no frame here that
         # is truly identical to the last — breathing and sway advance
         # continuously — so the saving comes from redrawing an almost-still
