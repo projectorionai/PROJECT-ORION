@@ -162,6 +162,7 @@ def test_a_failing_counter_returns_the_last_known_reading(monkeypatch, fake):
     or the GUI timer that asked, which is a real fault caused by a cosmetic
     one."""
     good = system_metrics.sample()
+    assert good.cpu == 12.5 and good.ram == 44.0
 
     class Broken(FakePsutil):
         def net_io_counters(self):
@@ -171,6 +172,12 @@ def test_a_failing_counter_returns_the_last_known_reading(monkeypatch, fake):
             raise OSError("no")
 
     monkeypatch.setitem(sys.modules, "psutil", Broken())
+    # Past both TTLs, so the broken counters are really asked.
+    monkeypatch.setattr(system_metrics, "_cpu_at", 0.0)
+    monkeypatch.setattr(system_metrics, "_net_at", 0.0)
+    assert system_metrics.sample() == good
+
+    # With nothing known yet, the answer is a zero reading, not an exception.
     system_metrics.reset()
     system_metrics.sample()
     later = system_metrics.sample()

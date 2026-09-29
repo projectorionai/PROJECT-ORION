@@ -150,6 +150,8 @@ def test_stalled_provider_leaves_time_for_fallback(monkeypatch):
     profile, answer = _run(router)
     assert profile.name == "spare" and answer == "{}"
     assert deadlines == [15.0, 15.0]
+    # The stalled call was abandoned at its deadline; only the spare ran.
+    assert [name for name, _url, _model in attempts] == ["spare"]
 
 
 def test_a_live_audio_profile_is_offered_as_a_vision_endpoint():

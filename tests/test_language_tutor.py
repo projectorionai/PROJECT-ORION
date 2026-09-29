@@ -194,9 +194,7 @@ def test_starting_a_session_seeds_automatically(tutor):
 # ── sessions / directive ─────────────────────────────────────────────────────
 
 def test_immersion_directive_pins_target_language_only():
-    session = LanguageTutor(deck=None).start_session("Spanish", "A2", immersion=True) \
-        if False else None
-    # build directly to avoid touching the real deck
+    # built directly to avoid touching the real deck
     from orion_core.language_tutor import TutorSession, resolve_language
     d = TutorSession(resolve_language("es"), "A2", immersion=True).directive()
     assert "Spanish" in d and "A2" in d
@@ -283,7 +281,6 @@ def test_tool_unknown_action_lists_actions(tool):
 def test_language_tutor_is_registered_in_the_handler_table():
     import inspect
     from orion_core.dispatcher import OrionDispatcher
-    src = inspect.getsource(OrionDispatcher.__init__) if hasattr(OrionDispatcher, "__init__") else ""
     # handler_table is built in __init__ or a helper; assert the mapping exists
     # by scanning the whole class source.
     whole = inspect.getsource(OrionDispatcher)
