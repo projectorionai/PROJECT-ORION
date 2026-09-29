@@ -36,11 +36,29 @@ def _qt():
 
 def _run(coro_factory, answer):
     qt = _qt()
+    ticks = []
 
     class _Dialog(QDialog):
+        """Answers once the heartbeat has visibly run while it is open.
+
+        It used to answer after a fixed 150 ms, which a busy machine could
+        spend entirely on the dialog's first paint, so the heartbeat looked
+        dead when it was only late. A heartbeat that really is dead still
+        fails: the dialog then answers after 5 s with too few ticks.
+        """
+
         def open(self):
             super().open()
-            QTimer.singleShot(150, self.accept if answer else self.reject)
+            self._at_open, self._polls = len(ticks), 0
+            self._poll = QTimer(self)
+            self._poll.timeout.connect(self._answer_when_seen)
+            self._poll.start(10)
+
+        def _answer_when_seen(self):
+            self._polls += 1
+            if len(ticks) - self._at_open >= 5 or self._polls >= 500:
+                self._poll.stop()
+                (self.accept if answer else self.reject)()
 
         def key(self):
             return "k-123"
@@ -48,7 +66,6 @@ def _run(coro_factory, answer):
     loop = qasync.QEventLoop(qt)
     errors = []
     loop.set_exception_handler(lambda _loop, context: errors.append(context))
-    ticks = []
 
     async def heartbeat():
         while True:
