@@ -66,10 +66,13 @@ def draw(state, speaking, amp, viseme, steps, seed=11):
     head.paint(p, SIZE / 2, SIZE * 0.47, radius, PRI, ACC, BG)
     p.end()
     # The cost of a paint is the CPU time this thread spends in it (what the
-    # event loop loses), best of a few of the same frame. Wall-clock time on a
-    # busy machine measures the machine: the wait for a core, not the paint.
-    best = float("inf")
-    for _ in range(5):
+    # event loop loses), averaged over repaints of the same frame. Wall-clock
+    # time on a busy machine measures the wait for a core, not the paint; and
+    # Windows counts thread time in 15.6 ms steps, so one paint cannot be
+    # timed on its own there.
+    repeats = 8
+    spent = 0.0
+    for _ in range(repeats):
         scratch = QImage(SIZE, SIZE, QImage.Format.Format_RGB32)
         scratch.fill(BG)
         p = QPainter(scratch)
@@ -77,8 +80,8 @@ def draw(state, speaking, amp, viseme, steps, seed=11):
         started = time.thread_time()
         head.paint(p, SIZE / 2, SIZE * 0.47, radius, PRI, ACC, BG)
         p.end()
-        best = min(best, (time.thread_time() - started) * 1000.0)
-    return img, best
+        spent += time.thread_time() - started
+    return img, spent * 1000.0 / repeats
 
 
 def stats(img):

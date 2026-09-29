@@ -275,9 +275,14 @@ def test_a_real_camera_frame_reduces_without_converting_every_pixel():
     numpy = pytest.importorskip("numpy")
     frame = numpy.full((720, 1280, 3), 30, dtype=numpy.uint8)
     frame[250:600, 100:280] = 200
-    started = time.perf_counter()
-    grid = to_grid(frame)
-    elapsed = time.perf_counter() - started
+    # CPU time on this thread, averaged: wall-clock time on a busy machine is
+    # mostly the wait for a core, and Windows counts thread time in 15.6 ms
+    # steps, too coarse to time one frame on its own.
+    repeats = 10
+    started = time.thread_time()
+    for _ in range(repeats):
+        grid = to_grid(frame)
+    elapsed = (time.thread_time() - started) / repeats
     assert grid is not None and grid.size == 32 * 24
     assert max(grid.cells) > min(grid.cells), "the bright region must survive"
     assert elapsed < 0.01, f"reduction took {elapsed * 1000:.0f}ms per frame"
