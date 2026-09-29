@@ -205,6 +205,23 @@ def test_non_compiling_model_output_never_offered(repair_env):
     assert target.read_text(encoding="utf-8") == ORIGINAL_SOURCE
 
 
+def test_a_draft_is_checked_without_writing_to_the_temp_folder(repair_env, tmp_path,
+                                                              monkeypatch):
+    """The compile check runs in memory. It used to write the draft to a
+    fixed name in the shared temp folder and leave its .pyc behind."""
+    import tempfile
+    scratch = tmp_path / "temp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    agent, target = repair_env
+    agent.router = _ScriptedRouter(BROKEN_SOURCE)
+    _incident_for(agent, target)
+    result = asyncio.run(agent.repair_file("inc-t", confirm=False))
+    assert not result.ok and "fake_module.py" in result.text
+    agent.router = _ScriptedRouter(FIXED_SOURCE)
+    assert asyncio.run(agent.repair_file("inc-t", confirm=False)).ok
+    assert list(scratch.iterdir()) == []
+
 def test_fenced_model_output_is_unwrapped(repair_env):
     agent, target = repair_env
     agent.router = _ScriptedRouter(f"Here you go:\n```python\n{FIXED_SOURCE}```\n")

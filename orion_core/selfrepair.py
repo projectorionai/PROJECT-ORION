@@ -1302,9 +1302,6 @@ class SelfRepairAgent:
         except ValueError:
             shown = target.name
         prompt = f"{problem}\n\nFILE: {shown}\n```python\n{body}\n```"
-        import py_compile
-        import tempfile
-
         feedback = ""
         last_problem = ""
         for attempt in range(2):
@@ -1349,17 +1346,15 @@ class SelfRepairAgent:
                 last_problem = "the edits changed nothing"
                 feedback = "\n\nYOUR EDITS CHANGED NOTHING. Make the fix."
                 continue
-            tmp = Path(tempfile.gettempdir()) / f"orion_repair_{incident.id}.py"
+            # Compiled in memory: nothing is written to the shared temp folder,
+            # and the error names the real file and line for the retry.
             try:
-                tmp.write_text(corrected, encoding="utf-8")
-                py_compile.compile(str(tmp), doraise=True)
+                compile(corrected, target.name, "exec", dont_inherit=True)
             except Exception as exc:
                 last_problem = f"does not compile ({first_line(exc, 100)})"
                 feedback = (f"\n\nTHE EDITED FILE DOES NOT COMPILE: {first_line(exc, 160)}. "
                             "Fix your edit.")
                 continue
-            finally:
-                tmp.unlink(missing_ok=True)
             cause = answer.split("<<<<<<<", 1)[0].strip()
             incident.root_cause = cause[:800]
             incident.repaired_content = corrected
