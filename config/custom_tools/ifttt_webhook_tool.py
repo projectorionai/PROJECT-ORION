@@ -82,7 +82,7 @@ def _run_impl(**kwargs) -> ToolResult:
             payload[key_name] = str(value)
 
     request = urllib.request.Request(
-        ENDPOINT.format(event=urllib.parse.quote(event), key=key),
+        ENDPOINT.format(event=urllib.parse.quote(event, safe=""), key=key),
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "User-Agent": "ORION/1.0"},
         method="POST")

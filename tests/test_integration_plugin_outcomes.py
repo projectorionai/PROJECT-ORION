@@ -115,3 +115,28 @@ def test_homeassistant_ordinary_names_still_reach_the_service_api(monkeypatch):
                         sent.append(path) or {"entity_id": "light.kitchen", "state": "on"})
     assert plugin.run(action="state", entity_id="light.kitchen").ok
     assert sent == ["/api/states/light.kitchen"]
+
+
+def test_ifttt_event_name_cannot_change_the_webhook_path(monkeypatch):
+    plugin = load("ifttt_webhook")
+    monkeypatch.setattr(plugin, "_config", lambda: {"key": "fixture-key"})
+    urls = []
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return b"Congratulations"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def capture(request, timeout=None):
+        urls.append(request.full_url)
+        return _Response()
+    monkeypatch.setattr(plugin.urllib.request, "urlopen", capture)
+    plugin.run(event="kettle/../../other")
+    assert urls and "/trigger/kettle%2F..%2F..%2Fother/with/key/" in urls[0]
