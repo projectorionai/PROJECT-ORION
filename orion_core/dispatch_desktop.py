@@ -646,6 +646,12 @@ class DesktopDispatchMixin:
                     "share": "text"}.get(kind)
         if required and required not in payload:
             return ToolResult(f"phone_action '{kind}' needs '{required}'.", ok=False)
+        if kind == "openUrl" and not re.match(r"(?i)https?://", payload["url"].strip()):
+            # Web links only. Any other scheme is script in the phone page
+            # (javascript:) or another app's deep link (payments, installs),
+            # and calls, texts, e-mail and maps have their own kinds.
+            return ToolResult("phone_action openUrl takes a web link (http or https) "
+                              "only; use call, sms, email or navigate for those.", ok=False)
         try:
             self.bus.phone_action.emit(payload)
         except Exception as exc:

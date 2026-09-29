@@ -99,10 +99,24 @@ class NativeBridge(
         )
     }
 
-    /** Open an external URL in the phone's browser / relevant app. */
+    /**
+     * Open a web link in the phone's browser. Web links only: calls, texts,
+     * e-mail and maps have their own methods above, and any other scheme is
+     * another app's deep link (a payment request, an app install) that a
+     * model misled by a web page could otherwise fire at the phone.
+     */
     @JavascriptInterface
     fun openUrl(url: String) {
-        launch(Intent(Intent.ACTION_VIEW, Uri.parse(url.trim())), "Can't open that link.")
+        val uri = Uri.parse(url.trim())
+        val scheme = uri.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https") {
+            activity.runOnUiThread {
+                Toast.makeText(activity, "Only web links can be opened from ORION.",
+                    Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        launch(Intent(Intent.ACTION_VIEW, uri), "Can't open that link.")
     }
 
     /** Offer [text] to the Android share sheet. */

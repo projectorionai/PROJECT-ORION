@@ -135,6 +135,13 @@ def test_the_phone_page_pairs_catches_up_and_only_repairs_when_refused(tmp_path)
             page.evaluate(reset)
             assert dialogs, "a refused device was not asked to pair again"
 
+            # A plain browser gets actions as links: web links only, never
+            # a javascript: URL running beside this phone's pairing token.
+            assert page.evaluate("actHref({kind:'openUrl',url:'javascript:alert(1)'})") == ""
+            assert page.evaluate("actHref({kind:'openUrl',url:'upi://pay?am=1'})") == ""
+            assert page.evaluate("actHref({kind:'openUrl',url:'https://example.com/'})") \
+                == "https://example.com/"
+
             assert errors == [], errors
             browser.close()
     finally:

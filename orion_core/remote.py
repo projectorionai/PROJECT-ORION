@@ -366,7 +366,9 @@ function actHref(a){
  if(a.kind==='sms')return 'smsto:'+(a.number||'')+(a.body?('?body='+encodeURIComponent(a.body)):'');
  if(a.kind==='email')return 'mailto:'+encodeURIComponent(a.to||'')+'?subject='+encodeURIComponent(a.subject||'')+'&body='+encodeURIComponent(a.body||'');
  if(a.kind==='navigate'||a.kind==='map')return 'geo:0,0?q='+encodeURIComponent(a.query||'');
- if(a.kind==='openUrl')return a.url||'';
+ // Web links only: a javascript: or other app's URL here would run in, or
+ // leave from, the page that holds this phone's pairing token.
+ if(a.kind==='openUrl')return /^https?:\/\//i.test(a.url||'')?a.url:'';
  return '';}
 function doAction(a){
  if(!a||!a.kind)return;

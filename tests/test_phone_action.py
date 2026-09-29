@@ -76,3 +76,30 @@ def test_phone_action_navigate_needs_query():
     assert ok.ok
     assert d.bus.phone_action.emitted[0] == {
         "kind": "navigate", "query": "Birmingham New Street"}
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("url", [
+    "javascript:alert(document.cookie)",
+    "JavaScript:alert(1)",
+    "upi://pay?pa=someone@bank&am=500",
+    "intent://scan/#Intent;scheme=zxing;end",
+    "file:///sdcard/secret.txt",
+    "market://details?id=com.example",
+])
+def test_open_url_takes_web_links_only(url):
+    """Anything but http(s) is script in the phone page or another app's deep
+    link; calls, texts, e-mail and maps have their own kinds."""
+    d = _dispatcher()
+    result = d.phone_action({"kind": "openUrl", "url": url})
+    assert result.ok is False
+    assert d.bus.phone_action.emitted == []
+
+
+def test_open_url_accepts_a_web_link():
+    d = _dispatcher()
+    result = d.phone_action({"kind": "open_url", "url": "https://example.com/page"})
+    assert result.ok
+    assert d.bus.phone_action.emitted == [{"kind": "openUrl", "url": "https://example.com/page"}]
