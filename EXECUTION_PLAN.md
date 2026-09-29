@@ -64,6 +64,36 @@ Housekeeping: a stray editor configuration file and its tool-specific ignore
 entries were removed; the publication checker's generic dot-directory rule
 covers them.
 
+### Third round: every folder, in order
+
+`.github`, `android`, `assets`, `config`, `deploy`, `docs`, `launcher`,
+`orion_core`, `skills`, `tests`, `tools`, then the root files. Found and fixed:
+
+| # | Defect | Files | Commit subject |
+| --- | --- | --- | --- |
+| 25 | CI could only run on a push or pull request, so a branch could not be checked on Windows by hand; the workflows used actions on the retired Node 20 runtime. | `.github/workflows/ci.yml`, `android.yml` | ci: allow running CI by hand and move off Node 20 actions |
+| 26 | A phone action could open any URI scheme (payment requests, app installs, intents), in the page, the dispatcher and the Android bridge alike. | `orion_core/remote.py`, `orion_core/dispatch_desktop.py`, `android/.../NativeBridge.kt` | fix(phone): open web links only from ORION's phone actions |
+| 27 | The Home Assistant plugin put a model-chosen domain, service and entity straight into the API path, so `../` reached other endpoints; the IFTTT plugin did not escape `/` in the event name. | `config/custom_tools/homeassistant_call_service_tool.py`, `ifttt_webhook_tool.py` | two `fix(plugins)` commits |
+| 28 | The systemd units could not write conversation transcripts under `ProtectSystem=strict`, and put `StartLimitIntervalSec` in `[Service]`, where systemd ignores it. | `deploy/*.service`, `deploy/hostinger_setup.sh` | fix(deploy): let the node keep its transcripts, and make the unit limits apply |
+| 29 | On a host without pyautogui, the cursor overlay re-attempted the import every 30 ms tick (about 9 ms each, on the GUI thread). | `orion_core/gui/cursor_overlay.py` | perf(gui): remember a missing pyautogui instead of re-importing it every tick |
+| 30 | Each self-repair draft was written to a fixed name in the shared temp folder and left a `.pyc` there. | `orion_core/selfrepair.py` | fix(selfrepair): check a drafted fix in memory, not through the temp folder |
+| 31 | The software face flipped between 30 and 12 frames a second while settling: at the idle rate an easing tail moved further per frame and read as motion. Hidden by a test that ticked with near-zero time steps. | `orion_core/gui/animation_budget.py`, `holo_head.py` | fix(gui): stop the face flipping between frame rates while it settles |
+| 32 | `move_config` only recognised a running ORION by the name ORION.exe, so an ORION started from source let it copy live databases; its Windows-only probe made every move fail elsewhere. | `tools/move_config.py` | fix(tools): move_config sees an ORION started from source, and runs off Windows |
+| 33 | `setup_twilio` refused a correct number typed with spaces, and read a failed number listing (403, 5xx) as "no numbers on this account". | `tools/setup_twilio.py` | fix(tools): setup_twilio accepts a spaced number and reads a failed listing honestly |
+| 34 | `inspect_installed_build` read the whole executable into memory and stopped with a traceback on a module it could not compile. | `tools/inspect_installed_build.py` | fix(tools): hash a build in blocks and survive a module this Python cannot compile |
+| 35 | `pip install -r requirements.txt` failed on Linux at pywin32. | `requirements.txt` | fix(deps): install pywin32 only on Windows |
+| 36 | Documented settings that nothing reads: `ORION_REMOTE_TOKEN` in the Hostinger env template, nine retry, breaker, timeout and telemetry variables in `.env.example`; the setup script's health check used a route that does not exist. | `deploy/hostinger_setup.sh`, `.env.example` | fix(deploy) and docs(env) commits |
+| 37 | Five tools shipped after the capability baseline was written, so the release gate would not have noticed losing them. | `docs/capability_baseline.json` | chore(release): record aviation, fetch_url, find_tool, sound_sense and use_tool |
+
+The test suite itself: seven wall-clock checks were rewritten to measure what
+they claim without depending on how busy the machine is (thread CPU time for
+paint and frame-reduction budgets, calls in flight for concurrency, a fixed
+frame time for the face budget, ORION's real 1.5 s for search depth), which
+also resolves finding 5 below. Three tests that did not check what their names
+say now do. Smaller corrections: names used only in annotations are imported,
+three assignments nothing read are gone, the launcher banner no longer names
+Mark XXV, and the README lists everything NOTICE covers.
+
 ## Using the new behaviour
 
 - **Owner voice for sensitive actions:** say "only accept my voice for
@@ -96,9 +126,15 @@ covers them.
    steps (the stall detector's own heartbeat) waiting for the GIL while the
    import-warming thread runs, so they are not evidence of blocking code; judge
    them on real hardware with ORION's own stall detector.
-5. **Timing tests.** `test_gui_hot_paths::test_cursor_pos_is_cheap_enough_for_33_hz`
-   and `test_holo_head::test_paint_stays_within_the_frame_budget` measure wall
-   time and fail on a loaded machine.
+5. **Timing tests.** Resolved in the third round (#29 and the note after the
+   table): the cursor check was a real defect, the paint budget now reads CPU
+   time.
+6. **State-driven expressions on the avatar.** `AvatarEngine` maps states to
+   expressions (researching reads as focused, a warning as alarmed) and holds
+   an override, but the frame it returns carries neither and the controller
+   never calls the face's `apply_emotion`; the window streams the emotion
+   engine's output to the face directly instead. Wiring the mapping in would
+   change what the face shows, so it was left for a decision.
 
 ## Verification
 
@@ -109,8 +145,11 @@ Linux, Python 3.13, Qt offscreen, before and after this work:
 | Before | 6,787 | 22 | 33 |
 | After | 6,894 | 2 | 39 |
 | After the snapshot merge and round two | 6,923 | 2 | 39 |
+| After round three (8 workers in parallel) | 6,954 | 0 | 38 |
 
-The 2 remaining failures are the wall-clock timing tests listed above. Eleven
+After round two, the 2 remaining failures were the wall-clock timing tests
+listed above; round three rewrote them, and the suite now also passes with
+every test file run on its own. Eleven
 telephony failures were fixed by the `audioop-lts` requirement; Windows-only
 tests now skip elsewhere (hence 6 more skips); the work added 107 tests. The
 Android APK builds in GitHub Actions, including the pinning change. The publication check, byte-compilation and the
