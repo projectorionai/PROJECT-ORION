@@ -23,6 +23,10 @@ Environment=ORION_REMOTE_HOST=127.0.0.1
 Environment=ORION_REMOTE_PORT=8765
 # Put provider keys in /opt/orion/config/api_keys.json, or add them here:
 # Environment=ORION_MODE=auto
+# Everything the node writes lives in these directories. They are made
+# ("+": outside the sandbox) before the sandbox is set up, because systemd
+# will not start a unit whose ReadWritePaths entry is missing.
+ExecStartPre=+/usr/bin/install -d -o orion -g orion /opt/orion/config /opt/orion/conversations /opt/orion/research /opt/orion/reports /opt/orion/exports /opt/orion/logs
 ExecStart=/opt/orion/.venv/bin/python /opt/orion/orion.py --headless
 Restart=on-failure
 RestartSec=5
@@ -30,7 +34,9 @@ RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/opt/orion/config
+# conversations/ holds the transcripts: without it every remote turn's
+# history was silently lost, and recalling past conversations found nothing.
+ReadWritePaths=/opt/orion/config /opt/orion/conversations /opt/orion/research /opt/orion/reports /opt/orion/exports /opt/orion/logs
 ProtectHome=true
 
 [Install]

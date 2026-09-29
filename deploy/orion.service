@@ -21,6 +21,13 @@ Documentation=file:/opt/orion/deploy/README_HOSTINGER.md
 After=network-online.target
 Wants=network-online.target
 
+# Restart=always below, but a true crash loop must not hammer the box for
+# ever: five starts in five minutes and systemd gives up until someone looks.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# In [Unit], not [Service]: systemd ignores StartLimitIntervalSec in
+# [Service], which left crash loops restarting every RestartSec for ever.
+
 [Service]
 Type=simple
 User=orion
@@ -42,6 +49,9 @@ Environment=PYTHONUNBUFFERED=1
 # world-readable and ends up in support pastes.
 EnvironmentFile=-/opt/orion/config/orion.env
 
+# The writable directories below, made ("+": outside the sandbox) before it
+# is set up: systemd will not start a unit whose ReadWritePaths is missing.
+ExecStartPre=+/usr/bin/install -d -o orion -g orion /opt/orion/config /opt/orion/conversations /opt/orion/research /opt/orion/reports /opt/orion/exports /opt/orion/logs
 ExecStart=/opt/orion/.venv/bin/python /opt/orion/orion.py --headless
 
 # ── restarts ─────────────────────────────────────────────────────────────────
@@ -50,10 +60,6 @@ ExecStart=/opt/orion/.venv/bin/python /opt/orion/orion.py --headless
 # a genuine crash loop is visible in the journal rather than scrolling past.
 Restart=always
 RestartSec=10
-# ...but a true crash loop must not hammer the box for ever. Five starts in
-# five minutes and systemd gives up until someone looks.
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # ── resource limits ──────────────────────────────────────────────────────────
 # A VPS has no headroom to absorb a runaway. MemoryMax is a hard ceiling —
@@ -82,6 +88,9 @@ ReadWritePaths=/opt/orion/config
 ReadWritePaths=/opt/orion/research
 ReadWritePaths=/opt/orion/reports
 ReadWritePaths=/opt/orion/logs
+# Transcripts: without this every remote turn's history was silently lost.
+ReadWritePaths=/opt/orion/conversations
+ReadWritePaths=/opt/orion/exports
 
 [Install]
 WantedBy=multi-user.target

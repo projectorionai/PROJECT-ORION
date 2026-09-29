@@ -47,6 +47,15 @@ apt-get install -y -qq \
 # libasound2t64 is the Ubuntu 24.04 name; on Debian 12 it is libasound2.
 ok "packages installed"
 
+# The node is tested on $PYTHON_MIN and newer. Say so now, rather than let an
+# older interpreter fail later inside pip or at the first import.
+if ! python3 -c "import sys; want = tuple(map(int, '${PYTHON_MIN}'.split('.'))); sys.exit(sys.version_info[:2] < want)"; then
+  echo "This needs Python ${PYTHON_MIN}+; this system's python3 is $(python3 -V 2>&1)." >&2
+  echo "Use Ubuntu 24.04 / Debian 12 or newer, or install a newer python3 first." >&2
+  exit 1
+fi
+ok "python3 $(python3 -c 'import platform; print(platform.python_version())')"
+
 # ── 2. the orion user ────────────────────────────────────────────────────────
 say "Creating the service account"
 if id -u "$ORION_USER" >/dev/null 2>&1; then
@@ -79,7 +88,7 @@ ok "audio will initialise without hardware"
 
 # ── 4. the code ──────────────────────────────────────────────────────────────
 say "Preparing ${ORION_HOME}"
-mkdir -p "$ORION_HOME"/{config,research/dossiers,reports,logs}
+mkdir -p "$ORION_HOME"/{config,conversations,research/dossiers,reports,exports,logs}
 if [[ ! -f "$ORION_HOME/orion.py" ]]; then
   warn "No ORION source at ${ORION_HOME}."
   warn "Copy it up, then run this script again:"

@@ -28,6 +28,11 @@ Wants=network-online.target
 # the brain restarted, dropping live calls.
 After=orion.service
 
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# In [Unit], not [Service]: systemd ignores StartLimitIntervalSec in
+# [Service], which left crash loops restarting every RestartSec for ever.
+
 [Service]
 Type=simple
 User=orion
@@ -48,8 +53,6 @@ ExecStart=/opt/orion/.venv/bin/python -m orion_core.telephony_server
 
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # Smaller than the brain's: this holds audio buffers for live calls, not a
 # knowledge graph. If it needs a gigabyte something is wrong.
