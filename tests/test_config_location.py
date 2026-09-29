@@ -140,7 +140,6 @@ def test_it_refuses_while_orion_is_running(tmp_path, monkeypatch):
     assert not (app / move_config.CONFIG_POINTER_NAME).exists()
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="the probe runs cmd.exe")
 def test_a_real_move_verifies_then_points(tmp_path, monkeypatch):
     import sqlite3
 
@@ -172,6 +171,47 @@ def test_a_real_move_verifies_then_points(tmp_path, monkeypatch):
     # nothing deleted, ever
     assert (source / "real.db").exists()
     assert (source / "notes" / "a.txt").exists()
+
+
+def test_an_orion_started_from_source_counts_as_running(monkeypatch):
+    """The guard only looked for ORION.exe, so an ORION started with
+    `python orion.py` (or the headless node) let the copy run under a live
+    writer. It now asks ORION's own one-instance lock."""
+    import subprocess
+    import uuid
+
+    from orion_core import single_instance
+
+    # A lock name of this test's own: the real one is machine-wide, so a
+    # running ORION or a parallel test worker would otherwise share it.
+    tag = "-test-" + uuid.uuid4().hex[:12]
+    monkeypatch.setattr(single_instance, "MUTEX_NAME", single_instance.MUTEX_NAME + tag)
+    monkeypatch.setattr(single_instance, "SOCKET_NAME", single_instance.SOCKET_NAME + tag)
+    root = Path(__file__).resolve().parents[1]
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, time; sys.path.insert(0, sys.argv[1]);"
+         "from orion_core import single_instance as s;"
+         "s.MUTEX_NAME += sys.argv[2]; s.SOCKET_NAME += sys.argv[2];"
+         "c = s.claim(); print('held' if c.granted and c.handle is not None"
+         " else 'not held', flush=True); time.sleep(60)", str(root), tag],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        if holder.stdout.readline().strip() != "held":
+            pytest.skip("this platform offers no lock to hold")
+        monkeypatch.setitem(sys.modules, "psutil", None)     # no name check
+        assert move_config.orion_is_running() is True
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+    # Asking must not keep the lock: this process holds nothing afterwards.
+    assert single_instance.held() is None
+
+
+def test_the_visibility_probe_is_windows_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(move_config.os, "name", "posix")
+    assert move_config._visible_to_others(tmp_path) == ""
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_revert_removes_the_pointer_and_keeps_both_copies(tmp_path):

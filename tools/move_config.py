@@ -96,7 +96,35 @@ def looks_synced(path: Path) -> str:
     return ""
 
 
+def _single_instance():
+    """ORION's own one-instance lock module, or None if it cannot be loaded."""
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from orion_core import single_instance
+    except Exception:
+        return None
+    return single_instance
+
+
 def orion_is_running() -> bool:
+    """Whether an ORION is running, however it was started.
+
+    Asks ORION's own one-instance lock first. It is the same kernel object
+    ORION claims at start-up, so it also sees ``python orion.py``, the
+    headless node and a restart in progress, none of which is ORION.exe. The
+    process name is the fallback for when the lock cannot be consulted.
+    """
+    lock = _single_instance()
+    if lock is not None:
+        try:
+            if not lock.claim().granted:
+                return True
+        except Exception:
+            pass
+        finally:
+            lock.release()
     try:
         import psutil
     except Exception:
@@ -241,7 +269,12 @@ def _visible_to_others(destination: Path) -> str:
     Asks ``cmd.exe`` — a program with no stake in this interpreter's
     redirection — to count the files. If Python can see a copy that cmd
     cannot, the copy is in a sandbox and the whole move is an illusion.
+
+    Only Windows redirects a program's writes like this, and only Windows
+    has cmd.exe, so anywhere else there is nothing to probe.
     """
+    if os.name != "nt":
+        return ""
     probe = destination / ".orion-visibility-probe"
     try:
         probe.write_text("probe", encoding="utf-8")
