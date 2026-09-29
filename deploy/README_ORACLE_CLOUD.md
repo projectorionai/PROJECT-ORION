@@ -137,17 +137,20 @@ The PWA service worker and secure token entry require `https://`. Easiest is
 
 ## 7. Keeping it private & safe
 
-- The token is the only key — treat it like a password. Rotate it by deleting
-  `config/remote_token.txt` and restarting; re-enter the new one on the phone.
+- Each phone is paired once, with a one-time code, and gets its own revocable
+  credentials (stored hashed in `config/remote_devices.json`). To cut every
+  phone off, stop the node, delete `config/remote_devices.json` and
+  `config/remote_secret.key`, and start it again: it prints a fresh pairing
+  code. (The old static `config/remote_token.txt` is no longer accepted.)
 - Rate limiting (30 req/min per client) and hardening headers are built in.
 - Keep 8765 closed to the world; only 443 (Caddy) is public.
-- To share ORION with someone later, you'd add per-user tokens — noted as a
-  follow-up in the patch notes, not built yet (it stays single-user for now).
+- Pairing is per device, so a second phone can be paired too; approvals and
+  phone actions go to the phone that asked for them.
 
 ## 8. Optional: keep desktop and cloud in sync
 
 Point both nodes at the **same `config/` directory** (e.g. an rclone-synced
-volume or a small object-storage mount) and they share one memory + token.
+volume or a small object-storage mount) and they share one memory and one set of paired phones.
 Otherwise each node keeps its own memory and they diverge — which is fine if you
 just want a standalone pocket ORION.
 
@@ -158,5 +161,5 @@ On your PC you can dry-run the exact cloud node:
 ```powershell
 $env:ORION_HEADLESS = "1"
 python orion.py --headless
-# then open http://localhost:8765 and paste the token from config/remote_token.txt
+# then open http://localhost:8765 and enter the pairing code the console prints
 ```

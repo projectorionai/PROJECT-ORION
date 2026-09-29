@@ -56,6 +56,11 @@ systemctl start orion-telephony     # only if you want calls
 journalctl -u orion -f
 ```
 
+On first start, with no phone paired yet, the log shows a one-time code
+(`REMOTE: no paired devices yet — enter pairing code ABCD-1234 …`). Open the
+node's address on your phone and enter it within ten minutes; restart the
+service for a fresh one.
+
 ---
 
 ## Verification checklist
@@ -77,8 +82,8 @@ journalctl -u orion --no-pager | grep -i "qt.qpa\|xcb\|could not connect to disp
 #    Want: no output.
 
 # 3. The uplink answers — on loopback only.
-curl -s localhost:8765/health
-curl -s --max-time 5 http://YOUR_VPS_IP:8765/health
+curl -s localhost:8765/api/health
+curl -s --max-time 5 http://YOUR_VPS_IP:8765/api/health
 #    Want: the first answers, the SECOND times out. If the second answers,
 #    ORION is listening on a public interface; check ORION_REMOTE_HOST.
 
@@ -86,18 +91,17 @@ curl -s --max-time 5 http://YOUR_VPS_IP:8765/health
 curl -sI https://orion.yourdomain.com | head -3
 ```
 
-### The boot roll-call
+### The boot lines
 
 ```bash
-journalctl -u orion --no-pager | grep '^\[Tools\]' | tail -3
-#    Want: "Tool discovery complete: N active." with N around 140.
-journalctl -u orion --no-pager | grep '^\[Plugins\]'
-#    Want: "Plugin discovery complete: N active, 0 rejected".
-#    A non-zero rejected count names a plugin that failed its audit.
-journalctl -u orion --no-pager | grep '^\[Audio\]'
-#    Want: a line naming the host API. On a VPS this is the null device,
-#    which is correct — it means the audio threads initialised.
+journalctl -u orion --no-pager | grep 'SERVER:\|REMOTE: uplink'
+#    Want: "REMOTE: uplink active on 127.0.0.1:8765" and
+#    "SERVER: headless node ready — awaiting remote turns."
 ```
+
+The headless node is the brain and the phone uplink only. The tool, plugin
+and audio roll-call (`[Tools]`, `[Plugins]`, `[Audio]` lines) is printed by the
+desktop app, not by this service.
 
 ### Audio decoupling (desktop only — the VPS has no face)
 
@@ -123,7 +127,7 @@ p.stop_pipeline()"
 #    start — check ORION_FACE_THREAD.
 ```
 
-### Scheduled plugins
+### Scheduled plugins (desktop only: the headless node runs no plugins)
 
 ```bash
 # Cron arithmetic, the vault and the supervisor:
