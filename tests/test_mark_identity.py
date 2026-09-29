@@ -93,6 +93,14 @@ def _code_strings(path: Path) -> list[tuple[int, str]]:
     return out
 
 
+
+def test_the_launcher_banner_names_no_mark():
+    """orion.py's banner said Mark XXV for seven marks. It names none now and
+    points at APP_MARK; this keeps a copy from creeping back in."""
+    root = Path(__file__).resolve().parents[1]
+    banner = (root / "orion.py").read_text(encoding="utf-8").split('"""')[1]
+    assert not re.search(r"Mark [XVI]{2,}", banner), banner
+
 def test_no_ui_caption_hard_codes_a_mark():
     """The regression that made this file necessary.
 

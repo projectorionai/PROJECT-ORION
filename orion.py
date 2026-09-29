@@ -1,14 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  O.R.I.O.N.  Mark XXV  —  Open Resolution Intelligence Overt Network         ║
+║  O.R.I.O.N.  —  Open Resolution Intelligence Overt Network                   ║
 ║  Launcher  |  python orion.py  |  Windows / Linux                            ║
 ║                                                                              ║
 ║  The Mark X architecture lives in the orion_core/ package:                   ║
-║  modular services and managers (audio, vision, agents, memory, providers,   ║
-║  Outlook, Notion, briefing, dual-window GUI).  This file is intentionally   ║
-║  a thin shim so `python orion.py` keeps working exactly as it always has.   ║
+║  modular services and managers (audio, vision, agents, memory, providers,    ║
+║  Outlook, Notion, briefing, dual-window GUI).  This file is intentionally    ║
+║  a thin shim so `python orion.py` keeps working exactly as it always has.    ║
 ║                                                                              ║
-║  Current capabilities: docs/CAPABILITIES_2026-09-18.md                        ║
+║  The current mark: APP_MARK in orion_core/constants.py.                      ║
+║  Current capabilities: docs/CAPABILITIES_2026-09-18.md                       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
