@@ -42,6 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from orion_core import telephony_direct as direct   # noqa: E402
+from orion_core.telephony import normalise_number   # noqa: E402
 
 
 def _verify(credentials: direct.Credentials) -> tuple[bool, str]:
@@ -85,6 +86,10 @@ def _owns_the_number(credentials: direct.Credentials) -> tuple[bool, str]:
     try:
         response = httpx.get(url, timeout=direct.TIMEOUT_SECONDS,
                              auth=(credentials.username, credentials.password))
+        if response.status_code != 200:
+            # An error body has no number list; read as one it said "this
+            # account has no phone numbers yet" and refused good credentials.
+            return True, f"could not list your numbers (Twilio answered {response.status_code})"
         numbers = [str(n.get("phone_number", ""))
                    for n in response.json().get("incoming_phone_numbers", [])]
     except Exception as exc:
@@ -148,8 +153,12 @@ def setup(sid: str, token: str, number: str) -> int:
         print(f"\n  {sid[:4]}... does not look like an Account SID — those "
               "start with AC.\n  Nothing was written.")
         return 1
-    if not number.startswith("+"):
-        print(f"\n  {number} needs to be in international form, like "
+    typed = number
+    # Twilio lists and dials E.164 only: "+44 7700 900123" as typed would
+    # never match "+447700900123" on the account, and would be saved as is.
+    number = normalise_number(number) if number.startswith("+") else ""
+    if not number:
+        print(f"\n  {typed} needs to be in international form, like "
               "+441234567890.\n  Nothing was written.")
         return 1
 
