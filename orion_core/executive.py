@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .bus import OrionBus
@@ -51,8 +51,12 @@ class ExecutiveAssistantMode:
         router: Any | None = None,
         graph: Any | None = None,
         telemetry: Any | None = None,
+        outlook: Any | None = None,
     ) -> None:
         self.bus = bus
+        self.outlook = outlook
+        #: The slots last proposed by find_time, for "book option 2".
+        self._proposals: list[tuple[Any, str]] = []
         self.memory = memory
         self.cognition = cognition
         self.reminders = reminders
@@ -180,6 +184,111 @@ class ExecutiveAssistantMode:
         return ToolResult(f"Scheduled '{title}'" + (f" for {when}" if when else "")
                           + " — " + ", ".join(outcomes) + ".")
 
+    # ── finding time (conflict-aware scheduling, §2.4) ────────────────────────
+
+    async def find_time(self, minutes: int = 60, days: int = 7, title: str = "",
+                        deadline: str = "", hours: str = "",
+                        weekends: bool = False) -> ToolResult:
+        """Propose free slots across every calendar ORION can read.
+
+        Never books: the slots are offered, and only "book option N" schedules
+        one (brief §2.4 keeps this confirm-tier). Calendars that could not be
+        read are named, because "you are free" from a calendar that was never
+        consulted is the one wrong answer here that costs a double-booking.
+        """
+        from .calendar_sources import configured_feeds, describe_feed, parse_ics, read_feed
+        from .scheduling import DEFAULT_WORK_HOURS, DEFAULT_WORKDAYS, find_slots
+        from .time_service import TIME
+
+        try:
+            minutes = max(15, min(8 * 60, int(float(minutes or 60))))
+            days = max(1, min(31, int(float(days or 7))))
+        except (TypeError, ValueError):
+            return ToolResult("How long do you need, in minutes?", ok=False)
+        now = TIME.now()
+        zone = now.tzinfo
+        window_end = now + timedelta(days=days)
+        work_hours = _parse_hours(hours) or DEFAULT_WORK_HOURS
+        workdays = frozenset(range(7)) if weekends else DEFAULT_WORKDAYS
+        hard_deadline = _parse_deadline(deadline, zone)
+        if deadline.strip() and hard_deadline is None:
+            # A misread deadline proposes slots after it — ask instead.
+            return ToolResult(f"I couldn't read the deadline '{deadline}'. "
+                              "Give it as a date, like 2026-10-09.", ok=False)
+
+        busy: list[Any] = []
+        consulted: list[str] = []
+        unread: list[str] = []
+        for feed in configured_feeds():
+            name = describe_feed(feed)
+            try:
+                text = await asyncio.to_thread(read_feed, feed)
+                blocks = parse_ics(text, now, window_end, zone, source=name)
+                busy.extend(blocks)
+                consulted.append(f"{name} ({len(blocks)} busy)")
+            except Exception as exc:
+                unread.append(f"{name}: {first_line(exc, 80)}")
+        for label, service in (("Outlook", self.outlook), ("Notion", self.notion)):
+            if service is None or not getattr(service, "available", False):
+                continue
+            try:
+                result = await service.busy_blocks(now, window_end, zone)
+            except Exception as exc:
+                unread.append(f"{label}: {first_line(exc, 80)}")
+                continue
+            if result.ok:
+                blocks = [item["block"] for item in (result.evidence or [])]
+                busy.extend(blocks)
+                consulted.append(f"{label} ({len(blocks)} busy)")
+            else:
+                unread.append(f"{label}: {first_line(result.text, 80)}")
+
+        slots = find_slots([(b.start, b.end) for b in busy], now, window_end,
+                           timedelta(minutes=minutes), work_hours=work_hours,
+                           workdays=workdays, deadline=hard_deadline, limit=3)
+        label = title.strip() or "that"
+        self._proposals = [(slot, title.strip()) for slot in slots]
+        span = (f"before {hard_deadline:%a %d %b}" if hard_deadline
+                else f"in the next {days} day(s)")
+        if not slots:
+            lines = [f"I can't find {minutes} free minutes for {label} {span} "
+                     f"within {work_hours[0]:02d}:00–{work_hours[1]:02d}:00."]
+        else:
+            lines = [f"Free {minutes}-minute slots for {label} {span}:"]
+            for number, slot in enumerate(slots, 1):
+                lines.append(f"{number}. {slot.start:%a %d %b, %H:%M}–{slot.end:%H:%M}")
+        if consulted:
+            lines.append("Checked: " + ", ".join(consulted) + ".")
+        else:
+            lines.append("No calendar could be read, so these are free by working "
+                         "hours alone — add an ICS feed to config/calendars.json, or "
+                         "open Outlook, for real availability.")
+        if unread:
+            lines.append("Not checked: " + "; ".join(unread) + ".")
+        if slots:
+            lines.append("Nothing is booked — say 'book option 1' (or 2, 3) to schedule one.")
+        return ToolResult("\n".join(lines), evidence=[
+            {"start": s.start.isoformat(), "end": s.end.isoformat()} for s in slots])
+
+    async def book_slot(self, option: int = 1, title: str = "") -> ToolResult:
+        """Schedule one of the slots find_time last proposed."""
+        if not self._proposals:
+            return ToolResult("There are no proposed slots — ask me to find time first.",
+                              ok=False)
+        try:
+            index = int(option or 1) - 1
+        except (TypeError, ValueError):
+            index = -1
+        if not 0 <= index < len(self._proposals):
+            return ToolResult(f"Choose option 1 to {len(self._proposals)}.", ok=False)
+        slot, proposed_title = self._proposals[index]
+        name = title.strip() or proposed_title or "Focus time"
+        result = await self.schedule(name, slot.start.strftime("%Y-%m-%d %H:%M"),
+                                     f"Until {slot.end:%H:%M}.")
+        if result.ok:
+            self._proposals = []
+        return result
+
     # ── meeting summaries ─────────────────────────────────────────────────────
 
     async def summarise_meeting(self, transcript: str, title: str = "") -> ToolResult:
@@ -280,3 +389,36 @@ class ExecutiveAssistantMode:
             lines.append("- Workflows in flight: "
                          + "; ".join(list(workflows)[:5]))
         return ToolResult("\n".join(lines))
+
+
+def _parse_hours(text: str) -> tuple[int, int] | None:
+    """'8-17', '08:00–17:30' or '9 to 6pm' → (start_hour, end_hour)."""
+    numbers = re.findall(r"(\d{1,2})(?::\d{2})?\s*(am|pm)?", str(text or "").lower())
+    if len(numbers) < 2:
+        return None
+    hours = []
+    for value, meridiem in numbers[:2]:
+        hour = int(value) % 24
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        hours.append(hour)
+    start, end = hours
+    if end <= start and end + 12 <= 24 and end + 12 > start:
+        end += 12                               # "9 to 6" means 09:00–18:00
+    return (start, end) if 0 <= start < end <= 24 else None
+
+
+def _parse_deadline(text: str, zone: Any) -> datetime | None:
+    """An ISO date or date-time; a bare date means the end of that day."""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=zone)
+    if len(text) <= 10:
+        moment = moment.replace(hour=23, minute=59)
+    return moment

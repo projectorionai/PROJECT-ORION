@@ -335,11 +335,12 @@ class RemoteToolGate:
     """
 
     def __init__(self, dispatcher: Any, confirmations: RemoteConfirmationRegistry,
-                 *, notify: Any = None, log: Any = None) -> None:
+                 *, notify: Any = None, log: Any = None, audit: Any = None) -> None:
         self.dispatcher = dispatcher
         self.confirmations = confirmations
         self._notify = notify                     # async callable(device_id, conf)
         self._log = log or (lambda _m: None)
+        self._audit_log = audit                   # RemoteAuditLog, optional
         # The device the current turn belongs to (set per-request by the
         # gateway so a gated LocalBrain's tool calls attribute correctly).
         self.current_device: str = ""
@@ -368,9 +369,18 @@ class RemoteToolGate:
         tier = classify(name, args)
         if tier is Tier.FORBID:
             self._log(f"REMOTE: refused desktop-only tool '{name}'")
+            self._audit(device, name, "refused", args)
             return ToolResult(
                 "That's a desktop-only capability — for safety I won't run "
                 "it from a remote session.", ok=False)
+        # A dispatcher that knows it cannot run this tool at all (a headless
+        # node has no apps or mail to act on) answers for itself: parking a
+        # confirmation would ask the phone to approve something that then
+        # cannot happen.
+        can_run = getattr(self.dispatcher, "can_run", None)
+        if callable(can_run) and not can_run(name):
+            self._audit(device, name, "unavailable here", args)
+            return await self.dispatcher.dispatch(name, args)
         if tier is Tier.CONFIRM:
             summary = describe_action(name, args)
             conf = self.confirmations.create(name, args, device or "", summary)
@@ -380,13 +390,24 @@ class RemoteToolGate:
                 except Exception:
                     pass
             self._log(f"REMOTE: confirm-gated '{name}' → {conf.id}")
+            self._audit(device, name, "parked for approval", args)
             return ToolResult(
                 f"That would {summary}. I've sent it to your phone to "
                 "approve — tap to confirm and I'll carry on.",
                 ok=True, media={"confirm": conf.public()})
         if self.dispatcher is None:
             return ToolResult("No dispatcher is wired on this node.", ok=False)
-        return await self.dispatcher.dispatch(name, args)
+        result = await self.dispatcher.dispatch(name, args)
+        ok = bool(getattr(result, "ok", True))
+        self._audit(device, name, "ran" if ok else "failed", args,
+                    "" if ok else str(getattr(result, "text", "") or ""))
+        return result
+
+    def _audit(self, device: str | None, tool: str, status: str,
+               args: dict[str, Any] | None, detail: str = "") -> None:
+        if self._audit_log is not None:
+            self._audit_log.record("tool", device=device or "", tool=tool,
+                                   status=status, detail=detail, args=args)
 
     async def run_approved(self, conf: PendingConfirmation) -> ToolResult:
         """Run a confirmation the user has approved on the phone."""

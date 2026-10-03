@@ -179,7 +179,16 @@ class FilesDispatchMixin:
 
     def file_controller(self, args: dict[str, Any]) -> ToolResult:
         action = str(args.get("action") or "list").lower().strip()
-        path   = self._resolve_user_path(str(args.get("path") or args.get("directory") or BASE_DIR))
+        explicit = str(args.get("path") or args.get("directory") or "").strip()
+        # The project root is a sensible default to LIST or SEARCH, never a
+        # target to write, append, create or delete: with no path those
+        # actions resolved to the root itself and failed with "Is a directory"
+        # (or, for delete, were refused only because the root is not empty).
+        if not explicit and action in {
+                "write_text", "append_text", "delete", "remove", "mkdir",
+                "create_dir", "structure_build", "build_structure"}:
+            return ToolResult(f"file_controller {action} needs a path.", ok=False)
+        path   = self._resolve_user_path(explicit or str(BASE_DIR))
         if action in {"search_codebase", "search", "grep"}:
             query = SecuritySanitiser.guard_text(
                 str(args.get("query") or args.get("text") or ""), "file_controller.query"

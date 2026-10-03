@@ -68,7 +68,7 @@ from .remote_capability import (
 from .remote_endpoints import detect_endpoints
 from .security import SecuritySanitiser, SecurityViolation
 from .utils import utc_stamp
-from .atomic_io import atomic_write_text
+from .atomic_io import atomic_write_bytes, atomic_write_text
 
 # ── installable PWA shell ─────────────────────────────────────────────────────
 #
@@ -549,22 +549,34 @@ class RemoteAuthManager:
         self._secret = self._load_secret()
         self._pairings: dict[str, float] = {}      # sha256(code) → expiry epoch
         self._devices = self._load_devices()
+        #: Optional RemoteAuditLog; the gateway attaches its own.
+        self.audit: Any = None
+
+    def _audit(self, event: str, **fields: Any) -> None:
+        if self.audit is not None:
+            self.audit.record(event, **fields)
 
     # ── secret + device registry persistence ─────────────────────────────────
 
     def _load_secret(self) -> bytes:
+        # This key signs every access token: whoever can read it can mint one
+        # for any paired device. It was written with the process umask, so on
+        # a headless Linux node it sat world-readable (0644) beside 0600
+        # siblings. New keys are written owner-only; an old one is tightened.
         secret_path = self.config_dir / "remote_secret.key"
         try:
             if secret_path.exists():
                 existing = secret_path.read_text(encoding="utf-8").strip()
                 if len(existing) >= 32:
-                    return bytes.fromhex(existing)
+                    secret = bytes.fromhex(existing)
+                    _owner_only(secret_path)
+                    return secret
         except Exception:
             pass
         secret = secrets.token_bytes(32)
         try:
             self.config_dir.mkdir(parents=True, exist_ok=True)
-            secret_path.write_text(secret.hex(), encoding="utf-8")
+            atomic_write_text(secret_path, secret.hex(), encoding="utf-8")
         except Exception:
             pass
         return secret
@@ -617,6 +629,7 @@ class RemoteAuthManager:
             if hmac.compare_digest(supplied, stored) and expiry > now:
                 matched = stored
         if not matched:
+            self._audit("pair_failed", status="refused")
             return None
         del self._pairings[matched]                 # single-use
         device_id = uuid.uuid4().hex
@@ -629,6 +642,8 @@ class RemoteAuthManager:
         }
         self._save_devices()
         self._log(f"REMOTE: paired device '{self._devices[device_id]['name']}' ({device_id[:8]}…)")
+        self._audit("paired", device=device_id, status="ok",
+                    detail=self._devices[device_id]["name"])
         return device_id, refresh_token
 
     # ── access tokens ─────────────────────────────────────────────────────────
@@ -637,9 +652,12 @@ class RemoteAuthManager:
         """Refresh → (access_token, expires_in_s), or None when unauthorised."""
         device = self._devices.get(str(device_id or ""))
         if not device or device.get("revoked"):
+            self._audit("token_refused", device=str(device_id or ""),
+                        status="revoked" if device else "unknown device")
             return None
         expected = str(device.get("refresh_sha256") or "")
         if not hmac.compare_digest(self._hash(str(refresh_token or "")), expected):
+            self._audit("token_refused", device=str(device_id or ""), status="bad token")
             return None
         payload = f"{device_id}:{int(time.time()) + self.ACCESS_TTL_S}"
         encoded = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
@@ -689,6 +707,7 @@ class RemoteAuthManager:
         device["revoked"] = True
         self._save_devices()
         self._log(f"REMOTE: device {device_id[:8]}… revoked.")
+        self._audit("revoked", device=device_id, status="ok")
         return True
 
 
@@ -738,13 +757,21 @@ class RemoteAgentQueue:
     writes or mail sending even by asking for them by name.
     """
 
-    def __init__(self, dispatcher: Any = None, log: Any = None) -> None:
+    def __init__(self, dispatcher: Any = None, log: Any = None, audit: Any = None) -> None:
         self.dispatcher = dispatcher
         self._log = log or (lambda _msg: None)
+        self.audit = audit
         self.tasks: deque[dict[str, Any]] = deque(maxlen=50)
         self._owners: dict[str, str] = {}
 
-    def _remember(self, task: dict[str, Any], device_id: str) -> None:
+    def _remember(self, task: dict[str, Any], device_id: str,
+                  args: dict[str, Any] | None = None) -> None:
+        if self.audit is not None:
+            self.audit.record("agent_task", device=device_id, tool=task.get("tool", ""),
+                              status=task.get("status", ""),
+                              detail=task.get("error", "") or ("" if task.get("ok", True)
+                                                               else "tool reported failure"),
+                              args=args)
         self.tasks.append(task)
         self._owners[task["id"]] = device_id
         self._owners = {item["id"]: self._owners[item["id"]]
@@ -765,17 +792,17 @@ class RemoteAgentQueue:
         if tool in REMOTE_HARD_DENY:
             task.update(status="denied",
                         error="this capability is desktop-only and cannot run remotely")
-            self._remember(task, device_id)
+            self._remember(task, device_id, args)
             self._log(f"REMOTE: hard-denied remote tool request '{tool}'")
             return task
         if tool not in REMOTE_TOOL_WHITELIST:
             task.update(status="denied",
                         error="tool is not on the remote capability whitelist")
-            self._remember(task, device_id)
+            self._remember(task, device_id, args)
             return task
         if self.dispatcher is None:
             task.update(status="unavailable", error="no dispatcher wired on this node")
-            self._remember(task, device_id)
+            self._remember(task, device_id, args)
             return task
         try:
             result = await self.dispatcher.dispatch(tool, dict(args or {}))
@@ -784,7 +811,7 @@ class RemoteAgentQueue:
             task.update(status="denied", error=str(exc))
         except Exception as exc:
             task.update(status="failed", error=str(exc).splitlines()[0][:200])
-        self._remember(task, device_id)
+        self._remember(task, device_id, args)
         return task
 
     def get(self, task_id: str, device_id: str) -> Optional[dict[str, Any]]:
@@ -808,6 +835,26 @@ _LITE_ORB = (
     '</div><style>@keyframes orionlite{0%,100%{transform:scale(.94);opacity:.85}'
     '50%{transform:scale(1.02);opacity:1}}</style></div>'
 )
+
+
+def _trusted_proxies() -> frozenset[str]:
+    """Peers whose X-Forwarded-For is believed: loopback (a proxy on this
+    machine) plus any listed in ORION_TRUSTED_PROXIES (comma-separated)."""
+    extra = os.getenv("ORION_TRUSTED_PROXIES", "")
+    return frozenset({"127.0.0.1", "::1"} | {
+        item.strip() for item in extra.split(",") if item.strip()})
+
+
+def _owner_only(path: Path) -> None:
+    """Restrict *path* to its owner (0600) where POSIX permissions mean
+    anything. Best effort: a failure leaves the file as it was."""
+    if os.name != "posix":
+        return
+    try:
+        if path.stat().st_mode & 0o077:
+            path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def _on_windows() -> bool:
@@ -903,7 +950,12 @@ class RemoteGateway:
         self.host   = os.getenv("ORION_REMOTE_HOST", "0.0.0.0").strip() or "0.0.0.0"
         self.port   = int(os.getenv("ORION_REMOTE_PORT", "8765") or 8765)
         self.auth   = RemoteAuthManager(config_dir=config_dir, log=bus.log.emit)
-        self.agent_queue = RemoteAgentQueue(dispatcher=dispatcher, log=bus.log.emit)
+        # C4: who asked for what, and how it went — durable, unlike the log.
+        from .remote_audit import RemoteAuditLog
+        self.audit = RemoteAuditLog(self.auth.config_dir / "diagnostics" / "remote_audit.jsonl")
+        self.auth.audit = self.audit
+        self.agent_queue = RemoteAgentQueue(dispatcher=dispatcher, log=bus.log.emit,
+                                            audit=self.audit)
         # ── Full-parity remote (#12): a capability gate + on-phone confirmation.
         # Remote tool calls run through ``tool_gate`` — read/benign run at once,
         # irreversible/outward actions park as a confirmation pushed to the phone
@@ -911,7 +963,7 @@ class RemoteGateway:
         self.confirmations = RemoteConfirmationRegistry()
         self.tool_gate = RemoteToolGate(
             dispatcher, self.confirmations,
-            notify=self._push_confirm, log=bus.log.emit)
+            notify=self._push_confirm, log=bus.log.emit, audit=self.audit)
         # Give the conversational path a GATED brain so a spoken command on the
         # move actually executes (through the gate), and — crucially — so the
         # offline fallback can no longer reach the dispatcher ungated.
@@ -1108,11 +1160,14 @@ class RemoteGateway:
                         .add_extension(sans, critical=False)
                         .sign(key, hashes.SHA256()))
                 tls_dir.mkdir(parents=True, exist_ok=True)
-                key_path.write_bytes(key.private_bytes(
+                # Owner-only, like the token secret: anyone who can read the
+                # private key can impersonate the uplink to a pinned phone.
+                atomic_write_bytes(key_path, key.private_bytes(
                     serialization.Encoding.PEM,
                     serialization.PrivateFormat.PKCS8,
                     serialization.NoEncryption()))
                 cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+            _owner_only(key_path)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(str(cert_path), str(key_path))
             return context
@@ -1316,9 +1371,20 @@ class RemoteGateway:
 
     def _client_key(self, request: Any) -> str:
         # A direct client controls X-Forwarded-For; it cannot define its own
-        # rate-limit bucket. Use the authenticated socket peer instead.
-        peer = request.remote or "unknown"
-        return str(peer)
+        # rate-limit bucket, so the socket peer is the key. The exception is a
+        # reverse proxy on this machine (the deploy/ Caddy and Tailscale serve
+        # both connect from loopback): behind one, every phone arrived as
+        # 127.0.0.1 and shared ONE bucket, so ten bad pairing attempts from
+        # anywhere locked the owner out of /v1/auth/token for a minute. Only
+        # then is the forwarded address used — the right-most entry, the one
+        # our own proxy appended, not whatever the client claimed before it.
+        peer = str(request.remote or "unknown")
+        if peer in _trusted_proxies():
+            forwarded = str(request.headers.get("X-Forwarded-For") or "")
+            hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+            if hops:
+                return hops[-1][:64]
+        return peer
 
     def _rate_ok(self, key: str) -> bool:
         now = time.time()
@@ -1891,6 +1957,8 @@ class RemoteGateway:
             return self._web.json_response(
                 {"ok": False, "error": "no such pending action, or it expired"}, status=409)
         if not approve:
+            self.audit.record("confirm", device=device_id, tool=conf.tool,
+                              status="denied", args=conf.args)
             self._push_device_event(device_id, {"type": "confirm_result", "id": conf_id, "status": "denied"})
             return self._web.json_response({"ok": True, "status": "denied"})
         self.bus.log.emit(f"REMOTE: approved '{conf.tool}' from {device_id[:8]}")
@@ -1901,6 +1969,9 @@ class RemoteGateway:
                 {"ok": False, "error": str(exc).splitlines()[0][:200]}, status=502)
         text = (getattr(result, "text", "") or "Done.").splitlines()[0][:400]
         ok = bool(getattr(result, "ok", True))
+        self.audit.record("confirm", device=device_id, tool=conf.tool,
+                          status="approved" if ok else "approved, failed",
+                          detail="" if ok else text, args=conf.args)
         self._push_device_event(device_id, {"type": "confirm_result", "id": conf_id,
                           "status": "done", "ok": ok, "reply": text})
         return self._web.json_response({"ok": ok, "status": "done", "reply": text})

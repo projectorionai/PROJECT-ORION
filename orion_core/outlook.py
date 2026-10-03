@@ -133,6 +133,23 @@ class OutlookService:
             self._note_state("DISCONNECTED", first_line(exc))
             return ToolResult(f"Outlook operation failed: {first_line(exc)}", ok=False)
 
+    # ── calendar ──────────────────────────────────────────────────────────────
+
+    async def busy_blocks(self, window_start: Any, window_end: Any, zone: Any) -> ToolResult:
+        """Busy blocks from the default calendar (evidence), recurrences expanded.
+
+        Attach-only: finding free time is not a reason to start Outlook."""
+        if not self.available:
+            return self._unavailable()
+        from .calendar_sources import outlook_busy
+
+        def _read(_outlook: Any, namespace: Any) -> ToolResult:
+            blocks = outlook_busy(namespace, window_start, window_end, zone)
+            return ToolResult(f"{len(blocks)} busy block(s) in Outlook.",
+                              evidence=[{"block": b} for b in blocks])
+
+        return await self._run_com(_read, launch=False)
+
     # ── reading ───────────────────────────────────────────────────────────────
 
     async def read_inbox(

@@ -8,7 +8,7 @@ is acting — without the large sci-fi "scope" marker of earlier builds.
 
 The pointer:
     • follows the physical cursor via a lightweight poll (ctypes GetCursorPos
-      on Windows, pyautogui elsewhere), so it tracks ORION and you alike;
+      on Windows, Qt's cursor elsewhere), so it tracks ORION and you alike;
     • **flares** subtly (a small soft ring at the tip) whenever ORION performs a
       control action (``bus.control_activity``), so autonomous moves stand out
       without dominating the screen;
@@ -194,10 +194,15 @@ class CursorOverlay(QWidget):
                 return (_CURSOR_PT.x, _CURSOR_PT.y)
             except Exception:
                 pass
+        # Off Windows (or with user32 unavailable) Qt's own position is the
+        # right answer: logical pixels, as move() takes. This used to go
+        # straight to pyautogui, and where it is not installed a failed import
+        # is not cached, so every tick re-ran the import machinery — 95 us a
+        # call, 33 times a second, on the thread that draws the face.
         try:
-            import pyautogui
-            pos = pyautogui.position()
-            return (int(pos.x), int(pos.y))
+            from PyQt6.QtGui import QCursor
+            pos = QCursor.pos()
+            return (pos.x(), pos.y())
         except Exception:
             return (0, 0)
 

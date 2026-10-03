@@ -323,6 +323,39 @@ class NotionService:
         except Exception as exc:
             return ToolResult(f"Notion calendar query failed: {first_line(exc)}", ok=False)
 
+    async def busy_blocks(self, window_start: datetime, window_end: datetime,
+                          zone: Any) -> ToolResult:
+        """Timed entries in the calendar database as busy blocks (evidence).
+
+        Date-only entries are deadlines or all-day markers and do not block
+        time; see calendar_sources.notion_busy."""
+        if not self.available:
+            return self._unavailable()
+        database_id = self.calendar_db or self.tasks_db
+        if not database_id:
+            return ToolResult("No Notion calendar or tasks database is configured.", ok=False)
+        from .calendar_sources import notion_busy
+        try:
+            schema = await self._database_schema(database_id)
+            if not schema["date"]:
+                return ToolResult("The configured database has no date property.", ok=False)
+            payload: dict[str, Any] = {
+                "page_size": 100,
+                "filter": {"and": [
+                    {"property": schema["date"],
+                     "date": {"on_or_after": (window_start.date() - timedelta(days=1)).isoformat()}},
+                    {"property": schema["date"],
+                     "date": {"on_or_before": window_end.date().isoformat()}},
+                ]},
+            }
+            data = await self._request("POST", f"/databases/{database_id}/query", payload)
+            blocks = notion_busy(data.get("results") or [], schema["date"], schema["title"],
+                                 window_start, window_end, zone)
+            return ToolResult(f"{len(blocks)} busy block(s) in Notion.",
+                              evidence=[{"block": b} for b in blocks])
+        except Exception as exc:
+            return ToolResult(f"Notion calendar query failed: {first_line(exc)}", ok=False)
+
     async def create_event(self, title: str, start: str, end: str = "") -> ToolResult:
         """Schedule an entry in the calendar database (or dated task fallback)."""
         if not self.available:

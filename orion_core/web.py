@@ -233,10 +233,20 @@ class WebController:
         filename field, so typing a path then Enter selects it.
         """
         try:
-            path = SecuritySanitiser.guard_text(str(path), "web.file_dialog")
+            path = SecuritySanitiser.guard_text(str(path), "web.file_dialog").strip()
         except SecurityViolation as exc:
             return ToolResult(str(exc), ok=False)
+        if not path:
+            return ToolResult("Which file should I give the dialog?", ok=False)
         dialogs = await self.vision.detect_dialogs()
+        # Typing goes to whatever has focus, and Enter submits it. With no
+        # dialog open that was a chat box, a search field or a form — the path
+        # was typed and sent there ("Submitted … No open dialogs or pop-ups
+        # detected."). Only type into a dialog that is actually there.
+        if dialogs.text.startswith("No open dialogs"):
+            return ToolResult(
+                "I don't see a file dialog open, so I haven't typed anything — "
+                "open the upload or save dialog first.", ok=False)
         self.control.type_text(path)
         await asyncio.sleep(0.15)
         self.control.send_hotkeys("enter")
@@ -372,7 +382,9 @@ class WebController:
 
     def _normalise(self, url: str) -> str:
         url = SecuritySanitiser.guard_text(str(url or "").strip(), "web.url")
-        if not url:
+        if not url or url.lower() == "about:blank":
+            # Checked before the https:// prefix below, which turned
+            # "about:blank" into the unloadable "https://about:blank".
             return "about:blank"
         # Local file paths & file:// URLs — ORION can browse the filesystem in
         # the browser (folder listings and local files), not just the web.  The

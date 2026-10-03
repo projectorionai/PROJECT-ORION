@@ -7,7 +7,7 @@ mobile data. It builds only the portable, non-GUI half of ORION:
 
     OrionBus (a QObject) → Telemetry → Memory → Identity → Connectivity →
     Ollama → ProviderRouter → ConversationMemory → knowledge seeds → LearningService
-    → RemoteGateway (installable PWA + JSON API)
+    → HeadlessToolHost → RemoteGateway (installable PWA + JSON API)
 
 No windows, no audio capture, no screen grabbing, no Windows COM — so it runs on
 a headless Ubuntu/Oracle-Linux box with nothing but Python, aiohttp, PyQt6-Core
@@ -16,10 +16,15 @@ unchanged; this is an additional entry point selected with ``--headless`` or
 ``ORION_HEADLESS=1``.
 
 Answers come from the language-model router (cloud API when reachable, local
-Ollama otherwise), grounded in ORION's frozen identity and memory. Teach it new
-facts remotely with the learning path; everything persists to the same SQLite
-memory the desktop uses, so a cloud node and a desktop node can share a config
-directory (or a synced volume) and stay in lock-step.
+Ollama otherwise), grounded in ORION's frozen identity and memory. With no
+model reachable the gated LocalBrain still answers from the seeded knowledge,
+and a paired phone can run the read-only remote tools through
+``HeadlessToolHost``. Teach it new facts remotely with the learning path.
+
+Knowledge moves between a desktop and a node as consistent snapshots
+(``deploy/sync_state.sh``), never through a shared or synced config directory:
+SQLite's locking does not hold over NFS/SSHFS or a sync client, and the failure
+is silent corruption rather than an error.
 """
 
 from __future__ import annotations
@@ -131,7 +136,23 @@ async def run_headless() -> None:
         bus.log.emit(f"SERVER: knowledge packs skipped - {exc}")
 
     # Remote teaching: POST future facts through the learning path if desired.
-    _learning = LearningService(bus, memory, router, telemetry)  # noqa: F841
+    learning = LearningService(bus, memory, router, telemetry)
+
+    # What a phone can run here: the read-only remote tools, served by the
+    # same handlers as the desktop. Built defensively — those handlers import
+    # PyQt6.QtWidgets, which needs libEGL; a bare host without it keeps the
+    # old behaviour (tools unavailable) instead of failing to start.
+    tool_host: Any = None
+    neuro: Any = None
+    try:
+        from .changelog import Changelog
+        from .headless_tools import HeadlessToolHost
+        tool_host = HeadlessToolHost(
+            bus, memory, router=router, telemetry=telemetry,
+            learning=learning, changelog=Changelog())
+        neuro = NeuroKnowledgeBase(telemetry)
+    except Exception as exc:
+        bus.log.emit(f"SERVER: remote tools unavailable on this node - {exc}")
 
     bus.log.emit(f"SERVER: {connectivity.mode()} at startup ({APP_NAME} headless node).")
 
@@ -140,6 +161,7 @@ async def run_headless() -> None:
     gateway = RemoteGateway(
         router, memory, bus,
         identity=identity, conversation=conversation, telemetry=telemetry,
+        dispatcher=tool_host, knowledge=neuro,
     )
     await gateway.start()
 
@@ -148,6 +170,21 @@ async def run_headless() -> None:
     # human noticing, so the weekly checkpoint/VACUUM sweep matters most here.
     housekeeper = DatabaseHousekeeper(bus)
     housekeeping_task = asyncio.create_task(housekeeper.run(), name="orion-housekeeping")
+    # The desktop also folds each WAL back into its database every few minutes
+    # and once more at shutdown (maintenance.checkpoint_all explains why that
+    # is a durability measure); the node only ever ran the weekly sweep.
+    checkpoint_task = asyncio.create_task(
+        housekeeper.run_checkpoints(), name="orion-wal-checkpoint")
+
+    # §4.2: an external heartbeat and scheduled backups, each opt-in by env.
+    from .node_watch import HealthPinger, ScheduledBackup
+    watchers = [w for w in (HealthPinger.from_env(bus), ScheduledBackup.from_env(bus))
+                if w is not None]
+    watcher_tasks = [asyncio.create_task(w.run(), name=f"orion-{type(w).__name__}")
+                     for w in watchers]
+    for watcher in watchers:
+        bus.log.emit(f"SERVER: {type(watcher).__name__} on "
+                     f"(every {watcher.interval / 60:.0f} min).")
 
     # Graceful shutdown on SIGINT/SIGTERM (POSIX) or KeyboardInterrupt (Windows).
     shutdown = asyncio.Event()
@@ -187,10 +224,11 @@ async def run_headless() -> None:
         bus.log.emit("SERVER: shutting down headless node.")
         connectivity.stop()
         housekeeper.stop()
-        connectivity_task.cancel()
-        history_task.cancel()
-        housekeeping_task.cancel()
-        for task in (connectivity_task, history_task, housekeeping_task):
+        for watcher in watchers:
+            watcher.stop()
+        for task in (connectivity_task, history_task, housekeeping_task,
+                     checkpoint_task, *watcher_tasks):
+            task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
@@ -198,6 +236,10 @@ async def run_headless() -> None:
             except Exception:
                 pass
         await gateway.stop()
+        try:
+            await asyncio.to_thread(housekeeper.checkpoint_all)
+        except Exception as exc:
+            bus.log.emit(f"SERVER: final WAL checkpoint skipped - {exc}")
         if telemetry.history is not None:
             telemetry.history.close()
         memory.close()

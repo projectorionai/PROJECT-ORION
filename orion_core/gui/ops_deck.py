@@ -326,6 +326,14 @@ class SecurityCentrePanel(QFrame):
         self.qr.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.qr.setMinimumHeight(10)
         layout.addWidget(self.qr)
+
+        # What paired phones have actually made ORION do (remote_audit.py):
+        # pairings, refusals, tools run, actions parked for and given approval.
+        self.activity = QListWidget()
+        self.activity.setMaximumHeight(120)
+        describe_control(self.activity, "Remote activity",
+                         "What paired devices asked ORION to do, newest first")
+        layout.addWidget(self.activity)
         self.refresh()
 
     def attach_gateway(self, gateway: Any) -> None:
@@ -354,6 +362,27 @@ class SecurityCentrePanel(QFrame):
                 self.devices.addItem("No paired devices yet.")
         except Exception as exc:
             self.devices.addItem(f"Device listing failed: {exc}")
+        self._refresh_activity()
+
+    def _refresh_activity(self) -> None:
+        self.activity.clear()
+        audit = getattr(self.gateway, "audit", None)
+        if audit is None:
+            return
+        try:
+            rows = audit.recent(20)
+        except Exception as exc:
+            self.activity.addItem(f"Remote activity unavailable: {exc}")
+            return
+        if not rows:
+            self.activity.addItem("No remote activity yet.")
+            return
+        for row in rows:
+            when = str(row.get("at", ""))[11:19]
+            what = row.get("tool") or row.get("event")
+            status = row.get("status") or row.get("event")
+            device = f"  {row['device']}…" if row.get("device") else ""
+            self.activity.addItem(f"{when}  {what}: {status}{device}")
 
     def _pair(self) -> None:
         if self.gateway is None:

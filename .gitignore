@@ -166,3 +166,7 @@ recursive_file_list.txt
 !config/custom_tools/emotional_insight_generator.plugin.json
 !config/custom_tools/self_repair_agent_tool.py
 !config/custom_tools/self_repair_agent.plugin.json
+
+# Local backups and restores: archives hold the config directory.
+backups/
+restore/

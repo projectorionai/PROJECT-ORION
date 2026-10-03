@@ -37,15 +37,15 @@ onnxruntime>=1.16,<2                     # runs the speaker-voiceprint encoder a
 tokenizers>=0.15,<1                      # semantic.py: the sentence encoder's tokenizer (meaning-based recall)
 # pytesseract            # alternative OCR (needs the Tesseract system binary)
 # Mark XXXI sight: exact window text, Windows' own OCR, game capture, cameras
-uiautomation>=2.0.20,<3                  # exact text from Notepad/Word/Edge/Chrome via UI Automation
-winrt-runtime>=3,<4                      # Windows.Media.Ocr — the most accurate local OCR here
-winrt-Windows.Media.Ocr>=3,<4            # the OCR engine itself (imported by name in ocr_engine.py)
-winrt-Windows.Graphics.Imaging>=3,<4     # SoftwareBitmap the OCR engine reads from
-winrt-Windows.Storage.Streams>=3,<4      # in-memory stream the frame is decoded through
-winrt-Windows.Globalization>=3,<4        # OCR language selection
-winrt-Windows.Foundation>=3,<4           # async operations every winrt call returns
-winrt-Windows.Foundation.Collections>=3,<4  # the OCR result's line/word collections
-dxcam>=0.0.5,<1                          # DXGI desktop duplication: reads full-screen games
+uiautomation>=2.0.20,<3; sys_platform == "win32" # exact text from Notepad/Word/Edge/Chrome via UI Automation
+winrt-runtime>=3,<4; sys_platform == "win32" # Windows.Media.Ocr — the most accurate local OCR here
+winrt-Windows.Media.Ocr>=3,<4; sys_platform == "win32" # the OCR engine itself (imported by name in ocr_engine.py)
+winrt-Windows.Graphics.Imaging>=3,<4; sys_platform == "win32" # SoftwareBitmap the OCR engine reads from
+winrt-Windows.Storage.Streams>=3,<4; sys_platform == "win32" # in-memory stream the frame is decoded through
+winrt-Windows.Globalization>=3,<4; sys_platform == "win32" # OCR language selection
+winrt-Windows.Foundation>=3,<4; sys_platform == "win32" # async operations every winrt call returns
+winrt-Windows.Foundation.Collections>=3,<4; sys_platform == "win32" # the OCR result's line/word collections
+dxcam>=0.0.5,<1; sys_platform == "win32"  # DXGI desktop duplication: reads full-screen games
 cv2_enumerate_cameras>=1.1,<2            # camera NAMES per backend, so a camera survives renumbering
 
 # Research
@@ -53,13 +53,15 @@ curl_cffi>=0.7,<1                        # Chrome-fingerprint retry for sites th
 
 # Documents / data-viz (installed)
 python-docx>=1.1,<2                      # DOCX report export
+qrcode>=7.4,<9                           # phone-pairing QR on the Security Centre (pure Python); without it only the code shows
 matplotlib>=3.7,<4                       # TEST FIXTURE ONLY — builds a real PDF for the
                          # flashcard reader test. ORION itself never imports it:
                          # reports.py renders charts as pure-Python inline SVG so
                          # visualisation works offline with no plotting library.
 
-# Windows integration
-pywin32                  # Outlook COM, window/DPI helpers (Windows only)
+# Windows integration. Windows-only packages carry a platform marker so the
+# same file still installs on Linux/macOS (where those features report MISSING).
+pywin32; sys_platform == "win32"          # Outlook COM, window/DPI helpers (Windows only)
 
 # Documents / files (optional but recommended)
 pypdf>=4,<7                              # PDF text extraction (literature vault, file scans)

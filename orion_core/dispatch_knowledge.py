@@ -1486,7 +1486,16 @@ class KnowledgeDispatchMixin:
             return ToolResult(tracker.render(tracker.detect(commit=False)))
         return ToolResult(tracker.render_latest())
 
-    def code_changes_tool(self, args: dict[str, Any]) -> ToolResult:
+    async def code_changes_tool(self, args: dict[str, Any]) -> ToolResult:
+        """What ORION actually CHANGED in himself — off the event loop.
+
+        Parsing every module takes 2.6–2.8 s (measured 2026-10-03). As a plain
+        handler it ran on the qasync loop, which is the GUI and voice thread:
+        asking "what did you change?" froze him for the length of the answer.
+        """
+        return await asyncio.to_thread(self._code_changes_sync, args)
+
+    def _code_changes_sync(self, args: dict[str, Any]) -> ToolResult:
         """What ORION actually CHANGED in himself, read from his own source.
 
         The third and most useful of the three "what's new?" answers:

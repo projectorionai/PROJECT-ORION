@@ -2514,6 +2514,14 @@ class OrionCoreWindow(QMainWindow):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                # A step taken after the event loop has stopped (the last turn
+                # of an exit) cannot sleep or reach a worker; recovering would
+                # only raise again and print a traceback after "ORION has
+                # shutdown cleanly". There is nothing left to sample for.
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    return
                 self.write_log(f"TEL: telemetry loop recovered - {exc}")
                 await asyncio.sleep(1.0)
 

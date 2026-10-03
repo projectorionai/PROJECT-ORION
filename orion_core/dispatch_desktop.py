@@ -17,7 +17,7 @@ import time
 import webbrowser
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote_plus, urlparse
 
 import psutil
@@ -909,6 +909,13 @@ class DesktopDispatchMixin:
             except Exception as exc:
                 return ToolResult(f"Could not start phone access: {first_line(exc, 100)}",
                                   ok=False)
+        if action in {"phone_activity", "remote_activity", "phone_audit", "remote_audit"}:
+            # Readable whether or not the uplink is running now: the record
+            # outlives the gateway, which is the point of keeping one.
+            from .remote_audit import RemoteAuditLog
+            gateway = getattr(self, "gateway", None)
+            audit = getattr(gateway, "audit", None) or RemoteAuditLog()
+            return ToolResult(audit.render(int(args.get("limit") or 15)))
         if action in {"phone_off", "disable_phone", "remote_off"}:
             gateway = getattr(self, "gateway", None)
             if gateway is None:

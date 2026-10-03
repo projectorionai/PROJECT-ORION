@@ -89,7 +89,7 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from PyQt6.QtCore import Qt, QTimer

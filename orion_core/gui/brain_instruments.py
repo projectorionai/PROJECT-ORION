@@ -313,10 +313,16 @@ class _Animator(QObject):
 
     def set_visible(self, visible: bool) -> None:
         self.visible = bool(visible)
-        if self.visible:
-            self.kick()
-        else:
-            self.timer.stop()
+        try:
+            if self.visible:
+                self.kick()
+            else:
+                self.timer.stop()
+        except RuntimeError:
+            # At exit the animator (parentless, so Python-owned) can be
+            # collected before the page's last hideEvent; its timer is then
+            # already gone and there is nothing to stop.
+            pass
 
     def _tick(self) -> None:
         self.model.settle()

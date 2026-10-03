@@ -1246,7 +1246,7 @@ class VisionAgent:
                     # Dialog heuristic: modest-sized, titled, top-level window.
                     if not name or w <= 0 or h <= 0 or (w > 1400 and h > 900):
                         continue
-                    if re.search(r"(?i)dialog|confirm|save|open|error|warning|alert|sign in|cookie|consent", name):
+                    if re.search(r"(?i)dialog|confirm|save|open|upload|error|warning|alert|sign in|cookie|consent", name):
                         out.append({"role": role, "name": name,
                                     "rect": (rect.left, rect.top, w, h)})
                 except Exception:

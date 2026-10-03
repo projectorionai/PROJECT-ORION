@@ -1030,6 +1030,16 @@ class ProductivityDispatchMixin:
                 str(args.get("title") or args.get("text") or ""),
                 str(args.get("when") or args.get("due") or ""),
                 str(args.get("notes") or ""))
+        if action in {"find_time", "free_time", "find_slot", "availability"}:
+            return await self.executive.find_time(
+                minutes=args.get("minutes") or 60, days=args.get("days") or 7,
+                title=str(args.get("title") or args.get("text") or ""),
+                deadline=str(args.get("deadline") or args.get("due") or ""),
+                hours=str(args.get("hours") or ""),
+                weekends=bool(args.get("weekends")))
+        if action in {"book_slot", "book_option", "take_slot"}:
+            return await self.executive.book_slot(
+                args.get("option") or 1, str(args.get("title") or ""))
         if action in {"meeting_summary", "summarise_meeting", "minutes"}:
             return await self.executive.summarise_meeting(
                 str(args.get("transcript") or args.get("text") or ""),
@@ -1060,7 +1070,7 @@ class ProductivityDispatchMixin:
                 return await self.executive_core.blind_spots()
         return ToolResult(
             f"Unsupported executive action: {action}. Use status, prioritise, "
-            "schedule, meeting_summary, plan, progress, track, challenge, "
+            "schedule, find_time, book_slot, meeting_summary, plan, progress, track, challenge, "
             "focus, recommend, goals, or blindspots.",
             ok=False,
         )

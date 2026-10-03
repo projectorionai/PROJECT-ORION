@@ -273,7 +273,12 @@ class LearningService:
         smaller, high-value sets). Fully non-blocking: walking and extraction
         run off the event loop.
         """
-        root = Path(str(folder or "").strip()).expanduser()
+        if not str(folder or "").strip():
+            # Path("") is ".", which resolved to the project itself: a call
+            # with the folder left out ingested ORION's own source tree as
+            # thousands of "facts" (measured: 6,662 from 856 files).
+            return ToolResult("Which folder should I learn from?", ok=False)
+        root = Path(str(folder).strip()).expanduser()
         if not root.is_absolute():
             root = BASE_DIR / root
         if not root.is_dir():

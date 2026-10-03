@@ -1272,11 +1272,11 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
     },
     {
         "name": "system_startup",
-        "description": "Whether ORION starts automatically when Windows starts, and which browser he opens links in. 'enable' registers ORION to launch at sign-in; 'disable' removes it; 'status' reports both settings; 'repair' fixes an entry that points at a moved interpreter or project folder; 'browser' reports which browser is used. Also 'install_app' makes ORION a desktop application (Desktop + Start-menu shortcuts, pinnable to the taskbar, launches without a console). Use for 'start with my PC', 'launch on startup', 'make yourself an app', 'put yourself on my taskbar/desktop', 'which browser do you use'.",
+        "description": "Whether ORION starts automatically when Windows starts, and which browser he opens links in. 'enable' registers ORION to launch at sign-in; 'disable' removes it; 'status' reports both settings; 'repair' fixes an entry that points at a moved interpreter or project folder; 'browser' reports which browser is used. Also 'install_app' makes ORION a desktop application (Desktop + Start-menu shortcuts, pinnable to the taskbar, launches without a console). Use for 'start with my PC', 'launch on startup', 'make yourself an app', 'put yourself on my taskbar/desktop', 'which browser do you use', 'what has my phone been doing'.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "status, enable, disable, repair, browser, install_app (Desktop + Start-menu shortcuts, pinnable to taskbar), phone_on / phone_off (the remote phone uplink — off by default so nothing runs on localhost)."},
+                "action": {"type": "STRING", "description": "status, enable, disable, repair, browser, install_app (Desktop + Start-menu shortcuts, pinnable to taskbar), phone_on / phone_off (the remote phone uplink — off by default so nothing runs on localhost), phone_activity (what paired phones have asked ORION to do: pairings, tools run, actions approved or refused)."},
             },
         },
     },
@@ -1628,11 +1628,17 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
     },
     {
         "name": "executive",
-        "description": "Executive intelligence: status (the executive picture), prioritise (urgency-ranked task queue), schedule (task+reminder+Notion), meeting_summary (minutes from a transcript), plan (workflow planning), progress (goal/workflow monitoring), track (put a project under tracking), challenge (constructively stress-test a decision or idea: assumptions, risks, alternatives), focus (priority queue + recommendations + blind spots in one view), recommend (strategic recommendations from live state), goals (goal portfolio review), blindspots (structural gaps). Use 'challenge' whenever the user proposes a significant decision.",
+        "description": "Executive intelligence: status (the executive picture), prioritise (urgency-ranked task queue), schedule (task+reminder+Notion), find_time (propose free slots of a given length across Outlook, Notion and ICS calendar feeds, inside working hours and before an optional deadline — never books; use for 'find me 90 minutes this week for X', 'when am I free'), book_slot (schedule option N from the last find_time), meeting_summary (minutes from a transcript), plan (workflow planning), progress (goal/workflow monitoring), track (put a project under tracking), challenge (constructively stress-test a decision or idea: assumptions, risks, alternatives), focus (priority queue + recommendations + blind spots in one view), recommend (strategic recommendations from live state), goals (goal portfolio review), blindspots (structural gaps). Use 'challenge' whenever the user proposes a significant decision.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":     {"type": "STRING", "description": "status, prioritise, schedule, meeting_summary, plan, progress, track, challenge, focus, recommend, goals, or blindspots."},
+                "action":     {"type": "STRING", "description": "status, prioritise, schedule, find_time, book_slot, meeting_summary, plan, progress, track, challenge, focus, recommend, goals, or blindspots."},
+                "minutes":    {"type": "NUMBER", "description": "Length of the slot for find_time (default 60)."},
+                "days":       {"type": "NUMBER", "description": "How many days ahead find_time searches (default 7)."},
+                "deadline":   {"type": "STRING", "description": "For find_time: the slot must end before this date, e.g. 2026-10-09."},
+                "hours":      {"type": "STRING", "description": "For find_time: working hours, e.g. '8-17' (default 9-18)."},
+                "weekends":   {"type": "BOOLEAN", "description": "For find_time: also consider Saturday and Sunday."},
+                "option":     {"type": "NUMBER", "description": "For book_slot: which proposed slot (1, 2 or 3)."},
                 "decision":   {"type": "STRING", "description": "The decision/idea to stress-test (for challenge)."},
                 "context":    {"type": "STRING", "description": "Extra context for challenge."},
                 "title":      {"type": "STRING", "description": "Title for schedule / meeting_summary."},

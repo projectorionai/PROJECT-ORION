@@ -420,7 +420,8 @@ VOCABULARY: dict[str, str] = {
         "long running endeavour big goal objective"
     ),
     "executive": (
-        "priorities what should i do first urgent important"
+        "priorities what should i do first urgent important "
+        "find me time free slot when am i free availability hours this week block out"
     ),
     "reason": (
         "think hard difficult question work it out carefully deeply consider"
@@ -501,7 +502,7 @@ VOCABULARY: dict[str, str] = {
     "sentinel": "ambient watch host health warn me proactively watching",
     "social_media": "post to social my account publish a post logged in real account",
     "standing_questions": "keep watching keep an eye on tell me when something new",
-    "system_startup": "start with windows autostart boot on login default browser",
+    "system_startup": "start with windows autostart boot on login default browser phone remote uplink activity paired device audit",
     "voice_speaker_id": "who is this who is speaking who said that enrol my voice recognise know it is me by name specific person only listen to me ignore other voices other people talking tell my voice apart from others voiceprint answer only my voice",
     "workflow_patterns": "keep repeating same sequence worth saving pattern i always",
     "workspace_control": "desktop layout arrange windows save my workspace restore layout",

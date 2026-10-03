@@ -122,7 +122,7 @@ class LocalBrain:
 
         # Ordered intent resolution — first match wins.  Answers sourced from
         # memory/knowledge (recall, neuroscience) are remembered as correctable.
-        _correctable = (self._intent_recall, self._intent_neuro)
+        _correctable = (self._intent_recall, self._intent_neuro, self._intent_knowledge)
         for handler in (
             self._intent_greeting,
             self._intent_wellbeing,
@@ -138,6 +138,7 @@ class LocalBrain:
             self._intent_remember,
             self._intent_recall,
             self._intent_neuro,
+            self._intent_knowledge,
         ):
             reply = handler(lowered, raw)
             if reply is not None:
@@ -395,6 +396,52 @@ class LocalBrain:
                 "on it offline. Ask me about neurons, synapses, brain–computer "
                 "interfaces, the Utah array, Neuralink, spike sorting or decoding, "
                 "and I can go deep.")
+
+    # ── resident knowledge (programming, security, packs) ─────────────────────
+
+    _KNOWLEDGE_QUESTION = re.compile(
+        r"^(?:what(?:'s| is| are| was)?|explain|define|describe|tell me about|"
+        r"how (?:does|do|is|are))\s+(?:an?\s+|the\s+)?(.+)$")
+    _STOPWORDS = frozenset({
+        "what", "is", "are", "the", "a", "an", "of", "in", "on", "to", "and",
+        "for", "how", "does", "do", "work", "works", "mean", "means", "about",
+        "with", "between", "difference", "vs", "versus", "explain", "tell"})
+
+    def _intent_knowledge(self, low: str, raw: str) -> Optional[str]:
+        """Answer a general question from the seeded knowledge, offline.
+
+        ORION seeds programming, cybersecurity and business knowledge into
+        memory at start-up, yet without a model "what is a deadlock?" fell
+        through to "I can't reach the wider world for that". An answer is given
+        only when the best entry's own title shares a real word with the
+        question, so a loose match falls through instead of being recited.
+        """
+        match = self._KNOWLEDGE_QUESTION.match(low)
+        if not match or re.search(r"\bmy\b|\byour\b", low):
+            return None
+        topic = match.group(1).strip(" ?.!")
+        words = {w for w in re.findall(r"[a-z0-9][a-z0-9+#-]*", topic)
+                 if w not in self._STOPWORDS and len(w) > 2}
+        if not topic or not words:
+            return None
+        try:
+            rows = self.memory.query(topic, limit=3)
+        except Exception:
+            return None
+        for row in rows or []:
+            category = str(row.get("category") or "")
+            if category != "knowledge" and not category.startswith("pack_"):
+                continue
+            value = str(row.get("value") or "").strip()
+            title = value.split(":", 1)[0].lower()
+            title_words = set(re.findall(r"[a-z0-9][a-z0-9+#-]*", title))
+            if not any(w in title_words or any(t.startswith(w[:5]) for t in title_words)
+                       for w in words):
+                continue
+            if len(value) > 700:
+                value = value[:700].rsplit(" ", 1)[0] + "…"
+            return value
+        return None
 
     # ── task routing (real local tools) ───────────────────────────────────────
 

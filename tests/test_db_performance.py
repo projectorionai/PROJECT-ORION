@@ -131,8 +131,10 @@ def test_no_store_opens_sqlite_without_the_pragmas():
     root = Path(__file__).resolve().parents[1] / "orion_core"
     offenders = []
     for path in sorted(root.rglob("*.py")):          # subpackages too
-        if path.name in {"db.py", "maintenance.py", "diagnostics.py"}:
-            continue                      # maintenance/diagnostics open read-only
+        if path.name in {"db.py", "maintenance.py", "diagnostics.py", "backup_manager.py"}:
+            continue                      # maintenance/diagnostics open read-only;
+                                          # backups only snapshot (and must not
+                                          # turn the copy into a WAL database)
         source = path.read_text(encoding="utf-8", errors="replace")
         if "sqlite3.connect(" in source and "apply_pragmas" not in source:
             offenders.append(path.name)

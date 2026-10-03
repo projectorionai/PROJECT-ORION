@@ -13,6 +13,7 @@ release is one entry to prepend.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,7 +38,62 @@ class Release:
 
 
 # Newest first.  Each entry is a real, shipped milestone of this build.
+# The first entry must name the running package version (``__version__``):
+# the list once stopped at X.7 while the package shipped Mark XXXII, so "what's
+# new?" answered with a July release in late September. A test pins this.
 RELEASES: list[Release] = [
+    Release(
+        "32.0", "Mark XXXII — Iris & Signal Lanes", "2026-09-25",
+        "The Brain page is two native instruments, the Live channel stays up "
+        "through a dropped connection, and I use far less memory at start-up.",
+        [
+            "The Brain is redrawn as the Iris — my state, load and busy "
+            "systems — over the Signal Lanes, which step each request through "
+            "hear, think, act, speak and recall with the time to my first word. "
+            "Nothing is drawn while I am idle.",
+            "Navigation follows the screen: arrows and Ctrl+Tab move in sidebar "
+            "order, Alt+Left/Right go back and forward, Ctrl+1–9 jump to a "
+            "page and Esc returns to the Brain.",
+            "A dropped Live connection resumes the same conversation within "
+            "half a second, and a long-running tool finishes in the background "
+            "instead of freezing me.",
+            "MCP servers start on first use and GPU meters read NVML "
+            "in-process: about a gigabyte less at boot.",
+            "Ten MCP servers, and stronger chess — about 2490 Elo against "
+            "Stockfish's calibrated levels, with plain-language explanations.",
+        ],
+    ),
+    Release(
+        "31.0", "Mark XXXI — Research That Reads", "2026-09",
+        "Research opens and reads every page it cites, model routing heals "
+        "itself, and I read the screen exactly rather than by guesswork.",
+        [
+            "Every research run searches, opens and reads each page and takes "
+            "notes with the URL attached, live on the Research console.",
+            "A provider that retires a model is moved to one it still serves; "
+            "an account out of credit moves to free models rather than "
+            "truncating replies.",
+            "Windows UI Automation reads app text character for character; "
+            "Windows OCR and DXGI capture cover games and custom surfaces.",
+            "Whole-PC file search by name, type, size and date, and self-repair "
+            "that produces tested patches applied only with your approval.",
+        ],
+    ),
+    Release(
+        "30.0", "Mark XXX — Honest Outcomes", "2026-09-23",
+        "Plugins report what actually happened, paid background thoughts need "
+        "your opt-in, and deferred pages recover from a failed first build.",
+        [
+            "Plugin dispatch keeps explicit failure states and structured "
+            "evidence; an absent result is never reported as success.",
+            "Fitness goals and workout records are committed and read back; "
+            "integration plugins report configuration and service errors.",
+            "Background thoughts honour the local-only policy; paid ones need "
+            "ORION_PAID_THOUGHTS=1.",
+            "A failed deferred dashboard page can be retried, and audio queued "
+            "for an old connection is dropped after reconnecting.",
+        ],
+    ),
     Release(
         "X.7", "The Forge Awakens", "2026-07-14",
         "The Earth is back on the globe, my name can no longer be mangled by "
@@ -313,9 +369,19 @@ class Changelog:
         return self.releases[: max(1, count)]
 
     def find(self, version: str) -> Release | None:
-        version = str(version or "").strip().lstrip("vV")
+        """A release by version ("32", "32.0", "v9") or codename words
+        ("XXXI", "forge"). Codenames match whole words, case-insensitively,
+        so "XXX" finds Mark XXX and not Mark XXXI."""
+        wanted = str(version or "").strip().lstrip("vV").lower()
+        if not wanted:
+            return None
         for release in self.releases:
-            if release.version == version or version in release.codename.lower():
+            number = release.version.lower()
+            if wanted == number or (wanted.isdigit() and number.split(".")[0] == wanted):
+                return release
+        pattern = re.compile(r"(?<![\w])" + re.escape(wanted) + r"(?![\w])")
+        for release in self.releases:
+            if pattern.search(release.codename.lower()):
                 return release
         return None
 

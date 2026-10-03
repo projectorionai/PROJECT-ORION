@@ -35,7 +35,7 @@ import os
 import sys
 import time
 import traceback
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 _APP_IMPORT_STARTED_AT = time.perf_counter()
 
@@ -74,6 +74,9 @@ from .memory import MemoryAgent, OrionMemoryMatrix
 # deferred block in run_application. See tests/test_startup_imports.py.
 from .telemetry import Telemetry
 from .startup_budget import StartupBudget
+
+if TYPE_CHECKING:
+    from .providers import OrionProviderSettings
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -510,8 +513,37 @@ from .console_hygiene import QASYNC_STOPPED as _QASYNC_STOPPED  # noqa: E402
 from .console_hygiene import is_clean_shutdown  # noqa: E402,F401
 
 
+class _QuitLatch:
+    """Remembers a quit that arrives before shutdown handling is wired.
+
+    ``request_shutdown`` is connected to ``aboutToQuit`` only once the services
+    it tears down exist, which is most of the way through boot. A Ctrl+C, a
+    tray Quit or the last window closing before that stopped the loop,
+    ``_run_until_torn_down`` resumed it (correctly: teardown must finish), boot
+    carried on to the end, and ORION then sat waiting for a quit that had
+    already happened. Measured: SIGINT 4 s into boot, still running 50 s later.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.requested = False
+        try:
+            app.aboutToQuit.connect(self._on_quit)
+        except Exception:
+            pass
+
+    def _on_quit(self) -> None:
+        self.requested = True
+
+    def honour(self, request_shutdown: Any) -> bool:
+        """Call *request_shutdown* if a quit was latched; True when it was."""
+        if self.requested:
+            request_shutdown()
+        return self.requested
+
+
 async def run_application(app: QApplication, *, started_at: float | None = None) -> bool:
     """Runs ORION until shutdown; returns True when a self-restart was asked."""
+    early_quit = _QuitLatch(app)
     _boot_t0 = time.perf_counter() if started_at is None else started_at
     budget = StartupBudget(target_seconds=5.0, started_at=_boot_t0)
     budget.mark("launcher + imports + Qt")
@@ -1059,7 +1091,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     thoughts.actor = ThoughtActor(bus=bus, config_dir=CONFIG_DIR)
     executive_mode = ExecutiveAssistantMode(
         bus, memory, cognition, reminders=reminders, notion=notion,
-        router=router, graph=graph, telemetry=telemetry,
+        router=router, graph=graph, telemetry=telemetry, outlook=outlook,
     )
     reporting = ProactiveReportingService(
         bus, exporter, router=router, proactive=proactive, commerce=commerce,
@@ -1884,6 +1916,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         request_shutdown()
 
     app.aboutToQuit.connect(request_shutdown)
+    if early_quit.honour(request_shutdown):
+        bus.log.emit("BOOT: quit requested during start-up - shutting down.")
     bus.request_shutdown.connect(request_shutdown)
     bus.request_restart.connect(request_restart)
 
@@ -2366,8 +2400,15 @@ def main(*, started_at: float | None = None) -> None:
     # actually deliver the signal.
     import signal
     from PyQt6.QtCore import QTimer
+    #
+    # exit(0), not quit(). Under Qt 6, QGuiApplication.quit() first offers every
+    # top-level window a close event and abandons the quit if any refuses it;
+    # several of ORION's windows refuse by design (they hide to the tray), so
+    # Ctrl+C was ignored in about half of the runs measured on 2026-10-03.
+    # exit() ends the loop unconditionally and still emits aboutToQuit, which
+    # drives request_shutdown and the resumed teardown exactly as quit() did.
     try:
-        signal.signal(signal.SIGINT, lambda *_: app.quit())
+        signal.signal(signal.SIGINT, lambda *_: app.exit(0))
     except (ValueError, OSError):
         pass  # not on the main thread on some platforms — timer path still helps
     _sigint_timer = QTimer(app)
