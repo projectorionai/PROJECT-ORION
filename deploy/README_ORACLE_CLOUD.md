@@ -137,19 +137,56 @@ The PWA service worker and secure token entry require `https://`. Easiest is
 
 ## 7. Keeping it private & safe
 
-- The token is the only key — treat it like a password. Rotate it by deleting
-  `config/remote_token.txt` and restarting; re-enter the new one on the phone.
-- Rate limiting (30 req/min per client) and hardening headers are built in.
+- Phones pair with a one-time code (shown in `journalctl -u orion-node` at first
+  start; `sudo systemctl restart orion-node` prints a fresh one). Each phone gets
+  its own revocable credentials; there is no shared static token any more.
+- Rate limiting (30 req/min per client, 10/min on the pairing and token doors)
+  and hardening headers are built in. Behind Caddy on the same machine each
+  phone keeps its own limit (the node reads Caddy's `X-Forwarded-For` from
+  loopback only); list any other proxy in `ORION_TRUSTED_PROXIES`.
 - Keep 8765 closed to the world; only 443 (Caddy) is public.
-- To share ORION with someone later, you'd add per-user tokens — noted as a
-  follow-up in the patch notes, not built yet (it stays single-user for now).
+- Everything a paired phone makes the node do is recorded, without message
+  text or results, in `config/diagnostics/remote_audit.jsonl`.
+- The token-signing key and the TLS key are written owner-only (0600).
 
 ## 8. Optional: keep desktop and cloud in sync
 
-Point both nodes at the **same `config/` directory** (e.g. an rclone-synced
-volume or a small object-storage mount) and they share one memory + token.
-Otherwise each node keeps its own memory and they diverge — which is fine if you
-just want a standalone pocket ORION.
+**Never point both nodes at one shared or synced `config/` directory.**
+SQLite's locking does not hold over NFS, SSHFS, rclone mounts or sync
+clients, and the failure is silent corruption, not an error. Ship consistent
+snapshots one direction at a time instead:
+
+```bash
+bash deploy/sync_state.sh status ubuntu@<IP>   # what differs
+bash deploy/sync_state.sh push   ubuntu@<IP>   # desktop -> node
+bash deploy/sync_state.sh pull   ubuntu@<IP>   # node -> desktop
+```
+
+It stops the node's service first (it finds `orion-node` or `orion`; set
+`ORION_REMOTE_UNIT` otherwise) and refuses to push if it cannot. It reads the
+desktop's data wherever `tools/move_config.py` put it (`bash
+deploy/sync_state.sh where` shows which folder). Without syncing, each node
+keeps its own memory, which is fine for a standalone pocket ORION.
+
+## 9. Watching an unattended node
+
+Add these to the unit's environment (or `config/orion.env`):
+
+```ini
+# A monitor that alerts when pings stop: a healthchecks.io check URL, an
+# Uptime Kuma push monitor, or anything that alarms on a missed GET.
+ORION_HEALTHCHECK_URL=https://hc-ping.com/<your-check-uuid>
+ORION_HEALTHCHECK_MINUTES=5
+# Daily archives of the node's stores (consistent SQLite snapshots, eight kept).
+# Credentials are left out unless ORION_BACKUP_SECRETS=1.
+ORION_NODE_BACKUP_DIR=/var/backups/orion
+ORION_NODE_BACKUP_HOURS=24
+```
+
+Without a model the node still answers general questions from its seeded
+knowledge, and a paired phone can run the read-only remote tools
+(`query_intelligence`, `recall_conversation`, `resource_status`, `token_usage`,
+`patch_notes`, `diagnostics`) through `/v1/agent/tasks`.
 
 ---
 
@@ -158,5 +195,5 @@ On your PC you can dry-run the exact cloud node:
 ```powershell
 $env:ORION_HEADLESS = "1"
 python orion.py --headless
-# then open http://localhost:8765 and paste the token from config/remote_token.txt
+# then open http://localhost:8765 and enter the pairing code printed above
 ```

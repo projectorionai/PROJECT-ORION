@@ -1,6 +1,7 @@
 # O.R.I.O.N.
 
-Latest source audit and plugin availability: [23 September release review](docs/RELEASE_REVIEW_2026-09-23.md).
+Latest source audit: [3 October 2026](docs/AUDIT_2026-10-03.md). Plugin
+availability: [23 September release review](docs/RELEASE_REVIEW_2026-09-23.md).
 
 **Open Resolution Intelligence Overt Network** is a Python desktop assistant
 with a PyQt6 interface, voice interaction, persistent memory, desktop tools and
@@ -12,6 +13,28 @@ locally hosted language and vision models.
 Read the [current capabilities summary](docs/CAPABILITIES_2026-09-18.md) for
 implemented features, dependencies and practical limits. Older architecture
 notes and roadmaps describe development history; they are not release guarantees.
+
+## What changed in the 3 October audit
+
+Twenty-two defects fixed, most of them reproduced by running ORION, each with
+a regression test; the [audit](docs/AUDIT_2026-10-03.md) has the evidence. The
+ones you would notice:
+
+- **Ctrl+C always stops ORION.** Under Qt 6 about half of all presses were
+  ignored, because a window that hides to the tray could veto the quit.
+- **Backups work after moving the config folder**, copy databases consistently,
+  and no longer put API keys, tokens and private keys into a cloud-synced folder.
+- **"Find me 90 minutes this week for X."** Free slots across Outlook, Notion
+  and any ICS calendar feed (Google, Microsoft 365, iCloud), never booked until
+  you pick one.
+- **A record of what your phone made ORION do**, in the Security Centre and by
+  asking "what has my phone been doing?".
+- **A headless node that is useful on its own**: it answers from its seeded
+  knowledge without a model, runs the read-only remote tools, can ping a
+  monitor and back itself up, and keeps each phone's rate limit separate
+  behind a proxy. Its signing and TLS keys are now owner-only.
+- `requirements.txt` installs on Linux and macOS; the pairing QR's package is
+  declared.
 
 ## What changed in Mark XXXII
 

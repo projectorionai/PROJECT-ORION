@@ -1371,3 +1371,34 @@ Exposed as the `perception` tool, whose read branches (`status`, `scene`,
 classification fix above — the first tool built after that fix, and a check that
 it generalises. Verified: 59 tests in `tests/test_perception.py`; full suite
 **1221 passed, 1 skipped**.
+
+## Audit pass — new seams (2026-10-03)
+
+Defects and evidence are in [docs/AUDIT_2026-10-03.md](docs/AUDIT_2026-10-03.md);
+this section records only what changed in the structure.
+
+- **`headless_tools.HeadlessToolHost`** — the dispatcher a `--headless` node
+  hands its RemoteGateway. It reuses `KnowledgeDispatchMixin` and
+  `ProductivityDispatchMixin` handlers for the read-only remote tools, so desktop
+  and node cannot drift, and exposes `can_run(name)`. `RemoteToolGate` consults
+  `can_run` before parking a confirmation, so a node never asks a phone to
+  approve something it cannot do.
+- **`remote_audit.RemoteAuditLog`** — Cloud Roadmap C4's durable audit trail.
+  One instance per gateway, shared by `RemoteAuthManager` (pair, refuse, revoke),
+  `RemoteAgentQueue` (tasks), `RemoteToolGate` (refused, parked, ran) and the
+  confirm endpoint (approved, denied). It stores argument names but never values,
+  text or results. Read by the Security Centre and `system_startup
+  action=phone_activity`.
+- **`calendar_sources`** — the integration half of `scheduling.py`, which until
+  now nothing called. ICS feeds, Outlook COM and Notion each produce `BusyBlock`s
+  in ORION's zone (`TIME.now().tzinfo`), and `ExecutiveAssistantMode.find_time`
+  feeds them to `scheduling.find_slots`. `book_slot` books only on an explicit
+  choice.
+- **`node_watch`** — `HealthPinger` and `ScheduledBackup`, environment-gated
+  periodic tasks on the headless node beside the housekeeper. The node now also
+  runs the WAL checkpoint loop and the final checkpoint the desktop already ran.
+- **`backup_manager`** names archive entries relative to `CONFIG_DIR`, snapshots
+  SQLite through the backup API, and classifies every file as keep, secret or
+  skip (`classify()`).
+- **`app._QuitLatch`** and `app.exit(0)` on SIGINT: under Qt 6 `quit()` can be
+  vetoed by any window that refuses its close event.

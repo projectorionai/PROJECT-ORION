@@ -56,6 +56,20 @@ systemctl start orion-telephony     # only if you want calls
 journalctl -u orion -f
 ```
 
+## 5. Watch it (optional, recommended)
+
+Nobody is at a VPS's keyboard, so let something outside it notice a crash,
+and keep copies of what it learns. In `config/orion.env`:
+
+```ini
+ORION_HEALTHCHECK_URL=https://hc-ping.com/<your-check-uuid>   # alerts when pings stop
+ORION_NODE_BACKUP_DIR=/var/backups/orion                     # daily SQLite snapshots
+```
+
+What paired phones made ORION do is in `config/diagnostics/remote_audit.jsonl`.
+To move knowledge between your PC and the VPS use `deploy/sync_state.sh`
+(never a shared or synced folder — SQLite corrupts silently over those).
+
 ---
 
 ## Verification checklist
@@ -198,35 +212,30 @@ Both nodes read the same SQLite databases. SQLite does not support two
 writers over a network filesystem, and pretending otherwise corrupts the
 file — so this is a **one-way pull**, on a schedule, not a live mirror.
 
-```bash
-# On the desktop, nightly: push the knowledge ORION accumulated.
-rsync -az --delete \
-  ~/ORION/config/second_brain.db \
-  ~/ORION/config/knowledge_graph.db \
-  ~/ORION/config/ingestion.db \
-  root@YOUR_VPS_IP:/opt/orion/config/
-```
-
-Stop ORION on the VPS first, or copy a consistent snapshot rather than the
-live file:
+`deploy/sync_state.sh` does this safely: it snapshots each database with
+SQLite's own `.backup` (consistent even while ORION is writing), stops the
+VPS service before replacing anything, and refuses to push if it cannot.
 
 ```bash
-ssh root@YOUR_VPS_IP systemctl stop orion
-rsync -az ...
-ssh root@YOUR_VPS_IP systemctl start orion
+bash deploy/sync_state.sh status root@YOUR_VPS_IP   # what differs, changes nothing
+bash deploy/sync_state.sh push   root@YOUR_VPS_IP   # desktop -> VPS
+bash deploy/sync_state.sh pull   root@YOUR_VPS_IP   # VPS -> desktop (keeps your old copies)
 ```
 
-The alternative — `sqlite3 source ".backup snapshot.db"` on the desktop and
-shipping the snapshot — avoids the downtime and is what to do once the node
-matters. What you must not do is mount `config/` over NFS or SSHFS and point
-both at it: SQLite's locking does not work over those, and the failure is
-silent corruption rather than an error.
+It finds the desktop's data wherever `tools/move_config.py` put it (`bash
+deploy/sync_state.sh where` prints the folder) and the VPS unit whether it is
+called `orion` or `orion-node` (`ORION_REMOTE_UNIT` overrides).
+
+What you must not do is copy live database files with plain `rsync`/`cp`
+while ORION runs (a torn page opens fine and fails later), or mount `config/`
+over NFS or SSHFS and point both at it: SQLite's locking does not work over
+those, and the failure is silent corruption rather than an error.
 
 Which databases are safe to share, and which are not:
 
 | Database | Share it? | Why |
 | --- | --- | --- |
-| `second_brain.db`, `knowledge_graph.db` | yes | Facts. The same on both. |
+| `knowledge_graph.db` (the second brain), `evidence_graph.db` | yes | Facts and why they are believed. The same on both. |
 | `ingestion.db` | yes | What has been read already; avoids re-reading. |
 | `resolver_shadow.db` | no | Per-node evidence about that node's usage. |
 | `orion_core.db`, `focus.db`, `study.db` | no | Desktop session state. |
