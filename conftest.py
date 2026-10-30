@@ -56,6 +56,11 @@ os.environ.setdefault("ORION_HOLO_HEAD", "1")
 # switch it back on with fakes for the address, the sockets and netsh.
 os.environ.setdefault("ORION_REMOTE_LAN", "0")
 
+# No DirectML in the test process either, from the first import: the card may
+# be busy with training or a game, and no test may depend on it. Tests of the
+# GPU path switch it on themselves; ORION_GPU=1 runs the suite with it.
+os.environ.setdefault("ORION_GPU", "0")
+
 
 collect_ignore_glob = [
     "release/*",
@@ -289,9 +294,6 @@ def _redirect_user_data(monkeypatch, _test_data_dir, reminders_path):
     # Tests see no CUDA unless they ask for it: the same results on any PC,
     # and no test loads a model onto the owner's graphics card.
     monkeypatch.setattr("orion_core.accelerator._cuda", False)
-    # Nor DirectML: the card may be full with training or a game, and a test
-    # must not depend on it. Tests of the GPU path switch it back on themselves.
-    monkeypatch.setenv("ORION_GPU", "0")
     # Agent routing by meaning depends on whether some earlier test loaded
     # the sentence encoder; tests route by keywords unless they opt in.
     monkeypatch.setattr("orion_core.agent_router.ENABLED", False)

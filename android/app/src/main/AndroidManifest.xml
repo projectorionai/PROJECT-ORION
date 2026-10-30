@@ -22,6 +22,10 @@
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <!-- Calendar page: the phone's own calendars, read on the phone only. -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <!-- Focus page: a break or check-in on time; inexact when not granted. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
 
@@ -83,6 +87,9 @@
             android:screenOrientation="unspecified" />
         <activity android:name=".PhoneConsoleActivity" android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+        <activity android:name=".DayActivity" android:exported="false"
+            android:launchMode="singleTop" android:windowSoftInputMode="adjustResize" />
+        <receiver android:name=".FocusNudgeReceiver" android:exported="false" />
         <service android:name=".PhoneListeningService" android:exported="false"
             android:foregroundServiceType="microphone" />
         <service android:name=".OfflineNavigationService" android:exported="false"

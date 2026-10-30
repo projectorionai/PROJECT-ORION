@@ -25,6 +25,16 @@ choose it explicitly from Options when the host is online.
   offline use); otherwise it follows the phone's listening, thinking and
   speaking and reads the feeling in what is said with the PC's sentiment rules.
   The speaking waveform follows the audio sent to the phone speaker.
+- **Calendar, Focus and Fitness** — one tap under the header (or say "open my
+  calendar", "start a focus block", "log a workout"), working with the PC off.
+  Calendar shows the next thing and the week from the phone's own calendars
+  (read on the phone only) and adds an event as a draft. Focus is one big
+  countdown (15, 25 or 45 minutes, or body doubling with ORION's face beside
+  it and a check-in halfway), the task in small steps, and a gentle stop: a
+  block stopped past halfway still counts; the break and check-in arrive as
+  notifications with the app closed. Fitness logs workouts with weekly bars,
+  totals, a streak and a weekly target. Workouts and focus blocks are kept on
+  the phone, encrypted with the same Keystore key as the conversation.
 - **Independent voice** — Gemini Flash-Lite transcribes phone microphone audio.
   ORION streams Charon speech from a compatible Gemini TTS model directly to
   the phone. Long replies are grouped to conserve speech requests and played in

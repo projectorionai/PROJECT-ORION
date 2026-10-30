@@ -43,5 +43,4 @@
     <string name="access_on">ACCESS ON</string>
     <string name="sentinel_off">SENTINEL OFF</string>
     <string name="sentinel_on">SENTINEL ON</string>
-    <string name="accessibility_explanation">ORION can read visible screen labels and carry out gestures only when you enable Accessibility in Android settings and approve each remote request in the app.</string>
 </resources>

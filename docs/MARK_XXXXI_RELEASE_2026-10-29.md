@@ -44,6 +44,14 @@ Built from the shared checkout after the 30 Oct round; rollback to 41.1.0 is kep
   lost; programs ORION starts are port-checked again.
 - **He talks about his life like a friend** when asked casually, and the "Talk to ORION"
   caption is gone from the face.
+- **Phone app 3.18: Calendar, Focus and Fitness on the phone**, under the header or by
+  asking ("open my calendar", "start a focus block", "log a workout"), working with the PC
+  off; workouts and focus blocks are encrypted on the phone. The home-network pin is kept
+  for the same address and port. 190 unit tests pass (184 before); the production APK is
+  2,072,205 bytes (3.17: 2,038,121; three unused resources removed). APKs:
+  `releases/android/orion-companion-3.18-debug-compatible.apk` (updates the installed app,
+  also served by the PC) and `orion-companion-3.18-production.apk`. Not yet tried on a
+  phone.
 
 ## Mark XXXXI.1 (41.1.0), installed 29 Oct 2026 evening
 

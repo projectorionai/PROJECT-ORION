@@ -223,6 +223,20 @@ class PhoneConsoleActivity : AppCompatActivity() {
         }, LinearLayout.LayoutParams(0, dp(56), 1f))
         header.addView(button("Options") { options() }, LinearLayout.LayoutParams(dp(100), dp(46)))
         page.addView(header, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
+        // His day, one tap away and working with the PC off: Calendar, Focus, Fitness.
+        val day = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        listOf("Calendar" to DayActivity.CALENDAR, "Focus" to DayActivity.FOCUS,
+            "Fitness" to DayActivity.FITNESS).forEachIndexed { index, (name, tab) ->
+            day.addView(text(name, 13f).apply {
+                gravity = Gravity.CENTER
+                setTextColor(Color.rgb(223, 226, 235))
+                background = rounded(Color.rgb(22, 22, 26), dp(17), Color.rgb(58, 42, 47))
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { DayActivity.open(this@PhoneConsoleActivity, tab) }
+            }, LinearLayout.LayoutParams(0, dp(36), 1f).apply { if (index > 0) leftMargin = dp(8) })
+        }
+        page.addView(day, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         val listening = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -440,6 +454,13 @@ class PhoneConsoleActivity : AppCompatActivity() {
         val message = value.trim().take(16000)
         if (message.isEmpty()) return
         if (!queued) avatar.feel(message, fromUser = true)
+        // "Open my calendar", "start a focus block", "log a workout": the page
+        // itself, at once and offline, never a model's description of it.
+        DayPlanner.pageFor(message)?.let { tab ->
+            add("user", message)
+            DayActivity.open(this, tab)
+            return
+        }
         if (!PhoneNetwork.online(this)) {
             // No internet: the hosted AI cannot answer. What the phone knows
             // itself is answered now; anything else waits for the connection.

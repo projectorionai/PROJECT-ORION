@@ -33,8 +33,8 @@ android {
         applicationId "com.orion.companion"
         minSdk 26
         targetSdk 34
-        versionCode 39
-        versionName "3.17"
+        versionCode 40
+        versionName "3.18"
     }
 
     signingConfigs {
