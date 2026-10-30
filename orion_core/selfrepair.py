@@ -26,11 +26,13 @@ call site needing to know about self-repair.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
 import time
 import threading
+import uuid
 from collections import OrderedDict
 import traceback as tb_module
 from dataclasses import dataclass, field
@@ -49,6 +51,8 @@ SELF_REPAIR_DIR = CONFIG_DIR / "self_repair"
 # Identical captures are sampled to keep fault storms from filling the disk.
 JOURNAL_PATH = SELF_REPAIR_DIR / "journal.jsonl"
 _JOURNAL_LOCK = threading.RLock()
+_REPAIR_LOCK = threading.RLock()
+_AUTO_LIMIT_LOCK = threading.Lock()
 JOURNAL_REPEAT_WINDOW_S = 60.0
 
 
@@ -86,10 +90,25 @@ class Incident:
     reported: bool = False
     # The model's own statement of why it broke, kept with the drafted fix.
     root_cause: str = ""
+    source_digest: str = ""      # exact bytes from which this draft was generated
+    backup_digest: str = ""      # verified original, checked again before undo
+    applied_digest: str = ""     # undo must not overwrite a later external edit
+    applied_order: int = 0
+    baseline_tests_passed: Optional[bool] = None
+    baseline_tests_detail: str = ""
+    verified_digest: str = ""    # candidate bytes tied to before/after evidence
+    verification_inputs_digest: str = ""
 
     def summary(self) -> str:
         loc = f"{Path(self.file).name}:{self.line}" if self.file else "unknown"
         return f"[{self.id}] {self.error_type}: {self.message[:120]} ({loc})"
+
+
+@dataclass
+class _RepairTestEvidence:
+    passed: Optional[bool]
+    detail: str
+    outcomes: dict[str, str] = field(default_factory=dict)
 
 
 class SelfRepairAgent:
@@ -108,8 +127,10 @@ class SelfRepairAgent:
         # confirmation tokens, the spend gate, the forge/plugin sandbox and
         # loader, the write/parallel classification, the phone's tiers.
         "system_guard.py", "dispatch_desktop.py", "dispatch_web.py",
-        "forge.py", "forge_contract.py", "forge_autofix.py", "dynamic_loader.py", "sandbox.py",
+        "forge.py", "forge_contract.py", "forge_autofix.py", "forge_deployment.py", "dynamic_loader.py", "sandbox.py",
         "plugin_registry.py", "plugin_runner.py", "concurrency.py",
+        "dispatcher.py", "dispatch_productivity.py", "plugin_manifest.py",
+        "plugin_events.py", "plugin_vault.py",
         "remote_capability.py", "spillage.py",
     })
     #: Incidents kept in memory; the oldest resolved ones go first.
@@ -217,6 +238,8 @@ class SelfRepairAgent:
         self._prev_excepthook: Any = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._auto_repairs = 0
+        self._auto_pending = 0
+        self._apply_counter = 0
         self._auto_attempted: set[tuple[str, str, int]] = set()
         # Live repair tasks, so shutdown can cancel them instead of leaving
         # asyncio to destroy them pending and print a traceback for each.
@@ -615,6 +638,13 @@ class SelfRepairAgent:
             # the retrieval vocabulary, changelogs — match every report and
             # contain none of the behaviour.
             score *= self._DESCRIPTIVE_MODULES.get(path.name, 1.0)
+            # A named module is stronger evidence than a large new module's
+            # incidental prose. The 13 Oct scene module displaced vision.py
+            # for reports that explicitly said "vision".
+            if _re.search(r"(?<![\w])" + _re.escape(path.name.lower()) + r"(?![\w])", lowered_desc):
+                score += 1000.0
+            elif stem in terms:
+                score += 30.0
             if score <= 0:
                 continue
             line_no, best_hits = 1, 0.0
@@ -733,6 +763,13 @@ class SelfRepairAgent:
     async def attempt_auto_repair(self, incident: Incident) -> None:
         """Auto-repair a LOW-RISK, SELF-CONTAINED incident; leave everything
         else for approval.  Every outcome is journalled; never raises."""
+        # Reserve before the first await: simultaneous incidents must not all
+        # observe unused capacity and then exceed the per-session ceiling.
+        with _AUTO_LIMIT_LOCK:
+            pending = getattr(self, "_auto_pending", 0)
+            if self._auto_repairs + pending >= self.MAX_AUTO_REPAIRS_PER_SESSION:
+                return
+            self._auto_pending = pending + 1
         try:
             if self._auto_repairs >= self.MAX_AUTO_REPAIRS_PER_SESSION:
                 return
@@ -770,30 +807,51 @@ class SelfRepairAgent:
                 generated = await self._generate_repaired_file(incident, target)
                 if not generated.ok or not incident.repaired_content:
                     return
-            original = target.read_text(encoding="utf-8", errors="replace")
-            changed = self._diff_lines(original, incident.repaired_content)
+            original_bytes = await asyncio.to_thread(target.read_bytes)
+            if incident.source_digest and hashlib.sha256(original_bytes).hexdigest() != incident.source_digest:
+                self._journal("auto_declined", incident, note="source changed after the candidate was drafted")
+                return
+            original = original_bytes.decode("utf-8")
+            candidate = incident.repaired_content
+            changed = self._diff_lines(original, candidate)
             if changed > self.MAX_AUTO_DIFF_LINES:
                 self._journal("auto_declined", incident,
                               note=f"diff too large ({changed} lines) — approval required")
                 return
             passed, detail = await asyncio.to_thread(
-                self._run_patched_tests, target, incident.repaired_content)
+                self._verify_auto_candidate, incident, target, original, candidate)
             incident.tests_passed = passed
             incident.tests_detail = detail
             if passed is not True:            # failing OR absent tests → human
                 self._journal("auto_declined", incident,
                               note=f"tests not green ({detail}) — approval required")
                 return
-            result = await asyncio.to_thread(self._apply_repaired, incident, target)
+            # Verification runs off-loop. A parallel proposal must not replace
+            # the candidate while we are waiting for its evidence.
+            if incident.repaired_content != candidate:
+                incident.verified_digest = ""
+                self._journal("auto_declined", incident, note="candidate changed during verification")
+                return
+            if not incident.source_digest:
+                incident.source_digest = hashlib.sha256(original_bytes).hexdigest()
+            result = await asyncio.to_thread(
+                self._apply_repaired, incident, target,
+                expected_digest=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+                expected_source_digest=hashlib.sha256(original_bytes).hexdigest())
             if result.ok:
                 self._auto_repairs += 1
                 self._journal("auto_applied", incident, note=detail)
                 self.bus.log.emit(
                     f"REPAIR: auto-applied a validated {changed}-line fix to "
-                    f"{target.name} (its tests pass; backup kept). Restart to load it — "
+                    f"{target.name} (the same checks failed before and pass after; backup kept). Restart to load it — "
                     "say 'revert the last repair' to undo.")
+            else:
+                self._journal("auto_declined", incident, note=result.text[:800])
         except Exception:
             pass                               # autonomy must never crash capture
+        finally:
+            with _AUTO_LIMIT_LOCK:
+                self._auto_pending -= 1
 
     @staticmethod
     def _diff_lines(original: str, patched: str) -> int:
@@ -818,6 +876,12 @@ class SelfRepairAgent:
                 "file": Path(incident.file).name if incident.file else "",
                 "line": incident.line,
                 "note": note,
+                "incident_id": incident.id,
+                "source_digest": incident.source_digest,
+                "candidate_digest": incident.verified_digest,
+                "verification_inputs_digest": incident.verification_inputs_digest,
+                "baseline_tests_passed": incident.baseline_tests_passed,
+                "tests_passed": incident.tests_passed,
             }
             with _JOURNAL_LOCK:
                 # Fault storms must not append the same capture thousands of
@@ -869,9 +933,15 @@ class SelfRepairAgent:
 
     def _read_source_window(self, file: str, line: int, radius: int = 30) -> str:
         try:
-            lines = Path(file).read_text(encoding="utf-8", errors="replace").splitlines()
+            source = Path(file).read_text(encoding="utf-8", errors="replace")
         except Exception:
             return ""
+        return self._source_window(source, line, radius)
+
+    @staticmethod
+    def _source_window(source: str, line: int, radius: int = 30) -> str:
+        """Format the already-read source, avoiding a second GUI-thread read."""
+        lines = source.splitlines()
         start = max(0, line - radius)
         end = min(len(lines), line + radius)
         return "\n".join(f"{n+1:>5}  {lines[n]}" for n in range(start, end))
@@ -885,7 +955,7 @@ class SelfRepairAgent:
         # A reported defect has no traceback narrowing the location, so give the
         # model far more of the file to reason over than a stack frame needs.
         radius = 120 if incident.reported else 30
-        source = (self._read_source_window(incident.file, incident.line, radius)
+        source = (await asyncio.to_thread(self._read_source_window, incident.file, incident.line, radius)
                   if incident.file else "")
         log_tail = "\n".join(
             f"{r['level']} {r['component']}: {r['message']}" for r in incident.logs[-12:]
@@ -965,7 +1035,7 @@ class SelfRepairAgent:
         # exist. The proposal is still worth returning inline when it cannot be
         # saved; it must not be described as saved.
         try:
-            path.write_text(proposal, encoding="utf-8")
+            await asyncio.to_thread(path.write_text, proposal, encoding="utf-8")
             incident.proposal_path = str(path)
             saved = f"Saved for review at: {path}\n"
             self.bus.log.emit(
@@ -1007,7 +1077,7 @@ class SelfRepairAgent:
             generated = await self._generate_repaired_file(incident, target)
             if not generated.ok or not incident.repaired_content:
                 continue
-            original = target.read_text(encoding="utf-8", errors="replace")
+            original = await asyncio.to_thread(target.read_text, encoding="utf-8", errors="replace")
             passed, detail = await asyncio.to_thread(
                 self._run_patched_tests, target, incident.repaired_content)
             incident.tests_passed, incident.tests_detail = passed, detail
@@ -1037,6 +1107,14 @@ class SelfRepairAgent:
         Run the verification suite: byte-compile the package (fast smoke) and,
         if a tests/ directory exists, pytest.  Executed off the event loop.
         """
+        if getattr(sys, "frozen", False):
+            # ORION.exe is the application, not a Python CLI. Passing -m to it
+            # starts the GUI again; the bundled PYZ also contains bytecode,
+            # not the source checkout this verification suite must examine.
+            return ToolResult(
+                "Source verification is unavailable in the installed application. "
+                "Run the source checkout's tests with its Python interpreter; "
+                "no tests were run and no second ORION process was started.", ok=False)
         root = Path(path).expanduser() if path.strip() else BASE_DIR
 
         def _run() -> tuple[str, bool]:
@@ -1152,22 +1230,89 @@ class SelfRepairAgent:
         return matches
 
     def _run_patched_tests(self, target: Path, content: str) -> tuple[Optional[bool], str]:
+        evidence = self._run_test_evidence(target, content)
+        return evidence.passed, evidence.detail
+
+    def _verify_auto_candidate(self, incident: Incident, target: Path,
+                               original: str, candidate: str) -> tuple[Optional[bool], str]:
+        """Unattended changes need a reproduced failure and the same green checks.
+
+        Separate copies prevent baseline state and bytecode leaking into the
+        candidate run. Passing unrelated tests is not evidence of improvement.
+        """
+        import tempfile
+
+        # Copy once, then give each run its own working copy of these same
+        # inputs. Edits by a developer during either run cannot change the
+        # assertions or dependencies used to judge the candidate.
+        incident.verified_digest = ""
+        incident.verification_inputs_digest = ""
+        try:
+            with tempfile.TemporaryDirectory(prefix="orion_repair_inputs_") as folder:
+                snapshot = Path(folder)
+                self._copy_verification_inputs(snapshot, target.stem)
+                digest = hashlib.sha256()
+                for path in sorted(snapshot.rglob("*")):
+                    if path.is_file():
+                        digest.update(path.relative_to(snapshot).as_posix().encode("utf-8") + b"\0")
+                        digest.update(hashlib.sha256(path.read_bytes()).digest())
+                incident.verification_inputs_digest = digest.hexdigest()
+                baseline = self._run_test_evidence(target, original, snapshot=snapshot)
+                incident.baseline_tests_passed = baseline.passed
+                incident.baseline_tests_detail = baseline.detail
+                if baseline.passed is not False:
+                    return None, f"fault not reproduced by dedicated checks ({baseline.detail})"
+                patched = self._run_test_evidence(target, candidate, snapshot=snapshot)
+        except Exception as exc:
+            return None, f"could not snapshot verification inputs ({first_line(exc, 80)})"
+        if patched.passed is not True:
+            return patched.passed, f"before: {baseline.detail}; after: {patched.detail}"
+        if baseline.outcomes.keys() != patched.outcomes.keys():
+            return None, "test collection changed between baseline and candidate"
+        for name, outcome in baseline.outcomes.items():
+            if outcome in {"passed", "failed"} and patched.outcomes[name] != "passed":
+                return None, f"candidate stopped exercising a baseline check: {name}"
+        incident.verified_digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        return True, f"before: {baseline.detail}; after: {patched.detail}"
+
+    def _copy_verification_inputs(self, destination: Path, stem: str) -> None:
+        import shutil
+
+        shutil.copytree(PACKAGE_DIR, destination / PACKAGE_DIR.name,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.db", "*.db-wal", "*.db-shm"))
+        tests = destination / "tests"
+        tests.mkdir()
+        for source in self._relevant_tests(stem):
+            shutil.copy2(source, tests / source.name)
+        for relative in (Path("conftest.py"), Path("tests/conftest.py")):
+            source = BASE_DIR / relative
+            if source.is_file():
+                shutil.copy2(source, destination / relative)
+
+    def _run_test_evidence(self, target: Path, content: str,
+                           *, snapshot: Path | None = None) -> _RepairTestEvidence:
         """Copy the package to a temp dir, swap in the patched file, and run the
         module's tests there. Returns (passed|None, one-line detail). Never
         mutates the live source and never raises."""
+        if getattr(sys, "frozen", False):
+            return _RepairTestEvidence(None, "source-checkout tests cannot run inside the installed application; "
+                                       "the proposed source repair has not been tested")
         import shutil
         import subprocess
         import tempfile
+        import xml.etree.ElementTree as ET
 
         stem = target.stem
-        matches = self._relevant_tests(stem)
+        source_root = snapshot or BASE_DIR
+        source_package = snapshot / PACKAGE_DIR.name if snapshot else PACKAGE_DIR
+        matches = sorted((snapshot / "tests").glob("test_*.py")) if snapshot else self._relevant_tests(stem)
         if not matches:
-            return None, f"no tests matching '{stem}'"
+            return _RepairTestEvidence(None, f"no tests matching '{stem}'")
         tmp = Path(tempfile.mkdtemp(prefix="orion_repair_tests_"))
         try:
             pkg_copy = tmp / PACKAGE_DIR.name
             shutil.copytree(
-                PACKAGE_DIR, pkg_copy,
+                source_package, pkg_copy,
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.db",
                                               "*.db-wal", "*.db-shm"))
             # Relative to the package, so a patch to gui/core_window.py lands
@@ -1176,18 +1321,39 @@ class SelfRepairAgent:
                 relative = target.resolve().relative_to(PACKAGE_DIR.resolve())
             except ValueError:
                 relative = Path(target.name)
-            (pkg_copy / relative).write_text(content, encoding="utf-8")
+            (pkg_copy / relative).write_bytes(content.encode("utf-8"))
             dst_tests = tmp / "tests"
             dst_tests.mkdir()
-            conftest = BASE_DIR / "tests" / "conftest.py"
+            root_conftest = source_root / "conftest.py"
+            if root_conftest.exists():
+                shutil.copy2(root_conftest, tmp / "conftest.py")
+            conftest = source_root / "tests" / "conftest.py"
             if conftest.exists():
                 shutil.copy2(conftest, dst_tests / "conftest.py")
             for test_file in matches:
                 shutil.copy2(test_file, dst_tests / test_file.name)
+            env = os.environ.copy()
+            for key in ("PYTHONPATH", "PYTHONHOME", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
+                env.pop(key, None)
+            config = tmp / "runtime_config"
+            config.mkdir()
+            env.update(ORION_CONFIG_DIR=str(config), ORION_AUTOREPAIR="0",
+                       PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", QT_QPA_PLATFORM="offscreen")
+            report = tmp / "test-results.xml"
+            bootstrap = (
+                "import importlib.util, pathlib, sys; "
+                "spec = importlib.util.find_spec(sys.argv.pop(1)); "
+                "expected = pathlib.Path(sys.argv.pop(1)).resolve(); "
+                "assert spec and spec.submodule_search_locations and "
+                "expected in [pathlib.Path(p).resolve() for p in spec.submodule_search_locations], "
+                "'verification imported a package outside the isolated copy'; "
+                "import pytest; raise SystemExit(pytest.main(sys.argv[1:]))")
             proc = subprocess.run(
-                [sys.executable, "-m", "pytest", "-q",
+                [sys.executable, "-c", bootstrap, PACKAGE_DIR.name, str(pkg_copy),
+                 "-q", "-p", "no:cacheprovider",
+                 f"--rootdir={tmp}", f"--confcutdir={tmp}", f"--junitxml={report}",
                  *[str(dst_tests / t.name) for t in matches]],
-                cwd=str(tmp), capture_output=True, text=True, timeout=300,
+                cwd=str(tmp), env=env, capture_output=True, text=True, timeout=300,
             )
             summary = ""
             for line in reversed((proc.stdout or "").strip().splitlines()):
@@ -1195,13 +1361,28 @@ class SelfRepairAgent:
                     summary = line.strip()
                     break
             names = ", ".join(t.name for t in matches)
-            return (proc.returncode == 0), f"{names}: {summary}" if summary else names
+            detail = f"{names}: {summary}" if summary else names
+            if proc.returncode not in (0, 1) or not report.is_file():
+                return _RepairTestEvidence(None, f"test infrastructure unavailable: {detail}")
+            outcomes: dict[str, str] = {}
+            for case in ET.parse(report).iter("testcase"):
+                name = f"{case.get('classname', '')}::{case.get('name', '')}"
+                if name in outcomes or case.find("error") is not None:
+                    return _RepairTestEvidence(None, f"test setup/collection error: {detail}")
+                outcomes[name] = ("failed" if case.find("failure") is not None else
+                                  "skipped" if case.find("skipped") is not None else "passed")
+            if not any(value in {"passed", "failed"} for value in outcomes.values()):
+                return _RepairTestEvidence(None, f"no checks exercised the module: {detail}")
+            failed = "failed" in outcomes.values()
+            if (proc.returncode == 1) != failed:
+                return _RepairTestEvidence(None, f"inconsistent test evidence: {detail}")
+            return _RepairTestEvidence(not failed, detail, outcomes)
         except FileNotFoundError:
-            return None, "pytest not installed"
+            return _RepairTestEvidence(None, "pytest not installed")
         except subprocess.TimeoutExpired:
-            return None, "tests timed out"
+            return _RepairTestEvidence(None, "tests timed out")
         except Exception as exc:
-            return None, f"could not run tests ({first_line(exc, 80)})"
+            return _RepairTestEvidence(None, f"could not run tests ({first_line(exc, 80)})")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1277,7 +1458,8 @@ class SelfRepairAgent:
         or the result will not compile — the precise reason is fed back.
         """
         try:
-            original = target.read_text(encoding="utf-8", errors="replace")
+            original_bytes = await asyncio.to_thread(target.read_bytes)
+            original = original_bytes.decode("utf-8").replace("\r\n", "\n")
         except Exception as exc:
             return ToolResult(f"Could not read {target.name}: {first_line(exc)}", ok=False)
         if not self.router.has_text_fallback():
@@ -1286,11 +1468,11 @@ class SelfRepairAgent:
                 "available, ask me to repair the file again.", ok=False)
         if incident.reported:
             radius = 160
-            window = self._read_source_window(str(target), incident.line or 1, radius)
+            window = self._source_window(original, incident.line or 1, radius)
             problem = (f"REPORTED DEFECT (no exception — the behaviour is wrong):\n"
                        f"{incident.message}")
         else:
-            window = self._read_source_window(str(target), incident.line or 1, 60)
+            window = self._source_window(original, incident.line or 1, 60)
             problem = (f"Error: {incident.error_type}: {incident.message}\n\n"
                        f"Traceback:\n{incident.traceback}")
         # The whole file when it fits comfortably; a generous window otherwise.
@@ -1302,9 +1484,6 @@ class SelfRepairAgent:
         except ValueError:
             shown = target.name
         prompt = f"{problem}\n\nFILE: {shown}\n```python\n{body}\n```"
-        import py_compile
-        import tempfile
-
         feedback = ""
         last_problem = ""
         for attempt in range(2):
@@ -1349,20 +1528,24 @@ class SelfRepairAgent:
                 last_problem = "the edits changed nothing"
                 feedback = "\n\nYOUR EDITS CHANGED NOTHING. Make the fix."
                 continue
-            tmp = Path(tempfile.gettempdir()) / f"orion_repair_{incident.id}.py"
             try:
-                tmp.write_text(corrected, encoding="utf-8")
-                py_compile.compile(str(tmp), doraise=True)
+                # Compile source without creating a shared temporary module or
+                # leaving __pycache__ artefacts behind after every repair.
+                await asyncio.to_thread(compile, corrected, str(target), "exec")
             except Exception as exc:
                 last_problem = f"does not compile ({first_line(exc, 100)})"
                 feedback = (f"\n\nTHE EDITED FILE DOES NOT COMPILE: {first_line(exc, 160)}. "
                             "Fix your edit.")
                 continue
-            finally:
-                tmp.unlink(missing_ok=True)
             cause = answer.split("<<<<<<<", 1)[0].strip()
             incident.root_cause = cause[:800]
             incident.repaired_content = corrected
+            incident.source_digest = hashlib.sha256(original_bytes).hexdigest()
+            incident.verified_digest = ""
+            incident.verification_inputs_digest = ""
+            incident.tests_passed = None
+            incident.baseline_tests_passed = None
+            incident.tests_detail = incident.baseline_tests_detail = ""
             return ToolResult("draft ready")
         if last_problem.startswith("does not compile"):
             return ToolResult(f"The drafted fix for {target.name} {last_problem}; "
@@ -1371,7 +1554,8 @@ class SelfRepairAgent:
             f"I could not produce a clean, applicable diff for {target.name} "
             f"({last_problem or 'no usable edit'}).", ok=False)
 
-    def _apply_repaired(self, incident: Incident, target: Path) -> ToolResult:
+    def _apply_repaired(self, incident: Incident, target: Path, *, expected_digest: str = "",
+                        expected_source_digest: str = "") -> ToolResult:
         """Replace *target* with the drafted fix — only ever with a proven backup.
 
         This rewrites ORION's own source, so the ordering is the whole design.
@@ -1390,17 +1574,36 @@ class SelfRepairAgent:
         restore; and a restore that fails is reported as exactly that, with
         the path to recover from.
         """
+        with _REPAIR_LOCK:
+            return self._apply_repaired_locked(incident, target, expected_digest=expected_digest,
+                                               expected_source_digest=expected_source_digest)
+
+    def _apply_repaired_locked(self, incident: Incident, target: Path, *, expected_digest: str = "",
+                               expected_source_digest: str = "") -> ToolResult:
+        if incident.applied:
+            return ToolResult(f"The repair for {target.name} is already applied; its original backup is retained.")
         import py_compile
-        from .atomic_io import atomic_write_bytes, atomic_write_text
+        from .atomic_io import atomic_write_bytes
 
         stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
-        backup = self.BACKUP_DIR / f"{target.name}.{stamp}.bak"
+        backup = self.BACKUP_DIR / f"{target.name}.{stamp}.{uuid.uuid4().hex}.bak"
         try:
             original = target.read_bytes()
         except OSError as exc:
             return ToolResult(
                 f"I couldn't read {target.name} to back it up "
                 f"({first_line(exc, 60)}), so I changed nothing.", ok=False)
+        original_digest = hashlib.sha256(original).hexdigest()
+        if any(digest and original_digest != digest
+               for digest in (expected_source_digest, incident.source_digest)):
+            return ToolResult(
+                f"{target.name} changed after this fix was drafted. I preserved the newer source; "
+                "draft a fresh repair against the current file before applying it.", ok=False)
+        corrected = incident.repaired_content.encode("utf-8")
+        candidate_digest = expected_digest or incident.verified_digest
+        if candidate_digest and hashlib.sha256(corrected).hexdigest() != candidate_digest:
+            return ToolResult("The repair candidate changed after verification. Run a fresh verification "
+                              "before applying it; I changed nothing.", ok=False)
         try:
             self.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
             atomic_write_bytes(backup, original)
@@ -1411,21 +1614,34 @@ class SelfRepairAgent:
                 f"I couldn't make a verified backup of {target.name} "
                 f"({first_line(exc, 60)}), so I changed nothing.", ok=False)
         try:
-            atomic_write_text(target, incident.repaired_content, encoding="utf-8")
+            if target.read_bytes() != original:
+                return ToolResult(
+                    f"{target.name} changed while its backup was being prepared. I preserved the newer source; "
+                    f"the original snapshot remains at {backup}.", ok=False)
+            # Publish the exact UTF-8 bytes whose identity undo records. Text
+            # streams translate newlines on Windows and invalidate that hash.
+            atomic_write_bytes(target, corrected)
         except OSError as exc:
             # Atomic: a failed write never reached the target.
             return ToolResult(
                 f"I couldn't write the fix to {target.name} "
                 f"({first_line(exc, 60)}); the original is untouched.", ok=False)
         try:
+            if target.read_bytes() != corrected:
+                return ToolResult(
+                    f"The requested fix for {target.name} could not be verified because its source changed. "
+                    f"I preserved the current file; the original snapshot remains at {backup}.", ok=False)
             py_compile.compile(str(target), doraise=True)
         except Exception as exc:
             try:
                 atomic_write_bytes(target, original)
             except OSError as restore_exc:
-                self.bus.log.emit(
-                    f"REPAIR: {target.name} failed to compile AND could not be "
-                    f"restored ({first_line(restore_exc, 80)}) — backup at {backup}.")
+                try:
+                    self.bus.log.emit(
+                        f"REPAIR: {target.name} failed to compile AND could not be "
+                        f"restored ({first_line(restore_exc, 80)}) — backup at {backup}.")
+                except Exception:
+                    pass
                 return ToolResult(
                     f"The fix for {target.name} did not compile "
                     f"({first_line(exc, 60)}), and restoring the original ALSO "
@@ -1437,8 +1653,16 @@ class SelfRepairAgent:
                 f"({first_line(exc, 60)}), so I reverted it to the original.", ok=False)
         incident.applied = True
         incident.backup_path = str(backup)
-        self.bus.log.emit(f"REPAIR: applied fix to {target.name} (backup {backup.name}).")
-        self.bus.banner.emit(f"SELF-REPAIR APPLIED: {target.name} — restart to load", 3)
+        incident.backup_digest = original_digest
+        incident.applied_digest = hashlib.sha256(corrected).hexdigest()
+        self._apply_counter = getattr(self, "_apply_counter", 0) + 1
+        incident.applied_order = self._apply_counter
+        for signal, payload in (("log", (f"REPAIR: applied fix to {target.name} (backup {backup.name}).",)),
+                                ("banner", (f"SELF-REPAIR APPLIED: {target.name} — restart to load", 3))):
+            try:
+                getattr(self.bus, signal).emit(*payload)
+            except Exception:
+                pass  # Optional observers cannot erase a completed source receipt.
         self._journal("repaired", incident, note=f"backup {backup.name}")
         return ToolResult(
             f"Done — I've corrected {target.name} and it compiles. The original is "
@@ -1447,17 +1671,31 @@ class SelfRepairAgent:
             "anything seems off afterwards.")
 
     def revert_last(self) -> ToolResult:
+        with _REPAIR_LOCK:
+            return self._revert_last_locked()
+
+    def _revert_last_locked(self) -> ToolResult:
         applied = [i for i in self._incidents.values() if i.applied and i.backup_path]
         if not applied:
             return ToolResult("There's no applied repair to revert.")
-        incident = applied[-1]
+        incident = max(applied, key=lambda item: item.applied_order)
         target = Path(incident.file)
         backup = Path(incident.backup_path)
         try:
             from .atomic_io import atomic_write_bytes
+            current = target.read_bytes()
+            original = backup.read_bytes()
+            if not incident.applied_digest or not incident.backup_digest:
+                return ToolResult("This repair has no verified source identities for automatic undo. "
+                                  f"Review the retained backup at {backup} before restoring it manually.", ok=False)
+            if hashlib.sha256(current).hexdigest() != incident.applied_digest:
+                return ToolResult(f"{target.name} changed after this repair. I preserved the newer source; "
+                                  f"the pre-repair backup remains at {backup}.", ok=False)
+            if hashlib.sha256(original).hexdigest() != incident.backup_digest:
+                return ToolResult(f"The backup for {target.name} has changed. I preserved the current source.", ok=False)
             # Bytes, atomically: the backup is a byte copy of the original, and
             # a revert that fails part-way must not leave the source truncated.
-            atomic_write_bytes(target, backup.read_bytes())
+            atomic_write_bytes(target, original)
             incident.applied = False
             self._journal("reverted", incident)
             return ToolResult(

@@ -14,13 +14,18 @@ Also implements the immersive display modes:
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import os
 import sys
 import time
+import weakref
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Optional
 
 import psutil
+from PyQt6 import sip
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
@@ -32,6 +37,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QToolButton,
     QVBoxLayout,
@@ -39,7 +45,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..bus import OrionBus
-from ..constants import APP_BUILD, APP_NAME, APP_SUBTITLE
+from ..constants import APP_BUILD, APP_NAME, APP_SUBTITLE, SPACE
 from ..memory import MemoryAgent
 from ..utils import utc_stamp
 from .face import HologramFace
@@ -152,6 +158,25 @@ def unified_shell_enabled() -> bool:
 CONTENT_STRIP_HEIGHT = 190
 
 
+def _new_webgl_face() -> Any:
+    """The Three.js face: in its own process (face_host.RemoteFace) unless
+    ORION_FACE_PROCESS=0, or after the host failed this run - then in ORION's.
+
+    MEASURED, 10 Oct: with ORION's GUI thread busy 40% of the time the
+    in-process page drew 36 fps with 200 ms freezes; in its own process,
+    60 fps with no gap over 17 ms."""
+    from .face3d import QuantumFace3D, local_three, _register_scheme
+    if local_three() is None or not _register_scheme():
+        raise RuntimeError("the local avatar assets cannot be served")
+    from . import face_host
+    if face_host.enabled():
+        try:
+            return face_host.RemoteFace()
+        except Exception as exc:
+            print(f"[FACE] face process unavailable ({exc}) - drawing in-process.", flush=True)
+    return QuantumFace3D()
+
+
 def _wear_orion_colours(face: Any) -> Any:
     """Give a freshly built face ORION's crimson.
 
@@ -184,6 +209,72 @@ def _wear_orion_colours(face: Any) -> Any:
     return face
 
 
+#: ORION's state as the header says it (Mark XXXV): words, not a status code.
+_STATE_WORDS = {
+    "INITIALISING": "Waking up…", "LISTENING": "I'm listening", "SPEAKING": "Speaking",
+    "THINKING": "Thinking…", "PROCESSING": "Working on it…", "STANDBY": "Resting",
+    "IDLE": "Here when you need me", "PAUSED": "Paused", "OFFLINE": "Offline",
+    "RECONNECTING": "Reconnecting…", "MUTED": "Muted", "FOCUS": "Keeping quiet",
+    "ERROR": "Something's wrong",
+}
+
+
+def _state_words(state: str) -> str:
+    key = str(state or "").upper()
+    return _STATE_WORDS.get(key) or key.replace("_", " ").capitalize()
+
+
+def _clock_words(now: datetime) -> str:
+    """'Tue 7 Oct  ·  21:52' - the date and the time, without seconds ticking."""
+    return f"{now.strftime('%a')} {now.day} {now.strftime('%b')}  ·  {now.strftime('%H:%M')}"
+
+
+def _greeting_words(now: datetime, name: str = "") -> str:
+    hour = now.hour
+    if 5 <= hour < 12:
+        words = "Good morning"
+    elif 12 <= hour < 18:
+        words = "Good afternoon"
+    else:
+        words = "Good evening"
+    first = name.split()[0] if name.strip() else ""
+    return f"{words}, {first}" if first else words
+
+
+def _share_with_live(worker: Any, note: str) -> bool:
+    """Put a dropped file's content into Live's context the way other
+    background notes go (reward_learning._send_hint): queued, sent while the
+    channel is idle and never mid-sentence, and re-sent on a reconnect.
+
+    The review calls this before it returns, so the note is queued ahead of
+    the spoken acknowledgement and cannot cut it off on the channel."""
+    notes = getattr(worker, "_pending_context_notes", None)
+    flush = getattr(worker, "_flush_context_notes", None)
+    if notes is None or not callable(flush):
+        return False
+    notes.append(note)
+    try:
+        background.spawn(flush(), name="orion-dropped-file-context")
+    except RuntimeError:
+        pass            # no running loop: the next flush (or reconnect) sends it
+    return True
+
+
+def _note_dropped_file(worker: Any, path: str, result: Any) -> None:
+    """Record a dropped file in the activity ledger, as a tool call would be,
+    so the continuity brief of a later Live session still knows about it -
+    a context note dies with the session that received it."""
+    ledger = getattr(worker, "_activity_ledger", None)
+    payload = getattr(result, "response_payload", None)
+    if ledger is None or not callable(payload):
+        return
+    try:
+        activity = ledger.started("process_file", {"action": "review", "path": str(path)})
+        ledger.finished(activity, payload())
+    except Exception:
+        pass            # the ledger is a courtesy; the review itself is done
+
+
 class OrionCoreWindow(QMainWindow):
     def __init__(self, bus: OrionBus, memory: MemoryAgent) -> None:
         super().__init__()
@@ -213,6 +304,11 @@ class OrionCoreWindow(QMainWindow):
         self._overlay_active = False
         self._saved_geometry: Any = None
         self._orb_overlay: Any = None
+        self._orb_gestures: Any = None
+        self._orb_camera_tracker: Any = None
+        self._orb_hands_enabled = False
+        self._orb_started_tracker = False
+        self._orb_hand_session: int | None = None
 
         self.setWindowTitle(APP_NAME)
         # Face-only content can comfortably go much smaller than the old
@@ -231,6 +327,9 @@ class OrionCoreWindow(QMainWindow):
         from . import depth
 
         depth.lift_panels(self)
+        # The initial host can fail just like a rebuilt one. Without this
+        # watcher its empty container survived the startup timeout forever.
+        self._watch_face_health()
 
     def showEvent(self, event: Any) -> None:
         """Ask the compositor to blur the desktop behind the window.
@@ -252,8 +351,88 @@ class OrionCoreWindow(QMainWindow):
     def attach_worker(self, worker: Any) -> None:
         self.worker = worker
 
+    def attach_orb_controls(self, gestures: Any, camera_tracker: Any = None) -> None:
+        """Connect the opt-in two-hand camera mode to the existing orb view."""
+        self._orb_gestures = gestures
+        self._orb_camera_tracker = camera_tracker
+        action = getattr(self, "orb_hands_action", None)
+        if action is not None:
+            action.setEnabled(gestures is not None)
+
+    def _show_orb_controls(self) -> None:
+        QMessageBox.information(
+            self, "Orb Controls",
+            "Drag to move the orb. Right-drag to rotate it.\n"
+            "Scroll or Shift-drag to scatter its particles.\n"
+            "Double-click to reset its position and shape.\n\n"
+            "Camera hand control is available in the Appearance menu.",
+        )
+
+    def set_orb_hand_control(self, enabled: bool) -> bool:
+        action = getattr(self, "orb_hands_action", None)
+        gestures = getattr(self, "_orb_gestures", None)
+        if enabled and gestures is not None:
+            self.set_face_form("orb")
+            face = getattr(self, "face", None)
+            if (not hasattr(face, "set_orb_hands") or
+                    not getattr(face, "supports_orb_hands", True)):
+                from ..appearance import SCREEN_ONLY_REPLY, form_enabled
+                self.bus.log.emit(
+                    "GESTURE: camera hand control needs the Three.js orb."
+                    if form_enabled("orb") else
+                    f"GESTURE: camera hand control belongs to the orb. {SCREEN_ONLY_REPLY}")
+                enabled = False
+            else:
+                tracker = self._orb_camera_tracker
+                if tracker is not None and not getattr(tracker, "running", False):
+                    result = tracker.start()
+                    if not getattr(result, "ok", True):
+                        self.bus.log.emit(f"GESTURE: camera unavailable - {result.text}")
+                        enabled = False
+                    else:
+                        self._orb_started_tracker = True
+                if enabled:
+                    result = gestures.start_orb()
+                    if not getattr(result, "ok", True):
+                        self.bus.log.emit(f"GESTURE: {result.text}")
+                        enabled = False
+                    else:
+                        self._orb_hand_session = getattr(gestures, "orb_session", None)
+        elif enabled:
+            self.bus.log.emit("GESTURE: install mediapipe to use camera hand control.")
+            enabled = False
+        if not enabled:
+            if self._orb_hands_enabled and gestures is not None:
+                gestures.stop_orb()
+            if self._orb_started_tracker and self._orb_camera_tracker is not None:
+                # Off the loop: stop() joins the capture thread for up to 2 s
+                # while a camera driver finishes read() (Mark XXXV W1.1 audit).
+                # A start() meanwhile answers "the camera is still stopping".
+                import threading
+                threading.Thread(target=self._orb_camera_tracker.stop,
+                                 name="orb-camera-stop", daemon=True).start()
+            self._orb_started_tracker = False
+        self._orb_hands_enabled = enabled
+        self._to_face("set_orb_camera_enabled", enabled)
+        if action is not None:
+            action.setChecked(enabled)
+        return enabled
+
+    def _on_orb_gesture(self, sample: Any) -> None:
+        if isinstance(sample, dict) and sample.get("stopped"):
+            if (sample.get("session") is not None
+                    and sample["session"] != self._orb_hand_session):
+                return
+            if self._orb_hands_enabled:
+                self.set_orb_hand_control(False)
+            return
+        if self._orb_hands_enabled:
+            self._to_face("set_orb_hands", sample)
+
     def attach_dashboard(self, dashboard: QMainWindow) -> None:
         self.dashboard = dashboard
+        import weakref
+        dashboard._core_window_ref = weakref.ref(self)
 
     def attach_command_centre(self, centre: QMainWindow) -> None:
         self.command_centre = centre
@@ -371,12 +550,14 @@ class OrionCoreWindow(QMainWindow):
         bus→face connections are removed to avoid double-driving.  Emotion
         parameter sets still stream straight to the rig.
         """
+        if getattr(self, "avatar", None) is avatar:
+            avatar.attach(self.face)
+            return
         self.avatar = avatar
         # The window's own forwarders are what the bus is connected to (see
         # _connect_bus); disconnecting self.face.* would silently match
         # nothing and leave the rig driven twice.
-        for signal, slot in ((self.bus.state, self._face_set_state),
-                             (self.bus.amplitude, self._face_set_amplitude),
+        for signal, slot in ((self.bus.amplitude, self._face_set_amplitude),
                              (self.bus.speaking, self._face_set_speaking)):
             try:
                 signal.disconnect(slot)
@@ -426,36 +607,56 @@ class OrionCoreWindow(QMainWindow):
         if check is None:
             return                      # not the WebGL face; nothing to watch
 
-        # Every toggle of the compact orb rebuilds the face and starts another
-        # watcher, so several can be in flight at once. Each one watches the
-        # widget it was created for: without this, a watcher left over from a
-        # discarded face polls forever, eventually gives up, and condemns the
-        # perfectly good face that replaced it.
         watched = face
-
-        #: How long a fresh page is given before it is called broken.
-        #:
-        #: Six seconds was not enough. Toggling the compact orb rebuilds this
-        #: widget — setWindowFlags destroys the native window and a
-        #: QWebEngineView cannot survive that — and a new page must fetch a
-        #: megabyte of library, compile its shaders and build 22,000 points
-        #: while the rest of ORION is running. It regularly took longer, so
-        #: the watcher condemned a working face and latched a fallback that
-        #: never lifted.
+        token = object()
+        watched._orion_health_watch = token
         attempts = [0]
-        limit = 6
+        pending: list[Any] = [None]
+
+        def current() -> bool:
+            try:
+                return (getattr(self, "face", None) is watched
+                        and not getattr(self, "_shutting_down", False)
+                        and not getattr(watched, "_orion_retired", False)
+                        and getattr(watched, "_orion_health_watch", None) is token)
+            except RuntimeError:
+                return False
+
+        def probe() -> None:
+            if not current():
+                return
+            try:
+                if not self.isVisible():
+                    QTimer.singleShot(4000, probe)
+                    return
+            except RuntimeError:
+                return
+            marker = object()
+            pending[0] = marker
+
+            def answer(state: Any) -> None:
+                if current() and pending[0] is marker:
+                    pending[0] = None
+                    verdict(state)
+
+            # A dead renderer/pipe may never answer runJavaScript. Its absence
+            # must also consume a bounded attempt, with late replies ignored.
+            QTimer.singleShot(2000, lambda: answer("loading"))
+            self._probe_face(check, answer)
 
         def verdict(state: Any) -> None:
-            if getattr(self, "face", None) is not watched:
-                return          # this face has already been replaced
+            if not current():
+                return
             state = str(state)
             if state == "alive":
+                attempts[0] = 0
+                QTimer.singleShot(4000, probe)
                 return
             attempts[0] += 1
-            if state != "failed" and attempts[0] < limit:
-                # Still loading. Ask again rather than deciding.
-                QTimer.singleShot(4000, lambda: self._probe_face(check, verdict))
+            if state != "failed" and attempts[0] < 3:
+                QTimer.singleShot(4000, probe)
                 return
+            watched._orion_health_watch = None
             if not getattr(self, "_face_retried", False):
                 # One fresh page before giving up. A WebGL context refused
                 # under momentary GPU or memory pressure is usually granted a
@@ -468,7 +669,9 @@ class OrionCoreWindow(QMainWindow):
                     self._rebuild_face()
                 except Exception as exc:
                     self.bus.log.emit(f"FACE: the retry failed - {exc}")
-                return
+                else:
+                    if getattr(self, "face", None) is not watched:
+                        return
             self.bus.log.emit(
                 "FACE: the WebGL avatar will not start on this machine right "
                 "now — showing ORION's orb, which needs no GPU. His face comes "
@@ -479,7 +682,15 @@ class OrionCoreWindow(QMainWindow):
             except Exception as exc:
                 self.bus.log.emit(f"FACE: the fallback also failed - {exc}")
 
-        QTimer.singleShot(6000, lambda: self._probe_face(check, verdict))
+        if hasattr(watched, "on_failed"):
+            # The host reports a missing window immediately, including after
+            # it was initially healthy. Queue recovery outside its shutdown
+            # stack, which also completes any pending query callbacks.
+            watched.on_failed = lambda: QTimer.singleShot(0, lambda: verdict("failed"))
+        if getattr(watched, "failed", False):
+            QTimer.singleShot(0, lambda: verdict("failed"))
+        else:
+            QTimer.singleShot(6000, probe)
 
     @staticmethod
     def _probe_face(check: Any, verdict: Any) -> None:
@@ -509,9 +720,12 @@ class OrionCoreWindow(QMainWindow):
         the swarm anyway. That is what the user actually saw at startup: a
         flat voxel face and no 3-D avatar anywhere.
 
-        Order: the software head (ORION_HOLO_HEAD=0 to skip), then the
-        WebEngine face where a separate window makes it possible, then the
-        native GL panel (ORION_NATIVE_FACE=0 to skip), then the 2-D rig.
+        Order: the software head when explicitly asked for (ORION_HOLO_HEAD=1),
+        then the SCREEN face — the default form, built before anything that
+        touches WebEngine so the common startup loads no Chromium face process
+        and no Three.js page at all — then the orb, then the classic WebEngine
+        face where a separate window makes it possible, then the native GL
+        panel (ORION_NATIVE_FACE=0 to skip), then the 2-D rig.
 
         Kept as a seam for a second reason: the 3-D WebEngine face cannot
         survive a native window recreation under the offscreen QPA platform,
@@ -532,12 +746,26 @@ class OrionCoreWindow(QMainWindow):
         # The user's choice comes before every automatic fallback below. A
         # human face is not always what you want in the room — shown to
         # somebody who did not ask to be looked at by one, it lands somewhere
-        # between striking and unsettling — so the orb is a first-class form
-        # rather than a degraded mode, and asking for it is honoured exactly.
+        # between striking and unsettling — so the screen face is the default
+        # and the orb is a first-class form rather than a degraded mode, and
+        # asking for either is honoured exactly.
         from ..appearance import face_form
+        form = face_form()
+        if form == "screen":
+            # ORION's screen face: pure QPainter on the face pipeline's worker
+            # thread. It needs no WebGL, so a WebGL fallback flag does not
+            # apply to it, and nothing on this path imports face3d.
+            try:
+                from .screen_face import ScreenFacePanel
+                return _wear_orion_colours(ScreenFacePanel())
+            except Exception as exc:
+                from ..startup_report import say
+
+                say(f"[ORION] FACE: the screen face could not be built ({exc}) "
+                    f"- using the classic face instead.")
         webgl_ok = (webengine_face_possible()
                     and os.getenv("ORION_FACE_FALLBACK", "") != "orb")
-        if face_form() == "orb" or not webgl_ok and os.getenv("ORION_FACE_FALLBACK") == "orb":
+        if form == "orb" or not webgl_ok and os.getenv("ORION_FACE_FALLBACK") == "orb":
             # His orb. The Three.js face holds its own orb form — the same
             # scene, so switching back to the face is a morph, not a reload —
             # and the software-painted orb stands in when WebGL cannot run.
@@ -545,7 +773,7 @@ class OrionCoreWindow(QMainWindow):
                 try:
                     from .face3d import QuantumFace3D
                     if QuantumFace3D.available:
-                        face = QuantumFace3D()
+                        face = _new_webgl_face()
                         face.set_form("orb")
                         return _wear_orion_colours(face)
                 except Exception:
@@ -556,15 +784,20 @@ class OrionCoreWindow(QMainWindow):
             except Exception:
                 pass    # the orb could not be built; fall through to a face
 
-        # Otherwise ORION's own face: the quantum orb that holds the screen
-        # while he comes up, then materialises into him.
+        # Otherwise ORION's classic face: the quantum orb that holds the
+        # screen while he comes up, then materialises into him.
         if webgl_ok:
             try:
                 from .face3d import QuantumFace3D
                 if QuantumFace3D.available:
-                    return _wear_orion_colours(QuantumFace3D())
+                    return _wear_orion_colours(_new_webgl_face())
+                raise RuntimeError("WebEngine is unavailable")
             except Exception:
-                pass    # fall through to a face that always works
+                # A failed local loader must not replace an offline avatar
+                # with another renderer needing a GL context or the internet.
+                os.environ["ORION_FACE_FALLBACK"] = "orb"
+                from .hud import CentralHud
+                return _wear_orion_colours(CentralHud())
         if holo_head_enabled():
             try:
                 from .holo_head import HoloHeadPanel
@@ -580,7 +813,10 @@ class OrionCoreWindow(QMainWindow):
 
     def _face_set_state(self, state: Any) -> None:
         self.face_state = str(state or "STANDBY").upper()
-        self._to_face("set_state", state)
+        # Keep the snapshot current for a rebuilt view or compact overlay.
+        # Once attached, the behaviour controller is the only state writer.
+        if getattr(self, "avatar", None) is None:
+            self._to_face("set_state", state)
 
     def _face_set_amplitude(self, value: Any) -> None:
         self._to_face("set_amplitude", value)
@@ -623,7 +859,8 @@ class OrionCoreWindow(QMainWindow):
         self._sync_form_menu()
 
     def _form_button_toggled(self, button: Any, checked: bool) -> None:
-        """A Face/Orb button became the selected one, however it was pressed."""
+        """A form button (Screen Face, Classic Face, Orb) became the selected
+        one, however it was pressed."""
         if not checked or getattr(self, "_syncing_form", False):
             return
         for form, candidate in getattr(self, "_form_buttons", {}).items():
@@ -649,32 +886,48 @@ class OrionCoreWindow(QMainWindow):
         finally:
             self._syncing_form = False
 
-    def set_face_form(self, form: Any) -> str:
-        """Put ORION in his face or his orb, now, and remember it.
+    #: The Three.js renderer's own names for the two forms it can morph
+    #: between. The screen face is not one of them: it is a different widget.
+    _WEBGL_FORMS = {"classic": "face", "orb": "orb"}
 
-        Returns the form in effect, or "" if *form* named neither. Applied
-        live: somebody asking for the orb because a friend has just walked in
-        needs it gone now, not after a restart.
+    def set_face_form(self, form: Any) -> str:
+        """Put ORION in his screen face, classic face or orb, now, and
+        remember it.
+
+        Returns the form in effect, or "" if *form* named none of them.
+        Applied live: somebody asking for the orb because a friend has just
+        walked in needs it gone now, not after a restart.
         """
-        from ..appearance import face_form, set_face_form
+        from ..appearance import face_form, form_label, set_face_form
 
         chosen = set_face_form(form)
         if not chosen:
             return ""
-        if chosen == "face" and os.environ.pop("ORION_FACE_FALLBACK", None):
+        if chosen != "orb" and self._orb_hands_enabled:
+            self.set_orb_hand_control(False)
+        if chosen == "classic" and os.environ.pop("ORION_FACE_FALLBACK", None):
             # He fell back to the orb because WebGL would not start. Being
-            # asked for the face is a reason to try again, not to refuse.
+            # asked for the classic face is a reason to try again, not to
+            # refuse.
             self._face_retried = False
         face = getattr(self, "face", None)
-        if chosen != self._current_face_form():
-            if hasattr(face, "set_form"):
-                # The Three.js face morphs between the two in place: no new
-                # page, no reload, no flash — the change the room sees is him
-                # folding into the orb (or out of it).
-                face.set_form(chosen)
+        current = self._current_face_form()
+        if chosen != current:
+            if (hasattr(face, "set_form") and chosen in self._WEBGL_FORMS
+                    and current in self._WEBGL_FORMS):
+                # The Three.js face morphs between its face and its orb in
+                # place: no new page, no reload, no flash — the change the
+                # room sees is him folding into the orb (or out of it).
+                face.set_form(self._WEBGL_FORMS[chosen])
             else:
                 self._swap_face()
-        self.bus.log.emit(f"GUI: ORION is now in {chosen} form.")
+        avatar = getattr(self, "avatar", None)
+        if avatar is not None and hasattr(avatar, "set_form"):
+            # The behaviour engine knows "face", "orb" and "auto"; the screen
+            # face runs it on "auto" so its dormancy channel still reports
+            # standby (the screen face rests on it).
+            avatar.set_form(self._WEBGL_FORMS.get(chosen, "auto"))
+        self.bus.log.emit(f"GUI: ORION is now wearing his {form_label(chosen)}.")
         return face_form()
 
     def _current_face_form(self) -> str:
@@ -685,10 +938,48 @@ class OrionCoreWindow(QMainWindow):
         screen would never move.
         """
         face = getattr(self, "face", None)
+        kind = type(face).__name__
+        if kind == "ScreenFacePanel":
+            return "screen"
         form = getattr(face, "form", None)
-        if isinstance(form, str) and form in {"face", "orb"}:
-            return form
-        return "orb" if type(face).__name__ == "CentralHud" else "face"
+        if form == "orb":
+            return "orb"
+        if form == "face":
+            return "classic"
+        return "orb" if kind == "CentralHud" else "classic"
+
+    @staticmethod
+    def _retire_face(old: Any, layout: Any) -> None:
+        """Take a face off screen for good. A face drawn by a face host is
+        asked to quit first: deleting the widget alone left its process (and
+        ~350 MB) running until ORION exited, because the writer thread keeps
+        the Python object alive (Mark XXXV W1.2 review, 11 Oct 2026)."""
+        old._orion_retired = True
+        old._orion_health_watch = None
+        if hasattr(old, "on_failed"):
+            old.on_failed = None
+        shutdown = getattr(old, "shutdown", None)
+        if callable(shutdown) and hasattr(old, "host_wids"):
+            try:
+                shutdown()
+            except Exception:
+                pass
+        # A software face renders on a worker thread (face_pipeline). The
+        # widget gets no close event here, only deleteLater, so its worker is
+        # stopped explicitly — otherwise it went on drawing a face nobody
+        # could see until ORION exited.
+        stop_pipeline = getattr(old, "stop_pipeline", None)
+        if callable(stop_pipeline):
+            try:
+                stop_pipeline()
+            except Exception:
+                pass
+        try:
+            layout.removeWidget(old)
+            old.setParent(None)
+            old.deleteLater()
+        except RuntimeError:
+            pass
 
     def _swap_face(self) -> None:
         """Rebuild the face widget in place, whatever kind it is.
@@ -706,16 +997,16 @@ class OrionCoreWindow(QMainWindow):
         layout = container.layout()
         if layout is None:
             return
-        try:
-            layout.removeWidget(old)
-            old.setParent(None)
-            old.deleteLater()
-        except RuntimeError:
-            pass
+        self._retire_face(old, layout)
         self.face = self._build_face()
         self._watch_face_health()
         layout.addWidget(self.face, 1)
+        if (self._orb_hands_enabled and
+            (not hasattr(self.face, "set_orb_hands") or
+             not getattr(self.face, "supports_orb_hands", True))):
+            self.set_orb_hand_control(False)
         self._to_face("set_state", getattr(self, "face_state", "STANDBY"))
+        self._to_face("set_orb_camera_enabled", self._orb_hands_enabled)
         renderer = getattr(self, "face_renderer", None)
         if renderer is not None and hasattr(self.face, "attach_renderer"):
             try:
@@ -742,18 +1033,18 @@ class OrionCoreWindow(QMainWindow):
         if old is None or not self._face_is_webengine():
             return          # the native and 2-D rigs both survive recreation
         layout = self.face_container.layout()
-        try:
-            layout.removeWidget(old)
-            old.setParent(None)
-            old.deleteLater()
-        except RuntimeError:
-            pass
+        self._retire_face(old, layout)
         self.face = self._build_face()
         self._watch_face_health()
         layout.addWidget(self.face, 1)
+        if (self._orb_hands_enabled and
+            (not hasattr(self.face, "set_orb_hands") or
+             not getattr(self.face, "supports_orb_hands", True))):
+            self.set_orb_hand_control(False)
         # Re-apply what he was doing, or he comes back in whatever state a
         # freshly constructed avatar defaults to.
         self._to_face("set_state", getattr(self, "face_state", "STANDBY"))
+        self._to_face("set_orb_camera_enabled", self._orb_hands_enabled)
         renderer = getattr(self, "face_renderer", None)
         if renderer is not None and hasattr(self.face, "attach_renderer"):
             self.face.attach_renderer(renderer)
@@ -767,8 +1058,8 @@ class OrionCoreWindow(QMainWindow):
     def _build_ui(self) -> None:
         root   = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(SPACE.MD, SPACE.MD, SPACE.MD, SPACE.MD)
+        layout.setSpacing(SPACE.MD)
 
         self.header_frame = self._build_header()
         layout.addWidget(self.header_frame)
@@ -800,7 +1091,7 @@ class OrionCoreWindow(QMainWindow):
         self.swarm_rail = QWidget()
         swarm_rail_layout = QVBoxLayout(self.swarm_rail)
         swarm_rail_layout.setContentsMargins(0, 0, 0, 0)
-        self._swarm_rail_placeholder = QLabel("Swarm rail — waiting for ORION to finish booting.")
+        self._swarm_rail_placeholder = QLabel("")
         self._swarm_rail_placeholder.setObjectName("mutedLabel")
         self._swarm_rail_placeholder.setWordWrap(True)
         swarm_rail_layout.addWidget(self._swarm_rail_placeholder)
@@ -815,7 +1106,7 @@ class OrionCoreWindow(QMainWindow):
         self.deck_panel = QWidget()
         deck_layout = QVBoxLayout(self.deck_panel)
         deck_layout.setContentsMargins(0, 0, 0, 0)
-        self._deck_placeholder = QLabel("Command Deck loads here.")
+        self._deck_placeholder = QLabel("")
         self._deck_placeholder.setObjectName("mutedLabel")
         self._deck_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         deck_layout.addWidget(self._deck_placeholder)
@@ -905,9 +1196,12 @@ class OrionCoreWindow(QMainWindow):
         self.addAction(palette_action)
         # The Command Deck's visible Search bar opens the same palette from the
         # other window, via the bus (the two windows do not hold references to
-        # each other).
+        # each other). Queued: the palette is a modal dialog (palette.exec()),
+        # and a modal loop run inline inside an asyncio task re-enters the
+        # other tasks ("Cannot enter into task" - see gui_command below).
         try:
-            self.bus.open_palette.connect(self.open_command_palette)
+            self.bus.open_palette.connect(self.open_command_palette,
+                                          Qt.ConnectionType.QueuedConnection)
         except Exception:
             pass
 
@@ -939,6 +1233,8 @@ class OrionCoreWindow(QMainWindow):
         """
         self.bus.telemetry_sample.connect(self.hud.rail.apply_sample)
         self.bus.log.connect(self.hud.log.append)
+        from .. import session_log
+        session_log.attach(self.bus)        # no-op unless orion.py enabled it
         self.bus.mic_enabled.connect(self.hud.command.set_mic)
 
         self.hud.command.submitted.connect(self._hud_submit)
@@ -946,10 +1242,8 @@ class OrionCoreWindow(QMainWindow):
         self.hud.command.mic_toggled.connect(self._hud_set_mic)
         self.hud.drop.dropped.connect(self._hud_files_dropped)
 
-        # Uptime and process count refresh on their own slow timer, NOT on the
-        # 0.75 s telemetry tick: psutil.pids() walks the whole process table,
-        # and neither number changes fast enough to be worth that eighty times
-        # a minute on the loop that also carries audio.
+        # How long ORION has been active, on its own slow timer: a minute is
+        # its smallest step, so the 0.75 s telemetry tick would be waste.
         self._hud_facts_timer = QTimer(self)
         self._hud_facts_timer.setInterval(15_000)
         self._hud_facts_timer.timeout.connect(self._refresh_hud_facts)
@@ -984,14 +1278,26 @@ class OrionCoreWindow(QMainWindow):
         panel.raise_()
 
     def _refresh_hud_facts(self) -> None:
+        """'ORION has been active for 3 h 14 min' - since this ORION started."""
         try:
-            import platform
             import time as _time
 
-            seconds = max(0, int(_time.time() - psutil.boot_time()))
-            uptime = f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}"
-            self.hud.rail.set_facts(uptime, len(psutil.pids()),
-                                    platform.system()[:3].upper())
+            started = getattr(self, "_orion_started_at", None)
+            if started is None:
+                started = self._orion_started_at = psutil.Process().create_time()
+            seconds = max(0, int(_time.time() - started))
+            hours, minutes = seconds // 3600, (seconds % 3600) // 60
+            days, hours = hours // 24, hours % 24
+            # "2 days 3 h", "3 h 14 min", "32 min" - said, not "51:14".
+            if days:
+                active = f"{days} day{'s' if days != 1 else ''} {hours} h"
+            elif hours:
+                active = f"{hours} h {minutes} min"
+            elif minutes:
+                active = f"{minutes} min"
+            else:
+                active = ""
+            self.hud.rail.set_active(active)
         except Exception:
             pass
 
@@ -1024,15 +1330,26 @@ class OrionCoreWindow(QMainWindow):
         chosen = [str(p) for p in (paths or []) if str(p).strip()]
         if not chosen:
             return
-        self.write_log(f"YOU: (dropped) {chosen[0]}")
-        review = getattr(self.worker, "review_file", None) if self.worker else None
+        for path in chosen:
+            self.write_log(f"YOU: (dropped) {path}")
+        worker = self.worker
+        review = getattr(worker, "review_file", None) if worker else None
         if review is None:
             self.write_log("SYS: nothing is ready to look at that yet.")
             return
         try:
-            from .. import background
+            from .. import background, file_review
 
-            background.spawn(review(chosen[0]))
+            async def review_all():
+                # 30 Oct 2026 ("does he actually process them properly?"): he
+                # read the file's whole path aloud and the conversation never
+                # saw a word of it. Handed over, the review leads with what the
+                # file is and an offer, and its content joins the conversation
+                # before he speaks, so "yes, summarise it" can be answered.
+                with file_review.handed_over(lambda note: _share_with_live(worker, note)):
+                    for path in dict.fromkeys(chosen):
+                        _note_dropped_file(worker, path, await review(path))
+            background.spawn(review_all(), name="orion-dropped-files")
         except Exception as exc:
             self.write_log(f"SYS: could not open that file - {exc}")
 
@@ -1046,31 +1363,31 @@ class OrionCoreWindow(QMainWindow):
         you cannot see is a control you do not have.
         """
         add = self.hud.controls.add
-        add("remote", "REMOTE CONTROL", self.open_remote_control,
-            icon="\u2b1a", primary=True,
+        add("remote", "Phone Pairing", self.open_remote_control,
+            icon="phone", primary=True,
             hint="Pair a phone, and show the QR code to do it.")
-        add("fullscreen", "FULLSCREEN  [F11]", self.toggle_fullscreen,
-            icon="\u2921")
-        add("shortcut", "CREATE DESKTOP SHORTCUT", self.create_desktop_shortcut,
-            icon="\u25aa", hint="Put ORION on the desktop and Start menu.")
-        add("autostart", "AUTO-START: \u2026", self.toggle_autostart,
-            icon="\u25cf", hint="Start ORION when you log in.")
-        add("customise", "CUSTOMISE ASSISTANT", self.open_preferences,
-            icon="\u2699", hint="Name, voice, accent and audio devices.")
-        add("brief", "BRIEF ME NOW", self.run_morning_brief,
-            icon="\u2600", hint="Hear the latest briefing for this part of the day.")
-        add("ptt", "PUSH-TO-TALK: \u2026", self.toggle_push_to_talk,
-            icon="\u25a4", hint="Hold a key to talk, instead of always listening.")
-        add("overlay", "COMPACT ORB  [Ctrl+Shift+O]", self.toggle_overlay_mode,
-            icon="\u25c9", hint="Shrink ORION to the floating orb.")
-        add("audio", "AUDIO DEVICES", self.open_preferences,
-            icon="\u25d1", hint="Choose the microphone and the speakers.")
-        add("memory", "MEMORY", self.open_memory_viewer,
-            icon="\u25cb", hint="Read and delete what ORION remembers.")
-        add("palette", "COMMAND PALETTE  [Ctrl+K]", self.open_command_palette,
-            icon="\u2318")
-        add("deck", "COMMAND DECK  [Ctrl+D]", self.toggle_dashboard,
-            icon="\u29c9")
+        add("fullscreen", "Fullscreen  [F11]", self.toggle_fullscreen,
+            icon="maximize")
+        add("shortcut", "Create Desktop Shortcut", self.create_desktop_shortcut,
+            icon="monitor", hint="Put ORION on the desktop and Start menu.")
+        add("autostart", "Start at Login: \u2026", self.toggle_autostart,
+            icon="login", hint="Start ORION when you log in.")
+        add("customise", "Preferences", self.open_preferences,
+            icon="sliders", hint="Name, voice, accent and audio devices.")
+        add("brief", "Brief Me Now", self.run_morning_brief,
+            icon="bulb", hint="Hear the latest briefing for this part of the day.")
+        add("ptt", "Push to Talk: \u2026", self.toggle_push_to_talk,
+            icon="keyboard", hint="Hold a key to talk, instead of always listening.")
+        add("overlay", "Compact Face  [Ctrl+Shift+O]", self.toggle_overlay_mode,
+            icon="compact", hint="Shrink ORION to his floating face.")
+        add("audio", "Audio Devices", self.open_preferences,
+            icon="volume-high", hint="Choose the microphone and the speakers.")
+        add("memory", "Memory", self.open_memory_viewer,
+            icon="database", hint="Read and delete what ORION remembers.")
+        add("palette", "Command Palette  [Ctrl+K]", self.open_command_palette,
+            icon="search")
+        add("deck", "Command Deck  [Ctrl+D]", self.toggle_dashboard,
+            icon="dashboard")
         self._refresh_control_states()
 
     def _refresh_control_states(self) -> None:
@@ -1092,7 +1409,7 @@ class OrionCoreWindow(QMainWindow):
             state = "ON" if status().enabled else "OFF"
         except Exception:
             pass
-        hud.controls.set_state("autostart", f"AUTO-START: {state}")
+        hud.controls.set_state("autostart", f"Start at Login: {state.lower()}")
 
         state = "?"
         try:
@@ -1101,13 +1418,13 @@ class OrionCoreWindow(QMainWindow):
             state = "ON" if enabled() else "OFF"
         except Exception:
             pass
-        hud.controls.set_state("ptt", f"PUSH-TO-TALK: {state}")
+        hud.controls.set_state("ptt", f"Push to Talk: {state.lower()}")
 
     # ── what those controls needed ───────────────────────────────────────────
 
     def open_remote_control(self) -> None:
-        """Show the pairing page, where the QR code lives."""
-        self._open_deck_page("OPS")
+        """Show phone pairing in the Security Centre."""
+        self._open_deck_page("SECURITY")
 
     def create_desktop_shortcut(self) -> None:
         """Put ORION on the desktop and in the Start menu."""
@@ -1185,15 +1502,18 @@ class OrionCoreWindow(QMainWindow):
         frame  = QFrame()
         frame.setObjectName("headerFrame")
         layout = QHBoxLayout(frame)
-        layout.setContentsMargins(16, 10, 16, 10)
+        layout.setContentsMargins(SPACE.LG, SPACE.SM + 2, SPACE.LG, SPACE.SM + 2)
+        layout.setSpacing(SPACE.SM)
 
         # Mark XXXI: a wordmark and a separate mark tag, rather than one long
         # title — the version is legible at a glance and the name stays quiet.
-        from ..constants import APP_MARK
+        from ..constants import APP_MARK_TAG
 
-        self.title_label    = QLabel("O.R.I.O.N.")
+        # No trailing dot (owner, 28 Oct 2026): the header reads
+        # "O.R.I.O.N" and then the mark tag.
+        self.title_label    = QLabel("O.R.I.O.N")
         self.title_label.setObjectName("brandMark")
-        self.mark_label = QLabel(APP_MARK.upper())
+        self.mark_label = QLabel(APP_MARK_TAG)
         self.mark_label.setObjectName("markTag")
         # Subtitle carries a build stamp so a running window is unmistakably the
         # current build (a stale instance shows a different / missing stamp).
@@ -1202,16 +1522,24 @@ class OrionCoreWindow(QMainWindow):
         self.title_label.setToolTip(f"{APP_NAME}\n{self.subtitle_label.text()}")
         self.mark_label.setToolTip(self.subtitle_label.text())
         self.subtitle_label.hide()
+        # Mark XXXV: a hello beside the name, in the human tone - the window
+        # greets the person in front of it rather than only naming itself.
+        self.greeting_label = QLabel(_greeting_words(datetime.now()))
+        self.greeting_label.setObjectName("greetingLabel")
         text_box = QHBoxLayout()
-        text_box.setSpacing(10)
+        text_box.setSpacing(SPACE.MD - 4)
         text_box.addWidget(self.title_label)
         text_box.addWidget(self.mark_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        text_box.addSpacing(SPACE.SM)
+        text_box.addWidget(self.greeting_label, 0, Qt.AlignmentFlag.AlignVCenter)
         text_box.addWidget(self.subtitle_label)
 
         # ── Window controls — one compact icon cluster (was five loose buttons)
         # Plain geometric glyphs, not the emoji ⏸/⏹: Windows draws those as
         # blue picture-emoji, the only colour on screen that was not ORION's.
-        self.pause_btn = QPushButton("❚❚  PAUSE")
+        self.pause_btn = QPushButton("Pause")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.pause_btn, "pause")
         self.pause_btn.setAccessibleName("Pause speech and listening")
         self.pause_btn.setToolTip("Pause ORION's speech and listening (say 'pause'); "
                                   "say 'resume' or 'Orion' to zone back in.")
@@ -1220,7 +1548,9 @@ class OrionCoreWindow(QMainWindow):
         # Stop = cancel the current request outright (Ctrl+Shift+Space, or say
         # "Orion cancel"/"never mind"), returning to listening so you can
         # rephrase.  Unlike Pause it does not preserve position.
-        self.stop_btn = QPushButton("■  STOP")
+        self.stop_btn = QPushButton("Stop")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.stop_btn, "stop")
         self.stop_btn.setObjectName("stopButton")
         self.stop_btn.setToolTip("Cancel the current request and start over "
                                  "(Ctrl+Shift+Space; say 'Orion cancel' or "
@@ -1231,43 +1561,55 @@ class OrionCoreWindow(QMainWindow):
         # yourself" / "unmute"). He keeps listening and working; his replies
         # still arrive as text. Not the PC's volume — that is its own control.
         self._voice_muted = False
-        self.mute_btn = QPushButton("MUTE")
+        self.mute_btn = QPushButton("Mute")
         self.mute_btn.setCheckable(True)
         self.mute_btn.setAccessibleName("Mute ORION's voice")
         self.mute_btn.setToolTip("Mute ORION's voice — he keeps listening and replies in "
                                  "text (Ctrl+Shift+M; say 'mute yourself' / 'unmute').")
         self.mute_btn.clicked.connect(self._toggle_voice_mute)
 
-        self.dashboard_btn = QPushButton("⧉")
+        self.dashboard_btn = QPushButton("")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.dashboard_btn, "dashboard")
         self.dashboard_btn.setObjectName("iconButton")
         self.dashboard_btn.setToolTip("Command Deck → Widgets (Ctrl+D)")
         self.dashboard_btn.setAccessibleName('Widgets page')
         self.dashboard_btn.clicked.connect(self.toggle_dashboard)
-        self.centre_btn = QPushButton("◉")
+        self.centre_btn = QPushButton("")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.centre_btn, "gauge")
         self.centre_btn.setObjectName("iconButton")
         self.centre_btn.setToolTip("Command Deck → Command Centre (Ctrl+Shift+C)")
         self.centre_btn.setAccessibleName('Command Centre')
         self.centre_btn.clicked.connect(self.toggle_command_centre)
         # Mission (14 dockable panels) previously had no button/shortcut of
         # its own — the richest page on the deck, buried behind a swipe.
-        self.mission_btn = QPushButton("◎")
+        self.mission_btn = QPushButton("")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.mission_btn, "flag")
         self.mission_btn.setObjectName("iconButton")
         self.mission_btn.setToolTip("Command Deck → Mission (Ctrl+M)")
         self.mission_btn.setAccessibleName('Mission page')
         self.mission_btn.clicked.connect(self.toggle_mission_deck)
         # The fuzzy command palette (Ctrl+K, searches every dispatcher tool)
         # was hotkey-only and undiscoverable without a visible affordance.
-        self.palette_btn = QPushButton("⌘")
+        self.palette_btn = QPushButton("")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.palette_btn, "search")
         self.palette_btn.setObjectName("iconButton")
         self.palette_btn.setToolTip("Command palette — search every tool (Ctrl+K)")
         self.palette_btn.setAccessibleName('Command palette')
         self.palette_btn.clicked.connect(self.open_command_palette)
-        self.overlay_btn = QPushButton("◱")
+        self.overlay_btn = QPushButton("")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.overlay_btn, "compact")
         self.overlay_btn.setObjectName("iconButton")
-        self.overlay_btn.setToolTip("Compact overlay orb (Ctrl+Shift+O; Esc to exit)")
+        self.overlay_btn.setToolTip("Compact face (Ctrl+Shift+O; Esc to exit)")
         self.overlay_btn.setAccessibleName('Compact overlay')
         self.overlay_btn.clicked.connect(self.toggle_overlay_mode)
-        self.fullscreen_btn = QPushButton("⛶")
+        self.fullscreen_btn = QPushButton("")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.fullscreen_btn, "maximize")
         self.fullscreen_btn.setObjectName("iconButton")
         self.fullscreen_btn.setToolTip("Fullscreen (F11)")
         self.fullscreen_btn.setAccessibleName('Fullscreen')
@@ -1275,25 +1617,27 @@ class OrionCoreWindow(QMainWindow):
 
         # The controls popover's trigger. Everything that used to be buried
         # in a '•••' menu or a shortcut nobody could discover lives behind it.
-        self.controls_btn = QPushButton("⚙")
+        self.controls_btn = QPushButton("")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.controls_btn, "sliders")
         self.controls_btn.setObjectName("iconButton")
         self.controls_btn.setToolTip("Controls — settings, pairing, shortcuts")
         self.controls_btn.setAccessibleName("Controls")
         self.controls_btn.clicked.connect(self.open_controls)
 
-        self.workbench_btn = QPushButton("Vision lab")
+        self.workbench_btn = QPushButton("Vision Lab")
         self.workbench_btn.setObjectName("workbenchShortcut")
         self.workbench_btn.setToolTip("Scan anything with the camera, on a grid (Ctrl+Shift+E)")
         self.workbench_btn.clicked.connect(self.open_electronics_workbench)
         self.research_btn = QPushButton("Research")
         self.research_btn.setObjectName("workbenchShortcut")
         self.research_btn.setToolTip("The live research console — every search, page and note")
-        self.research_btn.setAccessibleName("Research console")
+        self.research_btn.setAccessibleName("Research Console")
         self.research_btn.clicked.connect(lambda: self._open_deck_page("RESEARCH"))
 
-        # Face | Orb, visible. It was two items buried in an "Appearance"
-        # submenu of the ••• menu, which is not where anybody looks when a
-        # visitor has just been unsettled by a face on the screen.
+        # Screen Face | Classic Face | Orb, visible. It was two items buried in
+        # an "Appearance" submenu of the ••• menu, which is not where anybody
+        # looks when a visitor has just been unsettled by a face on the screen.
         self.form_toggle = QFrame()
         self.form_toggle.setObjectName("segmented")
         form_row = QHBoxLayout(self.form_toggle)
@@ -1307,21 +1651,39 @@ class OrionCoreWindow(QMainWindow):
         # "Show ORION's face" that way changed nothing and left both lit.
         self._form_group = QButtonGroup(self.form_toggle)
         self._form_group.setExclusive(True)
-        for form, label, tip in (("face", "FACE", "Show ORION's face"),
-                                 ("orb", "ORB", "Show ORION as his orb")):
+        # Only the forms this build offers (appearance.ENABLED_FORMS - the
+        # Screen Face alone in Mark XXXVII). The classic face and the orb stay
+        # defined and their code paths stay in the tree, but get no button.
+        from ..appearance import enabled_forms
+        _offered = enabled_forms()
+        for form, label, tip, phrase in (
+            ("screen", "Screen Face", "Show ORION's screen face",
+             "switch to your screen face"),
+            ("classic", "Classic Face", "Show ORION's classic 3-D face",
+             "switch to your classic face"),
+            ("orb", "Orb", "Show ORION as his orb", "switch to your orb form"),
+        ):
+            if form not in _offered:
+                continue
             button = QPushButton(label)
             button.setObjectName("formItem")
             button.setCheckable(True)
-            button.setToolTip(tip + " (or say \"switch to your " + form + " form\")")
+            button.setToolTip(f"{tip} (or say \"{phrase}\")")
             button.setAccessibleName(tip)
             self._form_group.addButton(button)
             form_row.addWidget(button)
             self._form_buttons[form] = button
         self._form_group.buttonToggled.connect(self._form_button_toggled)
-        self.compact_btn = QPushButton("◱  COMPACT")
+        if len(self._form_buttons) < 2:
+            # One form is nothing to choose between: no lone "Screen Face"
+            # pill in the header. (Built and hidden, so the attribute exists.)
+            self.form_toggle.hide()
+        self.compact_btn = QPushButton("Compact")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.compact_btn, "compact")
         self.compact_btn.setObjectName("headerAction")
-        self.compact_btn.setToolTip("Shrink ORION to the floating orb (Ctrl+Shift+O)")
-        self.compact_btn.setAccessibleName("Compact orb")
+        self.compact_btn.setToolTip("Shrink ORION to his floating face (Ctrl+Shift+O)")
+        self.compact_btn.setAccessibleName("Compact face")
         self.compact_btn.clicked.connect(self.toggle_overlay_mode)
         self.more_btn = QToolButton()
         self.more_btn.setText("•••")
@@ -1333,33 +1695,53 @@ class OrionCoreWindow(QMainWindow):
             ("Mission    Ctrl+M", self.toggle_mission_deck),
             ("Widgets    Ctrl+D", self.toggle_dashboard),
             ("Command Centre    Ctrl+Shift+C", self.toggle_command_centre),
-            ("Research console", lambda: self._open_deck_page("RESEARCH")),
-            ("Compact orb    Ctrl+Shift+O", self.toggle_overlay_mode),
+            ("Research Console", lambda: self._open_deck_page("RESEARCH")),
+            ("Compact Face    Ctrl+Shift+O", self.toggle_overlay_mode),
             ("Fullscreen    F11", self.toggle_fullscreen),
         ):
             more_menu.addAction(label).triggered.connect(callback)
 
-        # Which form ORION wears. Two checkable entries rather than one
+        # Which form ORION wears. One checkable entry per form rather than a
         # toggle, so the menu says what he is currently in as well as what he
         # could be — somebody reaching for this is usually in a hurry with
         # another person in the room.
-        more_menu.addSeparator()
-        appearance = more_menu.addMenu("Appearance")
+        #
+        # Only offered forms appear (appearance.ENABLED_FORMS - the Screen
+        # Face alone in Mark XXXVII). With nothing to choose between, the
+        # Appearance submenu is not built at all, and the orb-only hand
+        # control entries go with it; the action object still exists (detached,
+        # disabled) so code that checks it keeps working.
         self._form_actions = {}
-        for form, label in (("face", "Face"), ("orb", "Orb")):
-            action = appearance.addAction(label)
-            action.setCheckable(True)
-            action.triggered.connect(
-                lambda _checked=False, chosen=form: self._choose_face_form(chosen))
-            self._form_actions[form] = action
-        self._sync_form_menu()
+        self.orb_hands_action = QAction("Camera Hand Control", self)
+        self.orb_hands_action.setCheckable(True)
+        self.orb_hands_action.setEnabled(False)
+        self.orb_hands_action.setToolTip(
+            "Move the orb with one open hand; pull two open hands apart to scatter it")
+        self.orb_hands_action.triggered.connect(self.set_orb_hand_control)
+        if len(_offered) > 1 or "orb" in _offered:
+            more_menu.addSeparator()
+            appearance = more_menu.addMenu("Appearance")
+            for form, label in (("screen", "Screen Face"), ("classic", "Classic Face"),
+                                ("orb", "Orb")):
+                if form not in _offered:
+                    continue
+                action = appearance.addAction(label)
+                action.setCheckable(True)
+                action.triggered.connect(
+                    lambda _checked=False, chosen=form: self._choose_face_form(chosen))
+                self._form_actions[form] = action
+            self._sync_form_menu()
+            if "orb" in _offered:
+                appearance.addAction(self.orb_hands_action)
+                help_action = appearance.addAction("Orb Controls…")
+                help_action.triggered.connect(self._show_orb_controls)
         self.more_btn.setMenu(more_menu)
 
         self.control_cluster = QFrame()
         self.control_cluster.setObjectName("controlCluster")
         cluster_row = QHBoxLayout(self.control_cluster)
-        cluster_row.setContentsMargins(3, 3, 3, 3)
-        cluster_row.setSpacing(2)
+        cluster_row.setContentsMargins(SPACE.XS, SPACE.XS, SPACE.XS, SPACE.XS)
+        cluster_row.setSpacing(SPACE.XS)
         for button in (self.mission_btn, self.dashboard_btn, self.centre_btn,
                        self.overlay_btn, self.fullscreen_btn):
             button.setParent(self.control_cluster)
@@ -1369,7 +1751,9 @@ class OrionCoreWindow(QMainWindow):
             cluster_row.addWidget(button)
 
         # Explicit shutdown — closing this window or Ctrl+Q stops ORION fully.
-        self.quit_btn = QPushButton("⏻")
+        self.quit_btn = QPushButton("")
+        from .line_icons import apply as apply_icon
+        apply_icon(self.quit_btn, "power")
         self.quit_btn.setObjectName("quitButton")
         self.quit_btn.setToolTip("Shut ORION down completely (Ctrl+Q)")
         self.quit_btn.setAccessibleName("Shut ORION down")
@@ -1380,27 +1764,59 @@ class OrionCoreWindow(QMainWindow):
         self.voice_led.setObjectName("voiceLed")
         self.voice_led.setProperty("speaking", "false")
         self.voice_led.hide()
-        self.state_label = QLabel("INITIALISING")
+        self.state_label = QLabel(_state_words("INITIALISING"))
         self.state_label.setObjectName("stateLabel")
-        self.clock_label  = QLabel(datetime.now().strftime("%H:%M:%S"))
+        self.clock_label  = QLabel(_clock_words(datetime.now()))
         self.clock_label.setObjectName("clockLabel")
 
-        # Clear left→right zones: brand ——— pause · windows · status · quit
-        layout.addLayout(text_box, 0)
-        layout.addSpacing(8)
-        layout.addStretch(1)
-        layout.addWidget(self.pause_btn)
-        layout.addWidget(self.stop_btn)
-        layout.addWidget(self.mute_btn)
-        layout.addSpacing(6)
-        layout.addWidget(self.form_toggle)
-        layout.addWidget(self.compact_btn)
-        layout.addSpacing(6)
-        layout.addWidget(self.control_cluster)
-        layout.addSpacing(6)
-        layout.addWidget(self.state_label)
-        layout.addWidget(self.clock_label)
-        layout.addWidget(self.quit_btn)
+        # Three zones: who (left), the voice controls (centre), where to go
+        # and the time (right). Everything used to sit at the two ends of one
+        # stretch, so the name and the greeting bunched up on the left and a
+        # third of the header stood empty before the first button. The two
+        # side zones take equal shares of the width, which keeps the voice
+        # controls in the true middle of the header.
+        left_zone = QHBoxLayout()
+        left_zone.setSpacing(0)
+        left_zone.addLayout(text_box)
+        left_zone.addStretch(1)
+
+        voice_zone = QHBoxLayout()
+        voice_zone.setSpacing(SPACE.SM)
+        voice_zone.addWidget(self.pause_btn)
+        voice_zone.addWidget(self.stop_btn)
+        voice_zone.addWidget(self.mute_btn)
+        voice_zone.addSpacing(SPACE.SM)
+        voice_zone.addWidget(self.form_toggle)
+        voice_zone.addWidget(self.compact_btn)
+
+        # Spacing set on the row rather than spacers between the items, so a
+        # label _fit_header hides takes its gap with it.
+        right_zone = QHBoxLayout()
+        right_zone.setSpacing(SPACE.MD)
+        right_zone.addStretch(1)
+        right_zone.addWidget(self.control_cluster)
+        right_zone.addSpacing(SPACE.SM)
+        right_zone.addWidget(self.state_label)
+        right_zone.addWidget(self.clock_label)
+        right_zone.addWidget(self.quit_btn)
+
+        layout.addLayout(left_zone, 1)
+        layout.addSpacing(SPACE.LG)
+        layout.addLayout(voice_zone, 0)
+        layout.addSpacing(SPACE.LG)
+        layout.addLayout(right_zone, 1)
+        # The two gaps either side of the voice controls: _fit_header closes
+        # them up before it starts hiding things on a narrow window.
+        self._header_gaps = [layout.itemAt(i).spacerItem()
+                             for i in (1, 3)]
+        # The header must never set the window's minimum width: Qt's answer
+        # to a row wider than its window was to grow the window past the
+        # screen, or to shave every button ("Vision Lab" to "ision La").
+        # _fit_header hides what the row cannot hold instead. (An explicit
+        # minimum also stops the layout imposing its own, so the height is
+        # pinned to the row's natural height by the size policy.)
+        frame.setMinimumWidth(SPACE.LG * 10)
+        frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         self.clock_timer = QTimer(self)
         self.clock_timer.setInterval(1000)
@@ -1413,12 +1829,78 @@ class OrionCoreWindow(QMainWindow):
         toggle hides the whole window rather than closing it)."""
         if not self.isVisible():
             return
-        self.clock_label.setText(datetime.now().strftime("%H:%M:%S"))
+        now = datetime.now()
+        self.clock_label.setText(_clock_words(now))
+        greeting = getattr(self, "greeting_label", None)
+        if greeting is not None:
+            identity = self._identity()
+            text = _greeting_words(now, identity.user_name() if identity else "")
+            if greeting.text() != text:
+                greeting.setText(text)
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
-        if hasattr(self, "clock_label"):
-            self.clock_label.setVisible(self.width() >= 1100)
+        # After the header has its new width, not before it.
+        QTimer.singleShot(0, self._fit_header)
+
+    def _header_give_way(self) -> list[tuple[str, list[Any]]]:
+        """What the header gives up on a narrow window, first to last.
+
+        A hello is the one thing in the row nobody needs, so it goes first;
+        then the gaps round the voice controls close up; then the clock (the
+        taskbar has one), the state words (the face shows his state) and the
+        two shortcuts the deck's sidebar also has. The voice controls, the
+        tools and Shut Down never give way.
+        """
+        return [
+            ("greeting", [self.greeting_label]),
+            ("gaps", []),
+            ("clock", [self.clock_label]),
+            ("state", [self.state_label]),
+            ("shortcuts", [self.workbench_btn, self.research_btn]),
+        ]
+
+    def _fit_header(self) -> None:
+        """Fit the header row to the window by giving things up in order.
+
+        The row carries the wordmark, the Mark tag, the greeting, the voice
+        controls, the shortcut cluster, the state and the clock - about
+        1500 px written out in Title Case with the gaps between its three
+        zones. Qt answers a row that is too wide by shaving every button,
+        which clipped "Vision Lab" to "ision La" and then to an empty pill,
+        so instead the row gives things up (_header_give_way) until what is
+        left fits, and takes them back as the window widens.
+        """
+        greeting = getattr(self, "greeting_label", None)
+        header = getattr(self, "header_frame", None)
+        layout = header.layout() if header is not None else None
+        if greeting is None or layout is None:
+            return
+        steps = self._header_give_way()
+        gaps = [gap for gap in getattr(self, "_header_gaps", []) if gap is not None]
+
+        def give_up(upto: int) -> None:
+            for index, (name, widgets) in enumerate(steps):
+                keep = index >= upto
+                if name == "gaps":
+                    for gap in gaps:
+                        gap.changeSize(SPACE.LG if keep else SPACE.XS, 0)
+                    side = SPACE.LG if keep else SPACE.MD
+                    margins = layout.contentsMargins()
+                    if margins.left() != side:
+                        layout.setContentsMargins(side, margins.top(), side, margins.bottom())
+                    continue
+                for widget in widgets:
+                    if widget.isHidden() == keep:
+                        widget.setVisible(keep)
+
+        available = header.width()
+        for upto in range(len(steps) + 1):
+            give_up(upto)
+            layout.invalidate()
+            layout.activate()
+            if layout.minimumSize().width() <= available:
+                break
 
     # ── display modes ─────────────────────────────────────────────────────────
 
@@ -1499,7 +1981,7 @@ class OrionCoreWindow(QMainWindow):
 
     def open_electronics_workbench(self) -> None:
         """Open the camera lab without activating any capture hardware."""
-        self._toggle_deck_page("WORKBENCH", "Electronics workbench")
+        self._toggle_deck_page("WORKBENCH", "Vision Lab")
 
     def open_camera_lab_live(self) -> bool:
         """Open the camera lab AND start the live feed.
@@ -1515,7 +1997,7 @@ class OrionCoreWindow(QMainWindow):
 
         Returns whether the feed actually started.
         """
-        self._toggle_deck_page("WORKBENCH", "Electronics workbench")
+        self._toggle_deck_page("WORKBENCH", "Vision Lab")
         workbench = self._deck_page_widget("WORKBENCH")
         if workbench is None or not hasattr(workbench, "start_camera"):
             self.bus.log.emit("GUI: the camera lab is not available.")
@@ -1569,7 +2051,7 @@ class OrionCoreWindow(QMainWindow):
     def _face_is_webengine(self) -> bool:
         """True when this window's face is the Three.js avatar, which cannot
         survive a QOpenGLWidget appearing beside it."""
-        return type(getattr(self, "face", None)).__name__ == "QuantumFace3D"
+        return type(getattr(self, "face", None)).__name__ in {"QuantumFace3D", "RemoteFace"}
 
     #: Deck pages that must not share the screen with the swarm rail.
     #:
@@ -1691,6 +2173,57 @@ class OrionCoreWindow(QMainWindow):
         self._open_deck_page(pages[0])
         self.bus.log.emit(f"GUI: swarm → {zone_name} zone ({pages[0]}).")
 
+    def _deck_query(self, payload: dict) -> dict:
+        """Answer interface_control's deck read / find / press request with a
+        receipt (gui/deck_reader.py). On the GUI thread, like every widget it
+        touches. A press is carried out AFTER the receipt goes back: a button
+        that opens a dialog must not hold the tool call open behind it."""
+        receipt: dict[str, Any] = {"request_id": payload.get("request_id"), "ok": False}
+        deck = getattr(self, "dashboard", None) or getattr(self, "command_centre", None)
+        if deck is None or not hasattr(deck, "page_widget"):
+            receipt["error"] = "The Command Deck is not open yet."
+            return receipt
+        from . import deck_reader
+
+        query = str(payload.get("query") or "")
+        target = str(payload.get("target") or "").strip()
+        page_word = str(payload.get("page") or "").strip()
+        page = deck.resolve_page_name(page_word) if page_word else None
+        if page_word and page is None:
+            receipt["error"] = (f"There is no deck page matching {page_word!r}. Pages: "
+                                + ", ".join(deck.page_names()) + ".")
+            return receipt
+        if query == "pages":
+            current = deck.current_page_name()
+            names = [f"{deck.display_name(n)}{' (on screen now)' if n == current else ''}"
+                     for n in deck.page_names()]
+            receipt.update(ok=True, text="Command Deck pages: " + ", ".join(names) + ".")
+        elif query == "read":
+            name = page or deck.current_page_name()
+            if not name:
+                receipt["error"] = "No Command Deck page is on screen; name one to read."
+                return receipt
+            self._open_deck_page(name)
+            ok, text = deck_reader.read_page(deck, name)
+            receipt.update(ok=ok, text=text, page=name)
+        elif query == "find":
+            ok, text, best = deck_reader.find(deck, target)
+            if best:
+                self._open_deck_page(best)
+            receipt.update(ok=ok, text=text, page=best)
+        elif query == "press":
+            ok, text, button, name = deck_reader.locate(deck, target, page)
+            receipt.update(ok=ok, text=text, page=name)
+            if ok and button is not None:
+                self._open_deck_page(name)
+                QTimer.singleShot(0, button.click)
+                self.bus.log.emit(f"GUI: pressed {target!r} on {name}.")
+        else:
+            receipt["error"] = f"Unknown deck request {query!r}."
+        if not receipt["ok"] and "error" not in receipt:
+            receipt["error"] = receipt.get("text") or "That did not work."
+        return receipt
+
     def _on_gui_command(self, payload: Any) -> None:
         """Handle a self-navigation request from ORION (emitted on the bus by
         the interface_control tool).  Runs on the GUI thread."""
@@ -1700,6 +2233,23 @@ class OrionCoreWindow(QMainWindow):
             action = str(payload.get("action") or "").lower().strip()
             target = str(payload.get("target") or "").strip()
             low    = target.lower()
+            if action == "presentation":
+                try:
+                    self._apply_presentation(payload.get("presentation") or {})
+                    receipt = {"request_id": payload.get("request_id"), "ok": True}
+                except Exception as exc:
+                    receipt = {"request_id": payload.get("request_id"), "ok": False,
+                               "error": str(exc)[:200]}
+                self.bus.gui_result.emit(receipt)
+                return
+            if action == "deck_query":
+                try:
+                    receipt = self._deck_query(payload)
+                except Exception as exc:
+                    receipt = {"request_id": payload.get("request_id"), "ok": False,
+                               "error": f"The deck could not be read - {str(exc)[:160]}"}
+                self.bus.gui_result.emit(receipt)
+                return
             # Gemini sometimes emits a generic Command Centre navigation as a
             # trailing companion call after the chess tool.  A successful chess
             # handoff is authoritative for a brief window: do not let that
@@ -1735,8 +2285,30 @@ class OrionCoreWindow(QMainWindow):
                 applied = self.set_face_form(target)
                 self._sync_form_menu()
                 if not applied:
+                    from ..appearance import SCREEN_ONLY_REPLY, form_unavailable
                     self.bus.log.emit(
-                        f"GUI: {target!r} is neither 'face' nor 'orb'.")
+                        f"GUI: {SCREEN_ONLY_REPLY}" if form_unavailable(target) else
+                        f"GUI: {target!r} is not one of ORION's forms (Screen Face).")
+            elif action in {"face_design", "design"}:
+                # Mark XXXIX: the Screen Face's designs (appearance.FACE_DESIGNS).
+                from ..appearance import design_label, set_face_design
+                from .screen_face import apply_design
+                chosen = set_face_design(target)
+                if chosen:
+                    apply_design(chosen)
+                    self.bus.log.emit(f"GUI: ORION's face is now the {design_label(chosen)} design.")
+                else:
+                    self.bus.log.emit(f"GUI: {target!r} is not one of ORION's face designs.")
+            elif action in {"show_dock", "hide_dock", "dock"}:
+                # The docked Screen Face is not on screen at start: this is how
+                # it is asked for. app._start_windows_integration installs the
+                # control; without it (a bare window in a test) there is none.
+                control = getattr(self, "_dock_control", None)
+                if callable(control):
+                    control(False if action == "hide_dock" or low in {
+                        "hide", "off", "away", "close"} else True)
+                else:
+                    self.bus.log.emit("GUI: the dock is not available yet.")
             elif action in {"camera", "camera_lab", "webcam", "live_camera"}:
                 # Deliberately NOT the vision tool: that captures one frame and
                 # describes it. This shows the live feed.
@@ -1768,7 +2340,8 @@ class OrionCoreWindow(QMainWindow):
                     background.spawn(panel.refresh_environment_widgets())
                 else:
                     self.bus.log.emit("GUI: environment panel not attached.")
-            elif action in {"overlay", "compact", "compact_orb", "minimise_to_orb"}:
+            elif action in {"overlay", "compact", "compact_orb", "minimise_to_orb",
+                            "compact_face", "minimise_to_face", "mini_face"}:
                 self.toggle_overlay_mode()
             elif action == "standby":
                 if not self._overlay_active:
@@ -1799,7 +2372,77 @@ class OrionCoreWindow(QMainWindow):
             self.bus.log.emit(f"GUI: interface command failed - {exc}")
 
     def _on_paused(self, paused: bool) -> None:
-        self.pause_btn.setText("►  RESUME" if paused else "❚❚  PAUSE")
+        self.pause_btn.setText("Resume" if paused else "Pause")
+        from .line_icons import apply
+        apply(self.pause_btn, "play" if paused else "pause")
+
+    def _apply_presentation(self, payload: dict) -> None:
+        """Apply presentation controls on the GUI thread with an acknowledgement."""
+        from ..constants import C
+        operation = payload.get("operation")
+        hud = getattr(self, "hud", None)
+        if operation == "display":
+            panel = self._ensure_content_panel()
+            if panel is None:
+                raise ValueError("The content display is unavailable.")
+            panel.show_presentation(payload)
+            panel.show()
+        elif operation == "ui_theme":
+            if not self.apply_accent(payload["accent"]):
+                raise ValueError("That accent has insufficient contrast. Choose a brighter colour.")
+        elif operation in {"ui_reactor", "ui_orbit"}:
+            # The reactor and the image orbit live on the 3-D orb. The screen
+            # face has neither, so switching to the orb comes FIRST and the
+            # renderer is asked again afterwards.
+            self.set_face_form("orb")
+            apply = getattr(self.face, "set_presentation", None)
+            if not callable(apply):
+                from ..appearance import SCREEN_ONLY_REPLY, form_enabled
+                raise ValueError(
+                    "These orb controls need the 3-D orb renderer, "
+                    "which is not available on this machine."
+                    if form_enabled("orb") else
+                    f"These orb controls are not part of this version. {SCREEN_ONLY_REPLY}")
+            apply(payload)
+        elif operation == "ui_chrome":
+            if hud is None:
+                raise ValueError("The desktop HUD is unavailable.")
+            for name in ("telemetry", "transcript"):
+                if name in payload:
+                    getattr(hud, "rail" if name == "telemetry" else "log").setVisible(payload[name])
+            timer = getattr(self, "_chrome_timer", None)
+            if timer is None:
+                timer = self._chrome_timer = QTimer(hud.rail)
+                timer.setSingleShot(True)
+                timer.timeout.connect(lambda: (hud.rail.show(), hud.log.show()))
+            timer.start(30_000)
+        elif operation == "ui_effect":
+            from ..appearance import motion_profile
+            apply = getattr(self.face, "set_presentation", None)
+            if callable(apply) and motion_profile().name != "reduced":
+                apply(payload)
+            else:
+                self.bus.banner.emit("Display updated", 1500)
+        elif operation == "ui_screen":
+            if payload["target"] in {"panels", "all"}:
+                panel = getattr(self, "_content_panel", None)
+                if panel is not None:
+                    panel.clear()
+            if payload["target"] in {"transcript", "all"} and hud is not None:
+                hud.log.clear()
+        elif operation == "ui_reset":
+            self.apply_accent(C.PRI)
+            timer = getattr(self, "_chrome_timer", None)
+            if timer is not None:
+                timer.stop()
+            if hud is not None:
+                hud.rail.show()
+                hud.log.show()
+            apply = getattr(self.face, "set_presentation", None)
+            if callable(apply):
+                apply(payload)
+        else:
+            raise ValueError("Unknown presentation operation.")
 
     def toggle_command_centre(self) -> None:
         """Ctrl+Shift+C — show the Command Deck on the Command Centre page."""
@@ -1883,7 +2526,7 @@ class OrionCoreWindow(QMainWindow):
         """Ask before anything that can change something."""
         from PyQt6.QtWidgets import QMessageBox
         reply = QMessageBox.question(
-            self, "Confirm command",
+            self, "Confirm Command",
             f"{command.title}\n\n{command.subtitle}\n\n"
             f"Subsystem: {command.subsystem}\n\nRun it now?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1923,11 +2566,9 @@ class OrionCoreWindow(QMainWindow):
         overlay.restore_requested.connect(self.exit_overlay_mode)
         overlay.quit_requested.connect(self._quit)
         overlay.set_state(getattr(self, "face_state", "STANDBY"))
-        try:
-            self.bus.state.connect(overlay.set_state)
-            self.bus.amplitude.connect(overlay.set_amplitude)
-        except Exception:
-            pass
+        # State and loudness, and - for the Screen Face it now shows - speech,
+        # emotion and lip-sync, so the small face is as alive as the big one.
+        overlay.connect_bus(self.bus)
         self._orb_overlay = overlay
         return overlay
 
@@ -1938,13 +2579,16 @@ class OrionCoreWindow(QMainWindow):
             self.enter_overlay_mode()
 
     def enter_overlay_mode(self) -> None:
-        """Shrink ORION to the floating orb. He keeps listening and working.
+        """Shrink ORION to his floating face (the orb, for the orb or classic
+        face). He keeps listening and working.
 
         The main window is hidden, not changed, and remembered exactly as it
         was (maximised, full-screen or its normal geometry) for the way back.
         """
         if self._overlay_active:
             return
+        if self._orb_hands_enabled:
+            self.set_orb_hand_control(False)
         self._overlay_active = True
         self._overlay_restore = ("fullscreen" if self.isFullScreen()
                                  else "maximised" if self.isMaximized()
@@ -1962,10 +2606,10 @@ class OrionCoreWindow(QMainWindow):
         except Exception as exc:
             # No orb means no way back from a hidden window: stay as we are.
             self._overlay_active = False
-            self.bus.log.emit(f"SYS: the compact orb could not open - {exc}")
+            self.bus.log.emit(f"SYS: the compact face could not open - {exc}")
             return
         self.hide()
-        self.bus.log.emit("SYS: compact orb engaged - double-click it, press Esc, "
+        self.bus.log.emit("SYS: compact face engaged - double-click it, press Esc, "
                           "use the ⤢ chip or Ctrl+Shift+O to restore.")
 
     def exit_overlay_mode(self) -> None:
@@ -1987,7 +2631,7 @@ class OrionCoreWindow(QMainWindow):
             self.showNormal()
         self.raise_()
         self.activateWindow()
-        self.bus.log.emit("SYS: compact orb disengaged.")
+        self.bus.log.emit("SYS: compact face disengaged.")
 
     def keyPressEvent(self, event: Any) -> None:
         if event.key() == Qt.Key.Key_Escape:
@@ -2012,7 +2656,7 @@ class OrionCoreWindow(QMainWindow):
         if button is None:
             return
         button.setChecked(self._voice_muted)
-        button.setText("UNMUTE" if self._voice_muted else "MUTE")
+        button.setText("Unmute" if self._voice_muted else "Mute")
         button.setAccessibleName("Unmute ORION's voice" if self._voice_muted
                                  else "Mute ORION's voice")
 
@@ -2027,6 +2671,7 @@ class OrionCoreWindow(QMainWindow):
 
     def _mark_shutting_down(self) -> None:
         self._shutting_down = True
+        self._cancel_background_plugin_prompts()
 
     def closeEvent(self, event: Any) -> None:
         """
@@ -2040,6 +2685,9 @@ class OrionCoreWindow(QMainWindow):
         main window closed — which is why `py orion.py` from a terminal once
         appeared to 'never quit'.
         """
+        self._cancel_background_plugin_prompts()
+        if self._orb_hands_enabled:
+            self.set_orb_hand_control(False)
         if not getattr(self, "_shutting_down", False) and self._tray_active():
             # Minimise to the tray instead of quitting.
             event.ignore()
@@ -2080,15 +2728,31 @@ class OrionCoreWindow(QMainWindow):
         self.bus.content_results.connect(self._on_content_results)
         self.bus.speaking.connect(self._face_set_speaking)
         self.bus.viseme.connect(self._face_set_viseme)     # Mark XXVI lip-sync
+        # Queued: a "stopped" sample is emitted on this thread by the
+        # gesture_control tool (inside its task), and handling it stops the
+        # orb camera tracker (a thread join of up to 2 s) and re-enters
+        # set_orb_hand_control while it is still running. Frame samples
+        # already arrive queued from the gesture thread.
+        self.bus.orb_gesture.connect(self._on_orb_gesture, Qt.ConnectionType.QueuedConnection)
         self.bus.speaking.connect(self._on_speaking_changed)
         self.bus.paused.connect(self._on_paused)
         # Self-GUI navigation: ORION drives his own interface over the bus
         # (queued connection → runs on the GUI thread, safe from the worker).
-        self.bus.gui_command.connect(self._on_gui_command)
+        # Queued, never inline. Tools emit this from inside an asyncio task on
+        # this thread, and a handler that waits on Windows (opening a camera
+        # through Media Foundation, the shell opening a folder) pumps the
+        # message queue: qasync then steps OTHER tasks inside the running one,
+        # "Cannot enter into task", and those tasks never resume. On 8 Oct the
+        # camera opened that way and the Live receive loop died silently -
+        # ten minutes of no transcripts and no replies. REPRODUCED: inline,
+        # a ticking task stopped for good; queued, it kept ticking (49/s).
+        self.bus.gui_command.connect(self._on_gui_command, Qt.ConnectionType.QueuedConnection)
         # Destructive-action confirmation (Section 10): a guarded OS power action
         # or file deletion surfaces here as an accessible dialog; only the user's
         # approval releases it, via the deterministic dispatcher callback.
-        self.bus.confirm_action.connect(self._on_confirm_action)
+        # Queued for the same reason as gui_command: the dialog runs a modal
+        # loop (box.exec()), and it is emitted from inside the voice task.
+        self.bus.confirm_action.connect(self._on_confirm_action, Qt.ConnectionType.QueuedConnection)
         # Mark X.7: the EmotionStateManager broadcasts full rendering
         # parameter sets; the face morphs to whatever arrives.
         self.bus.emotion_changed.connect(self._face_apply_emotion)
@@ -2126,7 +2790,7 @@ class OrionCoreWindow(QMainWindow):
             self.bus.log.emit(f"GUI: content panel unavailable - {exc}")
             return None
         panel = ContentPanel()
-        panel.setWindowTitle("O.R.I.O.N. — What he found")
+        panel.setWindowTitle("O.R.I.O.N. — What He Found")
         self._content_panel = panel
         hud = getattr(self, "hud", None)
         if hud is not None:
@@ -2243,6 +2907,11 @@ class OrionCoreWindow(QMainWindow):
         except Exception as exc:
             self.bus.log.emit(f"GUI: clipboard request failed - {exc}")
 
+    def _identity(self) -> Any:
+        """ORION's IdentityManager, once the voice worker is attached."""
+        dispatcher = getattr(self.worker, "dispatcher", None) if self.worker is not None else None
+        return getattr(dispatcher, "identity", None)
+
     def open_preferences(self) -> None:
         """Audio devices, identity and accent colour, in one place.
 
@@ -2262,17 +2931,42 @@ class OrionCoreWindow(QMainWindow):
             self.bus.log.emit(f"GUI: preferences unavailable - {exc}")
             return
 
-        dialog = PreferencesDialog(self, accent=getattr(self, "_accent_override", ""))
+        identity = self._identity()
+        dialog = PreferencesDialog(self, accent=getattr(self, "_accent_override", ""),
+                                   user_name=identity.user_name() if identity else "",
+                                   messaging_provider=lambda: getattr(
+                                       getattr(getattr(self, "worker", None), "dispatcher", None), "messaging", None))
+        # The Brain selector saves as it changes; the running assistant
+        # applies it at once (Live closed for the local brain, Ollama started).
+        brain_changed = getattr(dialog, "brain_mode_changed", None)
+        if brain_changed is not None:
+            brain_changed.connect(lambda mode: OrionCoreWindow._apply_brain_mode(self, mode))
+        # Reply pause, expressive voice and the online voice live in the
+        # channel's own setup: refresh it (resuming the conversation) once he
+        # is quiet, so the change is heard now rather than at the next channel.
+        voice_changed = getattr(dialog, "voice_setting_changed", None)
+        if voice_changed is not None:
+            voice_changed.connect(lambda key, _value: OrionCoreWindow._refresh_live_channel(self, key))
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
         chosen = dialog.values()
+
+        if identity is not None:
+            try:
+                if identity.set_user_name(chosen.get("user_name", "")):
+                    name = identity.user_name()
+                    self.bus.log.emit(f"ORION: I'll call you {name}." if name
+                                      else "ORION: I'll stop using your name.")
+                    self._tick_clock()
+            except Exception as exc:
+                self.bus.log.emit(f"GUI: could not save your name - {exc}")
 
         try:
             from .. import audio_devices
 
             for kind in ("input", "output"):
                 wanted = chosen.get(f"{kind}_device", "")
-                if wanted == (audio_devices.device_name(kind) or ""):
+                if wanted == audio_devices.configured_spec(kind):
                     continue
                 # Over the bus, not audio_devices.set_device() directly.
                 # set_device only PERSISTS the choice — it does not reopen the
@@ -2289,6 +2983,53 @@ class OrionCoreWindow(QMainWindow):
         accent = chosen.get("accent", "")
         if accent:
             self.apply_accent(accent)
+
+        motion = chosen.get("motion", "")
+        if motion:
+            try:
+                from .. import appearance
+                if motion != appearance.motion_profile().name:
+                    applied = appearance.set_motion_profile(motion)
+                    if applied:
+                        self.bus.log.emit(
+                            f"GUI: motion preference set to "
+                            f"{appearance.MOTION_PROFILES[applied].label}.")
+            except Exception as exc:
+                self.bus.log.emit(f"GUI: could not apply the motion preference - {exc}")
+
+        design = chosen.get("face_design", "")
+        if design:
+            try:
+                from .. import appearance
+                from .screen_face import apply_design
+                if design != appearance.face_design():
+                    applied = appearance.set_face_design(design)
+                    if applied:
+                        apply_design(applied)
+                        self.bus.log.emit(f"GUI: ORION's face is now the "
+                                          f"{appearance.design_label(applied)} design.")
+            except Exception as exc:
+                self.bus.log.emit(f"GUI: could not apply the face design - {exc}")
+
+    def _apply_brain_mode(self, mode: str) -> None:
+        """Apply a brain mode Preferences has already saved."""
+        apply = getattr(getattr(self, "worker", None), "apply_brain_mode", None)
+        if not callable(apply):
+            self.bus.log.emit(f"BRAIN: {mode} saved; it applies from the next start.")
+            return
+        try:
+            _ok, message = apply(mode, persist=False)
+            self.bus.log.emit(f"BRAIN: {message}")
+        except Exception as exc:
+            self.bus.log.emit(f"BRAIN: could not apply the brain mode - {exc}")
+
+    def _refresh_live_channel(self, key: str) -> None:
+        """A voice setting the live channel reads at setup was saved."""
+        if key not in ("reply_pause", "expressive", "cloud_voice"):
+            return
+        refresh = getattr(getattr(self, "worker", None), "request_channel_refresh", None)
+        if callable(refresh):
+            refresh(f"new {key.replace('_', ' ')} setting")
 
     def apply_accent(self, accent: str) -> bool:
         """Recolour the whole shell, and ORION's face with it.
@@ -2398,9 +3139,12 @@ class OrionCoreWindow(QMainWindow):
         if not token or dispatcher is None:
             self.bus.log.emit("SYS: confirmation prompt could not be routed (no token/dispatcher).")
             return
+        if payload.get("background") is True:
+            self._show_background_plugin_confirmation(payload, dispatcher)
+            return
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Confirm destructive action")
+        box.setWindowTitle("Confirm Destructive Action")
         box.setText(message)
         box.setInformativeText("This cannot be undone easily. Approve only if you are sure.")
         approve = box.addButton("Confirm", QMessageBox.ButtonRole.AcceptRole)
@@ -2412,7 +3156,23 @@ class OrionCoreWindow(QMainWindow):
             self.bus.log.emit(f"SYS: user confirmed '{intent or 'action'}'.")
             try:
                 if intent == "file_cleanup" and hasattr(dispatcher, "confirm_cleanup"):
-                    result = dispatcher.confirm_cleanup(token)
+                    # Recycling checks every path under each target (recycle_bin
+                    # .refusal) and moves it through the shell - seconds for a big
+                    # folder, on the thread that is also the event loop (audit 6
+                    # Oct 2026, A02 review). Done on a worker; the outcome is
+                    # logged when it lands.
+                    async def _release(tok: str = token) -> None:
+                        try:
+                            done = await asyncio.to_thread(dispatcher.confirm_cleanup, tok)
+                            self.bus.log.emit(f"SYS: {done.text}")
+                        except Exception as exc:
+                            self.bus.log.emit(f"SYS: confirmed action failed - {exc}")
+
+                    if background.spawn(_release(), name="cleanup-release") is not None:
+                        self.bus.log.emit("SYS: cleaning up in the background…")
+                        result = None
+                    else:                       # no running loop: do it here
+                        result = dispatcher.confirm_cleanup(token)
                 elif hasattr(dispatcher, "confirm_system_action"):
                     result = dispatcher.confirm_system_action(token)
                 else:
@@ -2430,6 +3190,160 @@ class OrionCoreWindow(QMainWindow):
                     dispatcher.cancel_system_action(token)
             except Exception:
                 pass
+
+    def _cancel_background_plugin_prompts(self) -> None:
+        for state in list(getattr(self, "_background_plugin_prompts", {}).values()):
+            state["finish"](reason="host_closed")
+
+    def _show_background_plugin_confirmation(self, payload: dict, dispatcher: Any) -> None:
+        """Offer a token-bound approval without a modal loop or desktop focus.
+
+        The guard owns the action. GUI payload arguments are checked against
+        that record; only a deep copy of the bound arguments is previewed.
+        Clicking Approve releases the token through the existing dispatcher,
+        never by replaying GUI arguments or granting foreground permission.
+        """
+        from ..system_guard import ActionIntent, PendingAction, SystemActionGuard
+
+        token = payload.get("token")
+        guard = getattr(dispatcher, "system_guard", None)
+        def cancel() -> None:
+            if type(token) is not str or not token:
+                return  # Never turn a malformed token into cancel-all.
+            try:
+                dispatcher.cancel_system_action(token)
+            except Exception:
+                pass
+        # A message on one of ORION's own channels (message_channels) is
+        # approved the same way as a plugin's: non-modal, token-bound.
+        channel_message = payload.get("intent") == "channel_message"
+        if ((payload.get("intent") != "plugin_action" and not channel_message)
+                or type(token) is not str or not token or not isinstance(guard, SystemActionGuard)):
+            cancel()
+            return
+        guard._sweep()
+        pending = guard._pending.get(token)
+        if not isinstance(pending, PendingAction) or pending.intent is not ActionIntent.SEND_MESSAGE:
+            cancel()
+            return
+        if channel_message:
+            mismatch = (not isinstance(pending.payload.get("channel"), str) or not pending.payload["channel"]
+                        or payload.get("channel") != pending.payload["channel"]
+                        or payload.get("to") != pending.payload.get("to")
+                        or payload.get("body") != pending.payload.get("message"))
+        else:
+            mismatch = (not isinstance(pending.payload.get("plugin"), str) or not pending.payload["plugin"]
+                        or not isinstance(pending.payload.get("arguments"), dict)
+                        or payload.get("plugin") != pending.payload["plugin"]
+                        or payload.get("arguments") != pending.payload["arguments"])
+        if mismatch:
+            cancel()
+            return
+        try:
+            expires = float(pending.created_at + pending.ttl)
+            if not math.isfinite(expires) or pending.expired(guard._clock()):
+                raise ValueError("Expired approval")
+            bound = deepcopy(pending.payload)
+            if channel_message:
+                preview = (f"Channel: {bound['channel']}\nTo: {bound.get('to') or '(default)'}\n\n"
+                           f"{bound.get('message') or ''}")
+            else:
+                preview = json.dumps({"plugin": bound["plugin"], "arguments": bound["arguments"]},
+                                     ensure_ascii=False, indent=2, allow_nan=False)
+            # Refuse an oversized preview instead of showing truncated approval.
+            if len(preview.encode("utf-8")) > 256 * 1024:
+                raise ValueError("Approval preview exceeds its display limit")
+        except (TypeError, ValueError, OverflowError, RecursionError, UnicodeError):
+            cancel()
+            return
+        prompts = getattr(self, "_background_plugin_prompts", None)
+        if prompts is None:
+            prompts = self._background_plugin_prompts = {}
+        if token in prompts:
+            return  # A repeated signal must not create a second release button.
+        if len(prompts) >= 4 or getattr(self, "_shutting_down", False):
+            cancel()
+            return
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        if channel_message:
+            box.setWindowTitle("Approve Message")
+            box.setText(str(payload.get("message") or "Send this message?"))
+            box.setInformativeText("Nothing is sent unless you approve. This request expires "
+                                   "automatically; Cancel leaves it unsent.")
+        else:
+            box.setWindowTitle("Approve Background Plugin Action")
+            box.setText(f"Allow {bound['plugin']} to perform this exact action?")
+            box.setInformativeText("Review the full arguments under Show Details before approving. "
+                                   "This request expires automatically. Cancel leaves the action unstarted.")
+        box.setDetailedText(preview)
+        approve = box.addButton("Approve", QMessageBox.ButtonRole.AcceptRole)
+        reject = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(reject)
+        box.setEscapeButton(reject)
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        box.setModal(False)
+        box.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
+        box.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        timer = QTimer(box)
+        timer.setInterval(500)
+        host_ref = weakref.ref(self)
+        state: dict[str, Any] = {"box": box, "timer": timer, "done": False}
+
+        def finish(*, approved: bool = False, reason: str = "cancelled") -> None:
+            if state["done"]:
+                return
+            state["done"] = True
+            prompts.pop(token, None)
+            try:
+                timer.stop()
+                box.hide()
+                box.deleteLater()
+            except RuntimeError:
+                pass
+            host = host_ref()
+            alive = host is not None and not sip.isdeleted(host)
+            if alive:
+                try:
+                    host.destroyed.disconnect(host_destroyed)
+                except (TypeError, RuntimeError):
+                    pass  # Qt may already be destroying the host.
+            valid = (guard._pending.get(token) is pending and pending.payload == bound
+                     and not pending.expired(guard._clock()))
+            if approved and alive and valid and not getattr(host, "_shutting_down", False):
+                try:
+                    result = dispatcher.confirm_system_action(token)
+                    host.bus.log.emit(f"SYS: {result.text}")
+                except Exception as exc:
+                    cancel()
+                    try:
+                        host.bus.log.emit(f"SYS: confirmed plugin action failed ({type(exc).__name__}).")
+                    except RuntimeError:
+                        pass
+            else:
+                cancel()
+
+        def expire() -> None:
+            if guard._pending.get(token) is not pending or pending.expired(guard._clock()):
+                finish(reason="expired")
+        def choose(clicked: Any) -> None:
+            if clicked is approve:
+                finish(approved=True)
+            elif clicked is reject:
+                finish()
+        def host_destroyed(*_args: Any) -> None:
+            finish(reason="host_closed")
+        state["finish"] = finish
+        prompts[token] = state
+        box.buttonClicked.connect(choose)
+        box.finished.connect(lambda *_args: finish())
+        box.destroyed.connect(lambda *_args: finish(reason="closed"))
+        self.destroyed.connect(host_destroyed)
+        timer.timeout.connect(expire)
+        timer.start()
+        box.show()
 
     def _on_speaking_changed(self, active: bool) -> None:
         """Voice-activity LED driven by the SpeechQueueManager."""
@@ -2452,7 +3366,7 @@ class OrionCoreWindow(QMainWindow):
     def set_state(self, state: str) -> None:
         self.active_state       = str(state).upper()
         self.telemetry["state"] = self.active_state
-        self.state_label.setText(self.active_state)
+        self.state_label.setText(_state_words(self.active_state))
 
     # ── telemetry snapshot ────────────────────────────────────────────────────
 

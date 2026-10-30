@@ -88,7 +88,7 @@ def test_payload_budget_hints():
     router = _router([_profile()])
     assert router.payload_budget(_profile(model="llama-3.1-8b-instant")) == 5000
     assert router.payload_budget(_profile(model="gpt-4o-mini")) == 60000
-    assert router.payload_budget(_profile(model="claude-sonnet-5")) == 32000
+    assert router.payload_budget(_profile(model="gpt-4o")) == 32000
     assert router.payload_budget(_profile(model="x", budget_tokens=1234)) == 1234
 
 
@@ -104,7 +104,7 @@ def test_fit_to_budget_trims_oversized_prompt():
 
 
 def test_fit_to_budget_leaves_small_payloads_alone():
-    profile = _profile(model="claude-sonnet-5")
+    profile = _profile(model="gpt-4o")
     router = _router([profile])
     system, prompt = router._fit_to_budget(profile, "sys", "hello", "", None)
     assert (system, prompt) == ("sys", "hello")

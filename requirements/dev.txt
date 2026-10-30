@@ -1,0 +1,10 @@
+# ── O.R.I.O.N. requirements: development and tests ─────────────────────────
+# Not part of the runtime and not included by requirements.txt.
+#     python -m pip install -r requirements.txt -r requirements/dev.txt
+
+pytest>=8,<10                            # the test suite
+matplotlib>=3.7,<4                       # TEST FIXTURE ONLY — builds a real PDF for the
+                         # flashcard reader test. ORION itself never imports it:
+                         # reports.py renders charts as pure-Python inline SVG so
+                         # visualisation works offline with no plotting library.
+# py-spy (optional): the sampling profiler used to attribute boot time per line.

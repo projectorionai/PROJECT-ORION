@@ -35,14 +35,20 @@ from PyQt6.QtWidgets import (
 )
 
 from ..bus import OrionBus
-from ..constants import C, HEALTH_COLOURS
+from ..constants import C, HEALTH_COLOURS, SPACE
+from .labels import plural
 from .status_widgets import ProviderStatusStrip
+from .widgets import DetailsSection
 
 
 def _heading(text: str) -> QLabel:
     label = QLabel(text)
     label.setObjectName("panelHeading")
     return label
+
+
+#: One inner margin for every panel on the page (SPACE.MD-2 / SPACE.SM+4).
+_PANEL_MARGINS = (SPACE.MD - 2, SPACE.SM + 4, SPACE.MD - 2, SPACE.SM + 4)
 
 
 class _HealthPanel(QFrame):
@@ -58,8 +64,9 @@ class _HealthPanel(QFrame):
         super().__init__()
         self.setObjectName("panelFrame")
         layout = QVBoxLayout(self)
-        layout.addWidget(_heading("AGENT HEALTH"))
-        self.body = QLabel("awaiting telemetry…")
+        layout.setContentsMargins(*_PANEL_MARGINS)
+        layout.addWidget(_heading("Component Health"))
+        self.body = QLabel("Waiting for telemetry…")
         self.body.setObjectName("mutedLabel")
         self.body.setTextFormat(Qt.TextFormat.RichText)
         self.body.setWordWrap(True)
@@ -68,7 +75,7 @@ class _HealthPanel(QFrame):
 
     def render(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
-            self.body.setText("no components registered")
+            self.body.setText("No components registered")
             return
         parts = []
         for row in rows[:24]:
@@ -88,7 +95,9 @@ class _ResourcePanel(QFrame):
         super().__init__()
         self.setObjectName("panelFrame")
         layout = QGridLayout(self)
-        layout.addWidget(_heading("RESOURCES & SPEECH"), 0, 0, 1, 2)
+        layout.setContentsMargins(*_PANEL_MARGINS)
+        layout.setHorizontalSpacing(12)
+        layout.addWidget(_heading("Resources and Speech"), 0, 0, 1, 2)
         self.cpu_bar = QProgressBar()
         self.ram_bar = QProgressBar()
         self.gpu_bar = QProgressBar()
@@ -96,23 +105,26 @@ class _ResourcePanel(QFrame):
         for bar in (self.cpu_bar, self.ram_bar, self.gpu_bar, self.vram_bar):
             bar.setRange(0, 100)
             bar.setTextVisible(True)
-        layout.addWidget(QLabel("CPU"), 1, 0)
-        layout.addWidget(self.cpu_bar, 1, 1)
-        layout.addWidget(QLabel("RAM"), 2, 0)
-        layout.addWidget(self.ram_bar, 2, 1)
-        self.gpu_label = QLabel("GPU")
-        layout.addWidget(self.gpu_label, 3, 0)
-        layout.addWidget(self.gpu_bar, 3, 1)
-        layout.addWidget(QLabel("VRAM"), 4, 0)
-        layout.addWidget(self.vram_bar, 4, 1)
-        self.speech = QLabel("speech: —")
+        names = []
+        for text in ("Processor", "Memory", "Graphics", "Graphics Memory"):
+            name = QLabel(text)
+            name.setObjectName("mutedLabel")
+            names.append(name)
+        self.gpu_label = names[2]
+        for row, (name, bar) in enumerate(zip(names, (self.cpu_bar, self.ram_bar,
+                                                      self.gpu_bar, self.vram_bar)), start=1):
+            bar.setAccessibleName(name.text())
+            layout.addWidget(name, row, 0)
+            layout.addWidget(bar, row, 1)
+        self.speech = QLabel("Speech: —")
         self.speech.setObjectName("mutedLabel")
         self.speech.setWordWrap(True)
         layout.addWidget(self.speech, 5, 0, 1, 2)
-        self.traffic = QLabel("bus: —")
+        # Bus traffic is an engineering figure: the page shows it under
+        # Details rather than in this panel (see DiagnosticsCentreView).
+        self.traffic = QLabel("Bus traffic: —")
         self.traffic.setObjectName("mutedLabel")
-        layout.addWidget(self.traffic, 6, 0, 1, 2)
-        layout.setRowStretch(7, 1)
+        layout.setRowStretch(6, 1)
 
     def render(self, cpu: float, ram: float, speech: dict[str, Any],
                traffic_per_min: tuple[float, float],
@@ -123,22 +135,23 @@ class _ResourcePanel(QFrame):
             self.gpu_bar.setValue(int(gpu.get("util", 0)))
             self.vram_bar.setValue(int(gpu.get("mem_percent", 0)))
             self.gpu_label.setText(
-                f"GPU {str(gpu.get('name', '')).replace('NVIDIA ', '')[:16]}"
+                f"Graphics {str(gpu.get('name', '')).replace('NVIDIA ', '')[:16]}"
                 + (f" · {gpu.get('temp_c')}°C" if gpu.get("temp_c") else ""))
         else:
             self.gpu_bar.setValue(0); self.vram_bar.setValue(0)
-            self.gpu_label.setText("GPU n/a")
-        held = " — HELD (resume preserves position)" if speech.get("held") else ""
+            self.gpu_label.setText("Graphics — not available")
+        held = " — held (resuming keeps its place)" if speech.get("held") else ""
+        state = str(speech.get("state", "?")).replace("_", " ").capitalize()
         self.speech.setText(
-            f"speech: {speech.get('state', '?')}{held}   "
-            f"playback queue {speech.get('playback_queue_depth', 0)}   "
-            f"tts queue {speech.get('tts_queue_depth', 0)}   "
-            f"voice: {str(speech.get('local_voice', ''))[:28]}"
+            f"Speech: {state}{held}   ·   "
+            f"playback queue {speech.get('playback_queue_depth', 0)}   ·   "
+            f"waiting to speak {speech.get('tts_queue_depth', 0)}   ·   "
+            f"voice {str(speech.get('local_voice', ''))[:28] or '—'}"
         )
         logs_pm, events_pm = traffic_per_min
         self.traffic.setText(
-            f"bus traffic: {logs_pm:.0f} log line(s)/min, "
-            f"{events_pm:.0f} dashboard event(s)/min"
+            f"Bus traffic: {logs_pm:.0f} log lines and "
+            f"{events_pm:.0f} dashboard events a minute"
         )
 
 
@@ -149,8 +162,9 @@ class _ToolPanel(QFrame):
         super().__init__()
         self.setObjectName("panelFrame")
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(*_PANEL_MARGINS)
         header = QHBoxLayout()
-        header.addWidget(_heading("TOOL EXECUTION"))
+        header.addWidget(_heading("Tool Execution"))
         self.active = QLabel("idle")
         self.active.setObjectName("mutedLabel")
         header.addWidget(self.active)
@@ -182,21 +196,19 @@ class _CrashPanel(QFrame):
         super().__init__()
         self.setObjectName("panelFrame")
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(*_PANEL_MARGINS)
         header = QHBoxLayout()
-        header.addWidget(_heading("RECENT CRASHES"))
+        header.addWidget(_heading("Recent Crashes"))
         self.count = QLabel("none")
         self.count.setObjectName("mutedLabel")
         header.addWidget(self.count)
         header.addStretch(1)
         layout.addLayout(header)
-        self.body = QLabel("No crashes recorded. ✓")
+        self.body = QLabel("No crashes recorded.")
         self.body.setObjectName("mutedLabel")
         self.body.setTextFormat(Qt.TextFormat.RichText)
         self.body.setWordWrap(True)
         layout.addWidget(self.body)
-        hint = QLabel("Full reports live in  config/crash_reports/")
-        hint.setObjectName("mutedLabel")
-        layout.addWidget(hint)
         layout.addStretch(1)
 
     def render(self, rows: list[dict[str, Any]]) -> None:
@@ -234,14 +246,15 @@ class _HealthChecksPanel(QFrame):
         super().__init__()
         self.setObjectName("panelFrame")
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(*_PANEL_MARGINS)
         header = QHBoxLayout()
-        header.addWidget(_heading("SELF-DIAGNOSTIC"))
+        header.addWidget(_heading("Self-Diagnostic"))
         self.verdict = QLabel("no run yet")
         self.verdict.setObjectName("mutedLabel")
         header.addWidget(self.verdict)
         header.addStretch(1)
         layout.addLayout(header)
-        self.checks_label = QLabel("awaiting first self-diagnostic…")
+        self.checks_label = QLabel("Checking…")
         self.checks_label.setObjectName("mutedLabel")
         self.checks_label.setTextFormat(Qt.TextFormat.RichText)
         self.checks_label.setWordWrap(True)
@@ -254,7 +267,7 @@ class _HealthChecksPanel(QFrame):
         layout.addStretch(1)
 
     def render_checks(self, at: str, fails: int, warns: int, checks: list[dict[str, Any]]) -> None:
-        verdict = "all healthy" if not fails and not warns else f"{fails} fault(s), {warns} warning(s)"
+        verdict = "all healthy" if not fails and not warns else f"{plural(fails, 'fault')}, {plural(warns, 'warning')}"
         self.verdict.setText(f"{verdict} — last run {str(at)[11:19] or at}")
         parts = []
         for c in checks:
@@ -268,14 +281,14 @@ class _HealthChecksPanel(QFrame):
 
     def render_forge(self, snap: dict[str, Any] | None) -> None:
         if not snap:
-            self.forge_label.setText("<i>forge not attached this session</i>")
+            self.forge_label.setText("Forge not attached this session")
             return
         lessons = snap.get("lessons") or {}
         quarantine = snap.get("quarantine") or []
         contract_failures = snap.get("contract_failures") or []
         parts = [
-            f"<b>FORGE</b>  {snap.get('live', 0)} tool(s) live · "
-            f"{snap.get('session_ok', 0)}/{snap.get('session_total', 0)} session(s) ok this run · "
+            f"<b>Forge</b>  {plural(snap.get('live', 0), 'tool')} live · "
+            f"{snap.get('session_ok', 0)}/{plural(snap.get('session_total', 0), 'session')} ok this run · "
             f"lessons: {lessons.get('lessons', 0)} ({lessons.get('unresolved', 0)} unresolved)"
         ]
         if quarantine:
@@ -285,7 +298,7 @@ class _HealthChecksPanel(QFrame):
         if contract_failures:
             colour = self._COLOURS["FAIL"]
             names = ", ".join(str(row.get("name", "?")) for row in contract_failures[:5])
-            parts.append(f"<span style='color:{colour}'>●</span> {len(contract_failures)} contract failure(s): {names}")
+            parts.append(f"<span style='color:{colour}'>●</span> {plural(len(contract_failures), 'contract failure')}: {names}")
         if not quarantine and not contract_failures:
             parts.append(f"<span style='color:{self._COLOURS['PASS']}'>●</span> nothing held back")
         self.forge_label.setText("<br>".join(parts))
@@ -312,6 +325,14 @@ class DiagnosticsCentreView(QWidget):
         self._log_stamps: Deque[float] = deque(maxlen=2000)
         self._event_stamps: Deque[float] = deque(maxlen=2000)
         self._last_diagnostic: dict[str, Any] | None = None
+        # Built on first open, so the last full diagnostic has usually already
+        # been broadcast; start from it rather than a blank panel.
+        try:
+            last = bus.last_value("dashboard:diagnostics")
+            if isinstance(last, dict):
+                self._last_diagnostic = last
+        except Exception:
+            pass
         # Traffic taps — count only; rendering happens on the timer.
         bus.log.connect(lambda _m: self._log_stamps.append(time.monotonic()))
         bus.dashboard_event.connect(self._on_dashboard_event)
@@ -319,34 +340,57 @@ class DiagnosticsCentreView(QWidget):
             lambda _c, _p: self._event_stamps.append(time.monotonic())
         )
 
+        # Hierarchy (Mark XXXV refinement): the question this page answers —
+        # is anything wrong? — first, with the self-checks and crashes side by
+        # side; then component health and resources; then, under Details, the
+        # engineering readouts (the tool ledger, request and token counters,
+        # bus traffic). The capitalised page title is gone: the deck header
+        # names the page.
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
-        title = QLabel("ORION DIAGNOSTICS CENTRE")
-        title.setObjectName("titleLabel")
-        root.addWidget(title)
+        root.setContentsMargins(SPACE.MD, SPACE.SM, SPACE.MD, SPACE.MD)
+        root.setSpacing(SPACE.SM + 4)
 
         # Provider / connection / degraded-mode / token status strip (Sections
         # 2, 4, 5, 6, 7).  Reacts to bus signals; token counts refreshed on the
         # sample timer below.
-        self.status_strip = ProviderStatusStrip(bus)
-        root.addWidget(self.status_strip)
+        self.status_strip = ProviderStatusStrip(bus, show_tokens=False)
+        lead = QHBoxLayout()
+        lead.addStretch(1)
+        lead.addWidget(self.status_strip, 0)
+        root.addLayout(lead)
+
+        first = QHBoxLayout()
+        first.setSpacing(SPACE.SM + 4)
+        self.health_checks_panel = _HealthChecksPanel()
+        self.crash_panel = _CrashPanel()
+        first.addWidget(self.health_checks_panel, 1)
+        first.addWidget(self.crash_panel, 1)
+        root.addLayout(first)
 
         row = QHBoxLayout()
+        row.setSpacing(SPACE.SM + 4)
         self.health_panel = _HealthPanel()
         self.resource_panel = _ResourcePanel()
         row.addWidget(self.health_panel, 1)
         row.addWidget(self.resource_panel, 1)
         root.addLayout(row)
+        root.addStretch(1)
 
+        details_body = QWidget()
+        details_box = QVBoxLayout(details_body)
+        details_box.setContentsMargins(0, 0, 0, 0)
+        details_box.setSpacing(SPACE.SM)
+        counters = QHBoxLayout()
+        counters.addWidget(self.status_strip.token_mini)
+        counters.addSpacing(SPACE.LG)
+        counters.addWidget(self.resource_panel.traffic, 1)
+        details_box.addLayout(counters)
         self.tool_panel = _ToolPanel()
-        root.addWidget(self.tool_panel, 1)
-
-        self.health_checks_panel = _HealthChecksPanel()
-        root.addWidget(self.health_checks_panel)
-
-        self.crash_panel = _CrashPanel()
-        root.addWidget(self.crash_panel)
+        self.tool_panel.setMinimumHeight(220)
+        details_box.addWidget(self.tool_panel)
+        self.details = DetailsSection(
+            "Details — Tool Ledger, Request Counts and Bus Traffic", details_body)
+        root.addWidget(self.details)
 
         self._timer = QTimer(self)
         self._timer.setInterval(self.SAMPLE_MS)

@@ -10,6 +10,7 @@
   ],
   "events": [],
   "requires": [],
+  "secrets": ["TELEGRAM_BOT_TOKEN"],
   "parameters": {
     "type": "OBJECT",
     "properties": {

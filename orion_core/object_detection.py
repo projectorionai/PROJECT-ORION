@@ -23,7 +23,8 @@ Models, from ``CONFIG_DIR/models``:
   the model's shape, so no configuration is needed. A file you add wins over
   the default.
 
-Detection is synchronous and CPU-bound: callers run it in a worker thread.
+Detection is synchronous: callers run it in a worker thread. It runs on the
+GPU (DirectML) when accelerator.py finds one, otherwise on the CPU.
 """
 
 from __future__ import annotations
@@ -330,13 +331,11 @@ class ObjectDetector:
         if self._session is not None and self._model_path == path:
             return True
         try:
-            import onnxruntime as ort
-            options = ort.SessionOptions()
-            options.intra_op_num_threads = self.THREADS
-            options.inter_op_num_threads = 1
-            options.log_severity_level = 3
-            session = ort.InferenceSession(str(path), sess_options=options,
-                                           providers=["CPUExecutionProvider"])
+            from . import accelerator
+            # The GPU when there is one (accelerator.POLICY), else THREADS of
+            # the CPU; a GPU that fails moves this model to the CPU by itself.
+            session = accelerator.create_session("object_detection", path,
+                                                 threads=self.THREADS, inter_threads=1)
             model_input = session.get_inputs()[0]
             size = model_input.shape[-1]
             self._input_size = size if isinstance(size, int) and size > 0 else self.INPUT_SIZE

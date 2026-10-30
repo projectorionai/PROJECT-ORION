@@ -77,7 +77,7 @@ def test_decision_and_reflection_markers(_app):
     cc = _centre(_app)
     cc._on_thought({"at": "09:00:00", "kind": "decision", "text": "Act now."})
     _tick(cc, 40)
-    assert "⚙" in cc.thought_box.toPlainText()   # decisions get the gear marker
+    assert "▸" in cc.thought_box.toPlainText()   # decisions get the arrow marker
 
 
 def test_a_hidden_panel_does_not_animate(_app):

@@ -170,3 +170,38 @@ def test_background_relaunch_is_opt_in():
     assert "ORION_BACKGROUND" in source
     assert "--background" in source
     assert "ORION_RELAUNCHED" in source, "no guard against relaunching forever"
+
+
+# ── shell opens stay off the event-loop thread (pump_guard) ───────────────────
+
+def test_a_shell_open_on_the_gui_thread_runs_on_a_worker(monkeypatch):
+    """os.startfile (ShellExecute) pumps the caller's message queue; on the
+    qasync thread that re-entered other tasks ("Cannot enter into task",
+    8 Oct 23:32:09, the moment find_files opened the research folder)."""
+    import os
+    import threading
+    from orion_core import pump_guard
+    seen: list[str] = []
+
+    def fake_startfile(path, *a, **k):
+        seen.append(threading.current_thread().name)
+        if path == "bad":
+            raise OSError("no association")
+
+    monkeypatch.setattr(os, "startfile", fake_startfile, raising=False)
+    monkeypatch.setattr(pump_guard, "_original", None)
+    assert pump_guard.install() is True
+    try:
+        os.startfile("C:/research")                     # main thread here
+        assert seen == ["orion-startfile"]
+        try:
+            os.startfile("bad")
+        except OSError as exc:
+            assert "no association" in str(exc)          # errors still reach the caller
+        else:
+            raise AssertionError("the error was swallowed")
+        worker = threading.Thread(target=lambda: os.startfile("C:/x"), name="other")
+        worker.start(); worker.join()
+        assert seen[-1] == "other"                        # off the GUI thread: unchanged
+    finally:
+        monkeypatch.setattr(os, "startfile", fake_startfile, raising=False)

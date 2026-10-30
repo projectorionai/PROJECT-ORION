@@ -1,0 +1,44 @@
+{
+  "name": "jv_water_reminder",
+  "description": "Log water intake and explicitly start cancellable reminders towards the user's chosen daily goal; no medical target is inferred.",
+  "module": "jv_water_reminder_tool.py",
+  "version": "33.0.0",
+  "tier": "allow",
+  "permissions": [
+    "filesystem",
+    "audio"
+  ],
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "The action to perform.",
+        "enum": [
+          "start",
+          "stop",
+          "log",
+          "reset",
+          "status"
+        ]
+      },
+      "interval_minutes": {
+        "type": "number",
+        "description": "5\u2013240 minutes between reminders; default 60."
+      },
+      "goal_ml": {
+        "type": "number",
+        "description": "User's daily goal in ml, 250\u20135,000."
+      },
+      "amount_ml": {
+        "type": "number",
+        "description": "Measured amount drunk, 1\u20132,000 ml; default 250."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  },
+  "secrets": []
+}

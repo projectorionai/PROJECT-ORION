@@ -1,5 +1,5 @@
 """
-O.R.I.O.N. Mark XXXII — Open Resolution Intelligence Overt Network.
+O.R.I.O.N. Mark XXXXI — Open Resolution Intelligence Overt Network.
 
 Copyright (C) 2026 Project ORION contributors.
 
@@ -47,5 +47,5 @@ touching the others:
 Entry point:  python orion.py   (thin launcher kept for compatibility)
 """
 
-__version__ = "32.0.0"
-__codename__ = "Mark XXXII — Iris & Signal Lanes"
+__version__ = "41.1.1"
+__codename__ = "Mark XXXXI — Ascendant"

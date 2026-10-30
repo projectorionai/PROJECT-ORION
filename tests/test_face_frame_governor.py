@@ -63,17 +63,16 @@ def test_the_thresholds_are_hysteretic(entering, leaving):
         f"{leaving} must be above {entering} or the governor dithers")
 
 
-def test_idle_needs_a_run_of_calm_frames():
-    """A dwell, so a single quiet frame cannot drop the rate. The Python
-    AnimationBudget has always had this as SETTLE_FRAMES; the page did not."""
-    assert _const("IDLE_AFTER") >= 30
+def test_idle_needs_a_run_of_calm_time():
+    """The dwell lasts independently of the display's refresh rate."""
+    assert _const("IDLE_AFTER_MS") >= 1000
 
 
 def test_waking_is_instant_and_any_one_signal_can_do_it():
     """Being slow to wake is a worse fault than being slow to sleep, so the
     leaving test is an OR with no dwell in front of it."""
     governor = HTML[HTML.index("function targetFrameMs()"):]
-    governor = governor[:governor.index("}\n\nfunction animate")]
+    governor = governor[:governor.index("\nlet nextFrameAt=")]
     leaving = governor[governor.index("if(idleRate)"):governor.index("else")]
     assert "||" in leaving, "leaving idle requires every signal to agree"
     assert "IDLE_AFTER" not in leaving, "waking up is behind a dwell"
@@ -122,7 +121,7 @@ def test_a_single_threshold_dithers_which_is_the_bug():
 def test_the_shipped_constants_do_not_dither():
     trace = _quiet_room()
     rates = _governor(trace, _const("QUIET_IN"), _const("QUIET_OUT"),
-                      _const("IDLE_AFTER"))
+                      _const("IDLE_AFTER_MS") * 60 / 1000)
     assert _changes(rates) == 0, (
         f"the face still changes rate {_changes(rates)} times in "
         f"{len(trace)} frames")
@@ -132,7 +131,7 @@ def test_real_speech_still_gets_the_full_rate():
     """The saving must not cost responsiveness: anything moving is 60 fps."""
     trace = [0.0] * 200 + [0.35] * 100 + [0.0] * 200
     rates = _governor(trace, _const("QUIET_IN"), _const("QUIET_OUT"),
-                      _const("IDLE_AFTER"))
+                      _const("IDLE_AFTER_MS") * 60 / 1000)
     speaking = rates[200:300]
     assert set(speaking) == {60}, "the face dropped frames while speaking"
     # And it woke on the very first loud frame, not after a dwell.
@@ -197,11 +196,53 @@ def test_the_original_sixty_fps_calibration_is_preserved():
 
 
 def test_the_frame_target_is_computed_once_per_frame():
-    """targetFrameMs() advances the dwell counter, so it is NOT idempotent.
-    Calling it again for the quality governor would count the same calm frame
-    twice and halve the dwell."""
-    body = HTML[HTML.index("function animate()"):]
+    """The scheduler publishes one target for both pacing and quality."""
+    body = HTML[HTML.index("function takeRenderFrame("):]
     assert body.count("targetFrameMs()") == 1, (
         "the frame target is computed more than once per frame")
     assert "let frameTargetMs" in HTML, (
         "the target is not published for step() to read")
+
+
+# ── the Motion and performance preference ─────────────────────────────────────
+
+def test_the_full_profile_leaves_the_face_exactly_as_designed(monkeypatch):
+    """Full is the default and must change nothing: same resolution cap, same
+    idle drift, same idle frame rate."""
+    from orion_core import appearance
+
+    monkeypatch.delenv("ORION_MOTION_PROFILE", raising=False)
+    monkeypatch.delenv("ORION_FACE_IDLE_FPS", raising=False)
+    monkeypatch.setattr(appearance, "_load", lambda: {})
+    page = face3d.three_sourced(face3d.FACE_HTML)
+    assert "devicePixelRatio,1.75)" in page
+    assert "let motionScale=1.00;" in page
+    assert "IDLE_FPS=30;" in page
+    for placeholder in ("__PIXEL_CAP__", "__MOTION_SCALE__", "__IDLE_FPS__"):
+        assert placeholder not in page
+
+
+def test_reduced_motion_calms_idle_drift_but_never_speech(monkeypatch):
+    from orion_core import appearance
+
+    monkeypatch.setenv("ORION_MOTION_PROFILE", "reduced")
+    monkeypatch.delenv("ORION_FACE_IDLE_FPS", raising=False)
+    page = face3d.three_sourced(face3d.FACE_HTML)
+    assert "let motionScale=0.30;" in page
+    # The scale multiplies idle drift and breathing only; the speech nod term
+    # (nodP) and the active frame rate are untouched.
+    assert "0.09*calm*motionScale" in page and "*0.015*nodP" in page
+    assert "const ACTIVE_FPS=60;" in page
+    assert appearance.motion_profile().deck_transitions is False
+
+
+def test_the_system_animation_setting_is_a_hint_not_a_decision(monkeypatch):
+    """Windows' 'show animations' switch is often part of 'best performance',
+    not a motion preference; the face only changes when the user chooses."""
+    from orion_core import appearance
+
+    monkeypatch.delenv("ORION_MOTION_PROFILE", raising=False)
+    monkeypatch.setattr(appearance, "_load", lambda: {})
+    monkeypatch.setattr(appearance, "_system_prefers_reduced_motion", lambda: True)
+    assert appearance.motion_profile().name == "full"
+    assert appearance.system_prefers_reduced_motion() is True

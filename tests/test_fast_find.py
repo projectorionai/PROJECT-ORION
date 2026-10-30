@@ -208,3 +208,103 @@ def test_find_files_uses_the_fast_path():
     assert "file_search.search" in source
     assert "fast_find.find" in source
     assert "_scan_user_files" not in source, "still using the slow walk directly"
+def test_a_ranking_alone_is_a_question():
+    """10 Oct (capability-gap ledger, twice): "Can you find the biggest files
+    currently on the PC" was refused with "tell me what to look for"."""
+    from orion_core import file_search as fs
+    biggest = fs.build_query({"sort": "largest"})
+    assert not biggest.is_empty() and biggest.kind == "file"
+    assert not fs.build_query({"sort": "newest"}).is_empty()
+    assert fs.build_query({"sort": "largest", "type": "folders"}).kind == "folder"
+    assert fs.build_query({}).is_empty() and fs.build_query({"sort": "name"}).is_empty()
+
+
+def test_folder_labels_use_the_real_redirected_location(tmp_path, monkeypatch):
+    from orion_core import app_resolver, file_search as fs
+    redirected = tmp_path / "OneDrive" / "Downloads"
+    redirected.mkdir(parents=True)
+    monkeypatch.setattr(app_resolver, "known_folder",
+                        lambda text, **_: redirected if text in {"my downloads", "downloads"} else None)
+    query = fs.build_query({"query": "my downloads"})
+    monkeypatch.setattr(fs, "_everything_query", lambda *_: pytest.fail("known label invoked whole-PC index"))
+    results = fs.search(query)
+    assert [hit.path for hit in results.hits] == [str(redirected)]
+    assert results.hits[0].is_folder
+    scoped = fs.build_query({"query": "invoice", "folder": "downloads"})
+    assert scoped.folder == str(redirected)
+
+
+def test_spoken_folder_query_keeps_the_topic_and_explicit_quoted_names():
+    from orion_core import file_search as fs
+    query = fs.build_query({"query": "the research folder about solar energy"})
+    assert query.kind == "folder" and query.name == "solar energy"
+    assert query.research_topic == "solar energy"
+    assert fs.build_query({"query": "folder called Tax 2026"}).name == "Tax 2026"
+    assert fs.build_query({"query": '"the report"'}).name == "the report"
+
+
+def test_research_folder_is_found_from_its_saved_report_title(tmp_path, monkeypatch):
+    from orion_core import constants, file_search as fs
+    monkeypatch.setattr(constants, "BASE_DIR", tmp_path / "program")
+    monkeypatch.setattr(constants, "CONFIG_DIR", tmp_path / "private")
+    reports = constants.CONFIG_DIR / "research" / "dossiers"
+    reports.mkdir(parents=True)
+    (reports / "report-42.md").write_text("# Solar energy\n\nSynthetic report", encoding="utf-8")
+    (reports / "unrelated.md").write_text("# Tax reporting\n", encoding="utf-8")
+    query = fs.build_query({"query": "the research folder about solar energy"})
+    result = fs.search(query, engines=())
+    assert [hit.path for hit in result.hits] == [str(reports)]
+    assert "titles match" in result.note
+    assert not fs.search(fs.build_query({"query": "research folder about lunar rocks"}), engines=()).hits
+
+
+def test_multiple_saved_research_folders_remain_multiple_candidates(tmp_path, monkeypatch):
+    from orion_core import constants, file_search as fs
+    monkeypatch.setattr(constants, "BASE_DIR", tmp_path / "program")
+    monkeypatch.setattr(constants, "CONFIG_DIR", tmp_path / "private")
+    for parent in (constants.CONFIG_DIR, constants.BASE_DIR):
+        folder = parent / "research" / "solar-study"
+        folder.mkdir(parents=True)
+        (folder / "solar-energy.md").write_text("# Solar energy", encoding="utf-8")
+    result = fs.search(fs.build_query({"query": "research folder about solar energy"}), engines=())
+    assert len(result.hits) == 2
+
+
+def test_recognised_folder_does_not_escape_an_explicit_search_scope(tmp_path, monkeypatch):
+    from orion_core import app_resolver, file_search as fs
+    downloads, documents = tmp_path / "Downloads", tmp_path / "Documents"
+    downloads.mkdir()
+    documents.mkdir()
+    monkeypatch.setattr(app_resolver, "known_folder",
+                        lambda text, **_: downloads if text == "downloads" else None)
+    query = fs.build_query({"query": "downloads", "folder": str(documents)})
+    assert not fs.search(query).hits
+
+
+def test_research_topic_can_be_scoped_to_a_subfolder_of_the_output_root(tmp_path, monkeypatch):
+    from orion_core import constants, file_search as fs
+    monkeypatch.setattr(constants, "BASE_DIR", tmp_path / "program")
+    monkeypatch.setattr(constants, "CONFIG_DIR", tmp_path / "private")
+    reports = constants.CONFIG_DIR / "research" / "dossiers"
+    reports.mkdir(parents=True)
+    (reports / "solar-energy.md").write_text("# Solar energy", encoding="utf-8")
+    query = fs.build_query({"query": "research folder about solar energy", "folder": str(reports)})
+    assert [hit.path for hit in fs.search(query, engines=()).hits] == [str(reports)]
+
+
+def test_research_folder_search_honours_its_deadline_in_empty_subtrees(tmp_path, monkeypatch):
+    from orion_core import constants, file_search as fs
+    monkeypatch.setattr(constants, "BASE_DIR", tmp_path / "program")
+    monkeypatch.setattr(constants, "CONFIG_DIR", tmp_path / "private")
+    ticks = iter(range(1000))
+    monkeypatch.setattr(fs.time, "monotonic", lambda: float(next(ticks)))
+    visited = []
+
+    def empty_tree(root, onerror):
+        for index in range(100):
+            visited.append(index)
+            yield str(root / str(index)), [], []
+
+    monkeypatch.setattr(fs.os, "walk", empty_tree)
+    assert fs.find_research_folders("solar energy", budget=2.0) == []
+    assert len(visited) <= 2, "empty directories bypassed the search deadline"

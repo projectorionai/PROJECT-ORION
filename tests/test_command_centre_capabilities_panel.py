@@ -93,7 +93,7 @@ def test_panel_has_the_five_expected_columns(_app):
     window = _window(_StubDispatcher(_registries()), _StubTelemetry())
     headers = [window.capabilities_table.horizontalHeaderItem(i).text()
                for i in range(window.capabilities_table.columnCount())]
-    assert headers == ["Module", "Role", "Health", "Depends on", "Version"]
+    assert headers == ["Module", "Role", "Health", "Depends On", "Version"]
 
 
 # ── rendering ────────────────────────────────────────────────────────────────
@@ -155,7 +155,7 @@ def test_the_note_summarises_registered_and_available_counts(_app):
     window = _window(_StubDispatcher(registries), _StubTelemetry())
     window._refresh_capabilities()
     note = window.capabilities_note.text()
-    assert "3 subsystem(s) registered" in note
+    assert "3 features listed" in note
     assert "2 available" in note
 
 
@@ -172,7 +172,7 @@ def test_refresh_is_safe_when_the_dispatcher_has_no_registries(_app):
     window = _window(_StubDispatcher(), _StubTelemetry())
     window._refresh_capabilities()   # must not raise
     assert window.capabilities_table.rowCount() == 0
-    assert "not available" in window.capabilities_note.text().lower()
+    assert "unavailable" in window.capabilities_note.text().lower()
 
 
 def test_refresh_is_safe_when_the_registry_lookup_raises(_app):

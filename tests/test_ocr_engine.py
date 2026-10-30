@@ -133,3 +133,56 @@ def test_dark_mode_is_inverted_for_rapidocr():
     dark = np.full((600, 800, 3), 25, dtype=np.uint8)
     ready, top = OcrEngine._rapid_ready(dark)
     assert top == 0 and int(ready[0, 0, 0]) == 230
+
+
+# ── RapidOCR's sessions: built by the first read, placed by accelerator.py ──
+
+def test_probing_rapidocr_builds_nothing_until_a_read(monkeypatch):
+    """_detect runs wherever `available` is first asked - the GUI thread too
+    (vision.find_element_via_ocr) - and building the three sessions there froze
+    every Python thread. The probe now only checks RapidOCR is installed; the
+    first read builds the engine, once, shared with the word locator."""
+    from orion_core import ocr_engine
+    built = []
+    box = [(0, 0), (40, 0), (40, 10), (0, 10)]
+    reader = lambda _image: ([[box, "hello", 0.9]], None)  # noqa: E731
+    monkeypatch.setattr(ocr_engine, "_build_rapidocr", lambda: built.append(1) or reader)
+    monkeypatch.setattr(ocr_engine, "_installed", lambda name: True)
+    eng = OcrEngine(_Bus())
+    adapter = eng._probe_rapidocr()
+    assert adapter is not None and built == []
+    image = np.full((40, 120, 3), 255, np.uint8)
+    assert adapter(None, image) == ("hello", 0.9)
+    assert eng._locate_words_rapidocr(image)[0]["text"] == "hello"
+    assert built == [1]
+
+
+def test_rapidocr_is_not_offered_when_it_is_not_installed(monkeypatch):
+    from orion_core import ocr_engine
+    monkeypatch.setattr(ocr_engine, "_installed", lambda name: name != "rapidocr_onnxruntime")
+    assert OcrEngine(_Bus())._probe_rapidocr() is None
+
+
+def test_rapidocr_sessions_are_placed_by_the_accelerator(monkeypatch):
+    """Detection and recognition go where accelerator.POLICY says (the GPU when
+    there is one), the angle classifier to the CPU, and RapidOCR's own session
+    factory is put back once the engine is built."""
+    pytest.importorskip("rapidocr_onnxruntime")
+    import onnxruntime as ort
+    from rapidocr_onnxruntime import utils as rapid_utils
+    from orion_core import accelerator, ocr_engine
+    asked = []
+
+    def create(model, path, **_kwargs):
+        asked.append(model)
+        return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+
+    monkeypatch.setattr(accelerator, "create_session", create)
+    original = rapid_utils.InferenceSession
+    engine = ocr_engine._build_rapidocr()
+    assert sorted(asked) == ["ocr_cls", "ocr_det", "ocr_rec"]
+    assert rapid_utils.InferenceSession is original
+    assert {m: accelerator.policy(m) for m in asked} == {
+        "ocr_det": "gpu", "ocr_rec": "gpu", "ocr_cls": "cpu"}
+    result, _ = engine(np.full((64, 64, 3), 255, np.uint8))
+    assert not result

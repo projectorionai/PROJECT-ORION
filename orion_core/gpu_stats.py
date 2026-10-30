@@ -30,7 +30,7 @@ _SMI_TIMEOUT_S = 0.75
 
 def _empty() -> dict[str, Any]:
     return {"available": False, "name": "n/a", "util": 0.0,
-            "mem_percent": 0.0, "mem_used_mb": 0, "temp_c": 0,
+            "mem_percent": 0.0, "mem_used_mb": 0, "mem_total_mb": 0, "temp_c": 0,
             "temp_percent": 0.0}
 
 
@@ -41,7 +41,17 @@ def _ensure_init() -> bool:
     try:
         import pynvml
         pynvml.nvmlInit()
-        _state["handle"] = pynvml.nvmlDeviceGetHandleByIndex(0)
+        preferred = "rtx 3060 ti"
+        count = pynvml.nvmlDeviceGetCount()
+        chosen = pynvml.nvmlDeviceGetHandleByIndex(0)
+        for index in range(count):
+            candidate = pynvml.nvmlDeviceGetHandleByIndex(index)
+            label = pynvml.nvmlDeviceGetName(candidate)
+            label = label.decode() if isinstance(label, bytes) else str(label)
+            if preferred in label.lower():
+                chosen = candidate
+                break
+        _state["handle"] = chosen
         name = pynvml.nvmlDeviceGetName(_state["handle"])
         _state["name"] = name.decode() if isinstance(name, bytes) else str(name)
         _state["backend"] = "nvml"
@@ -99,6 +109,7 @@ def sample() -> dict[str, Any]:
                 "util": float(util.gpu),
                 "mem_percent": round(mem.used / mem.total * 100.0, 1) if mem.total else 0.0,
                 "mem_used_mb": int(mem.used / (1024 * 1024)),
+                "mem_total_mb": int(mem.total / (1024 * 1024)),
                 "temp_c": int(temp),
             }
         else:
@@ -106,7 +117,7 @@ def sample() -> dict[str, Any]:
                 [_state["exe"] or "nvidia-smi",
                  "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=_SMI_TIMEOUT_S,
+                capture_output=True, text=True, errors="replace", timeout=_SMI_TIMEOUT_S,
                 check=False,
                 # ORION is a windowed application.  Without this flag Windows
                 # can create a console flash every time the optional fallback
@@ -115,7 +126,9 @@ def sample() -> dict[str, Any]:
             )
             if proc.returncode != 0 or not proc.stdout.strip():
                 raise RuntimeError(proc.stderr.strip() or "nvidia-smi returned no data")
-            row = next(csv.reader(io.StringIO(proc.stdout)), [])
+            rows = list(csv.reader(io.StringIO(proc.stdout)))
+            row = next((entry for entry in rows if entry and
+                        "rtx 3060 ti" in entry[0].lower()), rows[0] if rows else [])
             if len(row) < 5:
                 raise RuntimeError("nvidia-smi returned an incomplete row")
             name, util, used, total, temp = (item.strip() for item in row[:5])
@@ -126,7 +139,8 @@ def sample() -> dict[str, Any]:
                 "available": True, "name": name or "NVIDIA GPU",
                 "util": float(util),
                 "mem_percent": round(used_mb / total_mb * 100.0, 1) if total_mb else 0.0,
-                "mem_used_mb": int(used_mb), "temp_c": temp_c,
+                "mem_used_mb": int(used_mb), "mem_total_mb": int(total_mb),
+                "temp_c": temp_c,
             }
         out["temp_percent"] = min(100.0, max(0.0, float(out["temp_c"])))
     except Exception:

@@ -31,6 +31,9 @@ So this is a real engine, written here, that owns its own judgement:
               pair — and endgame knowledge: king-and-pawn key squares and the
               rule of the square, drawish-material scaling, and "mop-up" that
               drives a bare king to the edge so won endings actually get won.
+              Its weights were TRAINED, not guessed: fitted to Stockfish's
+              verdicts on 70,000 quiet positions from 6,400 engine games, and
+              kept because the trained version beat the hand-set one.
   LEARNING    three mechanisms, fed by games actually played (below).
   RATING      his own Elo, earned against real opponents — you, or Stockfish
               at a known strength when you set up a sparring match.
@@ -105,21 +108,48 @@ MATE_BOUND = MATE_SCORE - 1_000
 MAX_PLY = 64
 _INF = MATE_SCORE + 1
 
-#: "How strong is he?" — measured, not claimed. Sep 2026: this engine at
-#: ORION's own 1.5 s a move (opening theory seeded, as in play) against
-#: Stockfish 18 with UCI_LimitStrength at calibrated UCI_Elo 1900/2200/2500/2700
-#: (0.3 s a move, 1 thread), 73 games from 16 opening positions with colours
-#: alternated: +35 =19 -19. Maximum-likelihood performance rating 2486, 95%
-#: bootstrap interval 2396-2574. The engine before this rework, measured the
-#: same way over 64 games against UCI_Elo 1320-1900: 1725 (1618-1830). The
-#: scale is Stockfish's, anchored to computer-engine (CCRL) ratings — not a
-#: human FIDE or online rating.
-MEASURED_STRENGTH = (
-    "Measured over 73 games against Stockfish set to calibrated strengths, at my "
-    "usual 1.5 seconds a move, I play at about 2490 on Stockfish's Elo scale — "
-    "most likely somewhere between 2400 and 2575. That scale is anchored to "
-    "computer-engine ratings, not human FIDE ratings.")
+#: Current reproducible benchmark: shipped classical evaluation and seeded
+#: opening theory, without personalised learning or a promoted NNUE. Both
+#: engines received 0.08 s per move. Eight opening positions were paired by
+#: colour at each of Stockfish 18's UCI_Elo levels 1320, 1600 and 1900.
+#: The 24 pairs produced 28 wins, 10 draws and 10 losses. This is a fast-move
+#: performance measurement, not a rating for every time control or trained
+#: checkpoint. See docs/CHESS_BENCHMARK_MARK_XXXIII.md for the exact contract.
+#:
+#: Older prose quoted 2604 at a different, unequal time budget. That figure
+#: must not be presented as the unconditional strength of the current build.
+MEASURED_ELO = 1801
+MEASURED_INTERVAL = (1722, 1899)
+MEASURED_GAMES = 48
+MEASURED_ON = "30 Sep 2026"
+MEASURED_METHOD = ("in 24 colour pairs against Stockfish 18 at UCI_Elo 1320, 1600 and 1900, "
+                   "with both engines at 0.08 s per move; logistic maximum-likelihood "
+                   "performance with a 95% bootstrap interval")
 
+#: Below this Stockfish has no UCI_Elo: ChessService maps lower settings onto
+#: "Skill Level", which is not calibrated to any Elo, so a game against it
+#: says nothing a rating can use.
+STOCKFISH_RATED_FLOOR = 1320
+
+#: 1 = seeded at 1200 with K 40 (the defect above). 2 = seeded from the
+#: measurement; saved version-1 ratings are rebuilt once from their game log.
+RATING_VERSION = 2
+#: The user's starting rating. A guess, and labelled as one: it only becomes
+#: meaningful through games against an opponent whose rating is known.
+USER_START_RATING = 1200.0
+
+
+def strength_text() -> str:
+    """ORION's measured strength in one sentence — with its method, sample and
+    interval, because a bare number is exactly what got confused before."""
+    low, high = MEASURED_INTERVAL
+    return (f"Measured strength: about {MEASURED_ELO} on Stockfish's Elo scale "
+            f"(95% interval {low}–{high}), from {MEASURED_GAMES} games "
+            f"{MEASURED_METHOD}, on {MEASURED_ON}. That scale is anchored to "
+            "computer-engine ratings; this is not a FIDE or Lichess rating and does not predict other time controls.")
+
+
+MEASURED_STRENGTH = strength_text()
 
 def mate_distance(score: int) -> int | None:
     """Moves to mate for a search score from the side to move's view: positive
@@ -201,40 +231,178 @@ _KING_END = [
 #: the same — the middlegame table's centre-pawn preferences stop mattering.
 _PAWN_END = [0] * 8 + [0] * 8 + [5] * 8 + [10] * 8 + [20] * 8 + [35] * 8 + [55] * 8 + [0] * 8
 
-BASE_TABLES: dict[int, list[int]] = {
+_V1_BASE_TABLES: dict[int, list[int]] = {
     1: _PAWN, 2: _KNIGHT, 3: _BISHOP, 4: _ROOK, 5: _QUEEN, 6: _KING_MID,
 }
+
+# ── Tuned tables (version 2) ─────────────────────────────────────────────────
+# Fitted to Stockfish's judgement of 70,000 quiet positions from
+# engine games (Texel-style: the evaluation's win expectancy against
+# Stockfish's, by gradient descent), then kept only because ORION with them
+# beat ORION without them — see the Sep 2026 note on MEASURED_STRENGTH.
+BASE_TABLES: dict[int, list[int]] = {
+    1: [
+           0,    0,    0,    0,    0,    0,    0,    0,
+         -38,  -23,  -30,  -37,  -34,   -5,    5,  -35,
+         -37,  -26,  -23,  -22,  -12,  -15,    1,  -25,
+         -33,  -26,  -11,   -2,    0,   -5,  -13,  -29,
+         -21,  -14,   -9,   12,   21,    4,    0,  -11,
+           0,    2,   11,   33,   20,   21,   13,   29,
+          43,   48,   40,   56,   46,   49,   46,   46,
+           0,    0,    0,    0,    0,    0,    0,    0,
+    ],
+    2: [
+         -43,   -7,  -24,  -18,    2,  -17,   -5,  -47,
+         -32,  -20,   14,   23,   24,   15,  -11,  -23,
+          -9,   16,   26,   32,   34,   26,   30,   -4,
+          -1,    8,   39,   23,   35,   30,    0,    6,
+         -18,   27,   21,   42,   35,   42,   32,   -5,
+         -28,    7,    4,   41,   40,   21,   12,  -23,
+         -39,  -16,   10,    3,    8,   13,  -16,  -30,
+         -63,  -41,  -32,  -29,  -28,  -29,  -38,  -61,
+    ],
+    3: [
+         -14,   -1,  -14,   -8,   -7,  -11,   -3,  -13,
+          10,   13,   21,   -3,    5,    4,   32,    5,
+           2,   24,   10,    3,    9,    6,   18,   -5,
+          14,   -8,    4,   15,   11,   -1,    2,    9,
+         -16,   10,    3,   26,   17,    0,    7,  -10,
+         -11,    6,   -1,   17,   11,   13,   -3,   -7,
+         -22,   -5,    9,   -9,   -2,   -3,   -9,  -12,
+         -35,  -15,  -13,  -14,  -17,  -19,  -15,  -27,
+    ],
+    4: [
+         -18,  -14,   -4,   10,    7,   -3,  -19,  -15,
+         -22,   -8,   -5,   -5,  -10,   -2,   -8,  -23,
+         -12,    4,   -7,   -2,  -10,  -18,   -4,   -4,
+          -7,    1,    3,   -2,    3,  -14,    4,    3,
+          -1,   -4,    6,    9,    3,   -1,    4,    4,
+          -7,    3,    4,    3,    7,    6,   14,    1,
+           7,    2,   12,   20,   16,   13,   11,    4,
+           4,   13,    6,   10,    6,    6,    4,   13,
+    ],
+    5: [
+          -3,  -21,   -7,   10,    6,  -16,  -12,  -18,
+         -10,    0,    3,   15,   19,   13,    0,    3,
+          -9,    7,   11,    3,    3,    4,    5,  -13,
+          -5,    0,    5,    0,    5,   16,    8,   10,
+         -12,  -13,    7,   -6,    2,   11,    3,    6,
+          -4,   -1,    4,   13,   19,   11,    6,    1,
+         -19,   -4,   -6,    6,    3,    2,   18,   -4,
+         -25,  -15,   -8,   -4,   -1,  -12,  -13,  -22,
+    ],
+    6: [
+          18,   50,   37,  -22,   19,    6,   45,   46,
+          26,   25,    2,  -16,  -35,  -11,   25,   17,
+          -9,  -13,  -19,  -27,  -27,  -31,  -19,  -12,
+         -21,  -33,  -31,  -43,  -45,  -34,  -32,  -15,
+         -28,  -39,  -42,  -53,  -57,  -43,  -38,  -28,
+         -29,  -37,  -42,  -51,  -52,  -42,  -41,  -28,
+         -29,  -38,  -39,  -49,  -48,  -40,  -38,  -30,
+         -30,  -40,  -39,  -49,  -50,  -40,  -40,  -30,
+    ],
+}
+#: Endgame placement, one table per piece. What the learner changes in a
+#: piece's middlegame table is carried into its endgame table too (knights,
+#: bishops, rooks and queens), as it always was.
+EG_TABLES: dict[int, list[int]] = {
+    1: [
+           0,    0,    0,    0,    0,    0,    0,    0,
+         -11,  -10,    0,  -12,  -19,  -13,  -19,  -22,
+         -15,  -11,  -21,  -16,  -29,  -12,  -23,  -30,
+          -7,  -13,  -26,  -38,  -31,  -16,  -16,  -12,
+           2,    6,   -9,  -23,  -21,   -9,    4,  -12,
+          20,   22,   26,    6,   12,   20,   31,    3,
+          28,   47,   45,   53,   44,   46,   50,   45,
+           0,    0,    0,    0,    0,    0,    0,    0,
+    ],
+    2: [
+         -35,  -28,  -19,  -13,   -6,  -24,  -28,  -41,
+         -26,   -4,   20,   11,   21,   12,   -8,  -26,
+         -11,   10,   24,   32,   25,   27,   34,  -17,
+           1,   10,   23,   28,   30,   24,   12,   -9,
+         -11,   15,   32,   35,   29,   33,   12,  -19,
+         -18,   13,   23,   30,   30,   24,   14,  -16,
+         -27,  -16,   11,   15,    8,    5,   -2,  -27,
+         -49,  -28,  -17,  -21,  -21,  -16,  -30,  -42,
+    ],
+    3: [
+         -12,  -12,    1,   -5,   -8,    9,  -13,  -17,
+          -3,    7,   -4,   11,   12,    4,   11,   -4,
+           6,    5,   15,   12,    9,   18,   11,   -4,
+          -7,    8,   20,   12,    7,   16,    1,  -10,
+           1,    4,   10,   21,   12,    2,    8,   -2,
+         -10,    0,    1,   15,   13,    5,    5,   -2,
+         -15,   -6,    8,   -6,   -5,   -4,   -6,   -9,
+         -17,  -11,  -10,  -16,  -14,  -13,  -12,  -24,
+    ],
+    4: [
+           5,    4,    8,   -3,    0,    6,    3,   -2,
+           4,   -8,    4,  -15,   -5,   -7,  -12,  -13,
+         -10,   -4,   -5,   -4,   -5,   -8,  -12,   -2,
+           5,    0,    6,   -5,   -7,   -5,   -1,   -8,
+          -3,   14,    4,    5,  -13,   -2,  -10,   -3,
+           1,   -4,   -1,   -6,   -9,    3,   11,   -2,
+          -4,    8,   15,    9,    5,    6,    4,   -8,
+           8,   10,    8,   11,   -2,    4,    6,    5,
+    ],
+    5: [
+         -14,  -12,  -11,    5,    0,  -10,  -11,  -18,
+          -9,   -1,  -11,   -4,    6,    2,   -1,   -8,
+          -7,   15,   10,   10,   12,   13,    3,  -11,
+           1,    3,   10,   15,    8,    8,    6,    3,
+          -4,    2,   12,   12,    5,    6,    9,    6,
+          -9,    3,   11,    8,   15,   10,    4,   -3,
+          -9,    8,    2,    8,    6,    1,    3,   -7,
+         -22,   -9,  -10,   -1,   -1,  -12,  -10,  -18,
+    ],
+    6: [
+         -47,  -19,  -31,  -30,  -34,  -11,  -38,  -48,
+         -27,  -12,   -7,   -4,    0,   -7,  -19,  -22,
+         -34,    0,   11,    8,    7,    0,   -9,  -32,
+         -24,  -10,   10,   18,   22,   14,    0,  -20,
+         -26,    1,   22,   24,   22,   26,    3,  -12,
+         -26,   15,   12,   12,   30,   20,   -4,  -19,
+         -29,  -14,   -4,    4,    5,   -7,  -11,  -31,
+         -50,  -40,  -26,  -16,  -20,  -30,  -40,  -50,
+    ],
+}
+#: Which set of starting tables a saved brain's tables were learned on top of.
+#: A brain saved against older tables keeps what it LEARNED (its drift from
+#: those tables) and applies it to the current ones — see ``load``.
+TABLES_VERSION = 2
+_TABLE_HISTORY: dict[int, dict[int, list[int]]] = {1: _V1_BASE_TABLES, 2: BASE_TABLES}
 
 # ── evaluation weights ────────────────────────────────────────────────────────
 # (middlegame, endgame) pairs unless noted. Hand-set to textbook proportions and
 # kept only where a match against the previous version said they helped.
-_MG_VALUE = (0, 100, 320, 330, 500, 900, 0)
-_EG_VALUE = (0, 115, 320, 330, 500, 900, 0)
-_PASSED_MG = (0, 5, 5, 10, 20, 35, 55, 0)          # by relative rank, 0 = own back rank
-_PASSED_EG = (0, 10, 15, 25, 45, 75, 120, 0)
+_MG_VALUE = (0, 103, 318, 334, 496, 900, 0)
+_EG_VALUE = (0, 125, 309, 329, 504, 900, 0)
+_PASSED_MG = (0, -6, -26, -16, 15, 23, 54, 0)          # by relative rank, 0 = own back rank
+_PASSED_EG = (0, 13, 30, 36, 38, 73, 118, 0)
 #: Endgame weight per square of distance from each king to the square in front
 #: of a passer: the defender far away is good, our own king far away is bad.
-_PASSER_KING_ENEMY = (0, 0, 0, 5, 10, 15, 20, 0)
-_PASSER_KING_OWN = (0, 0, 0, -2, -4, -6, -8, 0)
+_PASSER_KING_ENEMY = (0, -5, 1, 7, 18, 25, 30, 0)
+_PASSER_KING_OWN = (0, -3, -10, -13, -14, -19, -20, 0)
 #: Taken off a passed pawn whose square in front is occupied.
-_BLOCKED_PASSER_MG = (0, 2, 2, 5, 10, 17, 27, 0)
-_BLOCKED_PASSER_EG = (0, 5, 7, 12, 22, 37, 60, 0)
+_BLOCKED_PASSER_MG = (0, 10, 7, 4, 18, 19, 41, 0)
+_BLOCKED_PASSER_EG = (0, 14, 13, 10, 25, 31, 73, 0)
 #: King shelter (middlegame): per pawn right in front, per pawn two ranks in
 #: front (each counted up to three), a base for a king on its first two ranks,
 #: and per file beside the king with none of our pawns / no pawns at all.
-_SHELTER = (12, 6, -30, -12, -10)
-_DOUBLED = (10, 20)
-_ISOLATED = (12, 15)
-_PROTECTED_PASSER_EG = 15
-_MOBILITY = {2: (4, 4, 4), 3: (5, 5, 6), 4: (2, 4, 6), 5: (1, 2, 12)}   # mg, eg, baseline squares
-_ROOK_OPEN = (25, 10)
-_ROOK_SEMI_OPEN = (12, 6)
-_ROOK_SEVENTH = (20, 30)
-_KNIGHT_OUTPOST = (22, 12)
-_BISHOP_OUTPOST = (10, 5)
-_BISHOP_PAIR = (30, 50)
+_SHELTER = (9, 0, -2, -13, -29)
+_DOUBLED = (17, 33)
+_ISOLATED = (8, 6)
+_PROTECTED_PASSER_EG = 19
+_MOBILITY = {2: (5, -4, 4), 3: (5, 1, 6), 4: (3, 5, 6), 5: (1, 7, 12)}   # mg, eg, baseline squares
+_ROOK_OPEN = (20, 12)
+_ROOK_SEMI_OPEN = (14, 30)
+_ROOK_SEVENTH = (5, 22)
+_KNIGHT_OUTPOST = (45, 9)
+_BISHOP_OUTPOST = (43, 10)
+_BISHOP_PAIR = (72, 56)
 _ATTACK_WEIGHT = (0, 0, 2, 2, 3, 5, 0)              # king-zone attack units by piece type
-_TEMPO = 10
+_TEMPO = 9
 
 # ── search parameters ─────────────────────────────────────────────────────────
 _EXACT, _LOWER, _UPPER = 0, 1, 2
@@ -544,10 +712,13 @@ class ChessBrain:
     #: dropped when it fills (dicts keep insertion order).
     TT_MAX_ENTRIES = 200_000
     PAWN_CACHE_MAX = 20_000
-    #: Do not start another iteration after this fraction of the budget: the
-    #: next depth costs several times the last, so it would almost never
-    #: finish, and the reply arrives sooner.
-    SOFT_TIME_FRACTION = 0.6
+    #: Start another iteration until this fraction of the budget has gone. It
+    #: was 0.6, on the reasoning that the next depth rarely finishes — but an
+    #: unfinished iteration still searches the best move first and switches
+    #: to any move proven better (``_iter_best``), so the last half-second is
+    #: not wasted. Measured, same 0.3 s budget each side, 160 games: +24 Elo
+    #: (95% -23..+72) for 0.95 over 0.6. The budget itself is unchanged.
+    SOFT_TIME_FRACTION = 0.95
 
     def __init__(self, path: Path | None = None, seed: int | None = None) -> None:
         self.path = Path(path) if path is not None else BRAIN_PATH
@@ -581,6 +752,10 @@ class ChessBrain:
         self._value_replay: Any = None
         self._net_lock = threading.RLock()
         self._search_lock = threading.RLock()
+        self.nnue: Any = None
+        self._managed_nnue = True
+        self._nnue_version = "classical"
+        self._nnue_stamp = None
         self.load()
         self._compile_tables()
         self._load_value()
@@ -596,10 +771,21 @@ class ChessBrain:
             for fen, moves in (data.get("book") or {}).items():
                 self.book[fen] = {uci: BookEntry.from_dict(rec)
                                   for uci, rec in moves.items()}
+            version = int(data.get("tables_version", 1))
+            learned_on = _TABLE_HISTORY.get(version)
             for piece, table in (data.get("tables") or {}).items():
                 index = int(piece)
-                if index in self.tables and len(table) == 64:
+                if index not in self.tables or len(table) != 64:
+                    continue
+                if learned_on is None or version == TABLES_VERSION:
                     self.tables[index] = [float(v) for v in table]
+                    continue
+                # Learned on older starting tables: keep the lesson (the
+                # drift), not the old table it was written on top of.
+                old, new = learned_on[index], BASE_TABLES[index]
+                self.tables[index] = [
+                    new[i] + max(-self.MAX_DRIFT, min(self.MAX_DRIFT, float(table[i]) - old[i]))
+                    for i in range(64)]
             self.games_learned = int(data.get("games_learned", 0))
             self.practice_games = int(data.get("practice_games", 0))
             saved = data.get("rating")
@@ -617,6 +803,7 @@ class ChessBrain:
                 "games_learned": self.games_learned,
                 "practice_games": self.practice_games,
                 "rating": self.rating,
+                "tables_version": TABLES_VERSION,
                 "tables": {str(k): [round(v, 2) for v in table]
                            for k, table in self.tables.items()},
                 "book": {fen: {uci: entry.to_dict()
@@ -659,7 +846,10 @@ class ChessBrain:
         eg_b: list[Any] = [None] * 7
         for piece in range(1, 7):
             mg_src = self.tables[piece]
-            eg_src = _PAWN_END if piece == 1 else _KING_END if piece == 6 else mg_src
+            eg_src = EG_TABLES[piece]
+            if 2 <= piece <= 5:
+                base = BASE_TABLES[piece]
+                eg_src = [eg_src[sq] + (mg_src[sq] - base[sq]) for sq in range(64)]
             mv, ev = _MG_VALUE[piece], _EG_VALUE[piece]
             mg_w[piece] = [int(mv + mg_src[sq]) for sq in range(64)]
             eg_w[piece] = [int(ev + eg_src[sq]) for sq in range(64)]
@@ -678,8 +868,25 @@ class ChessBrain:
     def _eval_stm(self, board: Any) -> int:
         """The static evaluation from the side to move's point of view, with a
         small bonus for having the move."""
+        if self.nnue is not None:
+            return self.nnue.evaluate(board)
         score = self._eval_white(board)
         return (score if board.turn else -score) + _TEMPO
+
+    def _refresh_nnue(self) -> None:
+        """Adopt only arena-promoted weights between local searches too."""
+        if not self._managed_nnue:
+            return
+        directory = self.path.parent / "grandmaster"
+        try:
+            stamp = (directory / "active.json").stat().st_mtime_ns
+        except OSError:
+            return
+        if stamp != self._nnue_stamp:
+            from .grandmaster.search import refresh_weights
+            version = refresh_weights(self, directory, self._nnue_version)
+            if version != self._nnue_version:
+                self._nnue_version, self._nnue_stamp = version, stamp
 
     def _eval_white(self, board: Any) -> int:
         """Static evaluation, White's point of view, from bitboards alone.
@@ -923,6 +1130,20 @@ class ChessBrain:
         if loaded is not None and loaded[0].sizes == [VALUE_FEATURES, VALUE_HIDDEN, 1]:
             self.value_net, meta = loaded
             self.value_positions = int(meta.get("positions", 0))
+            # Replay is as important as weights: after a restart one new game
+            # must not become the network's entire learning history.
+            history = meta.get("replay")
+            for row in (history[-4096:] if isinstance(history, list) else []):
+                try:
+                    active, target, weight = row
+                    if (not isinstance(active, list) or len(active) > 32
+                            or any(type(i) is not int or not 0 <= i < VALUE_FEATURES for i in active)
+                            or not math.isfinite(target) or not -1 <= target <= 1
+                            or not math.isfinite(weight) or weight <= 0):
+                        continue
+                    self._value_replay.add(active, target, weight)
+                except (ValueError, TypeError):
+                    continue
         else:
             self.value_net = MLP([VALUE_FEATURES, VALUE_HIDDEN, 1], hidden="relu",
                                  output="tanh", lr=1e-3, l2=1e-6, seed=5)
@@ -953,15 +1174,17 @@ class ChessBrain:
         about who went on to win; one ten moves from mate says a lot."""
         if not CHESS_AVAILABLE or self.value_net is None or not moves:
             return 0
+        if white_score not in (0.0, 0.5, 1.0):
+            raise ValueError("A chess result must be a win, draw or loss")
         outcome_white = 2.0 * white_score - 1.0           # -1 .. 1
         board = chess.Board()
         samples = []
         total = len(moves)
         for ply, uci in enumerate(moves):
             try:
-                board.push(chess.Move.from_uci(uci))
+                board.push_uci(uci)
             except (ValueError, AssertionError):
-                break
+                return 0                  # a corrupt trajectory cannot supply trustworthy labels
             active = value_features(board)
             outcome = outcome_white if board.turn == chess.WHITE else -outcome_white
             confidence = 0.3 + 0.7 * ((ply + 1) / max(1, total))
@@ -980,7 +1203,8 @@ class ChessBrain:
                     x[row, active] = 1.0
                 self.value_net.train_batch(x, [[t] for _a, t, _w in batch])
             self.value_positions += len(samples)
-            self.value_net.save(self.value_path, {"positions": self.value_positions})
+            self.value_net.save(self.value_path, {"positions": self.value_positions,
+                "replay": list(self._value_replay.items)[-4096:]})
         return len(samples)
 
     # ── his rating ────────────────────────────────────────────────────────────
@@ -1028,6 +1252,10 @@ class ChessBrain:
         clone._path, clone._iter_best, clone.last_pv = [], None, []
         clone.nodes, clone.last_reason = 0, ""
         clone._search_lock = threading.RLock()
+        if self.nnue is not None:
+            from .grandmaster.weights import Inference
+            # Read-only tensors may be shared, mutable accumulators may not.
+            clone.nnue = Inference(self.nnue.tensors)
         clone._rng = random.Random()
         return clone
 
@@ -1062,7 +1290,7 @@ class ChessBrain:
                 moves.append(move.uci())
             result = board.result(claim_draw=True)
             if result == "*":
-                result = "1/2-1/2"               # ran out of moves: call it level
+                continue                        # interrupted/capped games have no outcome label
             results[result] = results.get(result, 0) + 1
             learned += self.train_intuition(moves, {"1-0": 1.0, "0-1": 0.0}.get(result, 0.5))
             self.practice_games += 1
@@ -1093,6 +1321,7 @@ class ChessBrain:
             return 0
         with self._search_lock:
             self._interrupted = False
+            self._refresh_nnue()
             saved = (self.last_reason, self.last_pv)
             self._choose_move(board, seconds, max_depth, use_book=False)
             score = self._last_score
@@ -1124,6 +1353,7 @@ class ChessBrain:
             return {}
         with self._search_lock:
             self._interrupted = False
+            self._refresh_nnue()
             saved = (self.last_reason, self.last_pv)
             try:
                 root = board.copy()
@@ -1554,6 +1784,7 @@ class ChessBrain:
         ``last_pv``. The caller's *board* is never modified."""
         with self._search_lock:
             self._interrupted = False
+            self._refresh_nnue()
             return self._choose_move(board, seconds, max_depth, use_book)
 
     def _choose_move(self, board: Any, seconds: float, max_depth: int,

@@ -65,12 +65,12 @@ VALUE_CHARS = 160
 class MemoryViewer(QDialog):
     """A table of stored facts, with a Forget button on each row."""
 
-    COLUMNS = ("Category", "Key", "What ORION remembers", "Learned", "")
+    COLUMNS = ("Category", "Key", "What ORION Remembers", "Learned", "")
 
     def __init__(self, matrix: Any, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._matrix = matrix
-        self.setWindowTitle("O.R.I.O.N. — What he remembers")
+        self.setWindowTitle("O.R.I.O.N. — What He Remembers")
         self.setModal(False)
         self.setMinimumSize(880, 520)
         # The application's own styling, not a private copy of it. This was
@@ -85,11 +85,11 @@ class MemoryViewer(QDialog):
             f"QLabel#hint {{ color: {C.MUTED}; font-size: 11px; }}"
         )
 
-        heading = QLabel("What ORION remembers about you")
+        heading = QLabel("Memories")
         heading.setFont(QFont("Segoe UI", 13, QFont.Weight.DemiBold))
 
         self.search = QLineEdit()
-        self.search.setPlaceholderText("search everything he has stored…")
+        self.search.setPlaceholderText("Search memories…")
         describe_control(self.search, "Search stored memory",
                          "Filters the table. An empty box shows the most "
                          "recently updated entries.")
@@ -115,10 +115,7 @@ class MemoryViewer(QDialog):
         self.status = QLabel("")
         self.status.setObjectName("hint")
 
-        note = QLabel(
-            "Forgetting cannot be undone — the entry and its search index go "
-            "together. He is shown the exact text before anything is removed."
-        )
+        note = QLabel("Forgetting cannot be undone.")
         note.setObjectName("hint")
         note.setWordWrap(True)
 
@@ -194,7 +191,7 @@ class MemoryViewer(QDialog):
         excerpt = value if len(value) <= 200 else value[:200] + "…"
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Forget this?")
+        box.setWindowTitle("Forget This?")
         box.setText(f"Permanently forget {category}/{key}?")
         box.setInformativeText(f"“{excerpt}”\n\nThis cannot be undone.")
         confirm = box.addButton("Forget", QMessageBox.ButtonRole.DestructiveRole)

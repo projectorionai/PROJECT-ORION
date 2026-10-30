@@ -46,6 +46,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -59,7 +60,12 @@ if CHESS_AVAILABLE:
 else:  # pragma: no cover - python-chess is a hard requirement in practice
     chess = None  # type: ignore
 
-from ..constants import C
+from ..constants import C, CONFIG_DIR
+
+#: Board options (eval bar, move sound), beside ORION's other preferences.
+#: They were in QSettings("ORION", "Chess") - the registry, shared with every
+#: test run, so a test that toggled the sound turned the user's sound off.
+BOARD_OPTIONS_PATH = CONFIG_DIR / "chess_view.ini"
 from .. import background
 from .widgets import describe_control
 
@@ -360,6 +366,28 @@ class EvalBarWidget(QWidget):
 # PANEL
 # ──────────────────────────────────────────────────────────────────────────────
 
+class BoardViewport(QWidget):
+    """Keep the board square and its evaluation bar the same visible height."""
+
+    def __init__(self, board: ChessBoardWidget, bar: EvalBarWidget) -> None:
+        super().__init__()
+        self.board, self.bar = board, bar
+        board.setParent(self)
+        bar.setParent(self)
+        board.setMinimumSize(280, 280)
+        self.setMinimumSize(310, 280)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def resizeEvent(self, event: Any) -> None:
+        gap, bar_width = 8, 22 if not self.bar.isHidden() else 0
+        side = max(1, min(self.height(), self.width() - gap - bar_width))
+        x = max(0, (self.width() - side - gap - bar_width) // 2)
+        y = max(0, (self.height() - side) // 2)
+        self.board.setGeometry(x, y, side, side)
+        self.bar.setGeometry(x + side + gap, y, bar_width, side)
+        super().resizeEvent(event)
+
+
 class ChessPanel(QFrame):
     """Assembles the board with move entry, autonomous-play controls, and a
     move-list/commentary review pane. Construct with the shared
@@ -376,6 +404,7 @@ class ChessPanel(QFrame):
         # effect cache live with the rest of the game's state.
         self.sounds = chess_sound.MoveSounds()
         self._last_sounded: Optional[str] = None
+        self._eval_generation = 0
         self.setObjectName("panelFrame")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
@@ -384,18 +413,30 @@ class ChessPanel(QFrame):
         outer.setSpacing(8)
 
         header = QHBoxLayout()
-        header.addWidget(_heading("CHESS"))
+        header.addWidget(_heading("Chess"))
         self.status_chip = QLabel("—")
         self.status_chip.setObjectName("mutedLabel")
+        # ORION's Lichess games against friends, when the bridge is running.
+        self.lichess_label = QLabel("")
+        self.lichess_label.setObjectName("mutedLabel")
+        self.lichess_label.setVisible(False)
         header.addStretch(1)
+        header.addWidget(self.lichess_label)
         header.addWidget(self.status_chip)
         outer.addLayout(header)
 
-        body = QHBoxLayout()
+        self.modes = QTabWidget()
+        local = QWidget()
+        body = QHBoxLayout(local)
         body.setSpacing(10)
         body.addWidget(self._build_left_column(), 3)
         body.addWidget(self._build_right_column(), 2)
-        outer.addLayout(body)
+        self.modes.addTab(local, "Play && Analyse")
+        if self.service is not None:
+            from .chess_remote import RemoteChessWidget
+            self.remote_board = RemoteChessWidget(self.service)
+            self.modes.addTab(self.remote_board, "Remote && Training")
+        outer.addWidget(self.modes, 1)
 
         # After both columns exist, so the toggles are there to restore into.
         self._restore_board_options()
@@ -417,23 +458,21 @@ class ChessPanel(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        board_row = QHBoxLayout()
         self.board = ChessBoardWidget()
         self.board.move_requested.connect(self._submit_move_uci)
         self.eval_bar = EvalBarWidget()
-        board_row.addWidget(self.board, 1)
-        board_row.addWidget(self.eval_bar, 0)
-        layout.addLayout(board_row, 1)
+        self.board_viewport = BoardViewport(self.board, self.eval_bar)
+        layout.addWidget(self.board_viewport, 1)
 
         # The evaluation bar is a choice. Some players want the engine's verdict
         # in their peripheral vision; others find that it plays the game for
         # them. Both preferences are remembered between sessions.
         options_row = QHBoxLayout()
-        self.eval_toggle = QCheckBox("Evaluation bar")
+        self.eval_toggle = QCheckBox("Evaluation Bar")
         self.eval_toggle.setToolTip(
             "Show the engine's running assessment beside the board.")
         self.eval_toggle.toggled.connect(self._on_eval_toggled)
-        self.sound_toggle = QCheckBox("Move sound")
+        self.sound_toggle = QCheckBox("Move Sound")
         self.sound_toggle.setToolTip("A wooden click when a piece is played.")
         self.sound_toggle.toggled.connect(self._on_sound_toggled)
         options_row.addWidget(self.eval_toggle)
@@ -445,9 +484,9 @@ class ChessPanel(QFrame):
         self.move_input = QLineEdit()
         self.move_input.setPlaceholderText("Move (e.g. Nf3 or g1f3) — Enter to play")
         self.move_input.returnPressed.connect(self._submit_move_from_input)
-        submit_btn = QPushButton("PLAY")
+        submit_btn = QPushButton("Play")
         submit_btn.clicked.connect(self._submit_move_from_input)
-        self.live_btn = QPushButton("RETURN TO LIVE")
+        self.live_btn = QPushButton("Return to Live")
         self.live_btn.clicked.connect(self._go_live)
         move_row.addWidget(self.move_input, 1)
         move_row.addWidget(submit_btn)
@@ -468,10 +507,10 @@ class ChessPanel(QFrame):
         self.elo_spin.setRange(400, 3000)
         self.elo_spin.setSingleStep(50)
         self.elo_spin.setValue(1500)
-        self.elo_spin.setToolTip("Engine strength (ELO) for the side(s) it plays.")
-        new_btn = QPushButton("NEW GAME")
+        self.elo_spin.setToolTip("Engine strength (ELO) for the side it plays.")
+        new_btn = QPushButton("New Game")
         new_btn.clicked.connect(self._new_game)
-        self.resign_btn = QPushButton("RESIGN")
+        self.resign_btn = QPushButton("Resign")
         self.resign_btn.clicked.connect(self._resign)
         new_row.addWidget(QLabel("White")); new_row.addWidget(self.white_combo)
         new_row.addWidget(QLabel("Black")); new_row.addWidget(self.black_combo)
@@ -485,11 +524,11 @@ class ChessPanel(QFrame):
         self.delay_spin.setRange(0.2, 30.0)
         self.delay_spin.setValue(2.0)
         self.delay_spin.setSuffix("s")
-        self.start_btn = QPushButton("START AUTONOMOUS")
+        self.start_btn = QPushButton("Start Autonomous")
         self.start_btn.setToolTip("Both sides must be 'orion' and/or 'engine' — "
                                   "e.g. 'play against the engine' or 'train against yourself'.")
         self.start_btn.clicked.connect(self._start_autonomous)
-        self.stop_btn = QPushButton("STOP")
+        self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self._stop_autonomous)
         auto_row.addWidget(QLabel("Delay")); auto_row.addWidget(self.delay_spin)
         auto_row.addWidget(self.start_btn)
@@ -501,10 +540,22 @@ class ChessPanel(QFrame):
 
     def _chess_settings(self) -> Any:
         from PyQt6.QtCore import QSettings
-        return QSettings("ORION", "Chess")
+        return QSettings(str(BOARD_OPTIONS_PATH), QSettings.Format.IniFormat)
 
     def _restore_board_options(self) -> None:
         settings = self._chess_settings()
+        # Carried over once from where they used to live, so moving them
+        # does not quietly reset the user's choices.
+        legacy = None
+        for key in ("eval_bar", "move_sound"):
+            if not settings.contains(key):
+                try:
+                    from PyQt6.QtCore import QSettings
+                    legacy = legacy or QSettings("ORION", "Chess")
+                    if legacy.contains(key):
+                        settings.setValue(key, legacy.value(key, True, type=bool))
+                except Exception:
+                    pass
         show_eval = settings.value("eval_bar", True, type=bool)
         play_sound = settings.value("move_sound", True, type=bool)
         # setChecked fires toggled, which applies and re-saves the same value —
@@ -550,7 +601,7 @@ class ChessPanel(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        layout.addWidget(_heading("MOVES — click, or ←/→ to step"))
+        layout.addWidget(_heading("Moves — Click, or ←/→ to Step"))
         self.move_list = QListWidget()
         self.move_list.itemDoubleClicked.connect(self._on_history_item)
         # A single click or the arrow keys in the list show that position.
@@ -579,15 +630,15 @@ class ChessPanel(QFrame):
         layout.addLayout(nav_row)
 
         analyse_row = QHBoxLayout()
-        self.analyse_move_btn = QPushButton("ANALYSE LAST MOVE")
+        self.analyse_move_btn = QPushButton("Analyse Last Move")
         self.analyse_move_btn.clicked.connect(self._analyse_last_move)
-        self.analyse_game_btn = QPushButton("ANALYSE GAME")
+        self.analyse_game_btn = QPushButton("Analyse Game")
         self.analyse_game_btn.clicked.connect(self._analyse_game)
         analyse_row.addWidget(self.analyse_move_btn)
         analyse_row.addWidget(self.analyse_game_btn)
         layout.addLayout(analyse_row)
 
-        layout.addWidget(_heading("COMMENTARY"))
+        layout.addWidget(_heading("Commentary"))
         self.commentary = QPlainTextEdit()
         self.commentary.setReadOnly(True)
         self.commentary.setMaximumHeight(160)
@@ -750,6 +801,16 @@ class ChessPanel(QFrame):
     def _on_dashboard_event(self, channel: str, payload: object) -> None:
         if channel != "chess":
             return
+        if isinstance(payload, dict) and (str(payload.get("phase", "")).startswith("lichess")
+                                          or payload.get("phase") == "swarm"):
+            remote = getattr(self, "remote_board", None)
+            if remote is not None:
+                remote.consume(payload)
+            if payload.get("phase") == "swarm":
+                return
+        if isinstance(payload, dict) and str(payload.get("phase", "")).startswith("lichess"):
+            self._on_lichess(payload)
+            return                               # a remote game: this board is untouched
         # A coaching review arrives after the reply, in the background: show
         # it when it lands rather than making the reply wait for it.
         if isinstance(payload, dict) and payload.get("phase") == "review" \
@@ -758,6 +819,20 @@ class ChessPanel(QFrame):
         if isinstance(payload, dict) and payload.get("phase") in ("new_game", "sides"):
             self._sync_sides()
         self.refresh_from_service()
+
+    def _on_lichess(self, payload: dict) -> None:
+        """ORION's Lichess games (chess_lichess.py) as a status line, with the
+        notable moments — challenges, starts, results — in the commentary."""
+        if payload.get("phase") == "lichess_position":
+            self.lichess_label.setText(
+                f"LICHESS · playing {payload.get('opponent', '?')} as {payload.get('colour', '?')}")
+        else:
+            text = str(payload.get("text") or "")
+            self.lichess_label.setText(f"LICHESS · {text}" if payload.get("online", True)
+                                       else "LICHESS · offline")
+            if text:
+                self.commentary.appendPlainText(f"Lichess: {text}")
+        self.lichess_label.setVisible(True)
 
     def _sync_sides(self) -> None:
         """Show who holds each side of the game in progress. Only when a game
@@ -778,6 +853,8 @@ class ChessPanel(QFrame):
         if self.service is None:
             return
         svc = self.service
+        self._eval_generation += 1
+        eval_generation = self._eval_generation
         fen = svc.position_fen(svc.view_ply)
         last_move_uci = None
         if svc.view_ply > 0 and svc.view_ply <= len(svc.history):
@@ -811,7 +888,7 @@ class ChessPanel(QFrame):
 
         self.move_list.blockSignals(True)
         self.move_list.clear()
-        start_item = QListWidgetItem("Start position")
+        start_item = QListWidgetItem("Start Position")
         start_item.setData(Qt.ItemDataRole.UserRole, 0)
         self.move_list.addItem(start_item)
         for record in svc.history_list():
@@ -827,6 +904,10 @@ class ChessPanel(QFrame):
 
         async def _refresh_eval() -> None:
             info = await svc.evaluate_current()
+            # An earlier search may finish after a move or navigation redraw.
+            # Its score belongs to the older board, never the current bar.
+            if eval_generation != self._eval_generation or not svc.is_live:
+                return
             self.eval_bar.set_evaluation(
                 info["white_fraction"], _format_eval_label(info["cp"], info["mate"]))
 
@@ -834,7 +915,9 @@ class ChessPanel(QFrame):
             loop_running = asyncio.get_running_loop() is not None
         except RuntimeError:
             loop_running = False
-        if loop_running:
+        if not is_live:
+            self.eval_bar.set_evaluation(0.5, "—")
+        elif loop_running:
             background.spawn(_refresh_eval())
         # else: constructed before an event loop is running — the next
         # bus-driven refresh (once the loop is up) will catch up.

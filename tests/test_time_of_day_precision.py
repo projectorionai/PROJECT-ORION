@@ -1,11 +1,6 @@
 """
-Tests for the "ORION always says 'day' instead of morning/afternoon/evening"
-fix. The deterministic greeting-composition code (TemporalPresence, the
-STARTUP_GREETINGS fallback, local_brain's _intent_greeting) always computed
-the correct period — the bug was that offer_startup_briefing()'s own
-instruction to the live model said "incorporating" (paraphrase-friendly),
-unlike the stricter "word for word" instruction the later briefing-delivery
-path already used, so the model had licence to drop the specific word.
+Natural live greetings must retain the specific, correct time-of-day period.
+Wording may vary without turning morning/afternoon/evening into a vague 'day'.
 """
 
 from __future__ import annotations
@@ -64,7 +59,7 @@ def _worker(sent: list[str]) -> types.SimpleNamespace:
     return worker
 
 
-def test_offer_startup_briefing_instructs_word_for_word_delivery_on_live_channel():
+def test_offer_startup_briefing_allows_fresh_wording_but_keeps_the_period():
     from orion_core.live_worker import GenAILiveWorker
 
     captured: list[str] = []
@@ -79,7 +74,8 @@ def test_offer_startup_briefing_instructs_word_for_word_delivery_on_live_channel
     asyncio.run(GenAILiveWorker.offer_startup_briefing(worker))
     assert len(captured) == 1
     instruction = captured[0]
-    assert "word for word" in instruction
+    assert "in your own words" in instruction
+    assert "word for word" not in instruction
     assert "Good evening, sir." in instruction
     assert "'day'" in instruction   # explicitly forbids the vague substitute
 

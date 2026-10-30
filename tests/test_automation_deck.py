@@ -75,6 +75,24 @@ def test_selecting_a_workflow_populates_the_step_editor(_app, tmp_path):
     assert view.steps_table.item(0, 2).text() == "2"
 
 
+def test_editor_roundtrip_preserves_optional_steps(_app, tmp_path):
+    engine = _engine(tmp_path)
+    engine.define("resilient", [
+        {"tool": "web_search", "args": {"query": "news"}, "optional": True},
+        {"tool": "save_memory", "args": {"text": "notes"}, "optional": False},
+    ])
+    view = AutomationDeckView(OrionBus(), engine)
+    try:
+        view.library_list.setCurrentRow(0)
+        view.description_input.setText("edited description")
+        view._save_workflow()
+        steps = engine.definitions["resilient"]["steps"]
+        assert steps[0].get("optional") is True
+        assert not steps[1].get("optional")
+    finally:
+        view.close()
+
+
 # ── step editor / save ───────────────────────────────────────────────────────
 
 def test_new_clears_the_editor(_app, tmp_path):
@@ -211,3 +229,74 @@ def test_cancel_with_nothing_selected_reports_none_running(_app, tmp_path):
     view = AutomationDeckView(OrionBus(), engine)
     view._cancel_run()
     assert "no running workflow" in view.status_label.text().lower()
+
+
+def test_goals_page_uses_the_shared_goal_store_for_create_and_progress(_app, tmp_path):
+    from orion_core.dispatch_productivity import ProductivityDispatchMixin
+    from orion_core.goals import GoalStore, GoalsEngine
+    from orion_core.gui.goals_deck import GoalsDeckView
+
+    class GoalDispatcher(ProductivityDispatchMixin):
+        pass
+
+    engine = GoalsEngine(GoalStore(tmp_path / "goals.db"), import_legacy=False)
+    dispatcher = GoalDispatcher()
+    dispatcher.goal_tracker = engine
+    view = GoalsDeckView(OrionBus(), dispatcher)
+    try:
+        view.title_input.setText("Read books")
+        view.target_input.setText("10")
+        view.unit_input.setText("books")
+        result = asyncio.run(view.execute(view._arguments("create")))
+        assert result.ok, result.text
+        assert "Read books" in view.output.toPlainText()
+        view.progress_input.setText("read 2 books")
+        result = asyncio.run(view.execute(view._arguments("log_progress")))
+        assert result.ok, result.text
+        assert engine.overview()[0]["current"] == 2
+        assert "2" in view.output.toPlainText()
+    finally:
+        view.close()
+        engine.close()
+
+
+def test_goals_page_reports_dispatch_failures_without_losing_existing_view(_app):
+    from orion_core.gui.goals_deck import GoalsDeckView
+
+    class FailedDispatcher:
+        async def goals_tool(self, _args):
+            raise OSError("goal store unavailable")
+
+    view = GoalsDeckView(OrionBus(), FailedDispatcher())
+    try:
+        view.output.setPlainText("Previous goals")
+        assert asyncio.run(view.execute({"action": "create", "title": "test"})) is None
+        assert "goal store unavailable" in view.status.text()
+        assert view.output.toPlainText() == "Previous goals"
+        assert all(button.isEnabled() for button in view.buttons)
+    finally:
+        view.close()
+
+
+def test_goals_page_can_be_destroyed_while_a_result_is_pending(_app):
+    from PyQt6 import sip
+    from orion_core.gui.goals_deck import GoalsDeckView
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class WaitingDispatcher:
+            async def goals_tool(self, _args):
+                entered.set()
+                await release.wait()
+                return ToolResult("Saved goals")
+
+        view = GoalsDeckView(OrionBus(), WaitingDispatcher())
+        task = asyncio.create_task(view.execute({"action": "list"}))
+        await asyncio.wait_for(entered.wait(), 1)
+        sip.delete(view)
+        release.set()
+        result = await asyncio.wait_for(task, 1)
+        assert result.text == "Saved goals"
+
+    asyncio.run(scenario())

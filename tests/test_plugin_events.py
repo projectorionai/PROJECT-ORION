@@ -80,6 +80,27 @@ def test_declared_events_are_bound_and_delivered(bridge):
     assert plugin.seen == [("state", "SPEAKING"), ("speaking", True)]
 
 
+def test_direct_plugin_event_control_call_is_background_and_never_reaches_input(bridge):
+    from types import SimpleNamespace
+    from orion_core.control import AutonomousControlLayer
+    from orion_core.execution_policy import is_background
+    os_calls, outcomes = [], []
+    control = AutonomousControlLayer.__new__(AutonomousControlLayer)
+    control.enabled = True
+    control._pg = SimpleNamespace(typewrite=lambda *_args, **_kwargs: os_calls.append("typewrite"))
+    control._kb = SimpleNamespace(write=lambda *_args, **_kwargs: os_calls.append("write"))
+    control._narrate_typing = lambda *_: None
+    control._record = lambda *_: None
+    class Plugin:
+        def on_event(self, event, payload):
+            outcomes.append((is_background(), control.type_text("fixture input")))
+    bridge.subscribe("fixture", Plugin(), ["state"])
+    bridge.bus.state.emit("LISTENING")
+    assert len(outcomes) == 1 and outcomes[0][0] is True
+    assert not outcomes[0][1].ok and outcomes[0][1].receipt["status"] == "requires_foreground"
+    assert os_calls == []
+
+
 def test_an_undeclared_event_is_never_delivered(bridge):
     plugin = _Plugin()
     bridge.subscribe("lamp", plugin, ["state"])
@@ -188,7 +209,7 @@ def test_the_loader_binds_hooks_after_activation():
 def test_the_app_creates_the_bridge_and_the_tool_reports_it():
     app_src = (Path(__file__).resolve().parents[1] / "orion_core"
                / "app.py").read_text(encoding="utf-8")
-    assert "PluginEventBridge(bus=bus)" in app_src
+    assert "PluginEventBridge(bus=bus, registry=plugins)" in app_src
     assert "events=plugin_events" in app_src
     disp = (Path(__file__).resolve().parents[1] / "orion_core"
             / "dispatch_productivity.py").read_text(encoding="utf-8")
@@ -313,7 +334,7 @@ def test_disable_and_remove_unhook_the_plugin_at_once():
     disable_at = src.index('if action in {"disable", "deactivate", "off"}')
     assert "bridge.forget(name)" in src[disable_at:disable_at + 700]
     remove_at = src.index('if action in {"remove", "uninstall", "delete"}')
-    assert "bridge.forget(name)" in src[remove_at:remove_at + 500]
+    assert "bridge.forget(removed_name)" in src[remove_at:remove_at + 1000]
 
 
 def test_forget_stops_delivery_immediately(bridge):
@@ -347,3 +368,190 @@ def test_unmute_resets_the_fault_count(bridge):
     stats = bridge.stats["bad"]
     assert stats.muted is False and stats.faults == 0, (
         "a revived plugin needs a fresh budget, not one strike from being muted again")
+
+
+_HOOK_QT_APP = None
+
+
+@pytest.fixture()
+def qt_bridge():
+    from PyQt6.QtWidgets import QApplication
+    from orion_core.bus import OrionBus
+
+    global _HOOK_QT_APP
+    _HOOK_QT_APP = QApplication.instance() or QApplication([])
+    bridge = PluginEventBridge(bus=OrionBus(), log=lambda _m: None)
+    yield bridge, _HOOK_QT_APP
+    for name in list(bridge.hooked()):
+        bridge.forget(name)
+    _HOOK_QT_APP.processEvents()
+
+
+@pytest.mark.parametrize("event,args,expected", [
+    ("state", ("LISTENING",), "LISTENING"),
+    ("speaking", (True,), True),
+    ("banner", ("ready", 500), ("ready", 500)),
+    ("emotion_changed", ("thinking", {"strength": 0.6}),
+     ("thinking", {"strength": 0.6})),
+    ("telemetry_sample", ({"cpu": 12},), {"cpu": 12}),
+    ("connection_state", ({"online": True},), {"online": True}),
+    ("dashboard_event", ("tasks", []), ("tasks", [])),
+    ("paused", (False,), False),
+    ("safety_alert", ("synthetic",), "synthetic"),
+    ("log", ("synthetic",), "synthetic"),
+])
+def test_qt_hook_runs_after_emit_and_preserves_signal_payload(qt_bridge, event, args, expected):
+    bridge, app = qt_bridge
+    plugin = _Plugin()
+    bridge.subscribe("lamp", plugin, [event])
+    getattr(bridge.bus, event).emit(*args)
+    assert plugin.seen == [], "arbitrary plugin code ran inside the emitter"
+    app.processEvents()
+    assert plugin.seen == [(event, expected)]
+
+
+@pytest.mark.parametrize("change", ["forget", "reload", "disable"])
+def test_qt_hook_queued_before_retirement_does_not_run_afterward(qt_bridge, change):
+    from types import SimpleNamespace
+
+    bridge, app = qt_bridge
+    old, new = _Plugin(), _Plugin()
+    enabled = [True]
+    bridge.registry = SimpleNamespace(is_enabled=lambda _: enabled[0])
+    bridge.subscribe("lamp", old, ["state"])
+    bridge.bus.state.emit("old")
+    if change == "reload":
+        bridge.subscribe("lamp", new, ["state"])
+        bridge.bus.state.emit("new")
+    elif change == "disable":
+        enabled[0] = False
+    else:
+        bridge.forget("lamp")
+    app.processEvents()
+    assert old.seen == [], "an already queued hook survived retirement"
+    assert new.seen == ([("state", "new")] if change == "reload" else [])
+
+
+def test_qt_hook_emitted_while_disabled_is_not_replayed_on_enable(qt_bridge):
+    from types import SimpleNamespace
+
+    bridge, app = qt_bridge
+    enabled = [False]
+    bridge.registry = SimpleNamespace(is_enabled=lambda _: enabled[0])
+    plugin = _Plugin()
+    bridge.subscribe("lamp", plugin, ["state"])
+    bridge.bus.state.emit("disabled")
+    enabled[0] = True
+    bridge.bus.state.emit("enabled")
+    assert plugin.seen == []
+    app.processEvents()
+    assert plugin.seen == [("state", "enabled")]
+
+
+def test_qt_hook_receiver_stays_on_bus_thread_when_subscribed_from_worker(qt_bridge):
+    import threading
+    from types import SimpleNamespace
+    from PyQt6.QtCore import QThread
+
+    bridge, app = qt_bridge
+    seen = []
+    plugin = SimpleNamespace(on_event=lambda *_: seen.append(QThread.currentThread()))
+    worker = threading.Thread(target=lambda: bridge.subscribe("lamp", plugin, ["state"]))
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    bridge.bus.state.emit("ready")
+    app.processEvents()
+    assert seen == [bridge.bus.thread()], "the callback was stranded on the subscription thread"
+
+
+def test_qt_hook_emitted_from_worker_runs_on_bus_thread(qt_bridge):
+    import threading
+    from types import SimpleNamespace
+    from PyQt6.QtCore import QThread
+
+    bridge, app = qt_bridge
+    seen = []
+    plugin = SimpleNamespace(on_event=lambda *args: seen.append((args, QThread.currentThread())))
+    bridge.subscribe("lamp", plugin, ["state"])
+    worker = threading.Thread(target=lambda: bridge.bus.state.emit("ready"))
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive() and seen == []
+    app.processEvents()
+    assert seen == [(("state", "ready"), bridge.bus.thread())]
+
+
+@pytest.mark.parametrize("plugin", [_Faulty(), _Slow()])
+def test_qt_hook_fault_and_slow_budgets_hold_for_already_queued_events(qt_bridge, plugin):
+    from orion_core.plugin_events import MAX_SLOW
+
+    bridge, app = qt_bridge
+    bridge.subscribe("limited", plugin, ["state"])
+    for _ in range(MAX_SLOW + MAX_FAULTS):
+        bridge.bus.state.emit("ready")
+    app.processEvents()
+    stats = bridge.stats["limited"]
+    assert stats.muted
+    if isinstance(plugin, _Faulty):
+        assert stats.faults == MAX_FAULTS and stats.delivered == 0
+    else:
+        assert stats.slow_calls == MAX_SLOW and stats.delivered == MAX_SLOW
+
+
+def test_qt_hook_nested_pump_cannot_destroy_an_async_receive_task(tmp_path):
+    """A plugin can open a modal Qt pump; it must run outside an asyncio step."""
+    import json
+    import subprocess
+
+    probe = tmp_path / "plugin_pump.py"
+    probe.write_text(r'''
+import asyncio, json, os, sys
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+sys.path.insert(0, os.getcwd())
+from PyQt6.QtCore import QObject, QEventLoop, QTimer, pyqtSignal
+from PyQt6.QtWidgets import QApplication
+import qasync
+from orion_core.plugin_events import PluginEventBridge
+app = QApplication([])
+loop = qasync.QEventLoop(app)
+asyncio.set_event_loop(loop)
+errors, seen, ticks = [], [], [0]
+loop.set_exception_handler(lambda _l, ctx: errors.append(str(ctx.get("exception"))))
+class Bus(QObject):
+    state = pyqtSignal(str)
+class Plugin:
+    def on_event(self, *_):
+        seen.append(asyncio.current_task() is not None)
+        nested = QEventLoop()
+        QTimer.singleShot(150, nested.quit)
+        nested.exec()
+bus = Bus()
+bridge = PluginEventBridge(bus=bus, log=lambda _: None)
+bridge.subscribe("pump", Plugin(), ["state"])
+async def receive():
+    while True:
+        await asyncio.sleep(0.01)
+        ticks[0] += 1
+async def main():
+    receiver = asyncio.ensure_future(receive())
+    await asyncio.sleep(0.05)
+    bus.state.emit("ready")
+    await asyncio.sleep(0.2)
+    before = ticks[0]
+    await asyncio.sleep(0.1)
+    print(json.dumps({"inside_task": seen, "errors": errors,
+                      "later_ticks": ticks[0] - before}), flush=True)
+    bridge.forget("pump")
+    receiver.cancel()
+with loop:
+    loop.run_until_complete(main())
+''', encoding="utf-8")
+    done = subprocess.run([sys.executable, "-B", str(probe)], cwd=Path(__file__).resolve().parents[1],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+    assert done.returncode == 0, done.stderr
+    result = json.loads(done.stdout.splitlines()[-1])
+    (tmp_path / "plugin_pump_result.json").write_text(json.dumps(result), encoding="utf-8")
+    assert result["inside_task"] == [False], result
+    assert result["errors"] == [], result
+    assert result["later_ticks"] >= 3, result

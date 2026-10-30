@@ -64,3 +64,18 @@ def test_the_live_config_file_is_valid_json():
     twilio = data["servers"]["twilio"]
     if twilio.get("enabled") and not any((twilio.get("env") or {}).values()):
         assert missing_credentials(autofill_credentials("twilio", twilio))
+
+
+def test_twilio_accepts_either_documented_authentication_method():
+    from orion_core.mcp_host import missing_credentials
+
+    base = {"env": {"TWILIO_ACCOUNT_SID": "AC123", "TWILIO_AUTH_TOKEN": "",
+                    "TWILIO_API_KEY": "", "TWILIO_API_SECRET": ""}}
+    assert missing_credentials(base) == [
+        "TWILIO_AUTH_TOKEN or TWILIO_API_KEY + TWILIO_API_SECRET"]
+    base["env"]["TWILIO_AUTH_TOKEN"] = "token"
+    assert missing_credentials(base) == []
+    base["env"]["TWILIO_AUTH_TOKEN"] = ""
+    base["env"]["TWILIO_API_KEY"] = "key"
+    base["env"]["TWILIO_API_SECRET"] = "secret"
+    assert missing_credentials(base) == []

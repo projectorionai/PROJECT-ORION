@@ -59,23 +59,53 @@ import psutil
 from PyQt6.QtCore import QSettings, Qt, QTimer
 from PyQt6.QtWidgets import (
     QDockWidget,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QPlainTextEdit,
+    QPushButton,
+    QTabBar,
+    QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..bus import OrionBus
-from ..constants import HEALTH_GLYPHS
+from ..constants import CONFIG_DIR, HEALTH_GLYPHS
+from .labels import plural
+
+#: Where the dock arrangement is kept: beside ORION's other preferences.
+#: It used to go through QSettings("ORION", "MissionDeck"), which on Windows
+#: is the registry - one key shared by the installed app, source runs and
+#: every test run, so running the test suite rearranged the user's deck.
+LAYOUT_PATH = CONFIG_DIR / "mission_layout.ini"
 
 _REFRESH_MS = 2000
 _FEED_LIMIT = 120
 
+#: What each dock's tab SAYS. Fourteen tabs named "PROJECT EXPLORER",
+#: "COMPONENT HEALTH"... in three narrow dock areas elided to "PRO... T...
+#: ME...". The panel keys (and saved layouts) keep the full names.
+_SHORT_TITLES = {
+    "PROJECT EXPLORER": "Projects", "TASK CENTER": "Tasks", "MEMORY VIEWER": "Memory",
+    "RESEARCH": "Research", "AGENT MONITOR": "Agents", "COMPONENT HEALTH": "Health",
+    "WORKFLOWS": "Workflows", "KNOWLEDGE GRAPH": "Graph", "ACTIVITY FEED": "Activity",
+    "FILE LIBRARY": "Files", "COMPANION": "Companion", "SECURITY CENTER": "Security",
+    "DESKTOP CONTROL": "Desktop", "SYSTEM HEALTH": "System",
+}
+#: Closed by default: each is a whole page of its own elsewhere in the deck
+#: (Diagnostics, Command Centre, Security). One click away in Panels.
+_HIDDEN_BY_DEFAULT = frozenset({"COMPONENT HEALTH", "DESKTOP CONTROL",
+                                "SYSTEM HEALTH", "SECURITY CENTER"})
+#: Bumped when the default arrangement changes, so an old saved layout
+#: (from before these defaults existed) does not override them.
+_LAYOUT_VERSION = 2
+
 # Which dashboard_event channels the Activity Feed narrates.
 _FEED_GLYPHS = {
     "mission": "◎", "research": "◈", "research_director": "◈",
-    "workflow": "⚙", "security": "⛨", "forge": "⚒", "briefing": "▤",
+    "workflow": "◆", "security": "⛨", "forge": "▲", "briefing": "▤",
     "avatar": "◉", "ingestion": "▥",
 }
 
@@ -139,11 +169,18 @@ class MissionDeckView(QMainWindow):
             QMainWindow.DockOption.AnimatedDocks
             | QMainWindow.DockOption.AllowNestedDocks
             | QMainWindow.DockOption.AllowTabbedDocks)
+        # Tabs along the top of each dock group read as labels, not as a
+        # strip of truncated fragments down the side.
+        self.setTabPosition(Qt.DockWidgetArea.AllDockWidgetAreas, QTabWidget.TabPosition.North)
 
         self._panels: dict[str, _TextPanel] = {}
         self._renderers: dict[str, Callable[[], str]] = {}
+        self._docks: dict[str, QDockWidget] = {}
         self._build_panels()
+        self._apply_default_layout()
+        self._default_state = self.saveState(_LAYOUT_VERSION)
         self._restore_layout()
+        self._retire_tab_bars()
 
         try:
             bus.dashboard_event.connect(self._on_event)
@@ -171,7 +208,25 @@ class MissionDeckView(QMainWindow):
         self._awareness_label.setObjectName("awarenessStrip")
         self._awareness_label.setWordWrap(True)
         box.addWidget(self._awareness_label)
-        heading = QLabel("MISSION CONTROL")
+        # Panels (show/hide any dock) and Reset (the tidy default) - closing
+        # a dock used to be one-way, with no visible way to get it back.
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        self._panels_btn = QToolButton()
+        self._panels_btn.setObjectName("workspaceMenu")
+        self._panels_btn.setText("Panels")
+        self._panels_btn.setAccessibleName("Show or hide Mission panels")
+        self._panels_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._panels_btn.clicked.connect(self._show_panels_menu)
+        controls.addWidget(self._panels_btn)
+        reset = QPushButton("Reset Layout")
+        reset.setObjectName("ghostButton")
+        reset.setToolTip("Put every panel back where it started")
+        reset.clicked.connect(self.reset_layout)
+        controls.addWidget(reset)
+        controls.addStretch(1)
+        box.addLayout(controls)
+        heading = QLabel("Your Missions")
         heading.setObjectName("panelHeading")
         box.addWidget(heading)
         self._mission_panel = _TextPanel()
@@ -216,7 +271,7 @@ class MissionDeckView(QMainWindow):
         self._graph_widget: Any = None
         self._memory_widget: Any = None
         for name, area, renderer in docks:
-            dock = QDockWidget(name, self)
+            dock = QDockWidget(_SHORT_TITLES.get(name, name.title()), self)
             dock.setObjectName(f"dock_{name.lower().replace(' ', '_')}")
             dock.setFeatures(
                 QDockWidget.DockWidgetFeature.DockWidgetMovable
@@ -244,10 +299,64 @@ class MissionDeckView(QMainWindow):
                 self._panels[name] = panel
                 self._renderers[name] = renderer
             self.addDockWidget(area, dock)
+            self._docks[name] = dock
             # Tab the later arrivals in each area so the panels open tidy.
             if area in previous_area:
                 self.tabifyDockWidget(previous_area[area], dock)
             previous_area[area] = dock
+
+    def _apply_default_layout(self) -> None:
+        """The arrangement a first open (or Reset) gets: duplicates closed,
+        the first panel of each area in front, side columns wide enough to
+        read and the bottom strip a readable height."""
+        for name, dock in self._docks.items():
+            dock.setVisible(name not in _HIDDEN_BY_DEFAULT)
+        for front in ("PROJECT EXPLORER", "RESEARCH", "ACTIVITY FEED"):
+            dock = self._docks.get(front)
+            if dock is not None:
+                dock.raise_()
+        self._size_docks()
+
+    def _size_docks(self) -> None:
+        """Readable default widths. Only effective once the page has a real
+        size - before its first show Qt ignored this, and the side columns
+        opened 120-180 px wide with every tab elided."""
+        sides = [self._docks[n] for n in ("PROJECT EXPLORER", "RESEARCH") if n in self._docks]
+        if sides:
+            self.resizeDocks(sides, [300] * len(sides), Qt.Orientation.Horizontal)
+        if "ACTIVITY FEED" in self._docks:
+            self.resizeDocks([self._docks["ACTIVITY FEED"]], [220], Qt.Orientation.Vertical)
+
+    def _show_panels_menu(self) -> None:
+        menu = self.createPopupMenu()
+        if menu is None:
+            return
+        menu.exec(self._panels_btn.mapToGlobal(self._panels_btn.rect().bottomLeft()))
+
+    def _retire_tab_bars(self) -> None:
+        """Hide every dock tab bar; Qt shows again the ones its layout uses.
+
+        QMainWindow builds a fresh tab bar each time the arrangement changes
+        (every tabify, the duplicates closed, a saved layout restored) and
+        leaves the superseded ones on screen where the old arrangement put
+        them: "Research  Agents" drawn over the awareness line and an
+        "Activity  Files" strip across Mission Control. Hidden first, only
+        the live bars come back - on the page's first show, and when a
+        restored state lays the docks out again.
+        """
+        for bar in self.findChildren(QTabBar, options=Qt.FindChildOption.FindDirectChildrenOnly):
+            bar.hide()
+
+    def reset_layout(self) -> None:
+        """Every panel back to the default arrangement (and remembered)."""
+        state = getattr(self, "_default_state", None)
+        if state is not None:
+            self._retire_tab_bars()
+            self.restoreState(state, _LAYOUT_VERSION)
+        else:
+            self._apply_default_layout()
+        self._size_docks()
+        self.save_layout()
 
     @staticmethod
     def _format_awareness(digest: dict[str, Any] | None) -> str:
@@ -258,20 +367,20 @@ class MissionDeckView(QMainWindow):
         summarisation logic, matching the design-spec's framing of this as
         the highest-value, lowest-cost fix in the whole redesign."""
         if digest is None:
-            return "AWARENESS — building situational context…"
+            return "Getting ready to help…"
         parts: list[str] = []
         focus = str(digest.get("focus") or "").strip()
         if focus:
-            parts.append(f"watching {focus}")
+            parts.append(f"Working on {focus}")
         project = str(digest.get("active_project") or "").strip()
         if project:
-            parts.append(f"project: {project}")
+            parts.append(f"Project: {project}")
         deadlines = digest.get("deadlines") or []
         if deadlines:
-            parts.append(f"{len(deadlines)} deadline(s) in view")
+            parts.append(f"{len(deadlines)} upcoming deadline{'s' if len(deadlines) != 1 else ''}")
         if not parts:
-            return "AWARENESS — no active focus recorded yet."
-        return "AWARENESS — " + " · ".join(parts)
+            return "Ready for your next task."
+        return " · ".join(parts)
 
     # ── live feed ─────────────────────────────────────────────────────────────
 
@@ -331,7 +440,7 @@ class MissionDeckView(QMainWindow):
 
     def _render_missions(self) -> str:
         if self.missions is None:
-            return "Mission engine offline."
+            return "Missions aren't available right now."
         try:
             snap = self.missions.panel_snapshot()
             lines = []
@@ -341,7 +450,7 @@ class MissionDeckView(QMainWindow):
                 lines.append(f"    {m['progress']:.0f}% · "
                              f"{m['open_tasks']} open · {m['status']}")
                 for risk in m.get("risks", [])[:2]:
-                    lines.append(f"    ⚠ {risk}")
+                    lines.append(f"    ▲ {risk}")
                 if m["name"] == snap.get("current") and m.get("recommendation"):
                     lines.append(f"    → {m['recommendation']}")
             return "\n".join(lines) or "No missions on the board."
@@ -376,16 +485,16 @@ class MissionDeckView(QMainWindow):
                                  f"{str(s.get('topic', ''))[:48]}")
             if self.evidence is not None:
                 stats = self.evidence.stats()
-                lines.append(f"Evidence: {stats['claims']} claim(s) across "
-                             f"{stats['topics']} topic(s), "
+                lines.append(f"Evidence: {plural(stats['claims'], 'claim')} across "
+                             f"{plural(stats['topics'], 'topic')}, "
                              f"avg confidence {stats['avg_confidence']:.0%}")
-            return "\n".join(lines) or "Research agenda empty."
+            return "\n".join(lines) or "No research is underway."
         except Exception as exc:
             return f"Research fault: {exc}"
 
     def _render_component_health(self) -> str:
         if self.telemetry is None:
-            return "Telemetry offline."
+            return "System status is unavailable."
         try:
             rows = self.telemetry.health.snapshot()
             return "\n".join(
@@ -401,7 +510,7 @@ class MissionDeckView(QMainWindow):
         the same source OPS's AgentMonitorPanel already uses, so the two
         surfaces agree instead of one silently showing telemetry instead."""
         if self.agents is None:
-            return "Agent manager offline."
+            return "Specialist helpers aren't available right now."
         try:
             rows = self.agents.describe()
             if not rows:
@@ -412,7 +521,7 @@ class MissionDeckView(QMainWindow):
                 focus = str(info.get("focus") or "")[:44]
                 calls = info.get("calls", 0)
                 last_active = info.get("last_active") or ""
-                activity = f"{calls} call(s), last {last_active}" if calls else "not yet consulted"
+                activity = f"{plural(calls, 'call')}, last {last_active}" if calls else "not yet consulted"
                 lines.append(f"● {name:20} {focus:44} {activity}")
             return "\n".join(lines)
         except Exception as exc:
@@ -420,7 +529,7 @@ class MissionDeckView(QMainWindow):
 
     def _render_workflows(self) -> str:
         if self.workflow_engine is None:
-            return "Workflow engine offline."
+            return "Workflows aren't available right now."
         try:
             names = []
             definitions = getattr(self.workflow_engine, "definitions", None)
@@ -428,14 +537,14 @@ class MissionDeckView(QMainWindow):
                 names = list(definitions)[:12]
             elif hasattr(self.workflow_engine, "list_workflows"):
                 names = list(self.workflow_engine.list_workflows())[:12]
-            return ("\n".join(f"⚙ {n}" for n in names)
+            return ("\n".join(f"• {n}" for n in names)
                     or "No workflows defined yet.")
         except Exception as exc:
             return f"Workflow fault: {exc}"
 
     def _render_graph(self) -> str:
         if self.graph is None:
-            return "Knowledge graph offline."
+            return "Saved connections aren't available right now."
         try:
             for method in ("stats", "summary"):
                 if hasattr(self.graph, method):
@@ -534,19 +643,27 @@ class MissionDeckView(QMainWindow):
     # ── layout persistence ────────────────────────────────────────────────────
 
     def _settings(self) -> QSettings:
-        return QSettings("ORION", "MissionDeck")
+        return QSettings(str(LAYOUT_PATH), QSettings.Format.IniFormat)
 
     def _restore_layout(self) -> None:
+        self._restored = False
         try:
             state = self._settings().value("layout")
             if state is not None:
-                self.restoreState(state)
+                self._restored = bool(self.restoreState(state, _LAYOUT_VERSION))
         except Exception:
             pass
 
+    def showEvent(self, event: Any) -> None:  # noqa: N802 (Qt override)
+        super().showEvent(event)
+        if not getattr(self, "_sized", False):
+            self._sized = True
+            if not getattr(self, "_restored", False):
+                QTimer.singleShot(0, self._size_docks)
+
     def save_layout(self) -> None:
         try:
-            self._settings().setValue("layout", self.saveState())
+            self._settings().setValue("layout", self.saveState(_LAYOUT_VERSION))
         except Exception:
             pass
 

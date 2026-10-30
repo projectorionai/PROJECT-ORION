@@ -104,6 +104,31 @@ class _StubChess:
         self.calls.append(("flip", ()))
         return ToolResult("flipped")
 
+    # Lichess: "start taking chess challenges", "challenge Sam", ...
+    async def lichess_start(self):
+        self.calls.append(("lichess_start", ()))
+        return ToolResult("online")
+
+    async def lichess_stop(self):
+        self.calls.append(("lichess_stop", ()))
+        return ToolResult("offline")
+
+    def lichess_status(self):
+        self.calls.append(("lichess_status", ()))
+        return ToolResult("status")
+
+    async def lichess_challenge(self, username, minutes, increment, rated, colour):
+        self.calls.append(("lichess_challenge", (username, minutes, increment, rated, colour)))
+        return ToolResult("sent")
+
+    def lichess_allow(self, username, allowed=True):
+        self.calls.append(("lichess_allow", (username, allowed)))
+        return ToolResult("ok")
+
+    def lichess_accept_anyone(self, enabled):
+        self.calls.append(("lichess_anyone", (enabled,)))
+        return ToolResult("ok")
+
 
 def _dispatcher(chess=None) -> OrionDispatcher:
     d = OrionDispatcher.__new__(OrionDispatcher)
@@ -267,3 +292,38 @@ def test_the_schema_promises_words_not_centipawns():
     assert "preferred line" not in text
     for action in ("back", "forward", "goto_move", "live", "flip"):
         assert action in schema["parameters"]["properties"]["action"]["description"]
+
+
+# ── Lichess by voice ─────────────────────────────────────────────────────────
+
+def test_routes_lichess_start_stop_and_status():
+    chess = _StubChess()
+    d = _dispatcher(chess)
+    asyncio.run(d.chess_tool({"action": "lichess_start"}))
+    asyncio.run(d.chess_tool({"action": "lichess_status"}))
+    asyncio.run(d.chess_tool({"action": "stop_challenges"}))
+    assert [c[0] for c in chess.calls] == ["lichess_start", "lichess_status", "lichess_stop"]
+
+
+def test_routes_a_challenge_with_its_clock():
+    chess = _StubChess()
+    d = _dispatcher(chess)
+    asyncio.run(d.chess_tool({"action": "challenge", "username": "Sam", "minutes": 10,
+                              "increment": 5, "rated": True, "colour": "white"}))
+    assert chess.calls == [("lichess_challenge", ("Sam", 10.0, 5, True, "white"))]
+
+
+def test_a_challenge_needs_a_username():
+    chess = _StubChess()
+    result = asyncio.run(_dispatcher(chess).chess_tool({"action": "challenge"}))
+    assert not result.ok and chess.calls == []
+
+
+def test_routes_the_lichess_allow_list():
+    chess = _StubChess()
+    d = _dispatcher(chess)
+    asyncio.run(d.chess_tool({"action": "lichess_allow", "username": "sam"}))
+    asyncio.run(d.chess_tool({"action": "lichess_disallow", "username": "sam"}))
+    asyncio.run(d.chess_tool({"action": "lichess_anyone", "enabled": False}))
+    assert chess.calls == [("lichess_allow", ("sam", True)), ("lichess_allow", ("sam", False)),
+                           ("lichess_anyone", (False,))]

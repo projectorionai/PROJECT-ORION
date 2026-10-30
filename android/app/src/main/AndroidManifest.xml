@@ -4,14 +4,45 @@
     <!-- Talk to the ORION uplink on the local network. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <!-- Voice input through the in-app browser (getUserMedia). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
 
     <!-- Android 11+ package visibility: declare the native actions ORION can
          hand off to (dial, text, e-mail, maps, browser) so they resolve. -->
     <queries>
+        <package android:name="com.google.android.gm" />
+        <package android:name="net.osmand" />
+        <package android:name="net.osmand.plus" />
+        <package android:name="btools.routingapp" />
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <!-- Offline dictation hands the microphone to Android's recogniser. -->
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
         <intent>
             <action android:name="android.intent.action.DIAL" />
         </intent>
@@ -44,8 +75,18 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:networkSecurityConfig="@xml/network_security_config"
-        android:usesCleartextTraffic="true"
+        android:usesCleartextTraffic="false"
         android:theme="@style/Theme.OrionCompanion">
+
+        <activity android:name=".OfflineMapActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+            android:screenOrientation="unspecified" />
+        <activity android:name=".PhoneConsoleActivity" android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+        <service android:name=".PhoneListeningService" android:exported="false"
+            android:foregroundServiceType="microphone" />
+        <service android:name=".OfflineNavigationService" android:exported="false"
+            android:foregroundServiceType="location" />
 
         <activity
             android:name=".MainActivity"
@@ -64,5 +105,37 @@
             android:name=".SetupActivity"
             android:exported="false"
             android:screenOrientation="portrait" />
+
+        <service
+            android:name=".OrionAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true"
+            android:label="ORION semantic viewport">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/orion_accessibility_service" />
+        </service>
+
+        <service
+            android:name=".OrionAudioService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+        <service
+            android:name=".OrionProjectionService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <service
+            android:name=".OrionSentinelService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-enabled persistent floating assistant control" />
+        </service>
     </application>
 </manifest>

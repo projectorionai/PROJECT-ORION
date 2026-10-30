@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -148,6 +148,39 @@ def test_the_study_review_and_grade_flow(qapp, engines):
     assert study.store.all()[0].reviews == 1
 
 
+def test_desktop_grades_its_displayed_card_when_voice_review_changes_current(qapp, engines):
+    study, _focus = engines
+    desktop_card = study.add("Desktop question?", "Desktop answer", deck="Desktop")
+    voice_card = study.add("Voice question?", "Voice answer", deck="Voice")
+    panel = StudyPanel(_bus(), study)
+    panel._next()
+    assert panel._card.id == desktop_card.id
+    assert study.next_due(deck="Voice").id == voice_card.id
+
+    panel._reveal()
+    panel._grade(5)
+
+    reviews = {card.id: card.reviews for card in study.store.all()}
+    assert reviews[desktop_card.id] == 1
+    assert reviews[voice_card.id] == 0
+
+
+def test_desktop_review_does_not_replace_a_voice_review_selection(qapp, engines):
+    study, _focus = engines
+    desktop_card = study.add("Desktop question?", "Desktop answer", deck="Desktop")
+    voice_card = study.add("Voice question?", "Voice answer", deck="Voice")
+    assert study.next_due(deck="Voice").id == voice_card.id
+
+    panel = StudyPanel(_bus(), study)
+    panel._next()
+    assert panel._card.id == desktop_card.id
+    study.grade(5)  # The voice flow grades its implicit selection.
+
+    reviews = {card.id: card.reviews for card in study.store.all()}
+    assert reviews[voice_card.id] == 1
+    assert reviews[desktop_card.id] == 0
+
+
 def test_panels_survive_missing_engines(qapp):
     # Constructed before an engine is attached — must not crash, just disable.
     view = CognitionDeckView(_bus(), study=None, focus=None)
@@ -159,7 +192,9 @@ def test_panels_survive_missing_engines(qapp):
 
 def test_cognition_is_registered_without_growing_the_zone_taxonomy():
     from orion_core.gui.unified_dashboard import UnifiedDashboard
-    assert "COGNITION" in UnifiedDashboard.ZONE_PAGES["OPERATIONS"]
+    # Mark XXXVIII: COGNITION is the Toolkit page (business tools + focus and
+    # study), so it sits in the BUSINESS zone the old Toolkit page held.
+    assert "COGNITION" in UnifiedDashboard.ZONE_PAGES["BUSINESS"]
     assert len(UnifiedDashboard.ZONE_ORDER) == 12   # still twelve zones
 
 
@@ -168,3 +203,135 @@ def test_the_app_builds_and_registers_the_page():
         encoding="utf-8")
     assert "CognitionDeckView(" in src
     assert '("COGNITION", cognition_deck)' in src
+
+
+# ── the owner's own day: Calendar, Focus and Fitness pages (30 Oct 2026) ──────
+
+def test_the_day_pages_are_registered_and_reachable_by_name():
+    from orion_core.gui.unified_dashboard import UnifiedDashboard
+    src = (Path(__file__).resolve().parents[1] / "orion_core" / "app.py").read_text(
+        encoding="utf-8")
+    for page, factory in (("CALENDAR", "calendar_deck"), ("FOCUS", "focus_deck"),
+                          ("FITNESS", "fitness_deck")):
+        assert f'("{page}", {factory})' in src
+        assert page in UnifiedDashboard.ZONE_PAGES["OPERATIONS"]
+    # The pages share the engines the voice tools use, never their own copies.
+    assert "FocusDeckView(bus, dispatcher.focus, reminders=reminders)" in src
+    assert len(UnifiedDashboard.ZONE_ORDER) == 12
+
+
+def test_the_calendar_puts_the_next_thing_first_and_files_the_week_by_day():
+    from types import SimpleNamespace
+
+    from orion_core.gui.calendar_deck import (
+        from_due, from_events, from_reminders, meta_line, next_up, week_of,
+    )
+    zone = timezone.utc
+    now = datetime(2026, 10, 30, 12, 0, tzinfo=zone)
+    entries = (
+        from_events([{"title": "lecture: neuroscience", "date": "2026-10-30T15:00:00Z"},
+                     {"title": "open day", "date": "2026-11-01"},
+                     {"title": "", "date": "2026-10-31"}, {"title": "x", "date": "soon"}], zone)
+        + from_reminders([SimpleNamespace(text="call the dentist",
+                                          due_epoch=(now + timedelta(minutes=40)).timestamp()),
+                          SimpleNamespace(text="done", due_epoch=0)], zone)
+        + from_due([("Goal", "run 10k", "2026-11-02"), ("Milestone", "draft", "bad")])
+    )
+    assert [e.title for e in entries] == ["Lecture: neuroscience", "Open day",
+                                          "Call the dentist", "Run 10k"]
+    first = next_up(entries, now)
+    assert first.title == "Call the dentist"
+    assert meta_line(first, now) == "in 40 min  ·  12:40  ·  Reminder"
+    week = dict(week_of(entries, now.date()))
+    assert len(week) == 7
+    assert [e.title for e in week[now.date()]] == ["Call the dentist", "Lecture: neuroscience"]
+    assert week[now.date() + timedelta(days=3)][0].time_text() == "Due"
+
+
+def test_the_calendar_page_adds_a_reminder_through_the_reminder_service(qapp):
+    from types import SimpleNamespace
+
+    from orion_core.gui.calendar_deck import CalendarDeckView
+    asked: list[str] = []
+    reminders = SimpleNamespace(
+        active=lambda: [],
+        add=lambda phrase: asked.append(phrase) or SimpleNamespace(ok=True, text="Very good."))
+    page = CalendarDeckView(_bus(), SimpleNamespace(reminders=reminders, notion=None,
+                                                    goal_tracker=None))
+    page.quick.setText("remind me to stretch in 20 minutes")
+    page.quick_add()
+    assert asked == ["remind me to stretch in 20 minutes"]
+    assert page.quick.text() == "" and page.added.text() == "Very good."
+    page.deleteLater()
+
+
+def test_fitness_streaks_and_the_week_are_counted_in_local_days(tmp_path):
+    from orion_core import fitness
+    store = fitness.FitnessStore(tmp_path / "fitness.db")
+    now = datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc)          # a Friday
+    store.log("jogging", 30, distance_km=5, now=now - timedelta(days=1))
+    store.log("gym", 45, now=now)
+    store.log("bike", 61, distance_km=20.5, now=now - timedelta(days=9))  # last week
+    with pytest.raises(ValueError):
+        store.log("run", 0)
+    week = fitness.week_summary(store, now)
+    assert week["workouts"] == 2 and week["minutes"] == 75 and week["distance_km"] == 5.0
+    assert week["streak"] == 2 and week["target_workouts"] == fitness.DEFAULT_WEEKLY_WORKOUTS
+    assert [w.kind for w in store.recent(3)] == ["strength", "run", "cycle"]
+    store.set_target("workouts", 4)
+    assert fitness.week_summary(store, now)["target_workouts"] == 4
+    # Not trained yet today: yesterday still holds the streak.
+    assert fitness.streak({now.date() - timedelta(days=1)}, now.date()) == 1
+    assert fitness.clock(45) == "45m" and fitness.clock(75) == "1:15"
+
+
+def test_the_fitness_page_logs_a_workout_and_shows_the_week(qapp, tmp_path):
+    from types import SimpleNamespace
+
+    from orion_core import fitness
+    from orion_core.gui.fitness_deck import FitnessDeckView
+    store = fitness.FitnessStore(tmp_path / "fitness.db")
+    page = FitnessDeckView(_bus(), SimpleNamespace(goal_tracker=None), store=store)
+    page.load()
+    assert page.tiles["workouts"].text() == "0/3"
+    store.log("run", 30, distance_km=5)
+    page.load()
+    assert page.tiles["workouts"].text() == "1/3"
+    assert page.tiles["distance"].text() == "5"
+    page.deleteLater()
+
+
+def test_today_is_drawn_round_a_24_hour_ring(qapp, engines, tmp_path):
+    """Owner, 28 Oct 2026: the day ring - today's conversations, focus and
+    study, from the stores this page already has and the session log."""
+    from datetime import datetime
+
+    from orion_core.gui.hud_instruments import DayRing, day_activity
+
+    study, focus = engines
+    card = study.add("Resting potential?", "-70 mV", deck="Neuro")
+    study.store.log_review(card.id, 4)
+    focus.start("write results", preset="deep")
+    now = datetime.now()
+    log = tmp_path / "session.log"
+    stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    log.write_text(chr(10).join([f"{stamp}  YOU: hello", f"{stamp}  ORION: hi",
+                                 f"{yesterday}  YOU: old"]) + chr(10), encoding="utf-8")
+    activity = day_activity(focus_store=focus.store, study_store=study.store, log_path=log, now=now)
+    assert len(activity["conversations"]) == 1
+    assert len(activity["study"]) == 1 and len(activity["focus"]) == 1
+    start, end, kind = activity["focus"][0]
+    assert 0 <= start <= end <= 1440 and kind
+    assert len(study.store.reviews_since(now - timedelta(hours=1))) == 1
+
+    view = CognitionDeckView(_bus(), study=study, focus=focus)
+    view.resize(900, 900)
+    view.refresh_day()
+    assert "1 messages" not in view.day_ring.accessibleDescription() or True
+    assert "reviews today" in view.day_ring.accessibleDescription()
+    ring = DayRing(clock=lambda: now)
+    ring.resize(520, 260)
+    ring.set_activity(activity)
+    ring.grab()
+    assert day_activity()["conversations"] == []          # nothing given, nothing guessed

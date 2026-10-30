@@ -244,6 +244,9 @@ class MorningBriefingService:
         self.notion = notion
         self.outlook = outlook
         self.memory = memory          # retained for compatibility; dedup now
+        # Attached by app.py once it exists: tasks the user finished are
+        # tombstoned there, and the tasks read out are remembered there.
+        self.cognition: Any | None = None
         self.cache = NewsSignatureCache()   # lives in its own SQLite cache
         # The exact stories read out, so open_news can open the right source.
         self.articles: list[dict[str, str]] = []
@@ -455,6 +458,7 @@ class MorningBriefingService:
                 background.spawn(self._calendar_section()),
                 background.spawn(self._tasks_section()),
                 background.spawn(self._email_section()),
+                background.spawn(self._goals_section()),
             ]
             results = await asyncio.gather(news_task, *side_tasks,
                                            return_exceptions=True)
@@ -662,47 +666,16 @@ class MorningBriefingService:
     # ── markets / crypto / personal feeds (proven; retained) ─────────────────
 
     async def _market_section(self, session: ClientSession) -> str:
-        parts: list[str] = []
-        headers = {"User-Agent": "Mozilla/5.0 (ORION briefing)"}
-        for symbol, label in self.MARKET_INDICES:
-            try:
-                url = (
-                    f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(symbol)}"
-                    "?range=1d&interval=1d"
-                )
-                async with session.get(url, headers=headers) as response:
-                    if response.status != 200:
-                        continue
-                    data = await response.json(content_type=None)
-                meta = (
-                    ((data.get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
-                )
-                price = meta.get("regularMarketPrice")
-                previous = meta.get("chartPreviousClose") or meta.get("previousClose")
-                if price is None:
-                    continue
-                # Spoken, the absolute level is noise — nobody needs to hear
-                # that the S&P is "at five thousand nine hundred". The move is
-                # the whole message, so lead with it and keep the level for
-                # the case where there is no previous close to compare.
-                if previous:
-                    change = (float(price) - float(previous)) / float(previous) * 100.0
-                    if abs(change) < 0.05:
-                        # "up 0.0 percent" is not something anyone says, and it
-                        # is the wrong claim besides — that is a market that
-                        # did not move.
-                        fragment = f"{label} flat"
-                    else:
-                        direction = "up" if change > 0 else "down"
-                        fragment = f"{label} {direction} {abs(change):.1f} percent"
-                else:
-                    fragment = f"{label} at {float(price):,.0f}"
-                parts.append(fragment)
-            except Exception:
-                continue
-        if not parts:
+        """Every index, in the right tense (markets.py): a market that has
+        not opened yet is reported as its last close - "on Friday the S and
+        P 500 closed up 0.7 percent" - never as today's move."""
+        from . import markets
+        quotes = await markets.fetch(session, [(symbol, label) for symbol, label in
+                                               markets.INDICES
+                                               if symbol in {s for s, _ in self.MARKET_INDICES}])
+        if not quotes:
             return "Markets: live quotes unavailable."
-        return "Markets: " + ", ".join(parts) + "."
+        return markets.summary(quotes)
 
     async def _crypto_section(self, session: ClientSession) -> str:
         try:
@@ -742,13 +715,33 @@ class MorningBriefingService:
             return f"Calendar feed unavailable ({first_line(exc, 80)})."
 
     async def _tasks_section(self) -> str:
-        if not self.notion.available:
+        """The owner's open tasks - ORION's own list AND the Notion board, by
+        the same view and overdue rule the awareness tool lists and clears
+        (owner_tasks). 25 Oct 2026: this read the board alone and called five
+        past calendar rows "overdue"; clear_overdue read ORION's list alone,
+        found nothing, and ORION told the owner nothing had been overdue."""
+        from . import owner_tasks
+        cognition = getattr(self, "cognition", None)
+        view = await owner_tasks.gather(self.notion, cognition)
+        if not view.rows and not view.board_configured:
             return ""
-        try:
-            result = await self.notion.list_tasks(limit=6)
-            return "Tasks: " + result.text if result.ok else ""
-        except Exception as exc:
-            return f"Task feed unavailable ({first_line(exc, 80)})."
+        if not view.rows and view.board_error:
+            return f"Task feed unavailable ({first_line(view.board_error, 80)})."
+        # 17 Oct 2026: remember exactly what was read out so "I've done all
+        # of those" can mark THESE tasks.
+        rows = view.rows[:6]
+        if cognition is not None:
+            await asyncio.to_thread(cognition.note_mentioned_tasks,
+                                    [r["title"] for r in rows], "briefing")
+        if not rows:
+            return "Tasks: The task board is clear."
+        text = owner_tasks.render(rows)
+        hidden = len(view.rows) - len(rows)
+        if hidden > 0:
+            text += f"\n(and {hidden} more open task(s) not listed)"
+        if view.board_configured and not view.board_read:
+            text += f"\n(The Notion board could not be read: {first_line(view.board_error, 80)}.)"
+        return "Tasks: " + text
 
     async def _email_section(self) -> str:
         if not self.outlook.available:
@@ -758,6 +751,16 @@ class MorningBriefingService:
             return "Email: " + result.text if result.ok else ""
         except Exception as exc:
             return f"Email feed unavailable ({first_line(exc, 80)})."
+
+    async def _goals_section(self) -> str:
+        """Goals at risk and today's goal actions (goals.py), off the loop.
+        Uses the live engine when app.py attached one; otherwise reads the
+        store only if it already exists, so no goals means no section."""
+        try:
+            from .goals import briefing_section
+            return await asyncio.to_thread(briefing_section, getattr(self, "goal_tracker", None))
+        except Exception:
+            return ""
 
     # ── delivery instruction ──────────────────────────────────────────────────
 
@@ -797,7 +800,7 @@ class MorningBriefingService:
             "If the material lists nothing for a topic, say the wires are quiet "
             "on it rather than inventing coverage. "
             "The topic labels and story ages are for your orientation; weave "
-            "them in naturally. If calendar entries, tasks or priority email "
+            "them in naturally. If calendar entries, tasks, goals or priority email "
             "appear, close with a short 'for your attention today'. Keep it "
             "conversational and calm at a steady, unhurried pace, and TIGHT — "
             "about seventy-five seconds, six or seven stories at most. It is far "

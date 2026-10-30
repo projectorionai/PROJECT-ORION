@@ -389,7 +389,10 @@ class ChessService:
         if self.analyst != "stockfish":
             try:
                 from .chess_brain import MATE_BOUND
-                score = await asyncio.to_thread(self.brain.analyse, board.copy(), 0.2)
+                from .grandmaster.search import Position
+                from .grandmaster.strength import Limits
+                score = await self.grandmaster.review.search(Position.from_board(board),
+                                                              Limits(seconds=0.2), operation="analyse")
                 if abs(score) > MATE_BOUND:
                     return (MATE_CP if score > 0 else -MATE_CP), (_mate_moves(score) or None)
                 return int(score), None
@@ -441,13 +444,19 @@ class ChessService:
         slow his down."""
         if not CHESS_AVAILABLE:
             return {"cp": None, "mate": None, "white_fraction": 0.5}
-        cached = self._evals.get(self._key(self.board))
+        # A search can yield while a move changes the live board. Keep the
+        # position and its cache key together so an old score is never stored
+        # under the new position after the search completes.
+        board = self.board.copy(stack=False)
+        key = self._key(board)
+        cached = self._evals.get(key)
         if cached is None and self._thinking:
             cached = getattr(self, "_last_shown_eval", None)
         if cached is None:
-            cached = await self._evaluate(self.board)
-            self._remember_eval(self.board, *cached)
-        self._last_shown_eval = cached
+            cached = await self._evaluate(board)
+            self._remember_eval(board, *cached)
+        if self._key(self.board) == key:
+            self._last_shown_eval = cached
         cp, mate = cached
         return {"cp": cp, "mate": mate, "white_fraction": self._win_probability(cp, mate)}
 
@@ -496,20 +505,18 @@ class ChessService:
         path handed the live board itself to the thread, which pushed and
         popped moves on it while the GUI and make_move could still use it.
         """
-        from .chess_brain import MAX_PLY
-        brain = self.brain
-        snapshot = board.copy()
-        depth = int(max_depth) if max_depth else MAX_PLY
-
-        def _search() -> tuple[Optional["chess.Move"], dict[str, Any]]:
-            # Hold the brain's lock across the search AND the read-back, so a
-            # review cannot slip in between and overwrite the numbers.
-            with brain._search_lock:
-                move = brain.choose_move(snapshot, seconds, depth)
-                return move, {"score": brain._last_score, "pv": list(brain.last_pv),
-                              "reason": brain.last_reason}
-
-        move, info = await asyncio.to_thread(_search)
+        from .grandmaster.search import Position
+        from .grandmaster.strength import Limits
+        # ChessBrain.choose_move executes in the spawned worker, including all
+        # tree traversal and evaluation. Preserve full repetition history.
+        await asyncio.to_thread(lambda: self.brain)
+        answer = await self.grandmaster.search.search(
+            Position.from_board(board), Limits(seconds=max(0.005, min(30, seconds)),
+                                               depth=max(1, min(64, max_depth or 64))))
+        move = chess.Move.from_uci(answer.uci) if answer.uci else None
+        info = {"score": answer.cp, "pv": [chess.Move.from_uci(uci) for uci in answer.pv],
+                "reason": ("opening book" if answer.in_book else
+                           f"depth {answer.depth}, {answer.nodes:,} nodes, {answer.cp / 100:+.2f}")}
         if move is not None:
             self._last_orion_info = info
             self.bus.log.emit(f"CHESS: ORION plays {move.uci()} — {info['reason']}")
@@ -992,8 +999,10 @@ class ChessService:
         if self.analyst == "stockfish":
             review = await self._stockfish_review(board, move)
         if review is None:
-            review = await asyncio.to_thread(self.brain.review_move, board, move,
-                                             REVIEW_SECONDS)
+            from .grandmaster.search import Position
+            from .grandmaster.strength import Limits
+            review = await self.grandmaster.review.search(Position.from_board(board),
+                Limits(seconds=REVIEW_SECONDS), operation="review", played=move.uci())
         if review and review.get("interrupted"):
             return          # ORION needed the board: stays queued, tried again after
         if not review:
@@ -1435,35 +1444,144 @@ class ChessService:
             return ToolResult("I'm already practising — say 'stop practising' to end it.")
         games = max(1, min(200, int(games)))
         self._practice_stop = _threading.Event()
-        brain = self.brain
-
-        def _progress(done: int, result: str) -> None:
-            if done % 5 == 0 or done == games:
-                self.bus.log.emit(f"CHESS: practice game {done}/{games} finished ({result}).")
-
         async def _run() -> None:
-            summary = await asyncio.to_thread(brain.practice, games, 0.05,
-                                              self._practice_stop, _progress)
+            summary = await self.grandmaster.practice(games)
             self.bus.log.emit(f"CHESS: {summary}")
 
         self._practice = asyncio.get_running_loop().create_task(
             _run(), name="orion-chess-practice")
-        return ToolResult(f"Practising {games} game(s) against myself in the background "
-                          "— my intuition network learns from every position. I'll say "
-                          "how it went in the log.")
+        return ToolResult(f"Queued {games} self-play game(s) in an isolated process. "
+                          "Completed games supply terminal-labelled NNUE training positions.")
 
     def stop_practice(self) -> ToolResult:
         if self._practice is None or self._practice.done():
             return ToolResult("I'm not practising at the moment.")
         self._practice_stop.set()
-        return ToolResult("Stopping after the current practice game.")
+        self._practice.cancel()
+        return ToolResult("Stopping the isolated practice worker.")
+
+    # ── Lichess: friends play him from anywhere (chess_lichess.py) ───────────
+
+    @property
+    def grandmaster(self) -> Any:
+        swarm = getattr(self, "_grandmaster", None)
+        if swarm is None:
+            from .chess_brain import BRAIN_PATH
+            from .grandmaster.supervisor import Grandmaster
+            path = getattr(getattr(self, "_brain", None), "path", BRAIN_PATH)
+            swarm = Grandmaster(path.parent / "grandmaster", path, self.bus)
+            self._grandmaster = swarm
+        return swarm
+
+    @property
+    def lichess(self) -> Any:
+        """ORION's Lichess BOT bridge, built on first use. Outbound only: it
+        streams from lichess.org and posts moves back; nothing listens here."""
+        bridge = getattr(self, "_lichess", None)
+        if bridge is None:
+            from .grandmaster.bridge import GrandmasterBridge
+            bridge = GrandmasterBridge(self.bus, self._lichess_think,
+                                       grandmaster=self.grandmaster, router=self.router,
+                                       on_finish=self._lichess_finished)
+            self._lichess = bridge
+        return bridge
+
+    async def _lichess_think(self, board: "chess.Board", seconds: float
+                             ) -> tuple[Optional["chess.Move"], Optional[int]]:
+        """His move in a Lichess game — his own engine, never Stockfish. A
+        separate search (same book, tables and intuition) so a Lichess game
+        and a game on this board never queue behind one another's lock."""
+        from .grandmaster.search import Position
+        from .grandmaster.strength import Limits
+        answer = await self.grandmaster.search.search(Position.from_board(board),
+                                                       Limits(seconds=max(0.005, min(30, seconds))))
+        return (chess.Move.from_uci(answer.uci) if answer.uci else None), answer.cp
+
+    def _lichess_finished(self, moves: str, result: str, game: Any) -> None:
+        """A finished Lichess game teaches him like any other — on a worker
+        thread, since training his intuition takes a moment and the game may
+        end while the user is busy with something else."""
+        brain = self.brain
+
+        async def _learn() -> None:
+            try:
+                summary = await asyncio.to_thread(brain.learn_from_game, moves.split(), result)
+                self.bus.log.emit(f"CHESS: learned from the Lichess game against "
+                                  f"{game.opponent} — {summary}")
+            except Exception as exc:
+                self.bus.log.emit(f"CHESS: couldn't learn from the Lichess game "
+                                  f"({first_line(exc, 80)}).")
+
+        try:
+            self._lichess_learning = asyncio.get_running_loop().create_task(_learn())
+        except RuntimeError:
+            pass
+
+    async def lichess_start(self) -> ToolResult:
+        ok, text = await self.lichess.start()
+        return ToolResult(text, ok=ok)
+
+    async def lichess_stop(self) -> ToolResult:
+        return ToolResult(await self.lichess.stop())
+
+    def lichess_status(self) -> ToolResult:
+        return ToolResult(self.lichess.status_text())
+
+    async def lichess_challenge(self, username: str, minutes: float = 5, increment: int = 3,
+                                rated: bool = False, colour: str = "random") -> ToolResult:
+        ok, text = await self.lichess.challenge(username, minutes, increment, rated, colour)
+        return ToolResult(text, ok=ok)
+
+    def lichess_allow(self, username: str, allowed: bool = True) -> ToolResult:
+        bridge = self.lichess
+        return ToolResult(bridge.allow(username) if allowed else bridge.disallow(username))
+
+    def lichess_accept_anyone(self, enabled: bool) -> ToolResult:
+        return ToolResult(self.lichess.set_accept_anyone(enabled))
+
+    async def lichess_resign(self) -> ToolResult:
+        from .chess_lichess import LichessStopUnconfirmed
+        try:
+            return ToolResult(await self.lichess.resign_all())
+        except LichessStopUnconfirmed as exc:
+            return ToolResult(str(exc), ok=False)
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
+    async def aclose(self) -> None:
+        """Drain async owners on qasync; native engine quit/join stays off-loop."""
+        tasks = [getattr(self, "_practice", None), self._review_task,
+                 getattr(self, "_lichess_learning", None)]
+        if self._autonomous is not None:
+            tasks.append(self._autonomous.task)
+        tasks = [task for task in tasks if task is not None and not task.done()]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        bridge = getattr(self, "_lichess", None)
+        if bridge is not None:
+            await bridge.aclose()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        swarm = getattr(self, "_grandmaster", None)
+        if swarm is not None:
+            await swarm.close()
+        engine, self._engine = self._engine, None
+        if engine is not None:
+            await asyncio.to_thread(engine.quit)
+
     def shutdown(self) -> None:
+        practice = getattr(self, "_practice", None)
+        if practice is not None and not practice.done():
+            practice.cancel()
+        swarm = getattr(self, "_grandmaster", None)
+        if swarm is not None:
+            swarm.shutdown()
         stop = getattr(self, "_practice_stop", None)
         if stop is not None:
             stop.set()
+        bridge = getattr(self, "_lichess", None)
+        if bridge is not None:
+            bridge.shutdown()
         self._cancel_autonomous_if_running()
         task = self._review_task
         if task is not None and not task.done():

@@ -1,0 +1,50 @@
+{
+  "name": "jv_reminder",
+  "description": "Use ORION's persistent spoken reminders and alarms, replacing the legacy cloud reminder imports.",
+  "module": "jv_reminder_tool.py",
+  "version": "33.0.0",
+  "tier": "allow",
+  "permissions": [
+    "filesystem",
+    "audio"
+  ],
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "The action to perform.",
+        "enum": [
+          "add",
+          "list",
+          "cancel"
+        ]
+      },
+      "text": {
+        "type": "string",
+        "description": "Reminder text."
+      },
+      "minutes": {
+        "type": "number",
+        "description": "Delay in minutes."
+      },
+      "at": {
+        "type": "string",
+        "description": "Absolute time."
+      },
+      "phrase": {
+        "type": "string",
+        "description": "Natural-language reminder request."
+      },
+      "id": {
+        "type": "integer",
+        "description": "Reminder id to cancel."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  },
+  "secrets": []
+}

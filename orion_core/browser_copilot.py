@@ -297,7 +297,12 @@ class BrowserCopilot:
 
     async def _cdp(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Send one CDP command and return its result, skipping event frames."""
-        if self._ws is None:
+        from .execution_policy import require_foreground
+        blocked = require_foreground("generic_browser_cdp")
+        if blocked is not None:
+            raise RuntimeError(blocked.text)
+        from aiohttp import WSMsgType
+        if self._ws is None or getattr(self._ws, "closed", False):
             raise RuntimeError("no browser session")
         self._next_id += 1
         msg_id = self._next_id
@@ -305,7 +310,11 @@ class BrowserCopilot:
                                             "params": params or {}}))
         deadline = time.monotonic() + _CDP_TIMEOUT_S
         while time.monotonic() < deadline:
-            raw = await asyncio.wait_for(self._ws.receive(), timeout=_CDP_TIMEOUT_S)
+            remaining = deadline - time.monotonic()
+            raw = await asyncio.wait_for(self._ws.receive(), timeout=max(0.001, remaining))
+            if getattr(raw, "type", None) in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
+                await self._teardown_session()
+                raise RuntimeError("The browser debugger disconnected. Open the page again to reconnect.")
             data = getattr(raw, "data", None)
             if not isinstance(data, str):
                 continue
@@ -323,6 +332,10 @@ class BrowserCopilot:
         result = await self._cdp("Runtime.evaluate", {
             "expression": expression, "returnByValue": True, "awaitPromise": True,
         })
+        if result.get("exceptionDetails"):
+            detail = result["exceptionDetails"]
+            raise RuntimeError((detail.get("exception") or {}).get("description")
+                               or detail.get("text") or "Browser script failed")
         return (result.get("result") or {}).get("value")
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -330,10 +343,23 @@ class BrowserCopilot:
     async def ensure(self, *, background: bool = False) -> ToolResult | None:
         """Launch (or reuse) the browser and connect the debugger.  Returns None
         on success, or an actionable ToolResult on failure."""
-        if self._ws is not None and self._headless == background:
+        from .execution_policy import require_foreground
+        blocked = require_foreground("generic_browser_session")
+        if blocked is not None:
+            return blocked
+        if self._ws is not None and not getattr(self._ws, "closed", False) and self._headless == background:
             return None
-        if self._ws is not None:
-            await self.close()                     # mode change → fresh session
+        if self._headless == background and self._proc is not None and self._proc.poll() is None:
+            # A closed tab/debugger socket does not require a second process
+            # competing for the same profile. Reattach to the running browser.
+            await self._teardown_session()
+            if await self._connect_debugger():
+                return None
+            await self.close()
+        if self._ws is not None or self._proc is not None:
+            # Transport teardown clears _ws but leaves the browser alive.
+            # A mode change must retire that process before replacing it.
+            await self.close()
         exe = self.find_browser()
         if exe is None:
             return ToolResult(
@@ -353,6 +379,9 @@ class BrowserCopilot:
         self._narrate("Opening a browser window" if not background
                       else "Opening a background browser", os.path.basename(exe))
         try:
+            blocked = require_foreground("generic_browser_launch")
+            if blocked is not None:
+                return blocked
             self._proc = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as exc:
@@ -366,6 +395,9 @@ class BrowserCopilot:
         return None
 
     async def _connect_debugger(self) -> bool:
+        from .execution_policy import require_foreground
+        if require_foreground("generic_browser_attach") is not None:
+            return False
         from aiohttp import ClientSession, ClientTimeout
         self._session = ClientSession(timeout=ClientTimeout(total=_CDP_TIMEOUT_S))
         base = f"http://127.0.0.1:{self.debug_port}"
@@ -377,7 +409,7 @@ class BrowserCopilot:
                     targets = await resp.json()
                 page = next((t for t in targets if t.get("type") == "page"), None)
                 if page is None:
-                    async with self._session.get(f"{base}/json/new?about:blank") as resp:
+                    async with self._session.put(f"{base}/json/new?about:blank") as resp:
                         page = await resp.json()
                 ws_url = page.get("webSocketDebuggerUrl")
                 if ws_url:
@@ -440,11 +472,13 @@ class BrowserCopilot:
             self._current_url = url
             self._narrate("Navigating", url)
             try:
-                await self._cdp("Page.navigate", {"url": url})
+                navigation = await self._cdp("Page.navigate", {"url": url})
+                if navigation.get("errorText"):
+                    return ToolResult(f"Navigation failed: {navigation['errorText']}", ok=False)
                 await self._await_ready()
+                title = await self._evaluate("document.title") or ""
             except Exception as exc:
                 return ToolResult(f"Navigation failed: {exc}", ok=False)
-            title = await self._evaluate("document.title") or ""
             self._narrate("Loaded", str(title)[:120])
             return ToolResult(f"Opened {url} — “{str(title)[:100]}”.")
 
@@ -453,11 +487,17 @@ class BrowserCopilot:
         while time.monotonic() < deadline:
             try:
                 state = await self._evaluate("document.readyState")
-            except Exception:
+            except Exception as exc:
+                # Navigation can briefly destroy the previous JS context;
+                # a disconnected debugger needs reconnection, not polling.
+                if not any(reason in str(exc).lower() for reason in (
+                        "execution context was destroyed", "cannot find context")):
+                    raise
                 state = None
             if state in ("interactive", "complete"):
                 return
             await asyncio.sleep(0.25)
+        raise TimeoutError("The page did not become readable before the load deadline.")
 
     async def launch(self, *, background: bool = False) -> ToolResult:
         """Bring the browser up (no navigation) so it's ready to drive."""
@@ -494,14 +534,22 @@ class BrowserCopilot:
         if not values:
             return ToolResult("No form values were supplied.", ok=False)
         filled: list[str] = []
+        missing: list[str] = []
         for hint, value in values.items():
             res = await self.fill(str(hint), str(value))
             if res.ok:
                 filled.append(str(hint))
+            else:
+                missing.append(str(hint))
         if not filled:
             return ToolResult("None of the fields matched anything on this page.", ok=False)
+        if missing:
+            return ToolResult(f"Filled {', '.join(filled)}. Missing fields: {', '.join(missing)}; "
+                              "the form was not submitted.", ok=False)
         if submit:
-            await self.submit()
+            result = await self.submit()
+            if not result.ok:
+                return result
         return ToolResult(f"Filled {len(filled)} field(s): {', '.join(filled)}"
                           + (" and submitted." if submit else "."))
 

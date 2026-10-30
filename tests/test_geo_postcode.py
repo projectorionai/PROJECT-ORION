@@ -1,7 +1,7 @@
 """
-Tests for pinpoint UK-postcode geocoding (the 'M1 1AE flies to the sea' fix).
+Tests for UK-postcode geocoding and source provenance.
 
-A postcode-shaped query is routed to postcodes.io for its EXACT centroid before
+A postcode-shaped query is routed to postcodes.io for its reference point before
 Nominatim's coarse free-text search or the Open-Meteo fallback (which cannot
 resolve postcodes at all) can return a wrong point.
 """
@@ -59,22 +59,22 @@ def _engine(tmp_path, monkeypatch, fake_get_json):
     return engine
 
 
-def test_postcode_uses_postcodes_io_exact_centroid(tmp_path, monkeypatch):
+def test_postcode_uses_postcodes_io_reference_point(tmp_path, monkeypatch):
     calls: list[str] = []
 
     async def fake_get_json(url, timeout=12.0):
         calls.append(url)
-        # postcodes.io exact-lookup shape for M1 1AE (Manchester, Devon).
+        # Synthetic provider response, not a measurement of postcode accuracy.
         assert "api.postcodes.io/postcodes/" in url
         return {
             "status": 200,
             "result": {
                 "postcode": "M1 1AE",
-                "latitude": 50.5470,
-                "longitude": -3.4977,
-                "admin_district": "Teignbridge",
+                "latitude": 53.4800,
+                "longitude": -2.2400,
+                "admin_district": "Manchester",
                 "admin_ward": "Manchester",
-                "region": "South West",
+                "region": "North West",
                 "country": "England",
             },
         }
@@ -84,9 +84,10 @@ def test_postcode_uses_postcodes_io_exact_centroid(tmp_path, monkeypatch):
     assert len(places) == 1
     p = places[0]
     assert p.kind == "postcode"
-    assert abs(p.lat - 50.5470) < 1e-6 and abs(p.lon - -3.4977) < 1e-6
+    assert abs(p.lat - 53.4800) < 1e-6 and abs(p.lon - -2.2400) < 1e-6
     assert p.country == "England"
-    # Nominatim was never consulted — postcodes.io answered exactly.
+    assert p.source == "postcodes.io"
+    # Nominatim was never consulted — the postcode provider answered.
     assert all("nominatim" not in u for u in calls)
 
 

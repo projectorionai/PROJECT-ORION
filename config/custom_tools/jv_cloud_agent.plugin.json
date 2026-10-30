@@ -1,0 +1,73 @@
+{
+  "name": "jv_cloud_agent",
+  "description": "Connect to a deployed ORION HTTPS node, pair with a fresh code, inspect jobs or delegate a specific supported tool. This does not deploy a server or enable legacy JARVIS protocols.",
+  "module": "jv_cloud_agent_tool.py",
+  "version": "33.0.0",
+  "tier": "confirm",
+  "permissions": [
+    "network",
+    "filesystem"
+  ],
+  "requires": [
+    "aiohttp"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "The action to perform.",
+        "enum": [
+          "connect",
+          "disconnect",
+          "status",
+          "delegate",
+          "jobs",
+          "result",
+          "remind",
+          "cancel_reminder",
+          "briefing_now"
+        ]
+      },
+      "url": {
+        "type": "string",
+        "description": "ORION cloud HTTPS origin, for connect."
+      },
+      "pairing_code": {
+        "type": "string",
+        "description": "Fresh cloud-node pairing code."
+      },
+      "tool": {
+        "type": "string",
+        "description": "Exact supported ORION tool for delegate."
+      },
+      "arguments": {
+        "type": "object",
+        "description": "Arguments for the delegated tool.",
+        "additionalProperties": true
+      },
+      "id": {
+        "type": "string",
+        "description": "Cloud task/reminder id."
+      },
+      "text": {
+        "type": "string",
+        "description": "Reminder text."
+      },
+      "minutes": {
+        "type": "number",
+        "description": "Reminder delay."
+      },
+      "at": {
+        "type": "string",
+        "description": "Absolute reminder time."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  },
+  "secrets": [
+    "ORION_CLOUD_REFRESH_TOKEN"
+  ]
+}

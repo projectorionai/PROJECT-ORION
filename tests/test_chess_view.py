@@ -42,9 +42,48 @@ from orion_core import chess_engine as chess_engine_module
 from orion_core.chess_engine import ChessService
 
 
+@pytest.fixture(autouse=True)
+def _close_process_backed_chess_services(monkeypatch):
+    """Qt test panels must release the persistent search pools they instantiate."""
+    services = []
+    original = ChessService.__init__
+
+    def initialise(service, *args, **kwargs):
+        original(service, *args, **kwargs)
+        services.append(service)
+
+    monkeypatch.setattr(ChessService, "__init__", initialise)
+    yield
+    for service in services:
+        asyncio.run(service.aclose())
+
+
 @pytest.fixture(scope="module")
 def _app():
     return QApplication.instance() or QApplication([])
+
+
+def test_remote_late_evaluation_keeps_authoritative_board(_app):
+    from orion_core.gui.chess_remote import RemoteChessWidget
+    widget = RemoteChessWidget(None)
+    board = chess.Board()
+    board.push_uci("e2e4")
+    try:
+        widget.consume({"phase": "lichess_position", "game_id": "abcdefgh",
+                        "fen": board.fen(), "colour": "black"})
+        widget.consume({"phase": "lichess", "phase_detail": "evaluation",
+                        "game_id": "abcdefgh", "fen": chess.STARTING_FEN,
+                        "cp": 25, "depth": 8, "nodes": 100})
+        widget._render()
+        assert widget.board._fen == board.fen()
+        assert widget.board.flipped
+        assert "Depth 8" in widget.label.text()
+        assert widget._latest is None
+        widget.consume({"phase": "lichess_position", "game_id": "ijklmnop",
+                        "fen": chess.STARTING_FEN, "colour": "white"})
+        assert "cp" not in widget._snapshot
+    finally:
+        widget.close()
 
 
 class _Signal:
@@ -261,6 +300,35 @@ def test_panel_constructs_and_shows_live_status(monkeypatch, tmp_path, _app):
     service = _service(monkeypatch, tmp_path)
     panel = ChessPanel(_StubBus(), service)
     assert "LIVE" in panel.status_chip.text()
+
+
+def test_late_chess_evaluation_cannot_replace_the_newer_bar(monkeypatch, tmp_path, _app):
+    async def flow():
+        service = _service(monkeypatch, tmp_path)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def evaluate():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+                return {"white_fraction": 0.1, "cp": -900, "mate": None}
+            return {"white_fraction": 0.8, "cp": 500, "mate": None}
+
+        service.evaluate_current = evaluate
+        panel = ChessPanel(_StubBus(), service)
+        await first_started.wait()
+        panel.refresh_from_service()
+        await asyncio.sleep(0)
+        assert panel.eval_bar._white_fraction == 0.8
+        release_first.set()
+        await asyncio.sleep(0)
+        assert panel.eval_bar._white_fraction == 0.8
+
+    asyncio.run(flow())
 
 
 def test_new_game_button_starts_a_game_with_selected_sides_and_elo(monkeypatch, tmp_path, _app):
@@ -494,3 +562,17 @@ def test_the_deck_lets_the_chess_page_have_the_arrow_keys():
     source = inspect.getsource(UnifiedDashboard.keyPressEvent)
     assert "handle_navigation_key" in source
     assert source.index("handle_navigation_key") < source.index("next_page")
+
+
+def test_lichess_games_show_on_the_chess_page_without_touching_the_board(monkeypatch, tmp_path, _app):
+    service = _service(monkeypatch, tmp_path)
+    bus = _StubBus()
+    panel = ChessPanel(bus, service)
+    fen_before = panel.board._fen
+    bus.dashboard_event.emit("chess", {"phase": "lichess", "text": "accepted Sam's challenge (5+3)"})
+    bus.dashboard_event.emit("chess", {"phase": "lichess_position", "fen": chess.STARTING_FEN,
+                                       "opponent": "Sam", "colour": "white"})
+    assert panel.lichess_label.isVisibleTo(panel)
+    assert "Sam" in panel.lichess_label.text()
+    assert "accepted Sam's challenge" in panel.commentary.toPlainText()
+    assert panel.board._fen == fen_before

@@ -233,7 +233,8 @@ def test_load_plugins_does_not_activate_a_contract_breaking_module(tmp_path, mon
 
     plan = asyncio.run(load_plugins(loader, object(), tmp_path, bus))
 
-    assert [m.name for m in plan.loadable] == ["broken"]  # planning saw it as loadable
+    assert not plan.loadable  # discovery succeeded, but activation never did
+    assert "broken" in plan.skipped
     assert "broken_tool" not in loader.loaded_modules      # but it broke the contract
     # A tool that never activated must never be granted a remote tier.
     assert classify("broken") is Tier.CONFIRM

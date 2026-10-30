@@ -31,10 +31,11 @@ tier into the remote gate) is the integration step on top of this core.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -45,6 +46,24 @@ if TYPE_CHECKING:
 CAPABILITY_TIERS = frozenset({"allow", "confirm", "forbid"})
 _DEFAULT_TIER = "confirm"   # safest sensible default for an unknown plugin
 MANIFEST_SUFFIX = ".plugin.json"
+
+
+def plugin_identity(name: str) -> str:
+    """Management identity; callable/schema names remain exactly as declared."""
+    cleaned = "".join(
+        char if (char.isalnum() or char == "_") else "_"
+        for char in str(name or "").strip().lower()
+    ).strip("_")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned or "plugin"
+
+
+def _module_filename(module: str) -> bool:
+    """Manifest modules are sibling files, including on a different OS."""
+    return (isinstance(module, str) and module.endswith(".py") and module != ".py"
+            and Path(module).name == module and PureWindowsPath(module).name == module
+            and ":" not in module and not any(ord(char) < 32 for char in module))
 
 
 #: The capabilities a plugin may declare it needs. Deliberately coarse — this is
@@ -92,9 +111,8 @@ class PluginManifest:
     #: The other way to say it: every N seconds from start-up. Minimum 30 —
     #: anything faster is a loop, not a schedule.
     interval_seconds: float = 0.0
-    #: Environment variables this plugin needs, and the ONLY ones it will be
-    #: given. Held in config/plugin_vault.json, scoped per plugin, so a plugin
-    #: that needs a weather key cannot also read the Twilio token.
+    #: Keys requested from config/plugin_vault.json for this plugin's run.
+    #: The filtered mapping is not isolation from the host process or files.
     secrets: tuple[str, ...] = ()
     source_path: Path | None = None   # where this manifest was read from
 
@@ -111,9 +129,15 @@ class PluginManifest:
 
     @property
     def module_path(self) -> Path | None:
-        if self.source_path is None:
+        if self.source_path is None or not _module_filename(self.module):
             return None
-        return self.source_path.parent / self.module
+        try:
+            root = self.source_path.parent.resolve()
+            candidate = root / self.module
+            # A sibling symlink must not redirect import/quarantine elsewhere.
+            return candidate if candidate.resolve().parent == root else None
+        except (OSError, RuntimeError, ValueError):
+            return None
 
     @classmethod
     def from_dict(cls, data: dict, *, source_path: Path | None = None) -> "PluginManifest":
@@ -123,8 +147,8 @@ class PluginManifest:
         if not name:
             raise ManifestError("manifest is missing a non-empty 'name'")
         module = str(data.get("module") or "").strip()
-        if not module.endswith(".py"):
-            raise ManifestError(f"{name}: 'module' must be a .py filename")
+        if not _module_filename(module):
+            raise ManifestError(f"{name}: 'module' must be a .py filename beside the manifest")
         tier = str(data.get("tier") or _DEFAULT_TIER).strip().lower()
         if tier not in CAPABILITY_TIERS:
             raise ManifestError(
@@ -163,7 +187,7 @@ class PluginManifest:
         schedule = str(data.get("schedule") or "").strip()
         try:
             interval = float(data.get("interval_seconds") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ManifestError(f"{name}: 'interval_seconds' must be a number")
         if schedule or interval:
             from .plugin_schedule import ScheduleError, parse_schedule
@@ -197,6 +221,12 @@ def load_manifest(path: Path) -> PluginManifest:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ManifestError(f"{path.name}: invalid JSON — {exc}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise ManifestError(f"{path.name}: could not read manifest — {exc}") from exc
+    except (ValueError, RecursionError) as exc:
+        # Decoder limits (for example huge integers or deep nesting) do not
+        # use JSONDecodeError. One such file must not abort all discovery.
+        raise ManifestError(f"{path.name}: invalid JSON — {exc}") from exc
     return PluginManifest.from_dict(data, source_path=path)
 
 
@@ -228,14 +258,60 @@ def discover_manifests(custom_tools_dir: Path) -> tuple[list[PluginManifest], di
     manifests: list[PluginManifest] = []
     errors: dict[str, str] = {}
     directory = Path(custom_tools_dir)
-    if not directory.is_dir():
+    try:
+        paths = sorted(path for path in directory.iterdir() if path.name.endswith(MANIFEST_SUFFIX))
+    except (FileNotFoundError, NotADirectoryError):
         return manifests, errors
-    for path in sorted(directory.glob(f"*{MANIFEST_SUFFIX}")):
+    except OSError as exc:
+        errors[str(directory)] = f"could not read plugin directory — {exc}"
+        return manifests, errors
+    for path in paths:
         try:
             manifests.append(load_manifest(path))
         except ManifestError as exc:
             errors[path.name] = str(exc)
     return manifests, errors
+
+
+#: Plugins ORION has outgrown, by identity: (the built-in that does the job,
+#: why). Mark XXXIX (owner, 27 Oct 2026: "ORION's got 5 plugins rejected so
+#: this must be fixed as they are now obsolete"). Each was switched off and
+#: counted at every boot as "rejected"; each is archived on sight now - a
+#: verified copy in custom_tools/_superseded, never deleted - like a duplicate.
+OBSOLETE_PLUGINS: dict[str, tuple[str, str]] = {
+    "json_validator": ("diagnostics", "rebuilt into ORION: diagnostics 'config' checks "
+                       "settings files and JSON (with or without a schema), no extra package"),
+    "thought_model_monitor": ("ai_mode", "it reported simulated figures; the real local "
+                              "brain's status is ai_mode 'brain'"),
+    "dependency_manager": ("forge", "the forge resolves a tool's packages itself, with "
+                           "its own confirmation; this installed from any requirements file"),
+    "viseme_argument_adapter": ("emotion", "made for the retired 3-D face; the Screen Face "
+                                "takes its mouth from his voice and its expressions from emotion"),
+    "viseme_debugger": ("emotion", "made for the retired 3-D face (QuantumFace3D.set_viseme)"),
+}
+
+
+def retire_obsolete(custom_tools_dir: Path, registry: Any) -> dict[str, str]:
+    """Archive every OBSOLETE_PLUGINS plugin found under *custom_tools_dir*
+    through the registry. {name: skipped-reason} for the ones archived now.
+    Blocking (file moves): call it off the event loop."""
+    supersede = getattr(registry, "supersede", None)
+    if not callable(supersede):
+        return {}
+    manifests, _errors = discover_manifests(custom_tools_dir)
+    retired: dict[str, str] = {}
+    for manifest in manifests:
+        known = OBSOLETE_PLUGINS.get(plugin_identity(manifest.name))
+        if known is None:
+            continue
+        builtin, why = known
+        try:
+            outcome = supersede(manifest.name, builtin, why)
+        except Exception:
+            continue
+        if getattr(outcome, "ok", False):
+            retired[manifest.name] = f"superseded by the built-in tool '{builtin}'"
+    return retired
 
 
 def plan_load(custom_tools_dir: Path) -> LoadPlan:
@@ -245,9 +321,22 @@ def plan_load(custom_tools_dir: Path) -> LoadPlan:
     plan = LoadPlan()
     manifests, errors = discover_manifests(custom_tools_dir)
     plan.skipped.update(errors)
+    identities: dict[str, int] = {}
     for manifest in manifests:
+        identity = plugin_identity(manifest.name)
+        identities[identity] = identities.get(identity, 0) + 1
+    for manifest in manifests:
+        if identities[plugin_identity(manifest.name)] > 1:
+            key = manifest.source_path.name if manifest.source_path else manifest.name
+            plan.skipped[key] = f"duplicate manifest identity '{manifest.name}'; not importing an ambiguous tool"
+            continue
         module_path = manifest.module_path
-        if module_path is None or not module_path.is_file():
+        try:
+            present = module_path is not None and module_path.is_file()
+        except OSError as exc:
+            plan.skipped[manifest.name] = f"could not read module '{manifest.module}' — {exc}"
+            continue
+        if not present:
             plan.skipped[manifest.name] = f"module file '{manifest.module}' not found"
             continue
         missing = unmet_requirements(manifest)
@@ -286,44 +375,100 @@ async def load_plugins(
     """
     from .remote_capability import register_plugin_tier
 
-    plan = plan_load(custom_tools_dir)
+    retired: dict[str, str] = {}
+    if registry is not None:
+        try:
+            retired = await asyncio.to_thread(retire_obsolete, custom_tools_dir, registry)
+        except Exception as exc:
+            bus.log.emit(f"PLUGIN: could not archive obsolete plugins - {exc}")
+    plan = await asyncio.to_thread(plan_load, custom_tools_dir)
+    quarantined: set[str] = set()
+    quarantine_reason = getattr(registry, "quarantine_reason", None)
     for name, reason in plan.skipped.items():
+        # A module the loader quarantined leaves its manifest behind. That is
+        # a known, recoverable state - not a lost file (25 Oct 2026, owner).
+        held = ""
+        if callable(quarantine_reason) and reason.startswith("module file"):
+            try:
+                held = await asyncio.to_thread(quarantine_reason, name)
+            except Exception:
+                held = ""
+        if held:
+            bus.log.emit(f"PLUGIN: '{name}' is quarantined ({held}) - the Plugins page can "
+                         "restore or remove it.")
+            _mark(registry, name, False, "")
+            quarantined.add(name)
+            continue
         bus.log.emit(f"PLUGIN: skipped '{name}' — {reason}")
         _mark(registry, name, False, reason)
 
     still_loadable: list[PluginManifest] = []
     for manifest in plan.loadable:
         if registry is not None and not registry.is_enabled(manifest.name):
-            plan.skipped[manifest.name] = "disabled by the user"
-            bus.log.emit(f"PLUGIN: '{manifest.name}' is disabled — not loading.")
+            state_error = getattr(registry, "state_error", "")
+            reason = (f"saved plugin state unavailable — {state_error}" if state_error
+                      else "disabled by the user")
+            plan.skipped[manifest.name] = reason
+            bus.log.emit(f"PLUGIN: '{manifest.name}' held — {reason}; not loading.")
             continue
         still_loadable.append(manifest)
     plan.loadable = still_loadable
 
+    active: list[PluginManifest] = []
     for manifest in list(plan.loadable):
         module_path = manifest.module_path
         if module_path is None:
+            reason = "module path is unavailable or leaves the manifest directory"
+            plan.skipped[manifest.name] = reason
+            bus.log.emit(f"PLUGIN: '{manifest.name}' failed to load — {reason}")
+            _mark(registry, manifest.name, False, reason)
             continue
         outcome = await loader.load_and_register(module_path)
+        superseded = str(getattr(outcome, "superseded_by", "") or "")
+        if not outcome.succeeded and superseded and callable(getattr(registry, "supersede", None)):
+            # Held back on purpose: the built-in does this job. Neutral, and
+            # archived out of the active set (registry.supersede keeps a copy).
+            plan.skipped[manifest.name] = f"superseded by the built-in tool '{superseded}'"
+            try:
+                await asyncio.to_thread(registry.supersede, manifest.name, superseded,
+                                        "; ".join(outcome.error_log))
+            except Exception as exc:
+                bus.log.emit(f"PLUGIN: '{manifest.name}' is superseded by '{superseded}' "
+                             f"(could not archive it: {exc})")
+            continue
         if not outcome.succeeded:
             reason = "; ".join(outcome.error_log) or "unknown error"
+            plan.skipped[manifest.name] = reason
             bus.log.emit(f"PLUGIN: '{manifest.name}' failed to load — {reason}")
+            _mark(registry, manifest.name, False, reason)
+            continue
+        schema = getattr(outcome, "tool_schema", None)
+        if isinstance(schema, dict) and schema.get("name") != manifest.name:
+            reason = (f"module declares tool '{schema.get('name')}', but the manifest "
+                      f"declares '{manifest.name}'; capability and schedule names must agree")
+            plan.skipped[manifest.name] = reason
+            bus.log.emit(f"PLUGIN: '{manifest.name}' held — {reason}")
             _mark(registry, manifest.name, False, reason)
             continue
         activation = await loader.activate_tool(outcome, dispatcher)
         if not activation.ok:
+            plan.skipped[manifest.name] = activation.text
             bus.log.emit(f"PLUGIN: '{manifest.name}' failed to activate — {activation.text}")
             _mark(registry, manifest.name, False, activation.text)
             continue
         register_plugin_tier(manifest.name, manifest.tier)
+        active.append(manifest)
         # Mark XXVI: bind the plugin's declared event hooks (if any). Guarded —
         # a plugin that cannot be hooked is still a perfectly good tool.
-        if events is not None and manifest.events:
+        if events is not None:
             try:
                 # The imported module object lives on the loader, not on the
                 # outcome (ModuleLoadOutcome carries the schema/handler only).
                 entry = getattr(loader, "loaded_modules", {}).get(outcome.module_name) or {}
-                events.subscribe(manifest.name, entry.get("module"), manifest.events)
+                if manifest.events:
+                    events.subscribe(manifest.name, entry.get("module"), manifest.events)
+                else:
+                    events.forget(manifest.name)
             except Exception as exc:
                 bus.log.emit(f"PLUGIN: could not hook '{manifest.name}' - {exc}")
         _mark(registry, manifest.name, True, "")
@@ -338,23 +483,39 @@ async def load_plugins(
 
         # A manifest that declared a schedule starts being watched the moment
         # it loads, rather than at the next restart.
-        if scheduler is not None and getattr(manifest, "is_scheduled", False):
+        if scheduler is not None:
             try:
-                scheduler.add(manifest)
+                if getattr(manifest, "is_scheduled", False):
+                    scheduler.add(manifest)
+                else:
+                    scheduler.remove(manifest.name)
             except Exception as exc:
                 bus.log.emit(f"PLUGIN: '{manifest.name}' could not be "
                              f"scheduled - {exc}")
 
+    plan.loadable = active
+    plan.skipped.update(retired)
     # The boot roll-call's closing line. Plugins load in the background, so
     # this cannot be printed with the tool list — it is printed when the load
     # has actually finished, which is the only moment the counts are true.
+    # Only a FAILURE is "rejected" (Mark XXXIX): five plugins the owner had
+    # switched off were reported every boot as "5 rejected".
     try:
         from .startup_report import PLUGINS, say
 
         loaded = len(getattr(plan, "loadable", ()) or ())
-        held = len(getattr(plan, "skipped", ()) or ())
-        say(f"{PLUGINS} Plugin discovery complete: {loaded} active, "
-            f"{held} rejected, {loaded + held} total.", bus)
+        skipped = dict(getattr(plan, "skipped", {}) or {})
+        off = sum(1 for reason in skipped.values() if str(reason) == "disabled by the user")
+        superseded = sum(1 for reason in skipped.values()
+                         if str(reason).startswith("superseded by"))
+        parked = sum(1 for name in skipped if name in quarantined)
+        rejected = len(skipped) - off - superseded - parked
+        extra = [f"{n} {label}" for n, label in ((off, "switched off"),
+                                                 (superseded, "retired"),
+                                                 (parked, "quarantined")) if n]
+        say(f"{PLUGINS} Plugin discovery complete: {loaded} active, {rejected} rejected"
+            + (f" ({', '.join(extra)})" if extra else "")
+            + f", {loaded + len(skipped)} total.", bus)
     except Exception:
         pass
     return plan

@@ -9,6 +9,9 @@ it cannot drift from the code, so every factual claim it makes is checked here.
 from __future__ import annotations
 
 import re
+import ast
+import inspect
+import textwrap
 import sys
 from pathlib import Path
 
@@ -58,14 +61,41 @@ def test_every_documented_tier_is_real(doc):
 
 def test_every_documented_command_is_a_real_action(doc):
     """The command table must not promise an action the tool does not route."""
-    src = (Path(__file__).resolve().parents[1] / "orion_core"
-           / "dispatch_productivity.py").read_text(encoding="utf-8")
-    start = src.index("async def plugin_tool")
-    handler = src[start:start + 6000]
+    from orion_core.dispatch_productivity import ProductivityDispatchMixin
+    # Inspect complete action branches: the valid deps/reload routes grew
+    # beyond the old arbitrary 6,000-character source slice.
+    handler = ast.parse(textwrap.dedent(inspect.getsource(ProductivityDispatchMixin.plugin_tool)))
+    routed = set()
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == "action":
+            for comparator in node.comparators:
+                routed.update(item.value for item in ast.walk(comparator)
+                              if isinstance(item, ast.Constant) and isinstance(item.value, str))
     documented = set(re.findall(r"\| `plugin ([a-z_]+)", doc))
     assert documented, "no commands found in the guide"
     for action in documented:
-        assert f'"{action}"' in handler, f"the guide documents '{action}', which is not routed"
+        assert action in routed, f"the guide documents '{action}', which is not routed"
+
+
+@pytest.mark.parametrize("action", ["deps", "reload"])
+async def test_documented_management_commands_reach_their_handlers(action):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from orion_core.dispatch_productivity import ProductivityDispatchMixin
+    from orion_core.data import ToolResult
+
+    expected = ToolResult("handled")
+    deps = AsyncMock(return_value=expected)
+    reload = AsyncMock(return_value=expected)
+    dispatcher = SimpleNamespace(plugins=SimpleNamespace(install_dependencies=deps), _reload_plugins=reload)
+    result = await ProductivityDispatchMixin.plugin_tool(dispatcher, {"action": action, "name": "example"})
+    assert result is expected
+    if action == "deps":
+        deps.assert_awaited_once_with("example")
+        reload.assert_not_awaited()
+    else:
+        reload.assert_awaited_once_with()
+        deps.assert_not_awaited()
 
 
 def test_the_documented_file_layout_matches_the_code(doc):

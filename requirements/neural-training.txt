@@ -1,0 +1,13 @@
+# ── O.R.I.O.N. requirements: local neural training (separate environment) ──
+# Never installed into ORION's own environment and never imported by the app:
+# PyTorch, Transformers, PEFT and TRL would add gigabytes and a second GPU stack.
+# Training runs in its own environment, under resource admission, and produces
+# adapter CANDIDATES that must pass evaluation before anything uses them
+# (see docs/ORION_NEURAL_ARCHITECTURE_GUIDE.md and orion_core/neural_planner.py).
+#
+#     python -m venv .neural-env
+#     .neural-env\Scripts\python.exe -m pip install -r requirements/neural-training.txt
+#
+# Install a CUDA-enabled PyTorch wheel for your driver FIRST (pytorch.org selector);
+# a CPU wheel installed by this file cannot use the GPU.
+-r ../docs/neural_reference/requirements.in

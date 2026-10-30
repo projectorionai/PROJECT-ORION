@@ -134,6 +134,35 @@ def test_no_presence_reader_is_survivable():
     bridge.observe(chunk(2.0))          # must not raise
 
 
+def test_an_identified_owner_is_not_described_as_a_different_person(monkeypatch):
+    from orion_core import voice_enrolment, voiceprint
+    from orion_core.voice_presence import Presence
+
+    turns = voice_enrolment.SpeakerTurns()
+    monkeypatch.setattr(voice_enrolment, "_TURNS", turns)
+    turns.record(voiceprint.Verdict(True, .9, "SyntheticOwner", confident=True, kind="owner"))
+    assert Presence(speaker="SyntheticOwner", identified=True).prompt_line() == ""
+    assert "not the usual user" in Presence(speaker="Other", identified=True).prompt_line()
+
+
+def test_cleaned_offline_audio_does_not_repeat_raw_identity_but_phone_audio_still_checks():
+    from types import SimpleNamespace
+    from orion_core.speech_offline import OfflineTranscriber
+
+    observed, judged = [], []
+    transcriber = OfflineTranscriber(defer=True)
+    transcriber._selected = True
+    transcriber.engine = "synthetic"
+    transcriber._run_engine = lambda _pcm: "words"
+    transcriber.presence = SimpleNamespace(observe_pcm=lambda *a: observed.append(a))
+    transcriber._owner_is_speaking = lambda *a: judged.append(a) or True
+    pcm = chunk(2)
+    assert transcriber.transcribe_pcm(pcm, identity_checked=True) == "words"
+    assert not observed and not judged
+    assert transcriber.transcribe_pcm(pcm) == "words"
+    assert observed == [(pcm, RATE)] and judged == [(pcm, RATE)]
+
+
 def test_a_scheduler_that_throws_never_reaches_the_capture_thread():
     """An exception here costs ORION his hearing, and a tone reading is not
     worth that."""
@@ -156,7 +185,7 @@ APP = (ROOT / "orion_core" / "app.py").read_text(encoding="utf-8")
 
 
 def test_the_capture_loop_assembles_the_utterance():
-    assert "presence.utterance.feed(chunk)" in AUDIO, (
+    assert "presence.utterance.feed(raw_chunk)" in AUDIO, (
         "the live path still has no complete utterance to read")
 
 
@@ -224,3 +253,342 @@ def test_app_hands_the_reader_to_the_worker():
 def test_the_offline_path_still_has_its_own():
     """This adds a second feeder; it must not have moved the first."""
     assert "offline_stt.presence = voice_presence" in APP
+
+
+def _room_recorder(tmp_path, **kwargs):
+    from orion_core.conversation_recorder import ConversationRecorder
+
+    settings = {"clock": lambda: 100.0, "transcribe": lambda *_: "Synthetic room words",
+                "identify": lambda *_: None}
+    settings.update(kwargs)
+    return ConversationRecorder(tmp_path / "recordings", **settings)
+
+
+def test_recording_tap_precedes_interaction_queue_drops_and_drain(tmp_path):
+    from queue import Queue
+    from orion_core.audio import AudioGateThread
+
+    service = _room_recorder(tmp_path)
+    assert service.start(consent=True).ok
+    gate = AudioGateThread.__new__(AudioGateThread)
+    gate._conversation_recorder = service
+    gate.raw_q = Queue(maxsize=1)
+    gate._enqueue_capture(b"\x00\x10" * 6400, 100.4)
+    gate._enqueue_capture(b"\x00\x10" * 6400, 100.8)
+    assert gate.raw_q.qsize() == 1
+    gate.drain()
+    result = service.stop()
+    assert result.receipt["audio_seconds"] == pytest.approx(.8)
+
+
+def test_room_recording_still_obeys_explicit_mute_pause_and_shutdown_check(tmp_path):
+    service = _room_recorder(tmp_path)
+    assert service.start(consent=True).ok
+    service.set_capture_check(lambda: False)
+    assert not service.feed(b"\x00\x10" * 6400, 100.4)
+    service.set_capture_check(lambda: True)
+    assert service.feed(b"\x00\x10" * 6400, 100.8)
+    result = service.stop()
+    assert result.receipt["audio_seconds"] == pytest.approx(.4)
+    assert not service.feed(chunk(.4), 101.2)
+
+
+@pytest.mark.parametrize("vosk,whisper,brain,provider,expected", [
+    (True, False, True, False, True),
+    (False, True, True, False, True),
+    (False, True, False, True, True),
+    (False, False, True, False, False),
+    (True, False, False, False, False),
+])
+def test_offline_voice_readiness_includes_deferred_cached_hearing_and_local_rules(
+        monkeypatch, vosk, whisper, brain, provider, expected):
+    from types import SimpleNamespace
+    from orion_core import live_worker, speech_offline
+
+    transcriber = SimpleNamespace(ready=False, cached_available=whisper)
+    monkeypatch.setattr(speech_offline, "shared", lambda: transcriber)
+    worker = SimpleNamespace(
+        mic=SimpleNamespace(_stream=object(), transcribe_utterance=lambda *_: ""),
+        microphone_enabled=True, recogniser=SimpleNamespace(available=vosk),
+        local_brain=object() if brain else None,
+        router=SimpleNamespace(has_text_fallback=lambda: provider))
+    assert live_worker.GenAILiveWorker._offline_voice_ready(worker) is expected
+
+
+@pytest.mark.parametrize("muted,closed", [(True, False), (False, True)])
+def test_offline_voice_readiness_requires_an_open_unmuted_microphone(monkeypatch, muted, closed):
+    from types import SimpleNamespace
+    from orion_core import live_worker, speech_offline
+
+    monkeypatch.setattr(speech_offline, "shared", lambda: pytest.fail("muted/closed mic probed STT"))
+    worker = SimpleNamespace(
+        mic=SimpleNamespace(_stream=None if closed else object(), transcribe_utterance=lambda *_: ""),
+        microphone_enabled=not muted, recogniser=SimpleNamespace(available=True),
+        local_brain=object(), router=SimpleNamespace(has_text_fallback=lambda: True))
+    assert not live_worker.GenAILiveWorker._offline_voice_ready(worker)
+
+
+@pytest.mark.parametrize("fault", ["log", "persist", "speak"])
+def test_completed_offline_action_is_not_retried_when_output_callback_fails(fault):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from orion_core.live_worker import GenAILiveWorker
+
+    handled = []
+
+    async def preflight(text):
+        handled.append(text)
+        return "A completed local action."
+
+    def callback(stage):
+        def complete(*_):
+            if stage == fault:
+                raise RuntimeError("synthetic post-action output failure")
+        return complete
+
+    worker = SimpleNamespace(
+        paused=False, stop_event=threading.Event(), _fallback_epoch=0,
+        bus=SimpleNamespace(log=SimpleNamespace(emit=callback("log"))),
+        router=SimpleNamespace(is_online=lambda: False, has_text_fallback=lambda: pytest.fail(
+            "an already completed local action reached provider retry")),
+        local_brain=SimpleNamespace(try_known_response=preflight),
+        _emit_state=lambda *_: None, _persist_episode=callback("persist"), _say=callback("speak"))
+    with pytest.raises(RuntimeError, match="post-action output failure"):
+        asyncio.run(GenAILiveWorker._run_text_fallback(worker, "Synthetic local action"))
+    assert handled == ["Synthetic local action"]
+
+
+def test_room_recording_discards_every_byte_captured_before_session_consent(tmp_path):
+    service = _room_recorder(tmp_path)
+    assert service.start(consent=True).ok
+    assert not service.feed(b"\x00\x10" * 6400, 99.9)
+    assert service.feed(b"\x00\x10" * 6400, 100.1)
+    result = service.stop()
+    assert result.receipt["audio_seconds"] == pytest.approx(.1, abs=1 / RATE)
+
+
+def test_room_recording_overflow_is_nonblocking_and_reported_durably(tmp_path):
+    import json
+    import threading
+
+    service = _room_recorder(tmp_path, queue_limit=1)
+    assert service.start(consent=True).ok
+    session = service._session
+    entered, release = threading.Event(), threading.Event()
+    write = session.wav.writeframes
+
+    def delayed(block):
+        entered.set()
+        assert release.wait(3), "synthetic writer was not released"
+        write(block)
+
+    session.wav.writeframes = delayed
+    try:
+        assert service.feed(b"\x00\x10" * 6400, 100.4)
+        assert entered.wait(3)
+        assert service.feed(b"\x00\x10" * 6400, 100.8)
+        assert not service.feed(b"\x00\x10" * 6400, 101.2)
+    finally:
+        release.set()
+        result = service.stop()
+    assert result.receipt["state"] == "partial"
+    assert result.receipt["dropped_blocks"] == 1
+    assert result.receipt["dropped_seconds"] == pytest.approx(.4)
+    saved = json.loads((session.path / "manifest.json").read_text(encoding="utf-8"))
+    assert saved["dropped_blocks"] == 1 and saved["frames"] == 12800
+
+
+def test_room_recording_slow_transcription_cannot_block_audio_writer_or_restart(tmp_path):
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+
+    def delayed(*_):
+        entered.set()
+        assert release.wait(3), "synthetic transcriber was not released"
+        return "delayed words"
+
+    service = _room_recorder(tmp_path, transcribe=delayed)
+    assert service.start(consent=True).ok
+    service.feed(b"\x00\x10" * 6400, 100.4)
+    # Enough silence ends the first segment while capture continues.
+    service.feed(b"\x00\x00" * 12000, 101.15)
+    try:
+        assert entered.wait(3)
+        result = service.stop(timeout=.1)
+        assert not service.active and result.receipt["state"] == "finalizing"
+        assert result.receipt["audio_seconds"] == pytest.approx(1.15)
+        assert not service.start(consent=True).ok
+    finally:
+        release.set()
+        service.close()
+    assert service.snapshot()["state"] == "stopped"
+
+
+def test_room_recording_duration_limit_stops_and_never_implicitly_restarts(tmp_path):
+    clock = [100.0]
+    service = _room_recorder(tmp_path, max_seconds=.5, clock=lambda: clock[0])
+    assert service.start(consent=True).ok
+    assert service.feed(b"\x00\x10" * 6400, 100.4)
+    clock[0] = 100.6
+    assert not service.active
+    assert not service.feed(b"\x00\x10" * 6400, 100.8)
+    result = service.stop()
+    assert result.receipt["stop_reason"] == "duration limit"
+    assert result.receipt["audio_seconds"] <= .5
+
+
+def test_record_only_mode_holds_room_transcripts_and_replies_but_allows_typed_turns(monkeypatch):
+    from types import SimpleNamespace
+    from orion_core import conversation_recorder, live_worker, voice_enrolment
+
+    service = SimpleNamespace(record_only=True)
+    monkeypatch.setattr(conversation_recorder, "recorder", lambda: service)
+    monkeypatch.setattr(voice_enrolment, "turns", lambda: SimpleNamespace(reply_allowed=lambda: True))
+    worker = live_worker.GenAILiveWorker.__new__(live_worker.GenAILiveWorker)
+    assert not worker._voice_reply_allowed()
+    # No other worker state is needed: overheard commands are held first.
+    assert worker._on_local_transcript("shutdown Orion") is None
+    worker._typed_live_turn = True
+    assert worker._voice_reply_allowed()
+    worker._typed_live_turn = False
+    service.record_only = False
+    assert worker._voice_reply_allowed()
+
+
+def test_record_only_stop_tool_keeps_captured_typed_origin_after_live_turn_finishes(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from orion_core import conversation_recorder, live_worker, speaker_gate
+    from orion_core.data import ToolResult
+
+    monkeypatch.setattr(conversation_recorder, "recorder", lambda: SimpleNamespace(record_only=True))
+    seen = []
+
+    async def dispatch(name, args):
+        seen.append((name, args, speaker_gate.VOICE_TURN.get()))
+        return ToolResult("stopped")
+
+    worker = live_worker.GenAILiveWorker.__new__(live_worker.GenAILiveWorker)
+    worker.dispatcher = SimpleNamespace(dispatch_chain=dispatch)
+    worker._typed_live_turn = False          # turn_complete already arrived
+    token = live_worker._LIVE_TOOL_ORIGIN.set({"typed": True})
+    try:
+        payload, _ = asyncio.run(worker._dispatch_live_tool("conversation_recording", {"action": "stop"}))
+    finally:
+        live_worker._LIVE_TOOL_ORIGIN.reset(token)
+    assert payload["ok"] and seen == [("conversation_recording", {"action": "stop"}, False)]
+    worker._typed_live_turn = True           # a later typed request cannot authorise old room audio
+    token = live_worker._LIVE_TOOL_ORIGIN.set({"typed": False})
+    try:
+        payload, _ = asyncio.run(worker._dispatch_live_tool("conversation_recording", {"action": "stop"}))
+    finally:
+        live_worker._LIVE_TOOL_ORIGIN.reset(token)
+    assert not payload["ok"] and len(seen) == 1
+
+
+@pytest.mark.parametrize("arrives_after_stop", [False, True])
+def test_room_audio_captured_before_stop_stays_local_when_raw_queue_is_consumed_later(tmp_path, arrives_after_stop):
+    import threading
+    from queue import Queue
+    from orion_core.audio import AudioGateThread
+
+    clock = [100.0]
+    service = _room_recorder(tmp_path, clock=lambda: clock[0])
+    assert service.start(consent=True).ok
+    gate = AudioGateThread.__new__(AudioGateThread)
+    gate._conversation_recorder = service
+    gate.raw_q = Queue()
+    gate.stop_event = threading.Event()
+    gate._check_input_silence = lambda: None
+    gate._clean_capture = lambda *_: pytest.fail("room block reached interaction processing after stop")
+    clock[0] = 100.5
+    if arrives_after_stop:
+        service.stop()
+    gate._enqueue_capture(b"\x00\x10" * 6400, 100.4)
+    if not arrives_after_stop:
+        service.stop()
+    assert not service.active
+    assert gate.raw_q.queue[0][2] is True
+    gate.raw_q.put_nowait(None)
+    gate.run()
+    assert gate.raw_q.empty()
+
+
+def test_capture_block_straddling_recording_stop_is_entirely_local(tmp_path):
+    clock = [100.0]
+    service = _room_recorder(tmp_path, clock=lambda: clock[0])
+    assert service.start(consent=True).ok
+    clock[0] = 100.5
+    service.stop()
+    assert service.record_only_at(100.6, duration=.2)
+    assert not service.record_only_at(100.8, duration=.2)
+
+
+def test_record_only_suppresses_speaker_context_notes_even_when_typed_reply_is_allowed(monkeypatch):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from orion_core import conversation_recorder, live_worker
+
+    monkeypatch.setattr(conversation_recorder, "recorder", lambda: SimpleNamespace(record_only=True))
+    worker = live_worker.GenAILiveWorker.__new__(live_worker.GenAILiveWorker)
+    worker._typed_live_turn = True
+    worker.stop_event = threading.Event()
+    # A suppressed note needs neither a session, speech renderer nor transport.
+    worker._on_listener_changed("Synthetic speaker context")
+    asyncio.run(worker._send_listener_note("Synthetic speaker context"))
+
+
+def test_app_recording_capture_predicate_obeys_mute_ptt_pause_standby_and_stop(tmp_path, monkeypatch):
+    import ast
+    import threading
+    from types import SimpleNamespace
+    from orion_core import push_to_talk
+
+    worker = SimpleNamespace(microphone_enabled=True, paused=False, standby_mode=False,
+                             _standby=False, stop_event=threading.Event(),
+                             wake_mode_enabled=True, wake_active_until=0.0)
+    ptt = [True]
+    monkeypatch.setattr(push_to_talk, "gate_allows_capture", lambda: ptt[0])
+    # Execute only the real composition predicate; never boot the app or a mic.
+    node = next(n for n in ast.walk(ast.parse(APP))
+                if isinstance(n, ast.FunctionDef) and n.name == "_recording_capture_allowed")
+    namespace = {"worker": worker, "__package__": "orion_core"}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<recording capture policy>", "exec"), namespace)
+    allowed = namespace["_recording_capture_allowed"]
+    service = _room_recorder(tmp_path)
+    service.set_capture_check(allowed)
+    assert service.start(consent=True).ok
+    try:
+        for field, blocked in [("microphone_enabled", False), ("paused", True),
+                               ("standby_mode", True), ("_standby", True)]:
+            previous = getattr(worker, field)
+            setattr(worker, field, blocked)
+            assert not allowed() and not service.feed(chunk(.4), 100.4)
+            setattr(worker, field, previous)
+        worker.stop_event.set()
+        assert not allowed() and not service.feed(chunk(.4), 100.4)
+        worker.stop_event.clear()
+        ptt[0] = False
+        assert not allowed() and not service.feed(chunk(.4), 100.4)
+        ptt[0] = True
+        # The ordinary wake gate may be asleep; explicit recording still works.
+        assert allowed() and service.feed(chunk(.4), 100.4)
+    finally:
+        result = service.stop()
+    assert result.receipt["audio_seconds"] == pytest.approx(.4)
+
+
+
+def test_a_quiet_room_is_not_a_dead_microphone():
+    """20-29 Oct 2026: 30 s of the owner simply not talking read as a dead
+    microphone - "are you still there?" and standby, 21 times."""
+    import array
+    from orion_core.audio import AudioGateThread
+    room = array.array("h", [20 if i % 2 else -20 for i in range(512)]).tobytes()   # about -64 dBFS
+    dither = array.array("h", [1 if i % 2 else -1 for i in range(512)]).tobytes()
+    assert AudioGateThread._peak(room) > AudioGateThread._SIGNAL_FLOOR
+    assert AudioGateThread._peak(b"\x00\x00" * 512) <= AudioGateThread._SIGNAL_FLOOR
+    assert AudioGateThread._peak(dither) <= AudioGateThread._SIGNAL_FLOOR

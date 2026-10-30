@@ -12,6 +12,11 @@ import asyncio
 import sys
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from orion_core import constants, path_policy as policy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -55,6 +60,22 @@ def test_device_commands_are_not_power_commands():
                    "shut down the download", "turn off notifications",
                    "restart the download"):
         assert classify_intent(phrase) is ActionIntent.UNKNOWN, phrase
+
+
+def test_the_owners_real_shutdown_requests_are_power_commands():
+    """13 of 14 real requests fell through (8 Oct 2026): "Orion" is
+    transcribed as "Ryan" three times in four, and the requests come wrapped
+    in framing and trailing sentences."""
+    for phrase in ("Ryan, shut down.", "shut down to please.",
+                   "So Ryan , um , I want you to just shut down for now, please.",
+                   "Okay , shut down for now. We're going to work tomorrow.",
+                   "O ri on , uh shut down for now, please.",
+                   "Ryan shut down again, I'm repairing you."):
+        assert classify_intent(phrase.lower()) is ActionIntent.AMBIGUOUS, phrase
+    for phrase in ("don't shut down", "why did you shut down?",
+                   "I don't want you to shut down", "are you going to shut down?",
+                   "when you shut down tonight, save my notes"):
+        assert classify_intent(phrase.lower()) is ActionIntent.UNKNOWN, phrase
 
 
 def test_app_and_soft_stops_are_not_destructive():
@@ -232,3 +253,224 @@ def test_dispatcher_shutdown_arms_but_does_not_execute():
     per.executed.clear()
     disp.confirm_system_action(token)
     assert per.executed == []
+
+
+def test_orions_name_is_matched_as_a_whole_word():
+    """"ryan" joined the wake words (how his name is transcribed); a substring
+    test would have let "Bryant" or "Ryanair" open the wake gate."""
+    from orion_core.constants import WAKE_RE
+    for heard in ("ryan, shut down", "orion open notepad", "oh ryan what time", "o'rion hi"):
+        assert WAKE_RE.search(heard), heard
+    for other in ("hello bryant", "ryanair flights", "the orionids tonight"):
+        assert not WAKE_RE.search(other), other
+
+# User-file locations and token-bound approval (13 October continuation).
+
+@pytest.fixture
+def places(tmp_path, monkeypatch):
+    home = tmp_path / "profiles" / "owner"
+    documents = home / "Documents"
+    base = documents / "ORION-source"
+    config = home / "AppData" / "ORION" / "config"
+    drive = tmp_path / "data-drive"
+    windows = tmp_path / "Windows"
+    for root in (documents, base, config, drive, windows):
+        root.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
+    monkeypatch.setattr(constants, "BASE_DIR", base)
+    monkeypatch.setattr(constants, "CONFIG_DIR", config)
+    monkeypatch.setattr(constants, "PACKAGE_DIR", base / "orion_core")
+    monkeypatch.setattr(constants, "LAUNCHER_PATH", base / "orion.py")
+    monkeypatch.setattr(policy, "user_roots", lambda: [("your Documents folder", documents)])
+    monkeypatch.setattr(policy, "data_drives", lambda: [drive])
+    monkeypatch.setattr(policy, "_system_places", lambda: [(policy._norm(windows), "inside Windows")])
+    return SimpleNamespace(home=home, documents=documents, base=base, config=config,
+                           drive=drive, windows=windows)
+
+
+def test_ordinary_user_files_and_output_files_are_writable(places):
+    for path, zone in ((places.documents / "business" / "notes.txt", policy.Zone.USER),
+                       (places.drive / "work" / "notes.txt", policy.Zone.USER),
+                       (places.base / "exports" / "notes.txt", policy.Zone.WORKSPACE)):
+        verdict = policy.classify(path)
+        assert verdict.writable and verdict.zone is zone
+
+
+def test_program_settings_system_and_other_profiles_remain_closed(places):
+    targets = (places.base / "orion_core" / "audio.py", places.base / "dist" / "ORION.exe",
+               places.config / "memory.db", places.windows / "system.ini",
+               places.home.parent / "another-owner" / "Documents" / "notes.txt",
+               places.base / "README.md")
+    for path in targets:
+        verdict = policy.classify(path)
+        assert not verdict.writable, path
+        assert "Nothing was changed" in verdict.refusal()
+        assert verdict.remedy
+
+
+def test_parent_cannot_delete_protected_orion_descendants(places):
+    verdict = policy.classify(places.documents)
+    assert not verdict.writable
+    assert "containing" in verdict.area
+    assert not policy.classify(places.base).writable
+
+
+def test_user_area_root_is_protected_even_without_orion_inside(places, monkeypatch):
+    pictures = places.home / "Pictures"
+    pictures.mkdir()
+    monkeypatch.setattr(policy, "user_roots", lambda: [("your Pictures folder", pictures)])
+    assert not policy.classify(pictures).writable
+    assert policy.classify(pictures / "holiday" / "photo.jpg").writable
+
+
+def test_escaping_junction_is_judged_by_its_destination(places, monkeypatch):
+    requested = places.documents / "looks-safe" / "system.ini"
+    actual = places.windows / "system.ini"
+    original = policy.resolve
+    monkeypatch.setattr(policy, "resolve", lambda path: actual if Path(path) == requested else original(path))
+    verdict = policy.classify(requested)
+    assert not verdict.writable and verdict.path == actual
+
+
+def test_failed_resolution_does_not_use_the_safe_looking_spelling(places, monkeypatch):
+    def failure(_path):
+        raise OSError("junction cannot be resolved")
+    monkeypatch.setattr(policy, "resolve", failure)
+    verdict = policy.classify(places.documents / "looks-safe.txt")
+    assert not verdict.writable and "resolve safely" in verdict.area
+
+
+def test_measurement_keeps_unreadable_subtrees_explicit(tmp_path, monkeypatch):
+    (tmp_path / "one.txt").write_bytes(b"abc")
+    def walk(root, onerror):
+        onerror(PermissionError("unreadable subtree"))
+        yield str(root), [], ["one.txt"]
+    monkeypatch.setattr(policy.os, "walk", walk)
+    measured = policy.measure(tmp_path)
+    assert (measured.files, measured.bytes) == (1, 3)
+    assert not measured.complete and "at least" in measured.describe()
+
+
+def test_measurement_excludes_junction_contents(tmp_path, monkeypatch):
+    child = tmp_path / "linked-system"
+    child.mkdir()
+    monkeypatch.setattr(Path, "is_junction", lambda path: path == child, raising=False)
+    measured = policy.measure(tmp_path)
+    assert measured.folders == 1 and not measured.complete
+
+
+@pytest.mark.parametrize("intent_name", ["FILE_DELETE", "FILE_WRITE"])
+def test_file_approval_dispatches_only_the_bound_payload_once(intent_name):
+    from orion_core.data import ToolResult
+    from orion_core.dispatch_desktop import DesktopDispatchMixin
+    from orion_core.system_guard import ActionIntent, SystemActionGuard
+    intent = getattr(ActionIntent, intent_name)
+    executed = []
+    class Dispatch(DesktopDispatchMixin):
+        def _run_confirmed_file_action(self, chosen, payload):
+            executed.append((chosen, payload))
+            return ToolResult("synthetic receipt")
+    dispatch = Dispatch()
+    dispatch.system_guard = SystemActionGuard(machine="TEST", logger=lambda *_: None)
+    dispatch.bus = SimpleNamespace(log=SimpleNamespace(emit=lambda *_: None))
+    dispatch.peripherals = None
+    payload = {"path": "synthetic-user-file", "action": "delete"}
+    decision = dispatch.system_guard.request_confirmation(intent, payload=payload)
+    payload["path"] = "different-file"
+    assert dispatch.confirm_system_action(decision.token).ok
+    assert executed == [(intent, {"path": "synthetic-user-file", "action": "delete"})]
+    assert not dispatch.confirm_system_action(decision.token).ok
+    assert len(executed) == 1
+
+
+def test_open_named_folder_uses_file_search_instead_of_the_application_catalogue():
+    import asyncio
+    from orion_core.data import ToolResult
+    from orion_core.dispatch_desktop import DesktopDispatchMixin
+    calls = []
+    class Dispatch(DesktopDispatchMixin):
+        async def find_files(self, args):
+            calls.append(args)
+            return ToolResult("Two matching folders; choose one.", ok=False)
+    dispatch = Dispatch()
+    dispatch.desktop = SimpleNamespace(open_app=lambda *_: pytest.fail("tried to launch a folder as an app"))
+    result = asyncio.run(dispatch.open_app({"app_name": "the research folder about solar energy"}))
+    assert not result.ok and "choose one" in result.text
+    assert calls == [{"query": "the research folder about solar energy", "type": "folder", "action": "open"}]
+
+
+def _project_dispatch(tmp_path):
+    from orion_core.dispatch_files import FilesDispatchMixin
+    class Dispatch(FilesDispatchMixin):
+        def _resolve_user_path(self, raw):
+            return Path(raw)
+        def _ensure_write_safe(self, path):
+            path = Path(path).resolve()
+            assert path.is_relative_to(tmp_path.resolve())
+            return policy.Verdict(policy.Zone.USER, path, "synthetic user area")
+    return Dispatch()
+
+
+def test_project_scaffold_cannot_overwrite_an_existing_user_project(tmp_path):
+    root = tmp_path / "existing"
+    root.mkdir()
+    original = root / "README.md"
+    original.write_bytes(b"the owner's existing project")
+    result = _project_dispatch(tmp_path)._create_python_project({"path": str(root), "name": "demo"})
+    assert not result.ok and "existing user folder" in result.text
+    assert original.read_bytes() == b"the owner's existing project"
+    assert list(root.iterdir()) == [original]
+
+
+def test_project_scaffold_can_create_a_new_user_project(tmp_path):
+    root = tmp_path / "new"
+    result = _project_dispatch(tmp_path)._create_python_project({"path": str(root), "name": "demo"})
+    assert result.ok
+    assert (root / "src" / "demo" / "main.py").is_file()
+    assert (root / "tests" / "test_demo.py").is_file()
+    assert (root / "README.md").is_file()
+
+
+def test_all_project_destinations_are_checked_before_any_write(tmp_path):
+    from orion_core.security import SecurityViolation
+    root = tmp_path / "new"
+    dispatch = _project_dispatch(tmp_path)
+    original_check = dispatch._ensure_write_safe
+    def checked(path):
+        if Path(path).name == "README.md":
+            raise SecurityViolation("synthetic protected child")
+        return original_check(path)
+    dispatch._ensure_write_safe = checked
+    with pytest.raises(SecurityViolation, match="protected child"):
+        dispatch._create_python_project({"path": str(root), "name": "demo"})
+    assert not root.exists(), "preflight changed the filesystem before a protected-child refusal"
+
+
+@pytest.mark.parametrize("configured_area", ["config", "source"])
+def test_resolved_private_root_cannot_be_written_via_its_user_area_target(
+        places, monkeypatch, configured_area):
+    """A configured junction and its direct destination have one policy."""
+    alias = places.home / "AppData" / f"linked-{configured_area}"
+    actual = places.documents / f"relocated-{configured_area}"
+    actual.mkdir()
+    if configured_area == "config":
+        monkeypatch.setattr(constants, "CONFIG_DIR", alias)
+        target = actual / "memory.db"
+    else:
+        monkeypatch.setattr(constants, "BASE_DIR", alias)
+        monkeypatch.setattr(constants, "PACKAGE_DIR", alias / "orion_core")
+        monkeypatch.setattr(constants, "LAUNCHER_PATH", alias / "orion.py")
+        target = actual / "orion_core" / "audio.py"
+    original_resolve = policy.resolve
+
+    def resolve_junction(path):
+        expanded = original_resolve(path)
+        if expanded == alias or expanded.is_relative_to(alias):
+            return actual / expanded.relative_to(alias)
+        return expanded
+
+    monkeypatch.setattr(policy, "resolve", resolve_junction)
+    via_alias = alias / target.relative_to(actual)
+    assert not policy.classify(via_alias).writable
+    assert not policy.classify(target).writable
+    assert policy.classify(actual.parent / "ordinary.txt").writable

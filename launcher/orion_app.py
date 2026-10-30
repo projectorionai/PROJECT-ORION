@@ -17,7 +17,7 @@ What that buys, which a .lnk shortcut did not:
   * a real process to put in startup;
   * a background app with no console, like any other .exe.
 
-It sits in the project root so it can find ``.venv\\Scripts\\pythonw.exe`` and
+It sits in the project root so it can find a checked Python environment and
 ``orion.py`` beside it. Built with build_exe.py.
 """
 
@@ -26,6 +26,10 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from orion_core.runtime_selection import bundle_is_current, choose_interpreter, launch_environment
 
 
 def _base_dir() -> Path:
@@ -41,13 +45,7 @@ def _base_dir() -> Path:
 
 def _interpreter(base: Path) -> str:
     """The windowless interpreter to run ORION with."""
-    for candidate in (
-        base / ".venv" / "Scripts" / "pythonw.exe",
-        base / ".venv" / "Scripts" / "python.exe",
-    ):
-        if candidate.exists():
-            return str(candidate)
-    return "pythonw"          # fall back to whatever is on PATH
+    return choose_interpreter(base)
 
 
 def _standalone(base: Path) -> Path | None:
@@ -61,7 +59,7 @@ def _standalone(base: Path) -> Path | None:
     and icon.
     """
     candidate = base / "dist" / "ORION" / "ORION.exe"
-    return candidate if candidate.is_file() else None
+    return candidate if bundle_is_current(base, candidate) else None
 
 
 def main() -> int:
@@ -90,8 +88,9 @@ def main() -> int:
              | getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         subprocess.Popen([_interpreter(base), str(script)],
-                         cwd=str(base), creationflags=flags, close_fds=True)
-    except OSError as exc:
+                         cwd=str(base), creationflags=flags, close_fds=True,
+                         env=launch_environment(base))
+    except (OSError, RuntimeError) as exc:
         try:
             import ctypes
             ctypes.windll.user32.MessageBoxW(

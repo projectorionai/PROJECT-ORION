@@ -2,7 +2,7 @@
 
 **Open Resolution Intelligence Overt Network**  
 **Written against:** 25.0.0, “Mark XXV — Presence & Focus”  
-**Current source:** 32.0.0, “Mark XXXII — Iris & Signal Lanes”. See the README
+**Current source:** 41.1.1, “Mark XXXXI — Ascendant”. See the README
 and `orion_core/__init__.py` for the current release identity; the inventory
 below remains a dated snapshot.
 **Scope:** the current source tree, including later additions whose individual

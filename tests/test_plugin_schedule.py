@@ -38,6 +38,26 @@ from orion_core.plugin_vault import PluginVault, VaultError  # noqa: E402
 SATURDAY = datetime(2026, 9, 19, 14, 30)
 
 
+def test_scheduled_plugin_inherits_background_policy_and_cannot_upgrade_foreground():
+    from orion_core.data import ToolResult
+    from orion_core.execution_policy import foreground_scope, is_background, require_foreground
+    from orion_core.plugin_runner import Entry
+    observations = []
+    class Dispatcher:
+        async def dispatch(self, name, args):
+            observations.append(is_background())
+            with pytest.raises(RuntimeError, match="cannot upgrade"):
+                with foreground_scope("plugin-requested-upgrade"):
+                    pass
+            result = require_foreground("desktop input")
+            assert result is not None
+            return result
+    scheduler = PluginScheduler(Dispatcher())
+    result = asyncio.run(scheduler._execute(Entry("fixture", None)))
+    assert observations == [True]
+    assert not result.ok and result.status == "failed"
+
+
 # ── cron ──────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("expression, expected", [
@@ -382,3 +402,61 @@ def test_the_status_report_says_what_is_scheduled(clock):
     assert row["plugin"] == "news"
     assert "cron(0 6 * * *)" in row["schedule"]
     assert row["muted"] is False
+
+
+@pytest.mark.parametrize("outcome", [
+    None,
+    "completion was claimed without a dispatcher outcome",
+    {"ok": True, "text": "unwrapped plugin result"},
+    object(),
+    _Result(ok="false"),
+    _Result(ok=1),
+    _Result(ok=None),
+    _Result(ok=True, text=object()),
+])
+def test_scheduled_dispatch_requires_an_explicit_boolean_outcome(clock, outcome):
+    scheduler = _scheduler(_Dispatcher(lambda _: outcome), clock)
+    entry = scheduler.add(PluginManifest.from_dict(
+        _manifest(name="honest", interval_seconds=30)))
+
+    run = asyncio.run(scheduler._execute(entry))
+
+    assert run.ok is False
+    assert run.as_dict()["status"] == "failed"
+    assert "invalid" in run.detail.lower() and "outcome" in run.detail.lower()
+    assert entry.failures == 1
+
+
+@pytest.mark.parametrize("ok,status,failures", [(True, "succeeded", 0), (False, "failed", 1)])
+def test_scheduled_boolean_outcome_keeps_its_actual_verdict(clock, ok, status, failures):
+    scheduler = _scheduler(_Dispatcher(lambda _: _Result(ok, "observed result")), clock)
+    entry = scheduler.add(PluginManifest.from_dict(
+        _manifest(name="honest", interval_seconds=30)))
+
+    run = asyncio.run(scheduler._execute(entry))
+
+    assert run.ok is ok
+    assert run.detail == "observed result"
+    assert run.as_dict()["status"] == status
+    assert run.as_dict()["ok"] is ok
+    assert entry.failures == failures
+
+
+async def test_scheduled_timeout_is_distinct_and_still_counts_as_a_failure(clock, monkeypatch):
+    import orion_core.plugin_runner as runner
+
+    class PendingDispatcher:
+        async def dispatch(self, *_):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "RUN_TIMEOUT_S", .01)
+    scheduler = _scheduler(PendingDispatcher(), clock)
+    entry = scheduler.add(PluginManifest.from_dict(
+        _manifest(name="pending", interval_seconds=30)))
+
+    run = await scheduler._execute(entry)
+
+    assert run.ok is False
+    assert run.as_dict()["status"] == "timed_out"
+    assert "unverified" in run.detail.lower()
+    assert entry.failures == 1

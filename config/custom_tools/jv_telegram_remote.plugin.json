@@ -1,0 +1,50 @@
+{
+  "name": "jv_telegram_remote",
+  "description": "Explicit Telegram polling for permitted private chats only. Incoming /tool JSON commands queue for local review; approve uses native dispatch and its safeguards. Never starts during discovery.",
+  "module": "jv_telegram_remote_tool.py",
+  "version": "33.0.0",
+  "tier": "confirm",
+  "permissions": [
+    "network",
+    "filesystem"
+  ],
+  "requires": [
+    "aiohttp"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "The action to perform.",
+        "enum": [
+          "status",
+          "start",
+          "stop",
+          "send",
+          "pending",
+          "approve",
+          "reject"
+        ]
+      },
+      "chat_id": {
+        "type": "string",
+        "description": "Permitted private chat id for send."
+      },
+      "message": {
+        "type": "string",
+        "description": "Final outgoing message text."
+      },
+      "id": {
+        "type": "string",
+        "description": "Exact queued request id for local approve or reject."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  },
+  "secrets": [
+    "TELEGRAM_BOT_TOKEN"
+  ]
+}

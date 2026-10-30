@@ -18,6 +18,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from orion_core.providers import (
@@ -84,6 +86,115 @@ def test_transient_faults_escalate_to_a_ceiling():
         # Jitter only shortens the wait (never past the ceiling).
         assert 0.8 * ceiling - 1.0 < remaining <= ceiling
         _expire(router, "p")
+
+
+@pytest.mark.parametrize("kind,status", [("openai_compatible", 503), ("gemma_native", 500)])
+def test_google_server_burst_recovers_before_opening_breaker(kind, status):
+    profile = _profile(kind=kind, base_url="https://generativelanguage.googleapis.com/v1beta")
+    router = _router(profile)
+    calls = []
+
+    async def call():
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError(f"HTTP {status}: briefly overloaded")
+        return "recovered"
+
+    assert asyncio.run(router._call_with_heal(profile, call)) == "recovered"
+    assert len(calls) == 2
+    assert router.breaker_state(profile) == "closed"
+    assert profile.name not in router._fault_strikes
+
+
+def test_google_retry_failure_opens_breaker_once_and_preserves_final_fault():
+    profile = _profile(base_url="https://generativelanguage.googleapis.com/v1beta/openai")
+    router = _router(profile)
+    calls = []
+
+    async def call():
+        calls.append(True)
+        raise RuntimeError(f"HTTP 503: failed attempt {len(calls)}")
+
+    with pytest.raises(RuntimeError, match="failed attempt 2"):
+        asyncio.run(router._call_with_heal(profile, call))
+    assert len(calls) == 2
+    assert router._fault_strikes[profile.name] == 1
+    assert router.breaker_state(profile) == "open"
+
+
+def test_google_overload_uses_configured_alternate_without_persisting_choice(monkeypatch):
+    profile = _profile(base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                       models=["model-a", "model-b"])
+    router = _router(profile)
+    models = []
+    persisted = []
+    monkeypatch.setattr(router, "_persist_model", lambda p, **_: persisted.append(p.name))
+
+    async def call():
+        models.append(router.active_model(profile))
+        if len(models) == 1:
+            raise RuntimeError("HTTP 503: primary is overloaded")
+        return "alternate answered"
+
+    assert asyncio.run(router._call_with_heal(profile, call)) == "alternate answered"
+    assert models == ["model-a", "model-b"]
+    assert profile.model == "model-a"
+    assert persisted == []
+
+
+@pytest.mark.parametrize("error,base,already_shown", [
+    ("HTTP 503: busy", "https://generativelanguage.googleapis.com/v1beta", True),
+    ("HTTP 429: rate limit", "https://generativelanguage.googleapis.com/v1beta", False),
+    ("HTTP 401: invalid key", "https://generativelanguage.googleapis.com/v1beta", False),
+    ("HTTP 503: busy", "https://generativelanguage.googleapis.com.example.com/v1", False),
+])
+def test_google_retry_does_not_replay_output_or_retry_auth_quota_and_other_hosts(
+        error, base, already_shown):
+    profile = _profile(base_url=base)
+    router = _router(profile)
+    calls = []
+
+    async def call():
+        calls.append(True)
+        raise RuntimeError(error)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(router._call_with_heal(profile, call, may_retry=lambda: not already_shown))
+    assert len(calls) == 1
+
+
+def test_google_retry_respects_whole_call_deadline():
+    from orion_core.providers import _CALL, _CallScope
+
+    profile = _profile(base_url="https://generativelanguage.googleapis.com/v1beta")
+    router = _router(profile)
+    calls = []
+
+    async def call():
+        calls.append(True)
+        raise RuntimeError("HTTP 503: busy")
+
+    async def flow():
+        token = _CALL.set(_CallScope("interactive", time.monotonic() + 0.1))
+        try:
+            with pytest.raises(RuntimeError, match="HTTP 503"):
+                await router._call_with_heal(profile, call)
+        finally:
+            _CALL.reset(token)
+
+    asyncio.run(flow())
+    assert len(calls) == 1
+
+
+def test_google_array_error_preserves_reason_and_retry_delay():
+    import json
+    from orion_core.provider_transport import _error_text
+
+    raw = json.dumps([{"error": {"code": 503, "message": "Model is overloaded",
+                     "details": [{"retryDelay": "12s"}]}}], indent=2)
+    result = _error_text(raw)
+    assert result.startswith("Model is overloaded")
+    assert ProviderRouter.RETRY_RE.search(result).group(1) == "12"
 
 
 def test_connection_refused_is_transient_and_escalates():
@@ -245,3 +356,53 @@ def test_routing_and_breaker_events_reach_the_dashboard_feed():
     router.mark_failure(profile, RuntimeError("HTTP 500: internal error"))
     breakers = [p for n, p in router.bus.events if n == "dashboard_event" and p[0] == "provider_breaker"]
     assert breakers[-1][1]["provider"] == "p" and breakers[-1][1]["state"] == "open"
+
+
+# ── background work waits out a short cooldown instead of failing ────────────
+
+def test_wait_for_text_returns_when_a_cooling_provider_comes_back():
+    router = _router(_profile("groq"))
+    router._cooldowns["groq"] = time.monotonic() + 0.3
+    started = time.monotonic()
+    assert asyncio.run(router.wait_for_text(5.0)) is True
+    assert 0.25 <= time.monotonic() - started < 2.0
+
+
+def test_wait_for_text_gives_up_at_its_bound():
+    router = _router(_profile("groq"))
+    router._cooldowns["groq"] = time.monotonic() + 60.0
+    started = time.monotonic()
+    assert asyncio.run(router.wait_for_text(0.3)) is False
+    assert time.monotonic() - started < 1.5
+
+
+def test_wait_for_text_does_not_wait_when_nothing_can_come_back():
+    router = _router(_profile("groq", api_key=""))
+    started = time.monotonic()
+    assert asyncio.run(router.wait_for_text(30.0)) is False
+    assert time.monotonic() - started < 0.5
+
+
+def test_the_alternate_that_answered_is_tried_first_next_session(monkeypatch):
+    """Mark XXXX.4: a 5xx primary cost every session its timeout first; the
+    alternate that answered now leads for a few hours (never the config)."""
+    from orion_core import providers as mod
+
+    profile = _profile(base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                       models=["model-a", "model-b"])
+    router = _router(profile)
+    monkeypatch.setattr(router, "_persist_model", lambda p, **_: None)
+    calls = []
+
+    async def call():
+        calls.append(router.active_model(profile))
+        if len(calls) == 1:
+            raise RuntimeError("HTTP 503: primary is overloaded")
+        return "ok"
+
+    asyncio.run(router._call_with_heal(profile, call))
+    assert _router(profile).active_model(profile) == "model-b"     # a new session
+    assert profile.model == "model-a"
+    monkeypatch.setattr(mod, "STICKY_MODEL_S", -1)
+    router._remember_model(profile)
+    assert _router(profile).active_model(profile) == "model-a"

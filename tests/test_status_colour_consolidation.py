@@ -65,6 +65,34 @@ def test_command_centre_health_table_uses_the_shared_colour_tokens(_app):
         assert colour == QColor(expected[status]), f"{status} row uses the wrong colour"
 
 
+def test_command_centre_scans_audio_devices_off_the_event_loop(_app, monkeypatch):
+    """Owner's 17 Oct log: query_devices() blocked the event loop 325 ms from
+    this page. The scan runs on a worker; the combos fill from its signal."""
+    import threading
+    import time
+    from orion_core import audio_devices
+    scanned_on: list[str] = []
+    devices = [{"name": "Desk mic", "max_input_channels": 1, "max_output_channels": 0},
+               {"name": "Monitor", "max_input_channels": 0, "max_output_channels": 2}]
+
+    def fake_devices():
+        scanned_on.append(threading.current_thread().name)
+        return devices
+    monkeypatch.setattr(audio_devices, "_devices", fake_devices)
+    monkeypatch.setattr(audio_devices, "resolve_effective", lambda kind: 0 if kind == "input" else 1)
+    window = CommandCentreWindow(OrionBus(), _StubTelemetry(), None, None, None, None, None)
+    window._timer.stop()
+    window._populate_audio_devices()
+    end = time.monotonic() + 5
+    while (window.input_combo.count() < 2 or window.output_combo.count() < 2
+           or len(scanned_on) < 2) and time.monotonic() < end:
+        _app.processEvents()
+        time.sleep(0.01)
+    assert scanned_on and threading.main_thread().name not in scanned_on
+    assert window.input_combo.currentText() == "[0] Desk mic"
+    assert window.output_combo.currentText() == "[1] Monitor"
+
+
 # ── diagnostics_centre.py ────────────────────────────────────────────────────
 
 def test_diagnostics_health_panel_uses_the_shared_colour_tokens(_app):

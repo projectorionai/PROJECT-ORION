@@ -129,7 +129,9 @@ def test_a_long_sentence_is_not_treated_as_a_command():
 
 def test_receive_loop_gates_interrupt_on_the_decision():
     import inspect
-    src = inspect.getsource(LiveWorker._receive_realtime)
+    wrapper = inspect.getsource(LiveWorker._receive_realtime)
+    assert "await self._receive_realtime_stream(in_buffer)" in wrapper
+    src = inspect.getsource(LiveWorker._receive_realtime_stream)
     assert "_honour_server_interruption()" in src
     # and the ignore branch exists
     assert "finishing the sentence" in src.lower()

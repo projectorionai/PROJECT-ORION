@@ -22,10 +22,11 @@ States
     INTERRUPTED  an explicit stop cut speech short; collapses to IDLE once the
                  sources confirm they have stopped.
 
-Two independent "sources" are tracked (``native`` PCM and ``tts``).  The
-machine is SPEAKING while either is active and returns to IDLE only when both
-have reported stopped — including the deterministic playback tail, which the
-playback thread owns, so the last syllable is never clipped by a state flip.
+Two independent sources are tracked (``native`` PCM and ``tts``). Native
+speech includes the unfinished Live producer and its output device: a short
+network gap cannot release the microphone during the same reply. SPEAKING
+ends when the producer has completed and the device tail has drained. Lost
+producers are released by the worker's bounded stall check.
 
 A third, read-only signal — ``user_speech_started``/``user_speech_stopped``,
 pushed by the AudioGateThread's own VAD the instant it hears the user — drives
@@ -98,6 +99,9 @@ class AudioStateMachine:
         self._telemetry = telemetry
         self._lock = RLock()
         self._native_active = False
+        # A Live reply remains one utterance during a temporary network gap.
+        # Device starvation alone must not reopen the microphone mid-answer.
+        self._native_stream_active = False
         self._tts_active = False
         self._listening_active = False
         self._processing = False
@@ -114,6 +118,12 @@ class AudioStateMachine:
 
     def native_stopped(self) -> None:
         self._set(native=False)
+
+    def native_stream_started(self) -> None:
+        self._set(native_stream=True)
+
+    def native_stream_finished(self) -> None:
+        self._set(native_stream=False)
 
     def tts_started(self) -> None:
         self._set(tts=True)
@@ -136,6 +146,7 @@ class AudioStateMachine:
         transition: tuple[SpeechState, bool] | None = None
         with self._lock:
             self._native_active = False
+            self._native_stream_active = False
             self._tts_active = False
             if self._state is not SpeechState.IDLE:
                 self._state = SpeechState.INTERRUPTED
@@ -174,13 +185,14 @@ class AudioStateMachine:
             if mode is SpeechState.STANDBY:
                 # Dormant means dormant: no source can be considered active.
                 self._native_active = False
+                self._native_stream_active = False
                 self._tts_active = False
                 self._listening_active = False
                 self._processing = False
             new_state = self._compute_locked()
             if new_state is not self._state:
                 self._state = new_state
-                transition = (new_state, self._native_active or self._tts_active)
+                transition = (new_state, self.is_active())
         try:
             self.bus.log.emit(
                 f"AUDIO-STATE: {self._name(mode)}"
@@ -237,7 +249,7 @@ class AudioStateMachine:
         """The state implied by the current flags.  Caller holds the lock."""
         if self._mode in _OVERRIDE_MODES:
             return self._mode
-        if self._native_active or self._tts_active:
+        if self.is_active():
             return SpeechState.SPEAKING
         if self._processing:
             return SpeechState.PROCESSING
@@ -248,6 +260,7 @@ class AudioStateMachine:
     def _set(
         self,
         native: bool | None = None,
+        native_stream: bool | None = None,
         tts: bool | None = None,
         listening: bool | None = None,
         processing: bool | None = None,
@@ -256,19 +269,20 @@ class AudioStateMachine:
         with self._lock:
             if native is not None:
                 self._native_active = native
+            if native_stream is not None:
+                self._native_stream_active = native_stream
             if tts is not None:
                 self._tts_active = tts
             if listening is not None:
                 self._listening_active = listening
             if processing is not None:
                 self._processing = processing
-            active = self._native_active or self._tts_active
+            active = self.is_active()
             new_state = self._compute_locked()
             if new_state is not self._state:
                 self._state = new_state
-                # `active` stays strictly "is ORION's own audio playing" —
-                # bus.speaking and the half-duplex mic gate both key off this
-                # exact boolean, so LISTENING must never flip it true.
+                # Both the output device and its unfinished producer reserve
+                # the voice channel. LISTENING never reserves it.
                 transition = (new_state, active)
         if transition is not None:
             self._announce(*transition)
@@ -294,20 +308,21 @@ class AudioStateMachine:
     # ── reads (atomic, lock-free-consistent) ──────────────────────────────────
 
     def is_active(self) -> bool:
-        return self._native_active or self._tts_active
+        return self._native_active or self._native_stream_active or self._tts_active
 
     @property
     def state(self) -> SpeechState:
         return self._state
 
     def active_streams(self) -> int:
-        return int(self._native_active) + int(self._tts_active)
+        return int(self._native_active or self._native_stream_active) + int(self._tts_active)
 
     def describe(self) -> dict[str, object]:
         return {
             "state": self._state.value,
             "mode": self._name(self._mode),
             "native_active": self._native_active,
+            "native_stream_active": self._native_stream_active,
             "tts_active": self._tts_active,
             "listening_active": self._listening_active,
             "processing": self._processing,
@@ -323,12 +338,12 @@ class AudioStateMachine:
         one place that can see all of them at once — used by the health model
         and asserted in tests.
         """
-        if self._mode is SpeechState.STANDBY and (self._native_active or self._tts_active):
+        if self._mode is SpeechState.STANDBY and self.is_active():
             return "STANDBY while a source is still producing audio"
         if self._mode is SpeechState.STANDBY and self._listening_active:
             return "STANDBY while the gate reports the user speaking"
-        if self._state is SpeechState.IDLE and (self._native_active or self._tts_active):
+        if self._state is SpeechState.IDLE and self.is_active():
             return "IDLE while a source is active"
-        if self._state is SpeechState.SPEAKING and not (self._native_active or self._tts_active):
+        if self._state is SpeechState.SPEAKING and not self.is_active():
             return "SPEAKING with no active source"
         return ""

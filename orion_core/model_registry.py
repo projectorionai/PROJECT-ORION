@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # Bump when entries change so an estimate can record which registry it used.
-REGISTRY_VERSION = "2026-07-15"
+REGISTRY_VERSION = "2026-09-29"
 
 
 @dataclass(frozen=True)
@@ -38,12 +38,11 @@ _REGISTRY: dict[str, ModelMetadata] = {
     "gpt-4o": ModelMetadata("gpt-4o", 128_000, 16_384, 2.50, 10.00),
     "gpt-4.1": ModelMetadata("gpt-4.1", 1_000_000, 32_768, 2.00, 8.00),
     "o3": ModelMetadata("o3", 200_000, 100_000, None, None),
-    # Anthropic (Claude)
-    "claude-sonnet": ModelMetadata("claude-sonnet", 200_000, 64_000, 3.00, 15.00),
-    "claude-opus": ModelMetadata("claude-opus", 200_000, 32_000, 15.00, 75.00),
-    "claude-haiku": ModelMetadata("claude-haiku", 200_000, 32_000, 0.80, 4.00),
-    "claude-3": ModelMetadata("claude-3", 200_000, 4_096, None, None),
     # Google Gemini
+    "gemini-3.8-flash": ModelMetadata("gemini-3.8-flash", 1_048_576, 65_536),
+    "gemini-3.6-flash": ModelMetadata("gemini-3.6-flash", 1_048_576, 65_536),
+    "gemini-3.5-flash-lite": ModelMetadata("gemini-3.5-flash-lite", 1_048_576, 65_536),
+    "gemini-3.1-flash-lite": ModelMetadata("gemini-3.1-flash-lite", 1_048_576, 65_536),
     "gemini-2.5": ModelMetadata("gemini-2.5", 1_048_576, 65_536, None, None),
     "gemini-2.0": ModelMetadata("gemini-2.0", 1_048_576, 8_192, None, None),
     "gemini-1.5-pro": ModelMetadata("gemini-1.5-pro", 2_097_152, 8_192, None, None),
@@ -73,7 +72,7 @@ def _lookup(model: str) -> ModelMetadata | None:
             best, best_len = meta, len(key)
     if best is not None:
         return best
-    # Also match when the family key is contained (e.g. "…-claude-sonnet-…").
+    # Also match when the family key is contained (e.g. "…-gpt-4o-…").
     for key, meta in _REGISTRY.items():
         if key in m and len(key) > best_len:
             best, best_len = meta, len(key)

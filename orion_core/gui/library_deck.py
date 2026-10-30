@@ -8,17 +8,17 @@ A single control surface over the ``IngestionEngine``:
     • an offline semantic search box that ranks stored chunks;
     • a stats strip (documents, chunks, unique chunks, embedding-cache hits).
 
-Ingestion runs on a background ``QThread`` worker so a large folder never
-freezes the UI; each finished file streams back into the table via a signal.
+Ingestion, searches and library reads use the bounded bulk executor so slow
+storage never freezes the UI; each imported file streams back via a signal.
 The view degrades to a clear message when no engine is wired in.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -35,32 +35,34 @@ from PyQt6.QtWidgets import (
 )
 
 from ..bus import OrionBus
+from ..executors import bulk_executor
 
 
-class _IngestWorker(QObject):
-    """Runs a file or folder ingest off the UI thread."""
+class _LibrarySignals(QObject):
+    file_done = pyqtSignal(dict)
+    completed = pyqtSignal(str, int, object, str)
 
-    file_done = pyqtSignal(dict)      # one IngestionResult.to_dict()
-    finished = pyqtSignal(str)        # human summary line
 
-    def __init__(self, engine: Any, target: str, is_folder: bool) -> None:
-        super().__init__()
-        self._engine = engine
-        self._target = target
-        self._is_folder = is_folder
+def _emit(signals: _LibrarySignals, name: str, *args: Any) -> None:
+    try:
+        getattr(signals, name).emit(*args)
+    except RuntimeError:
+        pass  # the view was destroyed while a storage call was finishing
 
-    def run(self) -> None:
-        try:
-            if self._is_folder:
-                batch = self._engine.ingest_folder(
-                    self._target, progress=lambda r: self.file_done.emit(r.to_dict()))
-                self.finished.emit(batch.summary())
-            else:
-                result = self._engine.ingest_file(self._target)
-                self.file_done.emit(result.to_dict())
-                self.finished.emit(f"{Path(self._target).name}: {result.status}")
-        except Exception as exc:      # never let a worker crash take the UI down
-            self.finished.emit(f"Ingestion error: {exc}")
+
+def _ingest(engine: Any, signals: _LibrarySignals, target: str, is_folder: bool) -> str:
+    def progress(result: Any) -> None:
+        _emit(signals, "file_done", result.to_dict())
+
+    if is_folder:
+        return engine.ingest_folder(target, progress=progress).summary()
+    result = engine.ingest_file(target)
+    progress(result)
+    return f"{Path(target).name}: {result.status}"
+
+
+def _library_snapshot(engine: Any) -> tuple:
+    return engine.library(limit=300), engine.stats()
 
 
 class LibraryDeckView(QWidget):
@@ -68,14 +70,20 @@ class LibraryDeckView(QWidget):
         super().__init__()
         self.bus = bus
         self.engine = engine
-        self._thread: Optional[QThread] = None
-        self._worker: Optional[_IngestWorker] = None
+        self._jobs: dict[str, Any] = {}
+        self._search_generation = 0
+        self._search_query = ""
+        self._refresh_pending = False
+        self._rows: dict[str, int] = {}
+        self._signals = _LibrarySignals(self)
+        self._signals.file_done.connect(self._on_file_done, Qt.ConnectionType.QueuedConnection)
+        self._signals.completed.connect(self._on_completed, Qt.ConnectionType.QueuedConnection)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
 
-        header = QLabel("FILE LIBRARY  ·  KNOWLEDGE INGESTION")
+        header = QLabel("Library")
         header.setObjectName("panelHeading")
         root.addWidget(header)
 
@@ -116,7 +124,7 @@ class LibraryDeckView(QWidget):
         import_file.clicked.connect(self._pick_file)
         row.addWidget(import_file)
 
-        import_folder = QPushButton("📁  Import Folder")
+        import_folder = QPushButton("Import Folder")
         import_folder.clicked.connect(self._pick_folder)
         row.addWidget(import_folder)
 
@@ -139,7 +147,7 @@ class LibraryDeckView(QWidget):
 
         row = QHBoxLayout()
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search ingested knowledge (offline, semantic)…")
+        self.search_box.setPlaceholderText("Search the library…")
         self.search_box.returnPressed.connect(self._run_search)
         row.addWidget(self.search_box, 1)
         go = QPushButton("Search")
@@ -155,77 +163,114 @@ class LibraryDeckView(QWidget):
     # ── actions ────────────────────────────────────────────────────────────────
 
     def _pick_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Import a file to ORION's knowledge")
+        path, _ = QFileDialog.getOpenFileName(self, "Import a File to ORION's Knowledge")
         if path:
             self._start(path, is_folder=False)
 
     def _pick_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Import a folder to ORION's knowledge")
+        path = QFileDialog.getExistingDirectory(self, "Import a Folder to ORION's Knowledge")
         if path:
             self._start(path, is_folder=True)
 
     def _start(self, target: str, is_folder: bool) -> None:
-        if self.engine is None or self._thread is not None:
+        if self.engine is None or "import" in self._jobs:
             return
         self._set_status(f"Ingesting {Path(target).name}…")
-        self._thread = QThread(self)
-        self._worker = _IngestWorker(self.engine, target, is_folder)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.file_done.connect(self._on_file_done)
-        self._worker.finished.connect(self._on_finished)
-        self._thread.start()
+        self._submit("import", 0, _ingest, self.engine, self._signals, target, is_folder)
+
+    def _submit(self, kind: str, generation: int, fn: Any, *args: Any, **kwargs: Any) -> None:
+        # The callback retains only signals, never the QWidget. Deleting a page
+        # disconnects its slots; a running storage call may finish safely.
+        signals = self._signals
+        try:
+            future = bulk_executor().submit(fn, *args, **kwargs)
+        except Exception as exc:
+            self._set_status(f"{kind.title()} error: {exc}")
+            return
+        self._jobs[kind] = future
+
+        def finished(done: Any) -> None:
+            try:
+                result, error = done.result(), ""
+            except Exception as exc:
+                result, error = None, f"{type(exc).__name__}: {exc}"
+            _emit(signals, "completed", kind, generation, result, error)
+
+        future.add_done_callback(finished)
 
     def _on_file_done(self, result: dict) -> None:
         if result.get("status") in {"indexed", "updated", "skipped"}:
             self._upsert_row(result)
 
-    def _on_finished(self, summary: str) -> None:
-        self._set_status(summary)
-        if self._thread is not None:
-            self._thread.quit()
-            self._thread.wait(2000)
-        self._thread = None
-        self._worker = None
-        self.refresh()
+    def _on_completed(self, kind: str, generation: int, result: Any, error: str) -> None:
+        self._jobs.pop(kind, None)
+        if kind == "search" and generation != self._search_generation:
+            if self._search_query:
+                self._begin_search()
+            return
+        if kind == "refresh" and self._refresh_pending:
+            self._refresh_pending = False
+            self.refresh()
+            return
+        if error:
+            self._set_status(f"{kind.title()} error: {error}")
+        elif kind == "import":
+            self._set_status(result)
+        elif kind == "search":
+            for hit in result:
+                name = Path(hit["path"]).name
+                self.results.addItem(f"[{hit['score']:.2f}] {name} — {hit['snippet']}")
+        elif kind == "refresh":
+            docs, stats = result
+            self.table.setUpdatesEnabled(False)
+            try:
+                self.table.setRowCount(0)
+                self._rows.clear()
+                for doc in docs:
+                    self._upsert_row(doc)
+            finally:
+                self.table.setUpdatesEnabled(True)
+            self.stats.setText(
+                f"{stats['documents']} documents · {stats['chunks']} chunks · "
+                f"{stats['unique_chunks']} unique · "
+                f"cache {stats['embed_hits']}/{stats['embed_hits'] + stats['embed_misses']} hits")
+        if kind == "import":
+            self.refresh()  # include files indexed before a partial failure too
 
     def _run_search(self) -> None:
         self.results.clear()
         if self.engine is None:
             return
         query = self.search_box.text().strip()
+        self._search_query = query
+        self._search_generation += 1
         if not query:
             return
-        for hit in self.engine.search(query, limit=8):
-            name = Path(hit["path"]).name
-            self.results.addItem(f"[{hit['score']:.2f}] {name} — {hit['snippet']}")
+        if "search" not in self._jobs:
+            self._begin_search()
+
+    def _begin_search(self) -> None:
+        self._submit("search", self._search_generation, self.engine.search,
+                     self._search_query, limit=8)
 
     # ── table + stats ──────────────────────────────────────────────────────────
 
     def refresh(self) -> None:
         if self.engine is None:
             return
-        docs = self.engine.library(limit=300)
-        self.table.setRowCount(0)
-        for doc in docs:
-            self._upsert_row(doc)
-        stats = self.engine.stats()
-        self.stats.setText(
-            f"{stats['documents']} documents · {stats['chunks']} chunks · "
-            f"{stats['unique_chunks']} unique · "
-            f"cache {stats['embed_hits']}/{stats['embed_hits'] + stats['embed_misses']} hits")
+        if "refresh" in self._jobs:
+            self._refresh_pending = True
+            return
+        self._submit("refresh", 0, _library_snapshot, self.engine)
 
     def _upsert_row(self, doc: dict) -> None:
         path = doc.get("path", "")
         name = Path(path).name if path else doc.get("doc_id", "?")
         # Replace an existing row for the same path, else append.
-        target_row = self.table.rowCount()
-        for r in range(self.table.rowCount()):
-            item = self.table.item(r, 0)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) == path:
-                target_row = r
-                break
-        else:
+        target_row = self._rows.get(path)
+        if target_row is None:
+            target_row = self.table.rowCount()
+            self._rows[path] = target_row
             self.table.insertRow(target_row)
 
         tags = ", ".join(doc.get("tags", [])[:5])

@@ -39,6 +39,7 @@ class _Log:
 class _Bus:
     def __init__(self) -> None:
         self.log = _Log()
+        self.thought = _Log()
 
 
 class _Housekeeper:
@@ -81,8 +82,11 @@ def test_a_large_one_is_folded_back_in(tmp_path):
     assert len(outcomes) == 1
     assert outcomes[0].ok and outcomes[0].name == "checkpoint-wal"
     assert housekeeper.calls == 1
-    assert bus.log.lines, "he acted silently"
-    assert "MB" in bus.log.lines[0]
+    assert bus.thought.lines, "the completed action needs a useful activity note"
+    assert not bus.log.lines, "routine maintenance must not clutter the terminal"
+    assert "MB" in bus.thought.lines[0]["text"]
+    assert bus.thought.lines[0]["origin"] == "observation"
+    assert bus.thought.lines[0]["evidence"] == ["Maintenance action: checkpoint-wal; completed"]
 
 
 def test_a_standing_condition_does_not_become_a_loop(tmp_path):

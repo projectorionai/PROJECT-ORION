@@ -34,6 +34,7 @@ reasons rather than unlucky ones:
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import os
@@ -47,19 +48,28 @@ from .constants import CONFIG_DIR
 from .data import ToolResult
 from .journal_io import tail_lines
 from .dependencies import DynamicPackageResolver
-from .dynamic_loader import ReflectiveModuleLoader
+from .dynamic_loader import ReflectiveModuleLoader, shadowed_builtin
 from .forge_artefacts import ForgeArtefacts, extract_artefacts, synthesise_test
 from .forge_diagnosis import (
     Diagnosis,
     FailureClass,
     RepairTarget,
     diagnose,
+    failing_artefact,
     parse_missing_module,
 )
-from .forge_autofix import autofix_contract
+from .forge_autofix import (
+    add_argument_coercion,
+    add_missing_imports,
+    autofix_contract,
+    check_test_policy,
+    reconcile_schema,
+)
+from .forge_fixtures import FIXTURE_GUIDE, requirement_identity, validate_plan
 from .forge_lessons import ForgeLessonStore
 from .providers import NoTextProviderError, ProviderError
 from .sandbox import SandboxVerificationHarness
+from .atomic_io import atomic_write_bytes
 from .utils import canonical_module_id, first_line, utc_stamp
 
 # How many CODE repair attempts a session may spend. Dependency installs and
@@ -102,6 +112,9 @@ class ForgeSession:
     # How the model's artefacts were recovered ("blocks", "json", "bare") —
     # a drift back to the fragile JSON path is visible rather than silent.
     transport: str = ""
+    review_candidate: str = ""
+    plan_contract: dict[str, Any] | None = None
+    examples_verified: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -116,7 +129,21 @@ class ForgeSession:
             "errors": self.errors,
             "diagnoses": self.diagnoses,
             "transport": self.transport,
+            "plan": copy.deepcopy(self.plan_contract),
+            "examples_verified": self.examples_verified,
+            "review_candidate": self.review_candidate,
         }
+
+
+def forge_tool_name(raw: str) -> str:
+    """A forged tool's name, safe as a file name ("<name>_tool.py"): lower
+    case, [a-z0-9_] only, at most 60 characters, and without a trailing
+    "_tool" - the file name adds that, and a name that already ended in it
+    became resource_optimizer_tool_tool.py (owner's plugin list, 26 Oct 2026)."""
+    name = re.sub(r"[^a-z0-9_]+", "_", str(raw or "").strip().lower()).strip("_")[:60]
+    while name.endswith("_tool") and len(name) > len("_tool"):
+        name = name[: -len("_tool")].rstrip("_")
+    return "" if name == "tool" else name
 
 
 def _custom_tools_dir() -> Path:
@@ -138,6 +165,7 @@ class ForgeOrchestrationManager:
         llm_fixer: Callable[[str, list[str]], str] | None = None,
         llm_repairer: Callable[..., Any] | None = None,
         lessons: ForgeLessonStore | None = None,
+        history: Any = None,
     ) -> None:
         """
         Initialise the Forge orchestration manager.
@@ -164,10 +192,14 @@ class ForgeOrchestrationManager:
         self.llm_fixer = llm_fixer
         self.llm_repairer = llm_repairer
         self.lessons = lessons
+        self.history = history
         self.max_attempts = _max_attempts()
         self.sandbox = SandboxVerificationHarness(bus)
         self.resolver = DynamicPackageResolver(bus)
         self.loader = ReflectiveModuleLoader(bus)
+        # The loader refuses, before import, a plugin that duplicates one of
+        # these built-in tools (read from the dispatcher once it is attached).
+        self.loader.native_names = self._native_tool_names
         self.sessions: dict[str, ForgeSession] = {}
         # Set at the composition root so a verified tool is registered into
         # the LIVE dispatcher immediately (no restart needed).
@@ -188,10 +220,139 @@ class ForgeOrchestrationManager:
     @staticmethod
     async def _call(fn: Callable[..., Any], *args: Any) -> Any:
         """Invoke a generator/fixer that may be sync or async."""
-        result = fn(*args)
+        result = fn(*args) if inspect.iscoroutinefunction(fn) else await asyncio.to_thread(fn, *args)
         if inspect.isawaitable(result):
             result = await result
         return result
+
+    def _improvement_engine(self):
+        """Reuse measured history without changing ordinary Forge policy."""
+        from .forge_improvement import ForgeImprovementEngine
+        engine = self.__dict__.get("_measured_improvement")
+        if engine is None:
+            engine = ForgeImprovementEngine(
+                self, CONFIG_DIR / "self_improvement" / "benchmarks", _custom_tools_dir())
+            self._measured_improvement = engine
+        return engine
+
+    async def improve_tool(self, tool_name: str, benchmark: str, *,
+                           generations: int = 3, budget_seconds: int = 300,
+                           tool_plan: str = "") -> ToolResult:
+        """Compare bounded generations with independent, fixed benchmarks."""
+        return await self._improvement_engine().run(
+            tool_name, benchmark, generations=generations,
+            budget_seconds=budget_seconds, plan=tool_plan)
+
+    async def improvement_status(self, run_id: str = "") -> ToolResult:
+        return await self._improvement_engine().status(run_id)
+
+    def improvement_benchmarks(self) -> ToolResult:
+        return self._improvement_engine().catalogue()
+
+    def _native_tool_names(self) -> set[str]:
+        """The dispatcher's built-in tool names (empty before it is attached)."""
+        table = getattr(self.dispatcher, "handler_table", None)
+        if not callable(table):
+            return set()
+        try:
+            return set(table())
+        except Exception:
+            return set()
+
+    def _triage(self, tool_name: str, tool_plan: str) -> ToolResult | None:
+        """A refusal when an existing tool already covers the request
+        (forge_triage: known routes, built-in tools, installed plugins), else
+        None. Pure text analysis over the live catalogue: no model call."""
+        from .forge_triage import catalogue_from_dispatcher, triage
+        try:
+            verdict = triage(tool_name, tool_plan, catalogue_from_dispatcher(self.dispatcher))
+        except Exception as exc:
+            self.bus.log.emit(f"[FORGE] Manager: triage skipped - {first_line(exc, 100)}")
+            return None
+        if not verdict.covered:
+            return None
+        self.bus.log.emit(f"[FORGE] Manager: not forging '{tool_name}' - {verdict.call()} "
+                          f"already covers it ({verdict.basis}).")
+        return ToolResult(verdict.message(tool_name), ok=False, receipt={
+            "operation": "forge", "state": "covered", "tool": tool_name,
+            "covered_by": verdict.tool, "triage": verdict.to_dict()})
+
+    @staticmethod
+    def _mechanical_fixes(session: ForgeSession,
+                          error_log: list[str] | None = None) -> list[str]:
+        """Free, deterministic repairs (forge_autofix), before the first
+        verification and after a failure: standard imports the module or the
+        test uses but never made (and any a NameError in *error_log* names),
+        get_tool_schema() reconciled with run(), and typed arguments
+        converted on entry. A pass whose result would not parse leaves its
+        input alone. Analysis trials keep their own fail-closed source rules
+        and are not touched. Returns what was fixed."""
+        if session.tool_name.startswith("trial_"):
+            return []
+        target = (failing_artefact("\n".join(str(line) for line in error_log), session.tool_name)
+                  if error_log else None)
+        module_log = error_log if target in (None, RepairTarget.MODULE) else None
+        test_log = error_log if target in (None, RepairTarget.TEST) else None
+        notes: list[str] = []
+        code = session.tool_code
+        for repair in (lambda text: add_missing_imports(text, module_log),
+                       lambda text: reconcile_schema(text, session.tool_name),
+                       add_argument_coercion):
+            try:
+                result = repair(code)
+            except Exception:
+                continue
+            if result.changed:
+                code = result.code
+                notes.extend(result.fixed)
+        test = session.test_code
+        if str(test or "").strip():
+            try:
+                fixed = add_missing_imports(test, test_log, test_of=session.tool_name)
+            except Exception:
+                fixed = None
+            if fixed is not None and fixed.changed:
+                test = fixed.code
+                notes.extend(f"test: {note}" for note in fixed.fixed)
+        session.tool_code, session.test_code = code, test
+        return notes
+
+    @staticmethod
+    def _test_policy_problems(session: ForgeSession) -> list[str]:
+        """Why the generated test may not run in the verifier (it would touch
+        the real disk, home folder or network, sleep, or wait on input)."""
+        if session.tool_name.startswith("trial_"):
+            return []
+        try:
+            return check_test_policy(session.test_code)
+        except Exception:
+            return []
+
+    async def _repair_refused_test(self, session: ForgeSession, attempt: int,
+                                   problems: list[str]) -> bool:
+        """Record why the test was refused before it ran, then send only the
+        TEST back for repair, told how to meet the policy with the staged
+        fixtures. Consumes the attempt; True when a repair was made."""
+        session.sandbox_attempts = attempt
+        log = [f"TEST POLICY: {problem}" for problem in problems]
+        session.errors.extend(log)
+        text = " ".join(problems)
+        diagnosis = Diagnosis(
+            FailureClass.NETWORK if "network" in text else
+            FailureClass.TIMEOUT if ("sleeps" in text or "input()" in text) else
+            FailureClass.FILESYSTEM,
+            RepairTarget.TEST,
+            detail=f"the test was refused before it ran: {problems[0]}",
+            directive=("Rewrite only the TEST so that it meets the verification policy; "
+                       "change nothing in the module.\n" + FIXTURE_GUIDE))
+        session.diagnoses.append(f"attempt {attempt}: test policy — {problems[0]}")
+        self.bus.log.emit(f"[FORGE] Manager: ✗ attempt {attempt} — the test was refused "
+                          f"before it ran: {problems[0]}")
+        if self.lessons is not None:
+            self.lessons.record_failure(session.tool_name, diagnosis, log)
+        if attempt >= self.max_attempts:
+            return False
+        return await self._apply_repair(session, diagnosis, log)
 
     async def _apply_repair(
         self,
@@ -214,6 +375,13 @@ class ForgeOrchestrationManager:
             f"REPAIR TARGET: {diagnosis.target.value}",
             f"DIRECTIVE: {diagnosis.directive}",
         ]
+        if session.tool_name.startswith("trial_"):
+            from .forge_trial_policy import generation_guidance
+            context.append(generation_guidance(session.tool_name))
+        elif diagnosis.repairs_test and FIXTURE_GUIDE not in diagnosis.directive:
+            # A rewritten test can lean on the staged fixtures instead of the
+            # real disk, network and clock.
+            context.append(FIXTURE_GUIDE)
 
         if self.llm_repairer is not None:
             self.bus.log.emit(
@@ -223,6 +391,7 @@ class ForgeOrchestrationManager:
                 self.llm_repairer, session.tool_code, session.test_code,
                 diagnosis, context)
             self._absorb_repair(session, result, diagnosis)
+            self._guard_session_source(session)
             return True
 
         if self.llm_fixer is not None:
@@ -233,9 +402,45 @@ class ForgeOrchestrationManager:
             fixed_code = await self._call(self.llm_fixer, session.tool_code, context)
             if str(fixed_code or "").strip():
                 session.tool_code = str(fixed_code)
+            self._guard_session_source(session)
             return True
 
         return False
+
+    @staticmethod
+    def _check_planned_dependencies(session: ForgeSession) -> None:
+        """A generator or repair cannot expand a frozen dependency contract."""
+        if session.plan_contract is None:
+            return
+        allowed = {requirement_identity(item) for item in session.plan_contract["dependencies"]}
+        for item in session.requirements:
+            if requirement_identity(item) not in allowed:
+                raise ValueError(f"Unplanned Forge dependency {item!r}; revise the plan before installing packages")
+
+    @staticmethod
+    def _planned_missing_requirement(session: ForgeSession, missing: str) -> str:
+        """Keep a planned pin when a missing import triggers free resolution."""
+        if session.plan_contract is None:
+            return missing
+        ForgeOrchestrationManager._check_planned_dependencies(session)
+        name, _constraint = requirement_identity(missing)
+        for requirement in session.plan_contract["dependencies"]:
+            if requirement_identity(requirement)[0] == name:
+                return requirement
+        raise ValueError(f"Unplanned Forge dependency {missing!r}; no package was installed")
+
+    @staticmethod
+    def _guard_session_source(session: ForgeSession) -> None:
+        """Apply the same admission gate at generation, repair and publication."""
+        from .security import SecuritySanitiser, SecurityViolation
+        ForgeOrchestrationManager._check_planned_dependencies(session)
+        trial = session.tool_name if session.tool_name.startswith("trial_") else None
+        if trial and session.requirements:
+            raise SecurityViolation("Analysis trials cannot declare or install dependencies")
+        SecuritySanitiser.guard_forged_source(
+            session.tool_code, f"forge.{session.tool_name}.module", trial_name=trial)
+        SecuritySanitiser.guard_forged_source(
+            session.test_code, f"forge.{session.tool_name}.test", trial_name=trial, trial_test=True)
 
     @staticmethod
     def _absorb_repair(
@@ -276,6 +481,7 @@ class ForgeOrchestrationManager:
         code_generator: Callable[[str, str], tuple[str, str, list[str]]] | None = None,
         *,
         autonomous: bool = False,
+        force: bool = False,
     ) -> ToolResult:
         """
         Execute the complete tool-forging pipeline.
@@ -284,6 +490,12 @@ class ForgeOrchestrationManager:
         self-improvement heartbeat). Only those announce a failure aloud: a
         forge the user asked for already reports back through its tool result,
         which the voice model reads out, so announcing it too said it twice.
+
+        Before any model call the request is triaged (forge_triage): a need an
+        existing tool already meets is answered with that tool, not a second
+        copy of it. ``force`` skips that triage for a caller that has shown
+        the existing tool falls short; a name that duplicates a built-in tool
+        is refused either way, because the loader would never activate it.
 
         Orchestrates: Plan → Code Gen → Sandbox (with self-heal loop) →
                      Dependency Check → Live Activation.
@@ -306,7 +518,7 @@ class ForgeOrchestrationManager:
         # like "../../x" wrote outside custom_tools; the heartbeat path already
         # cleaned its names, the forge tool did not.
         raw_name = str(tool_name or "")
-        tool_name = re.sub(r"[^a-z0-9_]+", "_", raw_name.strip().lower()).strip("_")[:60]
+        tool_name = forge_tool_name(raw_name)
         if not tool_name:
             return ToolResult(f"'{raw_name}' is not a usable tool name.", ok=False)
         native = set()
@@ -322,13 +534,33 @@ class ForgeOrchestrationManager:
             return ToolResult(
                 f"'{tool_name}' is already one of ORION's built-in tools; "
                 "choose a distinct name for the new capability.", ok=False)
+        twin = shadowed_builtin(tool_name, native)
+        if twin:
+            return ToolResult(
+                f"'{tool_name}' would duplicate ORION's built-in tool '{twin}', and a "
+                f"duplicate is never activated. Use {twin}, or name the new tool for "
+                "what it adds.", ok=False,
+                receipt={"operation": "forge", "state": "covered", "tool": tool_name,
+                         "covered_by": twin})
+        if not force:
+            covered = self._triage(tool_name, tool_plan)
+            if covered is not None:
+                return covered
         locks = self.__dict__.setdefault("_name_locks", {})
         lock = locks.setdefault(tool_name, asyncio.Lock())
         if lock.locked():
             return ToolResult(f"'{tool_name}' is already being forged.", ok=False)
         async with lock:
-            return await self._forge_tool_locked(tool_name, tool_plan, gen,
-                                                 autonomous=autonomous)
+            try:
+                return await self._forge_tool_locked(tool_name, tool_plan, gen,
+                                                     autonomous=autonomous)
+            finally:
+                locks.pop(tool_name, None)
+                # Source/test text in old sessions can otherwise grow forever.
+                finished = [key for key, value in self.sessions.items()
+                            if value.tool_name not in locks]
+                for key in finished[:-100]:
+                    self.sessions.pop(key, None)
 
     async def _forge_tool_locked(self, tool_name: str, tool_plan: str,
                                  gen: Callable[[str, str], tuple[str, str, list[str]]],
@@ -344,26 +576,48 @@ class ForgeOrchestrationManager:
         )
 
         try:
+            from .forge_isolation import customer_verification_mode, save_review_candidate
+            customer_mode = customer_verification_mode()
+            if customer_mode and os.getenv("ORION_FORGE_SANDBOX", "process").strip().lower() != "container":
+                raise ValueError("Customer Forge requires ORION_FORGE_SANDBOX=container; no source will run on the host")
             # Phase 1: Plan
             self.bus.log.emit(f"[FORGE] Manager: Phase 1 — Planning '{tool_name}'")
+            generation_brief = tool_plan
+            brain = getattr(gen, "__self__", None)
+            # The real brain plans before it writes code. Injected legacy
+            # generators retain their two-argument contract; they can opt into
+            # fixed example acceptance through ForgeArtefacts.plan.
+            if (not tool_name.startswith("trial_") and isinstance(brain, LlmForgeBrain)
+                    and getattr(gen, "__name__", "") == "generate"):
+                session.plan_contract = validate_plan(await brain.plan(tool_name, tool_plan))
+                generation_brief = (tool_plan + "\n\nFIXED PLAN CONTRACT (implement exactly; "
+                                    "do not change its examples or declared inputs):\n"
+                                    + json.dumps(session.plan_contract, ensure_ascii=False))
             session.plan_phase_ok = True
 
             # Phase 2: Code Generation
             self.bus.log.emit(f"[FORGE] Manager: Phase 2 — Generating code")
-            generated = await self._call(gen, tool_name, tool_plan)
+            generated = await self._call(gen, tool_name, generation_brief)
             if isinstance(generated, ForgeArtefacts):
                 session.tool_code = generated.tool_code
                 session.test_code = generated.test_code
                 session.requirements = list(generated.requirements)
                 session.transport = generated.transport
+                if generated.plan is not None:
+                    supplied = validate_plan(generated.plan)
+                    if session.plan_contract is not None and supplied != session.plan_contract:
+                        raise ValueError("Generation changed the fixed Forge plan")
+                    session.plan_contract = supplied
             else:
                 tool_code, test_code, requirements = generated
                 session.tool_code = tool_code
                 session.test_code = test_code
                 session.requirements = list(requirements or [])
-            # A missing harness must never abort the forge — verify what we can.
+            # Ordinary tools retain the fallback harness. Analysis trials need
+            # explicit acceptance tests, not an import-only smoke test.
             if not str(session.test_code or "").strip():
-                session.test_code = synthesise_test(tool_name)
+                if not tool_name.startswith("trial_"):
+                    session.test_code = synthesise_test(tool_name)
             session.code_generation_ok = True
 
             # Security guard (Mark X.13): forged code must never reach into
@@ -373,9 +627,18 @@ class ForgeOrchestrationManager:
             # a violation raises and is caught by the except block below
             # like any other forge failure (recorded as an incident, fed to
             # diagnostics).
-            from .security import SecuritySanitiser
-            SecuritySanitiser.guard_forged_source(session.tool_code, f"forge.{tool_name}.module")
-            SecuritySanitiser.guard_forged_source(session.test_code, f"forge.{tool_name}.test")
+            self._guard_session_source(session)
+            if customer_mode and session.requirements:
+                raise ValueError("Customer Forge cannot install generated dependencies; use the reviewed verifier image")
+            # What generated code most often gets wrong mechanically (a
+            # missing import, run() and the schema disagreeing, numbers that
+            # arrive as floats) is fixed before the first verification, free.
+            prepared = self._mechanical_fixes(session)
+            if prepared:
+                self._guard_session_source(session)
+                session.diagnoses.append("before verification: autofix — " + "; ".join(prepared))
+                self.bus.log.emit("[FORGE] Manager: ✓ prepared locally (no model call) — "
+                                  + "; ".join(prepared))
 
             # Phase 3: Verification with diagnosis-driven repair.
             #
@@ -386,20 +649,48 @@ class ForgeOrchestrationManager:
             self.bus.log.emit(f"[FORGE] Manager: Phase 3 — Verification")
             dependency_fixes: set[str] = set()
             attempt = 0
+            verification_runs = 0
+            # Free mechanical repairs must still have a finite total budget.
+            max_verification_runs = self.max_attempts + MAX_DEPENDENCY_REPAIRS + 5
             last_error_log: list[str] = []
-            while attempt < self.max_attempts:
+            # (module, test) pairs already run: a free repair never re-runs one.
+            verified: set[tuple[str, str]] = set()
+            while attempt < self.max_attempts and verification_runs < max_verification_runs:
                 attempt += 1
+                verification_runs += 1
+                self._guard_session_source(session)
+                policy = self._test_policy_problems(session)
+                if policy:
+                    # A test that would touch the owner's real disk, home folder
+                    # or network, sleep, or wait on input never runs.
+                    if not await self._repair_refused_test(session, attempt, policy):
+                        break
+                    continue
                 self.bus.log.emit(
                     f"[FORGE] Manager: verification attempt {attempt}/{self.max_attempts} "
                     f"for '{tool_name}'"
                 )
+                verified.add((session.tool_code, session.test_code))
                 outcome = await self.sandbox.verify_tool(
                     session.tool_code,
                     session.test_code,
                     tool_name,
+                    **({"plan": copy.deepcopy(session.plan_contract)}
+                       if session.plan_contract is not None else {}),
                 )
+                if (outcome.passed and session.plan_contract is not None
+                        and (getattr(outcome, "examples_verified", False) is not True
+                             or getattr(outcome, "plan", None) != session.plan_contract)):
+                    raise ValueError("Verification did not execute the three planned examples; candidate not accepted")
+                if self.history is not None:
+                    await asyncio.to_thread(
+                        self.history.record, module=f"custom_tools/{tool_name}_tool.py",
+                        before=None, after=session.tool_code, reasoning=tool_plan,
+                        status="verified" if outcome.passed else "failed",
+                        verification={"attempt": verification_runs, **outcome.to_dict()})
 
                 if outcome.passed:
+                    session.examples_verified = getattr(outcome, "examples_verified", False) is True
                     session.sandbox_ok = True
                     session.sandbox_attempts = attempt
                     self.bus.log.emit(
@@ -423,6 +714,14 @@ class ForgeOrchestrationManager:
                     timed_out=bool(getattr(outcome, "timed_out", False)),
                     already_installed=dependency_fixes,
                 )
+                if (getattr(outcome, "stage", "") == "examples"
+                        and diagnosis.target not in {RepairTarget.DEPENDENCY, RepairTarget.NONE}):
+                    # The planner's answers are an independent acceptance gate,
+                    # so changing the model's own test cannot resolve a failure.
+                    diagnosis.target = RepairTarget.MODULE
+                    diagnosis.directive += ("\nRepair the module against this fixed plan; "
+                                            "do not weaken or rewrite the examples:\n"
+                                            + json.dumps(session.plan_contract, ensure_ascii=False))
                 session.diagnoses.append(f"attempt {attempt}: {diagnosis.summary()}")
                 self.bus.log.emit(
                     f"[FORGE] Manager: ✗ attempt {attempt} — {diagnosis.summary()}")
@@ -451,6 +750,7 @@ class ForgeOrchestrationManager:
                         error_log)
                     if autofix.changed:
                         session.tool_code = autofix.code
+                        self._guard_session_source(session)
                         session.diagnoses.append(
                             f"attempt {attempt}: autofix — {autofix.summary()}")
                         self.bus.log.emit(
@@ -461,6 +761,21 @@ class ForgeOrchestrationManager:
                             # immediately without consuming a code attempt.
                             attempt -= 1
                             continue
+
+                # The other free repairs: an import the traceback or the source
+                # shows missing, run() and the schema reconciled, typed
+                # arguments converted. Never for a package to install or a
+                # verifier that could not run, and never a pair already run.
+                if diagnosis.target not in (RepairTarget.DEPENDENCY, RepairTarget.NONE):
+                    fixed = self._mechanical_fixes(session, error_log)
+                    if fixed and (session.tool_code, session.test_code) not in verified:
+                        self._guard_session_source(session)
+                        session.diagnoses.append(
+                            f"attempt {attempt}: autofix — " + "; ".join(fixed))
+                        self.bus.log.emit("[FORGE] Manager: ✓ repaired locally (no model "
+                                          "call) — " + "; ".join(fixed))
+                        attempt -= 1
+                        continue
 
                 # Environmental repair: install the package and re-verify for
                 # free.  The tool's OWN name is never routed here — the
@@ -473,18 +788,33 @@ class ForgeOrchestrationManager:
                         and diagnosis.missing_module
                         and len(dependency_fixes) < MAX_DEPENDENCY_REPAIRS):
                     missing = diagnosis.missing_module
+                    if tool_name.startswith("trial_"):
+                        from .security import SecurityViolation
+                        raise SecurityViolation(
+                            "Analysis trials cannot install a missing dependency")
+                    if customer_mode or customer_verification_mode():
+                        raise ValueError("Customer Forge cannot install generated dependencies on the host")
+                    requirement = self._planned_missing_requirement(session, missing)
                     dependency_fixes.add(missing)
                     self.bus.log.emit(
                         f"[FORGE] Manager: missing module '{missing}' — installing "
                         "and re-verifying (no code attempt consumed)"
                     )
-                    dep = await self.resolver.resolve_and_install([missing])
+                    dep = await self.resolver.resolve_and_install([requirement])
                     if dep.succeeded:
-                        if missing not in session.requirements:
-                            session.requirements.append(missing)
+                        if requirement not in session.requirements:
+                            session.requirements.append(requirement)
                         attempt -= 1          # dependency repair, not a code repair
                         continue
 
+                if diagnosis.target is RepairTarget.NONE:
+                    # Nothing a code change can fix (the verifier itself could
+                    # not run). Stop now and say why, instead of paying for
+                    # repairs of code that was never executed.
+                    self.bus.log.emit(
+                        f"[FORGE] Manager: ✗ cannot verify on this machine - "
+                        f"{diagnosis.detail}. Stopping without repairs.")
+                    break
                 if attempt >= self.max_attempts:
                     break
                 if not await self._apply_repair(session, diagnosis, error_log):
@@ -498,8 +828,26 @@ class ForgeOrchestrationManager:
                     f"Verification failed after {session.sandbox_attempts} attempt(s) — {trail}")
                 raise RuntimeError(f"Verification failed. {trail}")
 
+            # Verification inside a container is not permission to import that
+            # source into ORION. Customer mode produces an inert review receipt,
+            # and never reaches dependency installation or live publication.
+            if customer_mode or customer_verification_mode():
+                if (getattr(outcome, "isolation", "") != "container"
+                        or getattr(outcome, "typecheck", "") != "passed"):
+                    raise ValueError("Customer candidate needs container verification and a passed type check")
+                candidate = await asyncio.to_thread(save_review_candidate,
+                    _custom_tools_dir().parent / "forge_candidates", tool_name,
+                    session.tool_code, session.test_code, outcome.to_dict())
+                session.review_candidate = str(candidate)
+                return ToolResult(
+                    f"'{tool_name}' passed container verification and is saved for review at {candidate}. "
+                    "No dependencies were installed on the host and the tool is not live.",
+                    evidence=[{"candidate": str(candidate), "verified": True,
+                               "activated": False, "isolation": "container"}])
+
             # Phase 4: Dependency Check
             self.bus.log.emit(f"[FORGE] Manager: Phase 4 — Dependency resolution")
+            self._guard_session_source(session)
             dep_outcome = await self.resolver.resolve_and_install(session.requirements)
             if dep_outcome.succeeded:
                 session.dependencies_ok = True
@@ -513,7 +861,7 @@ class ForgeOrchestrationManager:
                     f"[FORGE] Manager: ⚠ Dependency issues: "
                     f"{dep_outcome.error_log[:1]}"
                 )
-                # Continue anyway; some dependencies may already be present
+                raise RuntimeError("Declared dependencies could not be resolved")
 
             # Phase 5: Live Activation
             self.bus.log.emit(f"[FORGE] Manager: Phase 5 — Live activation")
@@ -524,22 +872,7 @@ class ForgeOrchestrationManager:
             # Never persist a placeholder or unparseable body — a stub 'code'
             # once reached disk and crashed the loader on every boot.
             self._assert_valid_tool_source(session.tool_code, tool_name)
-            await asyncio.to_thread(
-                lambda: tool_file.write_text(session.tool_code, encoding="utf-8")
-            )
-
-            load_outcome = await self.loader.load_and_register(tool_file)
-            if not load_outcome.succeeded:
-                session.errors.extend(load_outcome.error_log)
-                raise RuntimeError(
-                    f"Failed to load module: {load_outcome.error_log}"
-                )
-            # Register into the LIVE dispatcher so the tool is callable now.
-            if self.dispatcher is not None:
-                activation = await self.loader.activate_tool(load_outcome, self.dispatcher)
-                if not activation.ok:
-                    session.errors.append(activation.text)
-                    raise RuntimeError(f"Dispatcher activation failed: {activation.text}")
+            await self._activate_verified(session, tool_file)
 
             session.activation_ok = True
             self.bus.log.emit(
@@ -552,7 +885,8 @@ class ForgeOrchestrationManager:
                 f"✓ Successfully forged tool '{tool_name}'.\n"
                 f"• Plan: ✓\n"
                 f"• Code Gen: ✓\n"
-                f"• Contract + test: ✓ (attempt {attempts}/{self.max_attempts})\n"
+                f"• Contract + {'3 examples + ' if session.examples_verified else ''}test: ✓ "
+                f"(attempt {attempts}/{self.max_attempts})\n"
                 f"• Dependencies: ✓\n"
                 f"• Activation: ✓\n"
             )
@@ -569,6 +903,15 @@ class ForgeOrchestrationManager:
                 f"[FORGE] Manager: ✗ forge session '{session_id}' failed: {e}"
             )
             session.errors.append(f"{type(e).__name__}: {str(e)}")
+            if self.history is not None:
+                try:
+                    await asyncio.to_thread(
+                        self.history.record, module=f"custom_tools/{tool_name}_tool.py",
+                        before=None, after=session.tool_code or None, reasoning=tool_plan,
+                        status="failed", verification={"stage": "orchestration",
+                            "error": f"{type(e).__name__}: {str(e)[:2000]}"})
+                except Exception as history_error:
+                    self.bus.log.emit(f"[FORGE] Change evidence could not be persisted: {type(history_error).__name__}")
             retry_scheduled = False
             if isinstance(e, ProviderError):
                 # This session never really got a fair shot — every remaining
@@ -633,6 +976,214 @@ class ForgeOrchestrationManager:
                 "Retry: none scheduled — no further attempt is currently planned."
             )
             return ToolResult("\n".join(lines), ok=False)
+
+    async def _activate_verified(self, session: ForgeSession, tool_file: Path) -> None:
+        """Restore the stable file and registry if publication fails or is cancelled.
+
+        This is a tool-generation swap, not importlib.reload of live core code.
+        Existing calls keep their old callable and complete normally.
+        """
+        from .forge_isolation import customer_verification_mode
+        if customer_verification_mode():
+            raise ValueError("Customer Forge does not import or activate generated source on the host")
+        self._guard_session_source(session)
+        import sys
+        cancelled = asyncio.Event()
+        candidate = session.tool_code.encode("utf-8")
+
+        async def transaction() -> None:
+            before = await asyncio.to_thread(
+                lambda: tool_file.read_bytes() if tool_file.exists() else None)
+            module_name = tool_file.stem
+            old_module = sys.modules.get(module_name)
+            modules = getattr(self.loader, "loaded_modules", {})
+            old_loaded = modules.get(module_name)
+            dispatcher = self.dispatcher
+            missing = object()
+            previous_handler = missing
+            previous_schemas: list[Any] = []
+            previous_values: list[Any] = []
+            attempted_handler = missing
+            attempted_module = missing
+            attempted_loaded = missing
+            published_schemas: list[Any] | None = None
+            published_values: list[Any] | None = None
+            tool_name = session.tool_name
+            if dispatcher is not None:
+                previous_handler = getattr(dispatcher, "_tool_handlers", {}).get(tool_name, missing)
+                previous_schemas = [d for d in getattr(dispatcher, "TOOL_DECLARATIONS", [])
+                                    if d.get("name") == tool_name]
+                previous_values = copy.deepcopy(previous_schemas)
+            touched_registry = False
+            published = False
+            receipt: Path | None = None
+
+            def owns_generation() -> bool:
+                # A matching callable alone is insufficient: another publisher
+                # may have changed its schema or re-imported the same bytes.
+                if dispatcher is not None:
+                    current = getattr(dispatcher, "_tool_handlers", {}).get(tool_name, missing)
+                    schemas = [d for d in getattr(dispatcher, "TOOL_DECLARATIONS", [])
+                               if d.get("name") == tool_name]
+                    if touched_registry and current is attempted_handler and published_schemas is not None:
+                        expected, values = published_schemas, published_values
+                    elif current is previous_handler:
+                        expected, values = previous_schemas, previous_values
+                    else:
+                        return False
+                    if (len(schemas) != len(expected) or schemas != values
+                            or any(current is not original for current, original in zip(schemas, expected))):
+                        return False
+                expected_module = old_module if attempted_module is missing else attempted_module
+                expected_loaded = old_loaded if attempted_loaded is missing else attempted_loaded
+                return (sys.modules.get(module_name) is expected_module
+                        and modules.get(module_name) is expected_loaded)
+
+            async def restore(reason: str) -> bool:
+                # Preserve the whole later generation when its runtime or
+                # source has moved, including an identical-byte re-import.
+                def restore_source() -> bool:
+                    if not owns_generation() or tool_file.is_symlink():
+                        return False
+                    current = tool_file.read_bytes() if tool_file.exists() else None
+                    if current == before:
+                        return True
+                    if current != candidate:
+                        return False
+                    if before is None:
+                        tool_file.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(tool_file, before)
+                    return True
+
+                restored = owns_generation() and await asyncio.to_thread(restore_source)
+                restored = restored and owns_generation()
+                if restored:
+                    if dispatcher is not None and touched_registry:
+                        handlers = getattr(dispatcher, "_tool_handlers", {})
+                        if previous_handler is missing:
+                            handlers.pop(tool_name, None)
+                        else:
+                            handlers[tool_name] = previous_handler
+                        declarations = getattr(dispatcher, "TOOL_DECLARATIONS", None)
+                        if declarations is not None:
+                            declarations[:] = [d for d in declarations if d.get("name") != tool_name]
+                            declarations.extend(previous_schemas)
+                    if old_module is None:
+                        sys.modules.pop(module_name, None)
+                    else:
+                        sys.modules[module_name] = old_module
+                    if old_loaded is None:
+                        modules.pop(module_name, None)
+                    else:
+                        modules[module_name] = old_loaded
+                if self.history is not None:
+                    await asyncio.to_thread(
+                        self.history.record, module=f"custom_tools/{tool_file.name}",
+                        before=candidate.decode("utf-8"),
+                        after=before.decode("utf-8") if before is not None and restored else None,
+                        reasoning=reason if restored else "A later source or runtime generation was preserved. " + reason,
+                        status="rolled_back" if restored else "preserved_newer",
+                        verification={"restored": bool(restored)})
+                return bool(restored)
+
+            try:
+                if customer_verification_mode():
+                    raise ValueError("Customer Forge activation was disabled before publication")
+                from .forge_deployment import prepare
+                receipt = await asyncio.to_thread(prepare, tool_file, before, candidate)
+                await asyncio.to_thread(atomic_write_bytes, tool_file, candidate)
+                if customer_verification_mode():
+                    raise ValueError("Customer Forge activation was disabled before host import")
+                load_outcome = await self.loader.load_and_register(tool_file)
+                attempted_handler = getattr(load_outcome, "handler_fn", missing)
+                imported_module = getattr(load_outcome, "module_obj", None)
+                current_module = sys.modules.get(module_name)
+                current_loaded = modules.get(module_name)
+                if imported_module is not None:
+                    attempted_module = imported_module
+                elif (attempted_handler is not missing and attempted_handler is not None
+                        and getattr(current_module, "run", None) is attempted_handler):
+                    attempted_module = current_module
+                if (isinstance(current_loaded, dict)
+                        and current_loaded.get("handler") is attempted_handler):
+                    attempted_loaded = current_loaded
+                if not load_outcome.succeeded:
+                    raise RuntimeError(f"Failed to load module: {load_outcome.error_log}")
+                if not owns_generation():
+                    raise RuntimeError("Tool generation changed while loading; the newer state was preserved")
+                if cancelled.is_set():
+                    raise asyncio.CancelledError
+                if dispatcher is not None:
+                    declared_name = (getattr(load_outcome, "tool_schema", None) or {}).get("name", tool_name)
+                    # A model must not use its schema to replace a DIFFERENT
+                    # built-in or custom tool under a harmless filename.
+                    if declared_name != tool_name:
+                        raise ValueError("Verified schema name differs from the requested tool name")
+                    touched_registry = True
+                    activation = await self.loader.activate_tool(load_outcome, dispatcher)
+                    if not activation.ok:
+                        raise RuntimeError(f"Dispatcher activation failed: {activation.text}")
+                    published_schemas = [d for d in getattr(dispatcher, "TOOL_DECLARATIONS", [])
+                                         if d.get("name") == tool_name]
+                    published_values = copy.deepcopy(published_schemas)
+                if cancelled.is_set():
+                    raise asyncio.CancelledError
+                if self.history is not None:
+                    await asyncio.to_thread(
+                        self.history.record, module=f"custom_tools/{tool_file.name}",
+                        before=before.decode("utf-8") if before is not None else None,
+                        after=candidate.decode("utf-8"),
+                        reasoning=session.tool_plan, status="applied",
+                        verification={"syntax_contract_tests": True,
+                                      "attempts": session.sandbox_attempts})
+                if cancelled.is_set():
+                    raise asyncio.CancelledError
+                if dispatcher is not None and hasattr(dispatcher, "__dict__"):
+                    # A fault in a later call can revert this generation. A
+                    # stale request must never roll back a newer generation.
+                    async def rollback(handler: Any, reason: str) -> bool:
+                        if handler is not attempted_handler:
+                            return False
+                        if getattr(dispatcher, "_tool_handlers", {}).get(tool_name) is not handler:
+                            return False
+                        locks = self.__dict__.setdefault("_name_locks", {})
+                        lock = locks.setdefault(session.tool_name, asyncio.Lock())
+                        if lock.locked():
+                            return False
+                        try:
+                            async with lock:
+                                # A manual edit after deployment belongs to its author.
+                                current = await asyncio.to_thread(tool_file.read_bytes)
+                                if (current != candidate or not owns_generation() or
+                                        getattr(dispatcher, "_tool_handlers", {}).get(tool_name) is not handler):
+                                    return False
+                                return await restore(reason)
+                        finally:
+                            locks.pop(session.tool_name, None)
+                    callbacks = dispatcher.__dict__.setdefault("_forge_rollbacks", {})
+                    callbacks[tool_name] = rollback
+                await asyncio.to_thread(receipt.unlink, missing_ok=True)
+                published = True
+            finally:
+                if not published and receipt is not None:
+                    await restore("Activation failed or was cancelled; recovery was requested.")
+                    await asyncio.to_thread(receipt.unlink, missing_ok=True)
+
+        task = asyncio.create_task(transaction())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled.set()
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            # Retrieve failures even when caller cancellation wins the race.
+            if not task.cancelled():
+                task.exception()
+            raise
 
     async def forge_batch(
         self,
@@ -701,9 +1252,19 @@ class ForgeOrchestrationManager:
         middle of a live conversation.  Boot also reports what is being held
         back, because a silently skipped tool is a tool nobody re-forges.
         """
+        from .forge_isolation import customer_verification_mode
+        if customer_verification_mode():
+            self.bus.log.emit("[FORGE] Customer verification-only mode: persisted generated tools are not loaded or rehabilitated.")
+            return 0
         if self.dispatcher is None:
             return 0
         custom_tools_dir = _custom_tools_dir()
+        from .forge_deployment import recover_pending
+        recoveries = await asyncio.to_thread(recover_pending, custom_tools_dir, self.history)
+        conflicted = {item["file"] for item in recoveries if not item["restored"]}
+        for item in recoveries:
+            self.bus.log.emit(f"[FORGE] Interrupted deployment {item['file']}: "
+                              + ("previous generation restored" if item["restored"] else item["error"]))
         # Before loading, give quarantined tools a second chance: any that were
         # condemned for a missing package now installed (the sklearn/jsonschema
         # case) are restored here and picked up by the glob below in this same
@@ -719,14 +1280,26 @@ class ForgeOrchestrationManager:
                 f"[FORGE] Manager: quarantine rehabilitation skipped - {first_line(exc, 100)}")
         reloaded = 0
         rejected: list[str] = []
+        registry = getattr(self.dispatcher, "plugins", None)
+        from .plugin_manifest import discover_manifests
+        manifests, _manifest_errors = await asyncio.to_thread(discover_manifests, custom_tools_dir)
+        owned_modules = {manifest.module for manifest in manifests}
         for tool_file in sorted(custom_tools_dir.glob("*_tool.py")):
+            if tool_file.name in conflicted:
+                continue
             manifest = tool_file.with_name(tool_file.stem[: -len("_tool")] + ".plugin.json")
-            if tool_file.stem.endswith("_tool") and manifest.exists():
+            if tool_file.name in owned_modules or (tool_file.stem.endswith("_tool") and manifest.exists()):
                 # A plugin: load_plugins owns it and honours its enabled state.
                 # Loading it here too imported it twice and brought DISABLED
                 # plugins back at every boot.
                 continue
             try:
+                if registry is not None and not registry.is_enabled(tool_file.stem[:-len("_tool")]):
+                    state_error = getattr(registry, "state_error", "")
+                    reason = (f"saved plugin preferences unavailable — {state_error}" if state_error
+                              else "disabled by the user")
+                    self.bus.log.emit(f"[FORGE] Persisted tool '{tool_file.stem}' held — {reason}.")
+                    continue
                 outcome = await self.loader.load_and_register(tool_file)
                 if not outcome.succeeded:
                     detail = first_line(str((outcome.error_log or [""])[-1]), 120)
@@ -780,6 +1353,13 @@ class ForgeOrchestrationManager:
         the user thinks ORION has and it does not.
         """
         lines: list[str] = ["Forge health:"]
+        from .forge_isolation import customer_verification_mode
+        try:
+            customer_mode = customer_verification_mode()
+        except ValueError as exc:
+            return ToolResult(f"Forge health: invalid customer policy — {exc}", ok=False)
+        if customer_mode:
+            lines.append("  • Customer verification-only mode: generated code is held for review and is not activated.")
 
         contract_failures = dict(getattr(self.loader, "contract_failures", {}) or {})
         quarantine = self._quarantined()
@@ -816,7 +1396,7 @@ class ForgeOrchestrationManager:
             ok = sum(1 for s in sessions if s.activation_ok)
             lines.append(f"  • This run: {ok}/{len(sessions)} forge session(s) succeeded.")
 
-        if not contract_failures and not quarantine:
+        if not customer_mode and not contract_failures and not quarantine:
             lines.append("  • Nothing is held back — every forged tool on disk is live.")
         return ToolResult("\n".join(lines), ok=not (contract_failures or quarantine))
 
@@ -1061,35 +1641,103 @@ async def blocks_turn(
 class LlmForgeBrain:
     """Code generator + targeted repairer for the Forge, via ProviderRouter."""
 
+    #: Errors that mean every provider was busy, not that the prompt failed.
+    _PROVIDERS_BUSY = re.compile(r"(?i)all text providers failed|no text provider")
+
+    async def _turn(self, turn, prompt: str, **kwargs):
+        """One model turn, waiting out a provider cooldown once before failing.
+
+        A forge is several turns; a free-tier rate limit hit in the middle of
+        one used to throw the whole session away, even though the provider
+        was back in under half a minute.
+        """
+        try:
+            return await turn(self.router, prompt, **kwargs)
+        except Exception as exc:
+            waiter = getattr(self.router, "wait_for_text", None)
+            if not (self._PROVIDERS_BUSY.search(str(exc)) and callable(waiter)):
+                raise
+            if not await waiter(90.0):
+                raise
+            return await turn(self.router, prompt, **kwargs)
+
     def __init__(self, bus: OrionBus, router: Any,
-                 lessons: ForgeLessonStore | None = None) -> None:
+                 lessons: ForgeLessonStore | None = None, history: Any = None) -> None:
         self.bus = bus
         self.router = router
         # Optional: past failures become guidance in the generation prompt, so
         # the Forge stops rediscovering the same mistakes every session.
         self.lessons = lessons
+        self.history = history
 
     # ── generation ────────────────────────────────────────────────────────────
+
+    async def plan(self, tool_name: str, tool_plan: str) -> dict[str, Any]:
+        """One bounded planning turn, before code or its own tests exist."""
+        prompt = (
+            "Plan one small headless ORION tool before writing any code. "
+            "Return only a JSON object with inputs (parameter name -> JSON schema "
+            "with lowercase type), required (input names), output (the useful "
+            "non-empty string run() returns), dependencies (package requirements; "
+            "prefer the stdlib and bundled requests, psutil, numpy), and examples "
+            "(EXACTLY THREE objects). Each example needs arguments and expect "
+            "(an expected answer substring that proves its result); optionally "
+            "expect_error: false, files: {relative_path: text}, http: {URL: canned_body}. "
+            "Use private fixture files and {workdir} in arguments for absolute "
+            "fixture paths. No real user paths, network, installs, devices, "
+            "accounts or services in examples. Include a successful example. "
+            "Keep the whole plan under 32 KiB, with at most 24 inputs and 12 "
+            "dependencies. Do not produce module or test source.\n\n"
+            f"TOOL NAME: {tool_name}\nREQUEST: {str(tool_plan)[:12000]}"
+        )
+
+        async def turn(router, text):
+            instruction = "Return one bounded JSON tool plan, without code or prose."
+            try:
+                _profile, raw = await router.generate_text(
+                    text, instruction=instruction, task="forge.plan", max_tokens=2400)
+            except TypeError:
+                _profile, raw = await router.generate_text(text, system_extra=instruction)
+            if len(str(raw).encode("utf-8")) > 32768:
+                raise ValueError("Forge planner response exceeds the 32 KiB limit")
+            return self._parse_json(raw)
+
+        try:
+            planned = await asyncio.wait_for(self._turn(turn, prompt), timeout=45.0)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Forge planning did not finish within 45 seconds; no code was generated") from None
+        return validate_plan(planned)
 
     async def generate(self, tool_name: str, tool_plan: str) -> ForgeArtefacts:
         guidance = ""
         if self.lessons is not None:
             try:
-                guidance = self.lessons.guidance_block(tool_plan)
+                guidance = await asyncio.to_thread(self.lessons.guidance_block, tool_plan)
             except Exception:
                 guidance = ""     # memory must never block a forge
+        if self.history is not None:
+            try:
+                guidance += "\n" + await asyncio.to_thread(self.history.guidance_block, tool_plan)
+            except Exception:
+                pass
         prompt = (
             "Build a new tool for O.R.I.O.N.\n\n"
             f"TOOL NAME: {tool_name}\n"
             f"CAPABILITY PLAN: {tool_plan}\n\n"
             f"{_FORGE_CONTRACT}\n\n"
+            # The fixtures staged beside every verification (forge_fixtures);
+            # analysis trials follow their own test rules instead.
+            + ("" if tool_name.startswith("trial_") else f"{FIXTURE_GUIDE}\n\n")
             + (f"{guidance}\n\n" if guidance else "")
             + _FORGE_RESPONSE_FORMAT
         )
-        artefacts = await blocks_turn(self.router, prompt)
+        if tool_name.startswith("trial_"):
+            from .forge_trial_policy import generation_guidance
+            prompt += "\n\n" + generation_guidance(tool_name)
+        artefacts = await self._turn(blocks_turn, prompt)
         if not artefacts.tool_code.strip():
             raise RuntimeError("the model returned no tool module")
-        if not artefacts.test_code.strip():
+        if not artefacts.test_code.strip() and not tool_name.startswith("trial_"):
             # A missing test harness must never abort the forge — synthesise
             # a minimal loader-level test instead.
             artefacts.test_code = synthesise_test(tool_name)
@@ -1136,8 +1784,8 @@ class LlmForgeBrain:
             "corrected file — never a diff, never a fragment:\n"
             + "\n".join(wanted)
         )
-        artefacts = await blocks_turn(
-            self.router, prompt, require_module=diagnosis.repairs_module)
+        artefacts = await self._turn(
+            blocks_turn, prompt, require_module=diagnosis.repairs_module)
         # Preserve whatever the repair deliberately left alone.
         if not artefacts.tool_code.strip():
             artefacts.tool_code = tool_code
@@ -1156,7 +1804,7 @@ class LlmForgeBrain:
             "Return ONLY:\n=== TOOL ===\n```python\n"
             "<the complete corrected module>\n```"
         )
-        artefacts = await blocks_turn(self.router, prompt)
+        artefacts = await self._turn(blocks_turn, prompt)
         return artefacts.tool_code if artefacts.tool_code.strip() else tool_code
 
     # ── strict-JSON parsing (models love fences; strip them ruthlessly) ──────
@@ -1267,6 +1915,9 @@ class ImprovementHeartbeat:
     # This cap is checked against the FULL persisted journal, not just this
     # session, so it survives a restart instead of resetting to zero.
     MAX_ATTEMPTS_PER_TOOL_NAME = 2
+    # Review-only existing calculation contracts. A model cannot nominate
+    # arbitrary core/device tools or replace the benchmark oracle.
+    MEASURED_TARGETS = {"orion_latency_report": "latency_report_v1"}
 
     def __init__(self, bus: OrionBus, router: Any,
                  forge: ForgeOrchestrationManager,
@@ -1372,6 +2023,16 @@ class ImprovementHeartbeat:
             except asyncio.TimeoutError:
                 continue
 
+    async def _providers_ready(self) -> bool:
+        """A text provider is usable now, or will be within a minute."""
+        waiter = getattr(self.router, "wait_for_text", None)
+        if not callable(waiter):
+            return self._text_generation_available()
+        try:
+            return bool(await waiter(60.0))
+        except Exception:
+            return True
+
     def _text_generation_available(self) -> bool:
         """Best-effort check that the router has a usable text provider."""
         checker = getattr(self.router, "text_available", None)
@@ -1422,6 +2083,14 @@ class ImprovementHeartbeat:
             return False
         return any(queued == name for queued, _plan in self.forge.pending_retries)
 
+    @staticmethod
+    def _covered_by(result: Any) -> str:
+        """The existing tool named when the Forge declined to build a copy of it."""
+        receipt = getattr(result, "receipt", None)
+        if isinstance(receipt, dict) and receipt.get("state") == "covered":
+            return str(receipt.get("covered_by") or "an existing tool")
+        return ""
+
     async def tick(self) -> dict[str, Any]:
         """One self-review pass.  Returns the parsed analysis (for tests)."""
         entry: dict[str, Any] = {"at": utc_stamp(), "analysis": "", "actions": [], "forged": []}
@@ -1444,14 +2113,24 @@ class ImprovementHeartbeat:
             if self._forged_this_session >= self.MAX_AUTO_FORGES_PER_SESSION:
                 entry["forged"].append({"skipped": "session forge cap reached", "tool": name})
                 continue
+            if not await self._providers_ready():
+                self.forge.pending_retries.append((name, plan))
+                entry["forged"].append({"tool": name, "skipped": "providers cooling"})
+                continue
             self.bus.log.emit(
                 f"IMPROVE: retrying '{name}' — the previous attempt failed for "
                 "lack of an available provider.")
             result = await self.forge.forge_tool(name, plan, autonomous=True)
+            covered = self._covered_by(result)
+            if covered:
+                entry["forged"].append({"tool": name, "skipped": f"already covered by {covered}"})
+                continue
             self._forged_this_session += 1
             entry["forged"].append({"tool": name, "ok": result.ok,
                                     "detail": first_line(result.text, 160), "retry": True,
                                     "outage": self._failed_for_outage(name, result)})
+            if result.ok:
+                await asyncio.to_thread(self._announce_new_capability, name, plan)
 
         if not self._has_actionable_evidence():
             # Nothing is failing: say so and stop. A model asked "what would
@@ -1462,13 +2141,16 @@ class ImprovementHeartbeat:
             self._journal(entry)
             return entry
         context = self._compose_context(abandoned)
+        measured_targets = json.dumps(self.MEASURED_TARGETS, sort_keys=True)
         prompt = (
             "You are O.R.I.O.N. running your autonomous self-improvement "
             "heartbeat (no user is in this turn). Review your own recent "
             "operational evidence and decide what would genuinely improve you. "
             "Examine it through EVERY lens the evidence below actually supports "
             "(skip any lens with nothing to show, but do not stop at the first "
-            "one that does): diagnostics FAILs/WARNs pointing at something "
+            "one that does): UNMET REQUESTS — things the user asked for more "
+            "than once that you could not do, the strongest reason to forge; "
+            "diagnostics FAILs/WARNs pointing at something "
             "broken; telemetry tool-failure counts pointing at an unreliable or "
             "missing capability; recurring error patterns in the log; the "
             "awareness snapshot's focus/deadlines suggesting a capability gap; "
@@ -1482,19 +2164,61 @@ class ImprovementHeartbeat:
             '   {"type": "forge_tool", "tool_name": "<snake_case>", '
             '"plan": "<precise capability plan for a NEW additive tool>", '
             '"reason": "<the evidence that justifies it>"}\n'
+            '   ,{"type": "improve_tool", "tool_name": "<registered target>", '
+            '"benchmark": "<its registered benchmark>", "plan": "<specific measured goal>", '
+            '"reason": "<operational evidence>"}\n'
             " ]}\n"
             "Rules: propose forge_tool ONLY when the evidence shows a concrete, "
             "recurring need a new tool would close; otherwise return notes (or "
-            "an empty actions list). Never propose editing existing source."
+            "an empty actions list). Never propose editing existing source. "
+            "An improve_tool action only measures contained candidates and retains review evidence; "
+            "it does not activate code or train a hosted model. Use it only for a concrete "
+            f"observed defect in these exact target/benchmark pairs: {measured_targets}. "
+            "Do not run benchmarks just because a slow AI provider or microphone is mentioned; "
+            "optimising the timing-analysis calculation will not fix provider or audio latency."
         )
         data = await strict_json_turn(self.router, prompt)
         analysis = str(data.get("analysis") or "").strip()
         actions = [a for a in (data.get("actions") or []) if isinstance(a, dict)]
         entry["analysis"] = analysis
         entry["actions"] = actions
+        # The review has now seen these unmet requests; one that does not
+        # recur by its third showing stops steering the forge.
+        gap_keys = list(getattr(self, "_gap_keys", []) or [])
+        if gap_keys:
+            entry["unmet_requests"] = len(gap_keys)
+            try:
+                from .capability_gaps import LEDGER
+                await asyncio.to_thread(LEDGER.mark_presented, gap_keys)
+            except Exception:
+                pass
         for action in actions:
             if str(action.get("type")) == "note":
                 self._consolidate_note(str(action.get("text") or ""))
+                continue
+            if str(action.get("type")) == "improve_tool":
+                name = str(action.get("tool_name") or "")
+                benchmark = str(action.get("benchmark") or "")
+                seen = self.__dict__.setdefault("_measured_this_session", set())
+                if self.MEASURED_TARGETS.get(name) != benchmark:
+                    entry["forged"].append({"tool": name, "skipped": "unsupported measured contract"})
+                    continue
+                if name in seen or name in abandoned:
+                    entry["forged"].append({"tool": name, "skipped": "measured attempt already made or abandoned"})
+                    continue
+                if self._forged_this_session >= self.MAX_AUTO_FORGES_PER_SESSION:
+                    entry["forged"].append({"tool": name, "skipped": "session forge cap reached"})
+                    break
+                if not await self._providers_ready():
+                    entry["forged"].append({"tool": name, "skipped": "providers cooling"})
+                    break
+                seen.add(name)
+                result = await self.forge.improve_tool(
+                    name, benchmark, generations=2, budget_seconds=240,
+                    tool_plan=str(action.get("plan") or "")[:4096])
+                self._forged_this_session += 1
+                entry["forged"].append({"tool": name, "ok": result.ok, "measured": True,
+                                        "activated": False, "detail": first_line(result.text, 160)})
                 continue
             if str(action.get("type")) != "forge_tool":
                 continue
@@ -1518,17 +2242,74 @@ class ImprovementHeartbeat:
                     "tool": name, "skipped": "repeated failures",
                     "previous_failures": failed_counts.get(relative or name, 0)})
                 continue
+            if not getattr(self, "_strong_evidence", True):
+                # Log text alone: keep the idea as a note, do not build it.
+                entry["forged"].append({"tool": name,
+                                        "skipped": "weak evidence (log text only)"})
+                self._consolidate_note(
+                    f"Proposed tool idea (not built - only log text supported it): "
+                    f"{action.get('tool_name')}: {first_line(action.get('plan', ''), 160)}")
+                continue
+            if not await self._providers_ready():
+                # Every provider is rate limited: queue it for the next cycle
+                # instead of starting a forge that can only fail and then
+                # spending the next idea the same way (seen 2026-09-26).
+                self.forge.pending_retries.append((name, plan))
+                entry["forged"].append({"tool": name, "skipped": "providers cooling"})
+                self.bus.log.emit(
+                    f"IMPROVE: '{name}' waits for the next cycle — every text "
+                    "provider is rate limited right now.")
+                break
             self.bus.log.emit(
                 f"IMPROVE: forging '{name}' autonomously — {first_line(action.get('reason', ''), 100)}")
             result = await self.forge.forge_tool(name, plan, autonomous=True)
+            covered = self._covered_by(result)
+            if covered:
+                # Triage found an existing tool for it: nothing was built, so
+                # it is neither a failure nor a use of the session's forges.
+                entry["forged"].append({"tool": name, "skipped": f"already covered by {covered}"})
+                continue
             self._forged_this_session += 1
             entry["forged"].append({"tool": name, "ok": result.ok,
                                     "detail": first_line(result.text, 160),
                                     "outage": self._failed_for_outage(name, result)})
+            if result.ok:
+                await asyncio.to_thread(self._announce_new_capability, name, plan)
         self._journal(entry)
         if analysis:
-            self.bus.log.emit(f"IMPROVE: {first_line(analysis, 180)}")
+            signal = getattr(self.bus, "thought", None)
+            if signal is not None:
+                signal.emit({"id": f"review:{entry['at']}", "kind": "reflection",
+                             "origin": "generated_reflection", "observed_at": entry["at"],
+                             "text": first_line(analysis, 640),
+                             "evidence": [f"Recorded Forge operations: {len(entry['forged'])}"]})
         return entry
+
+    def _announce_new_capability(self, name: str, plan: str) -> None:
+        """Say so when an autonomous forge succeeds — a failure was always
+        spoken, a success only logged, so the user never learned they could
+        now ask. When the tool answers a recorded unmet request, quote it and
+        mark that need addressed (it returns if the user keeps asking)."""
+        spoken = name.replace("_", " ")
+        example = ""
+        try:
+            from .capability_gaps import LEDGER
+            key = LEDGER.match_tool(name, plan)
+            if key:
+                cluster = LEDGER.mark_addressed(key, name) or {}
+                example = (cluster.get("examples") or [""])[-1]
+        except Exception:
+            example = ""
+        if example:
+            line = (f"Earlier you asked me: '{example}'. I couldn't then, but I've built "
+                    f"a tool for it - {spoken} - so just ask again.")
+        else:
+            line = f"I've built myself a new ability: {spoken}. {first_line(plan, 160)}"
+        try:
+            self.bus.log.emit(f"IMPROVE: new capability '{name}' is live.")
+            self.bus.speak_request.emit(line)
+        except Exception:
+            pass
 
     #: Words that name a KIND of tool rather than what it is about.
     _GENERIC_NAME_WORDS = frozenset({
@@ -1572,10 +2353,30 @@ class ImprovementHeartbeat:
         and no diagnostics yet there is no basis for skipping, so the review
         runs as it always did.
         """
+        # Whether what follows may justify FORGING, or only notes. A log line
+        # containing "error" is in almost every session, and on its own it
+        # led reviews to invent tools nobody asked for (the journal to 30 Sep
+        # 2026: 40 failed forges, nine of them variations on "emotion").
+        self._strong_evidence = False
+        # Something the user asked for, and did not get, more than once — the
+        # most direct evidence there is. Counted once per new occurrence.
+        try:
+            from .capability_gaps import LEDGER
+            if LEDGER.recurring() and LEDGER.version != self.__dict__.get("_gaps_version_seen"):
+                self._gaps_version_seen = LEDGER.version
+                self._strong_evidence = True
+                return True
+        except Exception:
+            pass
         if not self._log_ring and self._last_diagnostics is None:
+            # Nothing observed yet: no basis for holding anything back.
+            self._strong_evidence = True
             return True
         diag = self._last_diagnostics or {}
-        if int(diag.get("fails", 0) or 0) or int(diag.get("warns", 0) or 0):
+        if int(diag.get("fails", 0) or 0):
+            self._strong_evidence = True
+            return True
+        if int(diag.get("warns", 0) or 0):
             return True
         if self.telemetry is not None:
             try:
@@ -1589,6 +2390,7 @@ class ImprovementHeartbeat:
                 fresh = any(v > seen.get(k, 0) for k, v in failures.items())
                 seen.update(failures)
                 if fresh:
+                    self._strong_evidence = True
                     return True
             except Exception:
                 pass
@@ -1617,6 +2419,16 @@ class ImprovementHeartbeat:
 
     def _compose_context(self, abandoned: set[str] | None = None) -> str:
         sections = []
+        # What the user wanted and did not get leads: everything below is
+        # ORION's view of himself; this is the user's view of ORION.
+        self._gap_keys: list[str] = []
+        try:
+            from .capability_gaps import LEDGER
+            unmet, self._gap_keys = LEDGER.context_for_review()
+            if unmet:
+                sections.append(unmet)
+        except Exception:
+            pass
         if abandoned:
             sections.append(
                 "=== ABANDONED TOOL IDEAS (do not re-propose these) ===\n"
@@ -1693,11 +2505,49 @@ class ImprovementHeartbeat:
             sections.append("=== FORGE SESSIONS THIS RUN ===\n" + "\n".join(forge_lines))
         return "\n\n".join(sections) or "=== NO EVIDENCE CAPTURED YET THIS SESSION ==="
 
+    #: The journal is re-read in full every tick (_failed_attempt_counts) and
+    #: was append-only. Past this size the oldest reviews are folded into one
+    #: summary line that keeps every recorded failure, so the abandon list —
+    #: what stops a doomed idea being retried forever — is exactly preserved.
+    JOURNAL_LIMIT_BYTES = 512 * 1024
+    JOURNAL_KEEP_ENTRIES = 150
+
     def _journal(self, entry: dict[str, Any]) -> None:
         try:
             with IMPROVE_JOURNAL.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except OSError:
+            return
+        self._compact_journal()
+
+    def _compact_journal(self) -> None:
+        try:
+            if IMPROVE_JOURNAL.stat().st_size <= self.JOURNAL_LIMIT_BYTES:
+                return
+            lines = [line for line in IMPROVE_JOURNAL.read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
+            older, kept = lines[:-self.JOURNAL_KEEP_ENTRIES], lines[-self.JOURNAL_KEEP_ENTRIES:]
+            if not older:
+                return
+            failures: list[dict[str, Any]] = []
+            for line in older:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                for item in entry.get("forged") or []:
+                    if (isinstance(item, dict) and item.get("ok") is False
+                            and not item.get("outage") and str(item.get("tool") or "").strip()):
+                        failures.append({"tool": str(item["tool"]).strip(), "ok": False,
+                                         "compacted": True})
+            summary = {"at": utc_stamp(), "compacted": len(older),
+                       "analysis": f"{len(older)} older review(s) compacted; "
+                                   "their forge failures are kept below.",
+                       "actions": [], "forged": failures}
+            from .atomic_io import atomic_write_text
+            atomic_write_text(IMPROVE_JOURNAL, "\n".join(
+                [json.dumps(summary, ensure_ascii=False)] + kept) + "\n")
+        except Exception:
             pass
 
     def describe(self) -> dict[str, Any]:

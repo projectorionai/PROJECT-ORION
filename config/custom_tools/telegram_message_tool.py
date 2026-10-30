@@ -9,7 +9,15 @@ import urllib.request
 from pathlib import Path
 
 TIMEOUT = 15
+MAX_RESPONSE_BYTES = 1_000_000
 CONFIG_NAME = "messaging.json"
+
+
+def _read_response(response) -> bytes:
+    body = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise ValueError("Telegram response exceeded the permitted size")
+    return body
 
 
 def _config() -> dict:
@@ -28,9 +36,14 @@ def _config() -> dict:
                 data = loaded.get("telegram") or {}
     except Exception:
         data = {}
+    if not isinstance(data, dict):
+        data = {}
     for key, env in (("bot_token", "TELEGRAM_BOT_TOKEN"),
                      ("default_chat_id", "TELEGRAM_CHAT_ID")):
         value = os.getenv(env, "").strip()
+        if key == "bot_token":
+            from orion_core.jv_plugins.runtime import secret
+            value = secret("telegram_message", env).strip() or value
         if value:
             data[key] = value
     return data if isinstance(data, dict) else {}
@@ -44,14 +57,16 @@ def _send(token: str, chat_id: str, text: str) -> tuple[bool, str]:
     request.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            payload = json.loads(response.read().decode("utf-8", "replace"))
+            payload = json.loads(_read_response(response).decode("utf-8", "replace"))
             if payload.get("ok"):
                 return True, ""
             return False, str(payload.get("description") or "Telegram refused it.")
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            body = json.loads(exc.read().decode("utf-8", "replace"))
+            body = json.loads(_read_response(exc).decode("utf-8", "replace"))
+        except ValueError:
+            return False, "Telegram returned an oversized or invalid error response; no automatic retry was attempted."
             detail = str(body.get("description") or "")
         except Exception:
             pass
@@ -136,15 +151,16 @@ def run(**kwargs) -> str:
         return "Telegram contacts:\n" + "\n".join(
             f"  {name}" for name in sorted(contacts))
 
-    message = str(kwargs.get("message") or kwargs.get("text") or "").strip()
-    if not message:
+    message = str(kwargs.get("message") or kwargs.get("text") or "")
+    if not message.strip():
         return "What would you like me to say?"
     if len(message) > 4096:
-        message = message[:4093] + "…"          # Telegram's hard limit
+        return "Could not send: Telegram messages are limited to 4096 characters. Shorten the message before sending."
 
     if not token:
-        return ("Telegram is not configured. Create a bot with @BotFather and put "
-                "its token under \"telegram\" in config/messaging.json.")
+        from orion_core.data import ToolResult
+        return ToolResult("Telegram is not configured. Connect a bot account before API delivery.", ok=False,
+            receipt={"kind": "messaging", "platform": "telegram", "status": "not_configured", "sent": False, "attempted": False})
 
     chat_id, error = _resolve(str(kwargs.get("to") or kwargs.get("contact") or ""),
                               config)

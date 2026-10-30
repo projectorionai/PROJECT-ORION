@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/orion_bg">
@@ -8,7 +9,8 @@
     <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
         android:id="@+id/swipeRefresh"
         android:layout_width="match_parent"
-        android:layout_height="match_parent">
+        android:layout_height="match_parent"
+        android:layout_marginTop="48dp">
 
         <WebView
             android:id="@+id/webView"
@@ -32,7 +34,7 @@
             android:layout_height="96dp"
             android:alpha="0.45"
             android:importantForAccessibility="no"
-            android:src="@drawable/ic_launcher_foreground" />
+            android:src="@mipmap/ic_launcher_foreground" />
 
         <TextView
             android:id="@+id/errorText"
@@ -92,7 +94,7 @@
             android:layout_width="120dp"
             android:layout_height="120dp"
             android:importantForAccessibility="no"
-            android:src="@drawable/ic_launcher_foreground" />
+            android:src="@mipmap/ic_launcher_foreground" />
 
         <com.google.android.material.progressindicator.LinearProgressIndicator
             android:layout_width="140dp"
@@ -119,22 +121,137 @@
             android:gravity="center"
             android:textColor="@color/orion_muted"
             android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/connectingChangeServerButton"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="@string/change_server"
+            android:textColor="@color/orion_accent" />
     </LinearLayout>
 
-    <!-- Settings handle to change the PC address. It sits in the top-right of
-         the orb stage, just below the page's header, so it no longer covers
-         the page's "● online" status; always on top so a stuck connect can
-         still be escaped. -->
-    <ImageButton
-        android:id="@+id/settingsButton"
-        android:layout_width="48dp"
+    <!-- Native Options keeps controls available while the gateway reconnects. -->
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="48dp"
-        android:layout_gravity="top|end"
-        android:layout_marginTop="50dp"
-        android:layout_marginEnd="4dp"
-        android:padding="12dp"
-        android:background="?attr/selectableItemBackgroundBorderless"
-        android:src="@drawable/ic_settings"
-        android:alpha="0.75"
-        android:contentDescription="@string/change_server" />
+        android:layout_gravity="top"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="@color/carbon_grey">
+
+        <TextView
+            android:id="@+id/telemetryText"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="48dp"
+            android:gravity="center_vertical"
+            android:paddingStart="16dp"
+            android:paddingEnd="8dp"
+            tools:text="ORION · Connected"
+            android:textColor="@color/orion_text"
+            android:textSize="13sp"
+            android:singleLine="true" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:visibility="gone"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp">
+
+            <Button
+                android:id="@+id/audioButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:minHeight="0dp"
+                android:text="@string/audio_off"
+                android:textSize="10sp" />
+
+            <Button
+                android:id="@+id/visionButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:minHeight="0dp"
+                android:text="@string/vision_off"
+                android:textSize="10sp" />
+
+            <Button
+                android:id="@+id/accessButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:minHeight="0dp"
+                android:text="@string/access_off"
+                android:textSize="10sp" />
+
+            <Button
+                android:id="@+id/sentinelButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:minHeight="0dp"
+                android:text="@string/sentinel_off"
+                android:textSize="10sp" />
+
+        </LinearLayout>
+        <Button
+            android:id="@+id/settingsButton"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:layout_marginEnd="8dp"
+            android:text="@string/options"
+            android:textColor="@color/orion_text" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/authorizationDeck"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:padding="16dp"
+        android:background="@color/carbon_grey"
+        android:elevation="20dp"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/authorization_required"
+            android:textColor="@color/crimson_accent"
+            android:textSize="12sp"
+            android:fontFamily="monospace" />
+
+        <TextView
+            android:id="@+id/authorizationDetails"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="12dp"
+            android:textColor="@color/orion_text"
+            android:textSize="12sp"
+            android:fontFamily="monospace" />
+
+        <FrameLayout
+            android:id="@+id/authorizationSliderSlot"
+            android:layout_width="match_parent"
+            android:layout_height="56dp" />
+
+        <Button
+            android:id="@+id/authorizationDeny"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="end"
+            android:layout_marginTop="8dp"
+            android:text="@string/deny"
+            android:textColor="@color/slate_grey"
+            android:backgroundTint="@color/carbon_grey" />
+    </LinearLayout>
 </FrameLayout>

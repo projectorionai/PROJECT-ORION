@@ -165,7 +165,7 @@ class ExecutiveAssistantMode:
         outcomes.append("tracked in cognitive state")
         if when.strip() and self.reminders is not None:
             try:
-                result = self.reminders.add(f"remind me at {when} to {title}", at=when)
+                result = await asyncio.to_thread(self.reminders.add, f"remind me at {when} to {title}", at=when)
                 if getattr(result, "ok", False):
                     outcomes.append("spoken reminder set")
             except Exception as exc:

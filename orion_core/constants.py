@@ -10,9 +10,11 @@ resolution — importing this module is always safe.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # ──────────────────────────────────────────────────────────────────────────────
 # IDENTITY
@@ -23,25 +25,33 @@ from pathlib import Path
 #: Command Deck, the briefing, the standalone build stamp. It had drifted
 #: before this was centralised: the window said Mark XXV while the swarm map
 #: still said MARK XXI, which is the sort of thing nobody notices for a year.
-APP_MARK_NUMBER = 32
-APP_MARK = "Mark XXXII"
+APP_MARK_NUMBER = 41
+APP_MARK = "Mark XXXXI"
 
 APP_NAME = f"O.R.I.O.N. {APP_MARK}"
+#: What ORION's own window (the one with his face) shows beside his name. The
+#: owner's wording (28 Oct 2026): "MARK XXXX" - forty as he writes it, so
+#: forty-one is XXXXI; the Command Deck shows no mark, and he SAYS "Mark forty-one".
+APP_MARK_TAG = "MARK XXXXI"
 APP_SUBTITLE = "OPEN RESOLUTION INTELLIGENCE OVERT NETWORK"
 # Build stamp — shown in the header so a running instance can be told apart
 # from a stale one at a glance (bump on each build so "am I on the new code?"
 # is answerable without guessing).
-APP_BUILD = "2026.09.25-xxxii"
+APP_BUILD = "2026.10.29-r4-xxxxi"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LIVE MODEL CHANNEL
 # ──────────────────────────────────────────────────────────────────────────────
 
 LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+#: Used only when the API cannot be asked which live models this key has
+#: (live_worker discovers them). Checked against the API on 2026-09-26; the
+#: previous two alternates had both been retired.
 LIVE_MODEL_FALLBACKS = (
     "models/gemini-2.5-flash-native-audio-preview-12-2025",
-    "models/gemini-2.5-flash-preview-native-audio-dialog",
-    "models/gemini-2.0-flash-live-001",
+    "models/gemini-2.5-flash-native-audio-latest",
+    "models/gemini-2.5-flash-native-audio-preview-09-2025",
+    "models/gemini-3.1-flash-live-preview",
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -55,7 +65,16 @@ CHUNK_SIZE = 512
 VAD_SAMPLE_LIMIT = 256
 MIC_QUEUE_LIMIT = 150
 
-WAKE_WORDS = ("orion", "o'rion", "oh rye on", "oh ryan", "orien", "o rion")
+#: "ryan" last, so the longer forms are stripped whole first. It is how the
+#: name is actually transcribed: 73 times against 23 for "orion" in 1,841 of
+#: the owner's turns (8 Oct 2026), every one of them addressed to ORION.
+WAKE_WORDS = ("orion", "o'rion", "oh rye on", "oh ryan", "orien", "o rion", "ryan")
+#: ORION's name as a whole word or phrase. Matching was a substring test,
+#: tolerable for "orion" but not once "ryan" joined the list ("Bryant",
+#: "Ryanair" would have opened the wake gate).
+WAKE_RE = re.compile(r"(?<![a-z'])(?:"
+                     + "|".join(re.escape(w) for w in sorted(WAKE_WORDS, key=len, reverse=True))
+                     + r")(?![a-z])")
 WAKE_WINDOW_SECONDS = 45.0
 BARGE_IN_CONFIDENCE = 0.80
 VOICE_HANGOVER_SECONDS = 1.5
@@ -73,9 +92,14 @@ RESUME_WORDS = ("resume", "continue", "carry on", "zone back in", "zone in",
 # Spoken CANCEL control.  Unlike pause (a hold that resumes in place), a cancel
 # word scraps the current request entirely and returns ORION to listening so the
 # user can rephrase from scratch — the spoken twin of the STOP button.
-CANCEL_WORDS = ("cancel that", "cancel", "never mind", "nevermind", "scrap that",
-                "forget it", "forget that", "start over", "start again",
-                "scratch that", "belay that")
+# Matched as the WHOLE utterance or its leading phrase (live_worker
+# is_cancel_command), never as a substring: "cancel my dentist reminder" and
+# "forget that meeting" said while ORION was speaking used to abort the turn
+# instead of reaching him as the commands they are.
+CANCEL_WORDS = ("cancel that", "cancel it", "cancel", "never mind", "nevermind",
+                "scrap that", "forget it", "forget that", "start over", "start again",
+                "scratch that", "belay that", "stop", "stop it", "stop that",
+                "that's enough", "thats enough", "enough")
 
 # Presence check + standby (Mark X.10).  When the microphone input flatlines
 # (a dead / muted / wrong device — NOT a merely quiet room, which still has a
@@ -125,6 +149,12 @@ INTERRUPT_PAUSE_PHRASES = (
 INTERRUPT_RESUME_PHRASES = (
     "orion continue", "orion resume",
 )
+# Heard while ORION speaks, these drop the request outright (live_worker
+# cancel_turn: the generation, the queued speech and the turn's tools) rather
+# than holding it. Whole-utterance only: "orion cancel my reminder" is a request.
+INTERRUPT_CANCEL_PHRASES = (
+    "orion cancel", "orion cancel that", "orion never mind", "orion forget it",
+)
 # Cooldown between honoured interruption commands so one spoken phrase caught
 # by both the partial and final recogniser passes never double-fires.
 INTERRUPT_COOLDOWN_SECONDS = 1.5
@@ -147,12 +177,12 @@ PLAYBACK_TAIL_SECONDS = 0.60
 PLAYBACK_DEVICE_LATENCY_S = max(
     0.05, min(1.0, float(os.getenv("ORION_AUDIO_LATENCY", "0.30") or 0.30)))
 
-# Deterministic buffering (Mark IX): accumulate a small prebuffer before the
-# first write of a fresh utterance so a cold audio device cannot underrun and
-# clip ORION's opening syllable.  Capped by PLAYBACK_PREBUFFER_MAX_WAIT so the
-# prebuffer never adds perceptible latency to the start of speech.
-PLAYBACK_PREBUFFER_CHUNKS = 3
-PLAYBACK_PREBUFFER_MAX_WAIT = 0.12
+# Buffer about a third of a second before starting a streamed utterance.  The
+# former 64 ms buffer ran dry when a long reply arrived with network jitter,
+# leaving an audible break in the middle of a sentence.  Keep the wait bounded
+# so short replies still start promptly.
+PLAYBACK_PREBUFFER_CHUNKS = 16
+PLAYBACK_PREBUFFER_MAX_WAIT = 0.35
 # Soft high-water mark: queue depth beyond this is logged, never dropped —
 # model audio is always played in full (dropping time-compresses speech).
 PLAYBACK_QUEUE_HIGH_WATER = 400
@@ -345,7 +375,8 @@ def _resolve_config_dir() -> Path:
 CONFIG_DIR = _resolve_config_dir()
 
 
-def _resolve_key_store() -> Path:
+def _resolve_key_store(config_dir: Path | None = None, *, home: Path | None = None,
+                       environ: Any = None, under_test: bool | None = None) -> Path:
     """Where the API keys live — ONE store, outside the synced project folder.
 
     Copies of api_keys.json used to sit in the OneDrive project folder (and a
@@ -354,13 +385,23 @@ def _resolve_key_store() -> Path:
     app's store at ~/ORION/config is the only one. A source run with no store
     of its own now reads AND writes that one rather than creating a new copy
     in the project. Never under pytest: the suite must not see real keys.
+
+    An ``ORION_CONFIG_DIR`` override owns its keys: it is how measurement and
+    diagnostic runs are isolated, and they must never reach the real store. A
+    directory chosen by the pointer file is different — that is the checkout's
+    own data after ``tools/move_config.py`` moved it out of OneDrive, and it
+    keeps using the installed store rather than silently starting keyless.
     """
-    local = CONFIG_DIR / "api_keys.json"
-    if local.exists() or "pytest" in sys.modules or os.getenv("PYTEST_CURRENT_TEST"):
+    config_dir = CONFIG_DIR if config_dir is None else Path(config_dir)
+    environ = os.environ if environ is None else environ
+    if under_test is None:
+        under_test = "pytest" in sys.modules or bool(environ.get("PYTEST_CURRENT_TEST"))
+    local = config_dir / "api_keys.json"
+    if local.exists() or under_test:
         return local
-    if CONFIG_DIR != BASE_DIR / "config":
-        return local                      # an explicit config dir owns its keys
-    installed = Path.home() / "ORION" / "config" / "api_keys.json"
+    if str(environ.get("ORION_CONFIG_DIR", "") or "").strip():
+        return local                      # an isolated run owns its keys
+    installed = (home or Path.home()) / "ORION" / "config" / "api_keys.json"
     return installed if installed.exists() else local
 
 
@@ -448,6 +489,14 @@ class C:
     # them: a second hue in the chrome is what this redesign removes.
     AMBER     = "#ffb020"
     GOLD      = "#ffcd5a"
+
+    # ── the human tone (Mark XXXV) ──────────────────────────────────────────
+    # The owner found the monochrome interface "stale and boring" (7 Oct
+    # 2026). Crimson stays ORION's - the live thing, focus, the fault. This
+    # soft apricot is YOURS: your words in the activity feed and the greeting
+    # that welcomes you. Warm, low-key, never on chrome or state.
+    HUMAN     = "#ffb38a"
+    HUMAN_DIM = "#b98468"
 
     # RGB tuples for painter code that blends alpha dynamically.
     PRI_RGB    = (255, 32, 56)

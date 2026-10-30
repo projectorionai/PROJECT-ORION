@@ -43,13 +43,34 @@ wrongly rejects its owner makes ORION deaf — he sits there while you talk at
 him, and the failure looks like a broken microphone, which is a miserable
 thing to debug. Wrongly accepting a stranger costs one unwanted reply. Those
 are not comparable, so the doubt always resolves towards listening.
+
+One person, several points (profile version 2)
+----------------------------------------------
+A single averaged voiceprint sits between how you sound quietly at night and
+how you sound calling across a room, and is a little far from both. A guided
+enrolment (``voice_enrolment``) therefore stores the mean AND up to three
+sub-centroids found by spherical k-means over its twenty-odd samples; a new
+utterance scores against the nearest of them. It also stores how well the
+samples agree with each other (leave-one-out), and from that a personal
+threshold that may only ever be LOWER than the global one, and never below
+``MIN_PERSONAL_THRESHOLD``: a loose speaker is not locked out, and a tight
+one is not made stricter than the margin the rest of the system assumes.
+
+Every decision comes out of :func:`decide`, which says owner, known (another
+enrolled person), unknown, uncertain or unreadable. None of these verdicts can
+authorise anything: they decide whether ORION answers and how he addresses
+the speaker. The only consequence a verdict can have for an action is the
+existing guard in ``speaker_gate``, which can REFUSE a spoken go-ahead.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -71,6 +92,26 @@ TARGET_DBFS = -30.0
 #: around 0.5, so the gap is wide and the midpoint is forgiving in the
 #: direction that matters. ORION_VOICE_THRESHOLD overrides it.
 DEFAULT_THRESHOLD = 0.70
+
+#: How far below a threshold a score must fall to count as confidently
+#: somebody else. The band in between is "uncertain", which listens.
+REJECT_MARGIN = 0.08
+
+#: The floor for a personal threshold. A profile may relax its own bar for a
+#: speaker whose samples agree loosely, but never below this.
+MIN_PERSONAL_THRESHOLD = 0.62
+
+#: A non-owner's profile must beat the owner's by this much before an
+#: utterance counts as that person rather than as a doubtful owner — so an
+#: enrolled relative with a similar voice can never silence the owner.
+KNOWN_MARGIN = 0.05
+
+#: Sub-centroids kept per profile, and how many samples each one needs.
+MAX_CENTROIDS = 3
+SAMPLES_PER_CENTROID = 6
+
+PROFILE_VERSION = 2
+BACKEND = "voiceprint-onnx"
 
 #: Below this, an utterance is too short to characterise a speaker. Shorter
 #: clips do produce an embedding, but a noisy one, and a noisy embedding
@@ -97,6 +138,13 @@ _LOCK = threading.Lock()
 _SESSION: Any = None
 _FILTERS: Any = None
 _WINDOW: Any = None
+
+#: The last few embeddings, keyed on the audio itself. The offline path reads
+#: every utterance twice — once for presence and tone, once for the gate — and
+#: each read was a full encoder pass over identical samples.
+_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_CACHE_SIZE = 8
+_CACHE_LOCK = threading.Lock()
 
 
 # ── the front end: audio to mel spectrogram, in plain numpy ──────────────────
@@ -261,15 +309,12 @@ def _session() -> Any:
     global _SESSION
     with _LOCK:
         if _SESSION is None:
-            import onnxruntime as ort
+            from . import accelerator
 
-            options = ort.SessionOptions()
-            options.intra_op_num_threads = 1
-            options.inter_op_num_threads = 1
-            options.log_severity_level = 3
-            _SESSION = ort.InferenceSession(
-                str(model_path()), options,
-                providers=["CPUExecutionProvider"])
+            # On the CPU by policy (accelerator.POLICY): the GPU saves under
+            # 3 ms a run and its session build holds Python's lock ~300 ms.
+            _SESSION = accelerator.create_session(
+                "voiceprint", model_path(), threads=1, inter_threads=1)
     return _SESSION
 
 
@@ -284,9 +329,35 @@ def embed(wav: Any, sample_rate: int = SAMPLE_RATE) -> Any:
 
     if not available():
         return None
-    wav = np.asarray(wav, dtype=np.float32).flatten()
+    wav = np.ascontiguousarray(np.asarray(wav, dtype=np.float32).flatten())
     if wav.size == 0:
         return None
+    key = (int(sample_rate), wav.size,
+           hashlib.blake2b(wav.tobytes(), digest_size=16).digest())
+    with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+        if cached is not None:
+            _CACHE.move_to_end(key)
+            return cached.copy()
+    vector = _embed_uncached(wav, int(sample_rate))
+    if vector is not None:
+        with _CACHE_LOCK:
+            _CACHE[key] = vector
+            while len(_CACHE) > _CACHE_SIZE:
+                _CACHE.popitem(last=False)
+        vector = vector.copy()
+    return vector
+
+
+def clear_cache() -> None:
+    """Forget the cached embeddings (after "forget my voice")."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def _embed_uncached(wav: Any, sample_rate: int) -> Any:
+    import numpy as np
+
     if np.abs(wav).max() > 1.5:             # int16 handed in as floats
         wav = wav / 32768.0
     wav = _resample(wav, int(sample_rate))
@@ -336,20 +407,277 @@ def similarity(a: Any, b: Any) -> float:
     return float(np.dot(a, b) / denominator) if denominator else 0.0
 
 
+# ── profiles: several points per person ──────────────────────────────────────
+
+def _unit(vector: Any) -> Any:
+    import numpy as np
+
+    if vector is None:
+        return None
+    v = np.asarray(vector, dtype=np.float32).flatten()
+    if not np.isfinite(v).all():
+        return None
+    norm = float(np.linalg.norm(v)) if v.size else 0.0
+    return (v / norm) if norm > 0 else None
+
+
+def _centroids(stack: Any, k: int) -> Any:
+    """Spherical k-means over unit vectors. Deterministic: seeded from the
+    sample the mean describes WORST, then each next-farthest — so the
+    conditions an average blurs (very quiet, very loud) get their own point."""
+    import numpy as np
+
+    mean = _unit(stack.mean(axis=0))
+    chosen = [int(np.argmin(stack @ mean))]
+    while len(chosen) < k:
+        nearest = np.max(stack @ stack[chosen].T, axis=1)
+        chosen.append(int(np.argmin(nearest)))
+    centres = stack[chosen].copy()
+    for _ in range(12):
+        labels = np.argmax(stack @ centres.T, axis=1)
+        updated = np.stack([
+            _unit(stack[labels == j].mean(axis=0)) if np.any(labels == j)
+            else centres[j] for j in range(k)])
+        if np.allclose(updated, centres, atol=1e-6):
+            break
+        centres = updated
+    return centres
+
+
+def _profile_points(stack: Any) -> list:
+    """The mean, plus sub-centroids once there are enough samples for them."""
+    mean = _unit(stack.mean(axis=0))
+    k = min(MAX_CENTROIDS, stack.shape[0] // SAMPLES_PER_CENTROID)
+    points = [mean]
+    if k >= 2:
+        points.extend(list(_centroids(stack, k)))
+    return points
+
+
+def _score_points(vector: Any, points: list) -> float:
+    import numpy as np
+
+    v = _unit(vector)
+    if v is None:
+        return 0.0
+    usable = [p for p in points if p is not None and p.size == v.size]
+    return max((float(np.dot(v, p)) for p in usable), default=0.0)
+
+
+def profile_vectors(record: Any) -> list:
+    """The unit vectors a stored profile scores against: its mean, and its
+    sub-centroids when it has them (version 1 profiles have only the mean)."""
+    if not isinstance(record, dict):
+        return []
+    points = [_unit(record.get("embedding"))]
+    for centre in record.get("centroids") or []:
+        points.append(_unit(centre))
+    return [p for p in points if p is not None]
+
+
+def score_profile(vector: Any, record: Any) -> float:
+    """Cosine similarity of *vector* to the nearest point of a profile."""
+    return _score_points(vector, profile_vectors(record))
+
+
+def _personal_threshold(self_scores: list) -> float:
+    """A bar the speaker's own samples clear: the 5th percentile of how each
+    scored against a profile built WITHOUT it, less a little room for the
+    conditions an enrolment session never sees. Bounded on both sides — see
+    profile_threshold — so it can only relax the global bar, never tighten
+    it."""
+    import numpy as np
+
+    if len(self_scores) < 6:
+        return DEFAULT_THRESHOLD
+    p05 = float(np.percentile(np.asarray(self_scores, dtype=float), 5))
+    return max(MIN_PERSONAL_THRESHOLD, min(DEFAULT_THRESHOLD, p05 - 0.03))
+
+
+def profile_threshold(record: Any, default: float = DEFAULT_THRESHOLD) -> float:
+    """The accept threshold for one profile: its personal one, never above
+    *default* and never below MIN_PERSONAL_THRESHOLD."""
+    try:
+        personal = float(record.get("threshold"))
+    except Exception:
+        return default
+    return max(MIN_PERSONAL_THRESHOLD, min(default, personal))
+
+
+def build_profile(embeddings: Any, styles: Any = None) -> dict | None:
+    """A stored profile from several embeddings of ONE person.
+
+    Holds embeddings only — never audio. ``embedding`` stays the plain mean,
+    so anything that reads a version 1 profile still reads this one.
+    """
+    import numpy as np
+
+    samples = [] if embeddings is None else embeddings
+    vectors = [v for v in (_unit(e) for e in samples) if v is not None]
+    if not vectors:
+        return None
+    stack = np.stack(vectors)
+    points = _profile_points(stack)
+    record: dict[str, Any] = {
+        "embedding": [float(x) for x in points[0]],
+        "clips": len(vectors),
+        "sample_count": len(vectors),
+        "backend": BACKEND,
+        "version": PROFILE_VERSION,
+    }
+    if len(points) > 1:
+        record["centroids"] = [[float(x) for x in p] for p in points[1:]]
+    if len(vectors) >= 3:
+        # Leave-one-out: how each sample scores against the profile the
+        # others would have built. Scoring a sample against a profile it is
+        # part of flatters every speaker equally and says nothing.
+        self_scores = []
+        for i in range(len(vectors)):
+            rest = np.delete(stack, i, axis=0)
+            self_scores.append(_score_points(stack[i], _profile_points(rest)))
+        scores = np.asarray(self_scores, dtype=float)
+        record["self_similarity"] = float(scores.min())
+        record["spread"] = {"mean": round(float(scores.mean()), 4),
+                            "std": round(float(scores.std()), 4),
+                            "p05": round(float(np.percentile(scores, 5)), 4)}
+        record["threshold"] = round(_personal_threshold(self_scores), 4)
+    else:
+        record["self_similarity"] = float(min(
+            similarity(v, points[0]) for v in vectors))
+    if styles:
+        counts: dict[str, int] = {}
+        for style in styles:
+            counts[str(style)] = counts.get(str(style), 0) + 1
+        record["styles"] = counts
+    return record
+
+
+def _comparable(record: Any) -> bool:
+    """A profile from a different encoder scores meaninglessly against this
+    one's embeddings, so it is skipped rather than compared."""
+    if not isinstance(record, dict) or not record.get("embedding"):
+        return False
+    backend = str(record.get("backend") or BACKEND)
+    return backend == BACKEND
+
+
+def resolve_owner(profiles: dict, nominated: str = "") -> str:
+    """Whose voice is the owner's: the nominated one if enrolled, else the
+    single enrolled voice, else nobody (see Voiceprints.owner)."""
+    if nominated and nominated in (profiles or {}):
+        return nominated
+    names = list(profiles or {})
+    return names[0] if len(names) == 1 else ""
+
+
 # ── enrolment ────────────────────────────────────────────────────────────────
+
+#: What a verdict can say about who spoke.
+KINDS = ("owner", "known", "unknown", "uncertain", "unreadable", "nobody")
+
 
 @dataclass
 class Verdict:
-    """What the check concluded, and how sure it is."""
+    """What the check concluded, and how sure it is.
+
+    ``score`` is the similarity to the OWNER's voice (to the best match when
+    nobody is the owner); ``match`` is the similarity to ``speaker``. ``kind``
+    is one of KINDS; verdicts made before it existed leave it empty, and
+    :attr:`category` infers it.
+    """
 
     is_owner: bool
     score: float = 0.0
     speaker: str = ""
     reason: str = ""
     confident: bool = False
+    kind: str = ""
+    match: float = 0.0
 
     def __bool__(self) -> bool:
         return self.is_owner
+
+    @property
+    def category(self) -> str:
+        if self.kind:
+            return self.kind
+        if not self.is_owner:
+            return "unknown" if self.confident else "uncertain"
+        return "owner" if self.confident else "uncertain"
+
+
+def _env_threshold() -> float | None:
+    raw = os.getenv("ORION_VOICE_THRESHOLD", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return None
+
+
+def decide(vector: Any, profiles: dict, owner: str = "",
+           threshold: float | None = None) -> Verdict:
+    """Whose voice *vector* is, among *profiles*, and whether it is the owner.
+
+    owner      the owner's profile clears its threshold (and beats any other)
+    known      another enrolled person clears theirs AND beats the owner's
+               score by KNOWN_MARGIN
+    unknown    nobody clears, and the owner's score is below their threshold
+               by more than REJECT_MARGIN
+    uncertain  anything in between — which listens, like every doubt here
+    unreadable no voiceprint could be made
+    nobody     nothing comparable is enrolled
+
+    ``is_owner`` is False only for a confident known or unknown voice while an
+    owner exists: that is the one case a gate may act on.
+    """
+    if vector is None:
+        return Verdict(True, reason="not enough speech to tell", kind="unreadable")
+    explicit = threshold if threshold is not None else _env_threshold()
+    entries = []
+    for name, record in (profiles or {}).items():
+        if not _comparable(record):
+            continue
+        limit = explicit if explicit is not None else profile_threshold(record)
+        entries.append((score_profile(vector, record), str(name), limit))
+    if not entries:
+        return Verdict(True, reason="nobody is enrolled", kind="nobody")
+
+    scores = {name: (score, limit) for score, name, limit in entries}
+    owner = owner if owner in scores else ""
+    passing = sorted((e for e in entries if e[0] >= e[2]), reverse=True)
+
+    if not owner:
+        # Nobody is the owner, so there is nothing for a gate to protect:
+        # identify if possible, and always listen.
+        if passing:
+            score, name, _ = passing[0]
+            return Verdict(True, score, name, "recognised", confident=True,
+                           kind="known", match=score)
+        best = max(entries)[0]
+        return Verdict(True, best, "", "not a voice ORION knows",
+                       confident=False, kind="unknown")
+
+    owner_score, owner_limit = scores[owner]
+    if passing:
+        score, name, _ = passing[0]
+        if name == owner:
+            return Verdict(True, score, owner, "recognised", confident=True,
+                           kind="owner", match=score)
+        if score - owner_score >= KNOWN_MARGIN:
+            return Verdict(False, owner_score, name, f"recognised as {name}",
+                           confident=True, kind="known", match=score)
+        # Close to the owner AND to someone else. Treated as the owner's
+        # doubtful turn, never as a reason to ignore them.
+        return Verdict(True, owner_score, owner,
+                       f"close to both {owner} and {name}, so assumed to be you",
+                       confident=False, kind="uncertain", match=owner_score)
+    if owner_score < owner_limit - REJECT_MARGIN:
+        return Verdict(False, owner_score, "", "a different voice",
+                       confident=True, kind="unknown")
+    return Verdict(True, owner_score, owner, "uncertain, so assumed to be you",
+                   confident=False, kind="uncertain", match=owner_score)
 
 
 @dataclass
@@ -483,9 +811,23 @@ class Voiceprints:
 
     @property
     def judging(self) -> bool:
-        """Whether any gate needs each utterance's speaker judged."""
+        """Whether each utterance's speaker should be judged.
+
+        True while a gate is on, and ALSO whenever the owner's voice is
+        enrolled: ORION then needs to know on every turn whether it is the
+        owner talking, to know whether to use their name. This is the switch
+        the live capture path reads (audio.py ``_speaker_judged``), so it is
+        what makes identification reach a Live session at all.
+
+        Read on the capture thread for every voiced chunk, so it costs one
+        cached load and nothing else.
+        """
         data = self._load()
-        return bool(data.get("only_owner") or data.get("guard_actions"))
+        if data.get("only_owner") or data.get("guard_actions"):
+            return True
+        profiles = data["profiles"]
+        owner = resolve_owner(profiles, str(data.get("owner") or ""))
+        return bool(owner and profiles.get(owner))
 
     def set_owner(self, name: str) -> tuple[bool, str]:
         data = self._load()
@@ -511,8 +853,6 @@ class Voiceprints:
         at different moments is less tied to one sentence, one mood and one
         distance from the microphone.
         """
-        import numpy as np
-
         name = str(name or "").strip()
         if not name:
             return False, "a name is needed to enrol a voice."
@@ -524,69 +864,73 @@ class Voiceprints:
         if not embeddings:
             return False, ("none of those clips held enough speech — about "
                            f"{MIN_SECONDS:.0f} seconds of talking is needed.")
+        return self.enrol_embeddings(name, embeddings, owner=owner)
 
-        centroid = np.mean(np.stack(embeddings), axis=0)
-        norm = float(np.linalg.norm(centroid))
-        if norm <= 0:
+    def enrol_embeddings(self, name: str, embeddings: list, *, owner: bool = True,
+                         styles: Any = None, method: str = "clips") -> tuple[bool, str]:
+        """Store a profile built from embeddings already computed — the guided
+        enrolment computes them one utterance at a time as they arrive, and
+        never keeps the audio."""
+        name = str(name or "").strip()
+        if not name:
+            return False, "a name is needed to enrol a voice."
+        record = build_profile(embeddings, styles)
+        if record is None:
             return False, "the clips produced no usable voiceprint."
-        centroid = centroid / norm
-
-        # How tightly the clips agree. A speaker whose own clips sit at 0.9
-        # can be judged more strictly than one whose sit at 0.75, and storing
-        # it means the threshold can adapt to the person rather than to an
-        # average of everybody.
-        spread = [similarity(e, centroid) for e in embeddings]
+        # How tightly the samples agree is stored with the profile, and from
+        # it a personal threshold (see build_profile). The backend stamp is
+        # what voice_speaker_id checks before comparing: a profile from a
+        # different encoder is skipped rather than scored meaninglessly.
+        record["enrolled_at"] = time.time()
+        record["method"] = method
         data = self._load()
-        data["profiles"][name] = {
-            "embedding": [float(v) for v in centroid],
-            "clips": len(embeddings),
-            "self_similarity": float(min(spread)) if spread else 0.0,
-            # The encoder that produced it. voice_speaker_id stamps the same
-            # field and skips profiles from a different one, because the two
-            # preprocess audio differently and their embeddings are not
-            # comparable — a silent, plausible-looking wrong answer.
-            "backend": "voiceprint-onnx",
-        }
-        self._save_profiles(data["profiles"])
+        profiles = self._read(self.profiles_path)    # fresh, never a stale copy
+        profiles[name] = record
+        self._save_profiles(profiles)
         if owner or not data.get("owner"):
             data["owner"] = name
         self._save(data)
-        return True, (f"{name}'s voice is enrolled from {len(embeddings)} "
+        count = int(record.get("clips") or 0)
+        return True, (f"{name}'s voice is enrolled from {count} "
                       f"clip(s)" + (" — ORION will treat this as your voice."
                                     if data['owner'] == name else "."))
 
     def forget(self, name: str) -> tuple[bool, str]:
+        """Delete a voiceprint. Forgetting the OWNER also switches off both
+        voice gates: with nothing to compare against they would only report
+        themselves as on while doing nothing."""
         data = self._load()
         if name not in data["profiles"]:
             return False, f"no voiceprint is stored for {name}."
-        del data["profiles"][name]
-        self._save_profiles(data["profiles"])
+        was_owner = (name == self.owner)
+        profiles = self._read(self.profiles_path)
+        profiles.pop(name, None)
+        self._save_profiles(profiles)
         if data.get("owner") == name:
             data["owner"] = ""
+        if was_owner:
+            data["only_owner"] = False
+            data["guard_actions"] = False
         self._save(data)
         return True, f"{name}'s voiceprint is forgotten."
 
     # -- the actual question -------------------------------------------------
+    def verdict_for(self, vector: Any) -> Verdict:
+        """Judge an embedding already computed (see :func:`decide`)."""
+        data = self._load()
+        profiles = data["profiles"]
+        owner = resolve_owner(profiles, str(data.get("owner") or ""))
+        return decide(vector, profiles, owner, _env_threshold())
+
     def identify(self, wav: Any, sample_rate: int = SAMPLE_RATE) -> Verdict:
         """Whose voice this is, among those enrolled."""
-        profiles = self._load()["profiles"]
-        if not profiles:
-            return Verdict(True, reason="nobody is enrolled")
+        if not self._load()["profiles"]:
+            return Verdict(True, reason="nobody is enrolled", kind="nobody")
         vector = embed(wav, sample_rate)
         if vector is None:
-            return Verdict(True, reason="not enough speech to tell")
-
-        best, score = "", -1.0
-        for name, record in profiles.items():
-            value = similarity(vector, record.get("embedding"))
-            if value > score:
-                best, score = name, value
-        limit = self.threshold()
-        if score >= limit:
-            return Verdict(best == (self.owner or best), score, best,
-                           "recognised", confident=True)
-        return Verdict(False, score, "", "not a voice ORION knows",
-                       confident=score < limit - 0.08)
+            return Verdict(True, reason="not enough speech to tell",
+                           kind="unreadable")
+        return self.verdict_for(vector)
 
     def is_owner(self, wav: Any, sample_rate: int = SAMPLE_RATE) -> Verdict:
         """Whether this is the person ORION works for.
@@ -607,23 +951,19 @@ class Voiceprints:
         owner = self.owner
         record = data["profiles"].get(owner)
         if not record:
-            return Verdict(True, reason="no owner voice is enrolled")
+            return Verdict(True, reason="no owner voice is enrolled", kind="nobody")
         if not available():
-            return Verdict(True, reason="the voice encoder is unavailable")
+            return Verdict(True, reason="the voice encoder is unavailable",
+                           kind="unreadable")
 
         vector = embed(wav, sample_rate)
         if vector is None:
-            return Verdict(True, reason="not enough speech to tell")
-        score = similarity(vector, record.get("embedding"))
-        limit = self.threshold()
-        if score >= limit:
-            return Verdict(True, score, owner, "recognised", confident=True)
+            return Verdict(True, reason="not enough speech to tell",
+                           kind="unreadable")
         # Only a clear miss counts as somebody else. The margin is the whole
-        # safety property: without it, every borderline utterance silences him.
-        if score < limit - 0.08:
-            return Verdict(False, score, "", "a different voice",
-                           confident=True)
-        return Verdict(True, score, owner, "uncertain, so assumed to be you")
+        # safety property: without it, every borderline utterance silences
+        # him. decide() keeps it, and adds the other enrolled voices.
+        return decide(vector, data["profiles"], owner, _env_threshold())
 
     def describe(self) -> str:
         data = self._load()
@@ -632,12 +972,16 @@ class Voiceprints:
                     f"{model_path().name} or onnxruntime is missing.")
         names = sorted(data["profiles"])
         if not names:
-            return ("No voice is enrolled yet. Give ORION about ten seconds "
-                    "of your speech and he will know your voice from anyone "
-                    "else's.")
+            return ("No voice is enrolled yet. Say \"learn my voice\" (or use "
+                    "Preferences) and read about twenty short lines - about "
+                    "five minutes - and ORION will know your voice from "
+                    "anyone else's.")
         owner = self.owner or "nobody"
+        record = data["profiles"].get(self.owner) or {}
+        limit = _env_threshold()
+        limit = limit if limit is not None else profile_threshold(record)
         return (f"Enrolled: {', '.join(names)}. ORION treats {owner} as your "
-                f"voice, at a similarity threshold of {self.threshold():.2f}.")
+                f"voice, at a similarity threshold of {limit:.2f}.")
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -646,13 +990,10 @@ def _write_json(path: Path, payload: Any) -> None:
     A half-written profile would be read back as no profile at all, and with
     the gate on that means ORION stops answering his owner.
     """
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        temporary.replace(path)
-    except Exception:
-        pass
+    from .atomic_io import atomic_write_text
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(payload, indent=2), encoding="utf-8")
 
 
 #: The process-wide store.
@@ -684,13 +1025,37 @@ def judge(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> Verdict:
     prints = store()
     if not prints.judging:
         return Verdict(True, reason="no voice gate is on")
+    if _learning():
+        # Whoever is talking during a guided enrolment is the voice being
+        # learned. Judging them against an older profile could mute the very
+        # samples the new one is built from.
+        return Verdict(True, reason="learning a voice right now",
+                       kind="unreadable")
     try:
         wav = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     except Exception:
         return Verdict(True, reason="the audio could not be read")
     verdict = prints.is_owner(wav, sample_rate)
     speaker_gate.note_verdict(verdict)
+    try:
+        from . import voice_enrolment
+
+        # Part-way through the utterance (the live path asks at 1.6 s), so
+        # it is recorded as provisional; the whole utterance replaces it.
+        voice_enrolment.turns().record(verdict, stage="partial",
+                                       seconds=wav.size / float(sample_rate or 1))
+    except Exception:
+        pass
     return verdict
+
+
+def _learning() -> bool:
+    try:
+        from . import voice_enrolment
+
+        return voice_enrolment.learning()
+    except Exception:
+        return False
 
 
 def should_listen(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> Verdict:
@@ -713,9 +1078,12 @@ def should_listen(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> Verdict:
 
 
 __all__ = [
-    "DEFAULT_THRESHOLD", "MIN_SECONDS", "N_MELS", "PARTIAL_FRAMES",
-    "PROFILE_PATH", "SAMPLE_RATE",
+    "DEFAULT_THRESHOLD", "KINDS", "KNOWN_MARGIN", "MIN_PERSONAL_THRESHOLD",
+    "MIN_SECONDS", "N_MELS", "PARTIAL_FRAMES", "PROFILE_PATH", "REJECT_MARGIN",
+    "SAMPLE_RATE",
     "Verdict", "Voiceprints",
-    "available", "embed", "is_owner", "judge", "mel_spectrogram", "model_path",
-    "should_listen", "similarity", "store",
+    "available", "build_profile", "clear_cache", "decide", "embed", "is_owner",
+    "judge", "mel_spectrogram", "model_path", "profile_threshold",
+    "profile_vectors", "resolve_owner", "score_profile", "should_listen",
+    "similarity", "store",
 ]

@@ -91,6 +91,180 @@ def test_the_ollama_probe_has_a_short_startup_timeout():
         "startup cannot afford seconds of it")
 
 
+def _resident_stt():
+    from orion_core.speech_offline import OfflineTranscriber
+
+    stt = OfflineTranscriber(defer=True)
+    stt.engine = "faster-whisper"
+    stt._selected = True
+    stt._model = object()
+    stt._last_used = 0.0
+    return stt
+
+
+def test_pressure_cleanup_retries_after_the_initial_shed_was_too_early(monkeypatch):
+    from orion_core import resource_governor as rg
+
+    monkeypatch.setenv("ORION_STT_IDLE_S", "600")
+    monkeypatch.setenv("ORION_GOVERNOR", "1")
+    governor = rg.ResourceGovernor()
+    governor.thresholds = (85.0, 92.0, 96.0)
+    monkeypatch.setattr(rg, "GOVERNOR", governor)
+    stt = _resident_stt()
+    attempts = []
+    governor.register("idle STT", rg.Pressure.CONSTRAINED,
+                      lambda: attempts.append(stt.release_if_idle(now=30, limit_s=60)))
+    governor.observe(90)
+    governor.observe(90)
+    assert attempts == [False] and stt._model is not None
+    governor.observe(90)
+    assert attempts == [False], "governor actions deliberately run once per transition"
+    # This is the periodic reaper's ordinary call after the model becomes idle.
+    assert stt.release_if_idle(now=90), "pressure cleanup reverted to the ten-minute delay"
+    assert stt._model is None and not stt.ready
+    loaded = []
+
+    def reload():
+        stt._model = object()
+        stt.engine = "faster-whisper"
+        loaded.append(stt.model_size)
+
+    monkeypatch.setattr(stt, "_select_engine", reload)
+    assert stt.ensure_ready()
+    assert loaded == [stt.model_size], "unloading must retain on-demand hearing"
+
+
+@pytest.mark.parametrize("case,limit,idle,expected", [
+    ("normal", "600", 90, False),
+    ("pressure", "600", 59, False),
+    ("pressure", "600", 60, True),
+    ("disabled", "600", 90, False),
+    ("pressure", "0", 1000, False),
+    ("pressure", "20", 25, True),
+    ("normal", "600", 600, True),
+])
+def test_idle_model_release_preserves_limits_and_governor_opt_outs(
+        monkeypatch, case, limit, idle, expected):
+    from orion_core import resource_governor as rg
+
+    monkeypatch.setenv("ORION_STT_IDLE_S", limit)
+    governor = rg.ResourceGovernor()
+    governor.acting = case != "disabled"
+    governor.level = rg.Pressure.NORMAL if case == "normal" else rg.Pressure.CONSTRAINED
+    monkeypatch.setattr(rg, "GOVERNOR", governor)
+    stt = _resident_stt()
+    assert stt.release_if_idle(now=idle) is expected
+    assert (stt._model is None) is expected
+
+
+def test_memory_pressure_does_not_unload_a_transcription_in_flight(monkeypatch):
+    import threading
+    from orion_core import resource_governor as rg
+
+    monkeypatch.setenv("ORION_STT_IDLE_S", "600")
+    governor = rg.ResourceGovernor()
+    governor.acting = True
+    governor.level = rg.Pressure.CRITICAL
+    monkeypatch.setattr(rg, "GOVERNOR", governor)
+    stt = _resident_stt()
+    entered, finish = threading.Event(), threading.Event()
+
+    def transcribing():
+        with stt._lock:
+            entered.set()
+            assert finish.wait(2)
+
+    thread = threading.Thread(target=transcribing)
+    thread.start()
+    try:
+        assert entered.wait(1)
+        assert not stt.release_if_idle(now=90)
+        assert stt._model is not None
+    finally:
+        finish.set()
+        thread.join(1)
+    assert not thread.is_alive()
+    assert stt.release_if_idle(now=90), "a previously busy model never got another cleanup chance"
+
+
+async def test_production_stt_pressure_release_runs_off_the_gui_thread(monkeypatch):
+    import ast
+    import asyncio
+    import threading
+    import time
+    from pathlib import Path
+    from orion_core import resource_governor as rg
+    from orion_core import speech_offline
+
+    # Execute the actual registered callback without booting an app/model.
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "orion_core/app.py").read_bytes())
+    registration = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "register" and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value == "the idle speech-to-text model")
+    released_on = []
+    collected_on = []
+    monkeypatch.setattr(speech_offline.gc, "collect",
+                        lambda: collected_on.append(threading.get_ident()) or 0)
+
+    class Model:
+        def __del__(self):
+            released_on.append(threading.get_ident())
+
+    stt = _resident_stt()
+    stt._model = Model()
+    stt._last_used = time.monotonic() - 120
+    governor = rg.ResourceGovernor()
+    governor.acting = True
+    governor.level = rg.Pressure.CONSTRAINED
+    monkeypatch.setattr(rg, "GOVERNOR", governor)
+    monkeypatch.setenv("ORION_STT_IDLE_S", "600")
+    callback = eval(compile(ast.Expression(registration.args[2]), "STT registration", "eval"),
+                    {"asyncio": asyncio, "offline_stt": stt})
+    gui_thread = threading.get_ident()
+    result = callback()
+    assert asyncio.iscoroutine(result), "model destruction still ran synchronously on the GUI thread"
+    assert await result
+    assert released_on and released_on[0] != gui_thread
+    assert collected_on == [gui_thread], "global collection may destroy unrelated Qt objects"
+
+
+async def test_idle_reaper_collects_on_the_loop_thread_after_worker_model_release(monkeypatch):
+    import asyncio
+    import threading
+    import time
+    from orion_core import speech_offline
+
+    monkeypatch.setenv("ORION_STT_IDLE_S", "1")
+    stt = _resident_stt()
+    stt._last_used = time.monotonic() - 2
+    released_on, collected_on = [], []
+    done = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+
+    class Model:
+        def __del__(self):
+            released_on.append(threading.get_ident())
+
+    def collect():
+        collected_on.append(threading.get_ident())
+        loop.call_soon_threadsafe(done.set)
+        return 0
+
+    stt._model = Model()
+    monkeypatch.setattr(speech_offline.gc, "collect", collect)
+    reaper = asyncio.create_task(stt.idle_reaper(interval=0.01))
+    try:
+        await asyncio.wait_for(done.wait(), timeout=2)
+    finally:
+        reaper.cancel()
+        await asyncio.gather(reaper, return_exceptions=True)
+    assert released_on and released_on[0] != loop_thread
+    assert collected_on == [loop_thread], "the reaper collected GUI objects on its worker"
+
+
 # ── 2. a pasted prompt is not a command ──────────────────────────────────────
 
 PASTE = ("Please review the following requirements and give me a plan. The user "
@@ -237,3 +411,122 @@ def test_a_package_is_only_attempted_once_per_session():
 
     loader = ReflectiveModuleLoader(_Bus())
     assert loader._dependency_attempts == set()
+
+
+def test_offline_whisper_uses_exact_cached_english_checkpoint_before_multilingual(tmp_path, monkeypatch):
+    import sys
+    from orion_core.speech_offline import OfflineTranscriber
+
+    cache = tmp_path / "whisper"
+    cache.mkdir()
+    english = cache / "base.en.pt"
+    english.write_bytes(b"synthetic checkpoint; never loaded")
+    (cache / "base.pt").write_bytes(b"synthetic fallback")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    loaded, model = [], object()
+
+    def unavailable(*_a, **_k):
+        raise RuntimeError("synthetic faster-whisper unavailable")
+
+    def load_model(path):
+        loaded.append(path)
+        return model
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=unavailable))
+    monkeypatch.setitem(sys.modules, "whisper", SimpleNamespace(load_model=load_model))
+    transcriber = OfflineTranscriber(model_size="base.en", defer=True)
+    assert transcriber.ensure_ready() and transcriber.engine == "whisper"
+    assert loaded == [str(english)] and transcriber._model is model
+
+
+def test_offline_whisper_retains_installed_multilingual_fallback(tmp_path, monkeypatch):
+    from orion_core import speech_offline
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    names = speech_offline._whisper_checkpoints("base.en")
+    assert names == [tmp_path / "whisper" / "base.en.pt", tmp_path / "whisper" / "base.pt"]
+    explicit = tmp_path / "private.pt"
+    assert speech_offline._whisper_checkpoints(str(explicit)) == [explicit]
+
+
+@pytest.mark.parametrize("complete,has_ref,expected", [
+    (True, True, True), (False, True, False), (True, False, False),
+])
+def test_cached_offline_hearing_checks_complete_local_snapshot_without_loading(
+        tmp_path, monkeypatch, complete, has_ref, expected):
+    from orion_core import speech_offline
+
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    root = tmp_path / "models--Systran--faster-whisper-base.en"
+    snapshot = root / "snapshots" / "synthetic-revision"
+    snapshot.mkdir(parents=True)
+    for name in ("model.bin", "config.json", "tokenizer.json", "vocabulary.txt"):
+        if complete or name != "tokenizer.json":
+            (snapshot / name).write_bytes(b"synthetic local metadata")
+    if has_ref:
+        (root / "refs").mkdir()
+        (root / "refs" / "main").write_text("synthetic-revision", encoding="utf-8")
+    monkeypatch.setattr(speech_offline, "_package_present", lambda name: name == "faster_whisper")
+    transcriber = speech_offline.OfflineTranscriber(model_size="base.en", defer=True)
+    monkeypatch.setattr(transcriber, "_select_engine", lambda: pytest.fail("status loaded an ASR model"))
+    assert transcriber.cached_available is expected
+    assert not transcriber.ready and not transcriber._selected
+    status = transcriber.status()
+    assert status["cached_available"] is expected and not status["loaded"]
+
+
+def test_cached_offline_hearing_recognises_english_checkpoint_without_importing_engine(tmp_path, monkeypatch):
+    from orion_core import speech_offline
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    checkpoint = tmp_path / "whisper" / "base.en.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"synthetic checkpoint")
+    monkeypatch.setattr(speech_offline, "_package_present", lambda name: name == "whisper")
+    transcriber = speech_offline.OfflineTranscriber(model_size="base.en", defer=True)
+    monkeypatch.setattr(transcriber, "_select_engine", lambda: pytest.fail("readiness loaded a model"))
+    assert transcriber.cached_available and not transcriber.ready
+    transcriber._selected = True  # an actual load failure wins over cached metadata
+    assert not transcriber.cached_available
+
+
+def test_optional_metrics_failure_preserves_successful_offline_transcript():
+    from orion_core.speech_offline import OfflineTranscriber
+
+    def broken_metric(*_):
+        raise RuntimeError("synthetic optional metrics failure")
+
+    transcriber = OfflineTranscriber(
+        telemetry=SimpleNamespace(metrics=SimpleNamespace(incr=broken_metric)), defer=True)
+    transcriber.engine = "faster-whisper"
+    transcriber._selected = True
+    transcriber._model = SimpleNamespace(
+        transcribe=lambda *_a, **_k: ([SimpleNamespace(text="I can hear offline.")], None))
+    assert transcriber.transcribe_pcm(b"\x01\x00" * 160, identity_checked=True) == "I can hear offline."
+
+
+@pytest.mark.parametrize("alias,repo", [
+    ("large", "Systran/faster-whisper-large-v3"),
+    ("distil-large-v2", "Systran/faster-distil-whisper-large-v2"),
+    ("distil-medium.en", "Systran/faster-distil-whisper-medium.en"),
+    ("distil-small.en", "Systran/faster-distil-whisper-small.en"),
+    ("distil-large-v3", "Systran/faster-distil-whisper-large-v3"),
+    ("distil-large-v3.5", "distil-whisper/distil-large-v3.5-ct2"),
+    ("large-v3-turbo", "mobiuslabsgmbh/faster-whisper-large-v3-turbo"),
+    ("turbo", "mobiuslabsgmbh/faster-whisper-large-v3-turbo"),
+])
+def test_cached_offline_hearing_resolves_installed_faster_whisper_aliases(tmp_path, monkeypatch, alias, repo):
+    from orion_core import speech_offline
+
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    root = tmp_path / ("models--" + repo.replace("/", "--"))
+    snapshot = root / "snapshots" / "synthetic-revision"
+    snapshot.mkdir(parents=True)
+    for name in ("model.bin", "config.json", "tokenizer.json", "vocabulary.txt"):
+        (snapshot / name).write_bytes(b"synthetic metadata; never a real model")
+    (root / "refs").mkdir()
+    (root / "refs" / "main").write_text("synthetic-revision", encoding="utf-8")
+    monkeypatch.setattr(speech_offline, "_package_present", lambda name: name == "faster_whisper")
+    transcriber = speech_offline.OfflineTranscriber(model_size=alias, defer=True)
+    monkeypatch.setattr(transcriber, "_select_engine", lambda: pytest.fail("alias status loaded a model"))
+    assert transcriber.cached_available and not transcriber.ready

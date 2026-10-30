@@ -13,7 +13,6 @@ import asyncio
 import importlib.util
 import json
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -271,12 +270,19 @@ class DynamicPackageResolver:
             raise RuntimeError("refused to install: " + "; ".join(
                 f"{spec} ({why})" for spec, why in refused))
 
+        from .forge_runtime import pip_install_command
+        cmd = pip_install_command(packages)
+        if cmd is None:
+            # The installed app is not a Python with pip ("ORION.exe -m pip"
+            # was what ran), and no Python was found on this PC to install with.
+            raise RuntimeError(
+                "installing packages for a new tool needs Python on this PC - install "
+                "Python 3 (python.org) or set ORION_FORGE_PYTHON to a python.exe")
         try:
-            cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + packages
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=True, errors="replace",
                 timeout=timeout_seconds,
             )
             if result.returncode == 0:

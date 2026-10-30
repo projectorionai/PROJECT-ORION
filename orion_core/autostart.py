@@ -96,7 +96,8 @@ def best_launch_exe() -> "Path | None":
     """
     root = entry_script().parent
     standalone = root / "dist" / "ORION" / "ORION.exe"
-    if standalone.exists():
+    from .runtime_selection import bundle_is_current
+    if bundle_is_current(root, standalone):
         return standalone
     launcher = root / "ORION.exe"
     if launcher.exists():
@@ -112,9 +113,20 @@ def startup_command() -> str:
     Falls back to launching orion.py with the windowless interpreter.
     """
     exe = best_launch_exe()
-    if exe is not None:
-        return f'"{exe}"'
-    return f'"{launch_interpreter()}" "{entry_script()}"'
+    command = (f'"{exe}"' if exe is not None
+               else f'"{launch_interpreter()}" "{entry_script()}"')
+    # Phase 1 Windows integration: at sign-in ORION's core starts in the tray
+    # (the docked Screen Face showing) and his windows open on demand. The
+    # entry is rewritten by ensure_current() whenever this switch changes.
+    return command + (" --tray" if _start_in_tray() else "")
+
+
+def _start_in_tray() -> bool:
+    try:
+        from . import windows_settings
+        return bool(windows_settings.get("start_in_tray_at_login"))
+    except Exception:
+        return False
 
 
 def interpreter_can_run_orion(interpreter: str, timeout: float = 25.0) -> bool:

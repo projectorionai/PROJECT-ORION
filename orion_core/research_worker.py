@@ -32,6 +32,7 @@ you are meant to trust without having watched it happen.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -39,8 +40,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from .constants import CONFIG_DIR
+
 #: Where dossiers are filed.
-DOSSIER_DIR = Path("research") / "dossiers"
+DOSSIER_DIR = CONFIG_DIR / "research" / "dossiers"
 
 #: Most sources cited in one dossier. Beyond this the list stops being a
 #: bibliography and becomes a log.
@@ -66,6 +69,9 @@ class Source:
     url: str = ""
     extract: str = ""
     origin: str = ""          # which gatherer produced it
+    #: How it was seen: "page" (opened and read), "snippet", "headline" or
+    #: "encyclopaedia" (live_research.EVIDENCE_LABELS). Mark XXXX.9.
+    evidence: str = ""
 
     @property
     def key(self) -> str:
@@ -107,7 +113,12 @@ class Dossier:
     sections: list[tuple[str, str]] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
     gatherer: str = ""
+    #: live_research.describe_evidence level: pages, snippets_only,
+    #: encyclopaedia_only or none.
+    evidence_level: str = ""
     path: Path | None = None
+    filing_error: str = ""
+    generation_errors: list[str] = field(default_factory=list)
 
     @property
     def minutes(self) -> float:
@@ -132,16 +143,24 @@ class Dossier:
             lines += ["## Key takeaways", ""]
             lines += [f"{n}. {point}" for n, point in enumerate(self.takeaways, 1)]
             lines.append("")
+        if self.generation_errors:
+            lines += ["## Incomplete investigation", ""]
+            lines += [f"- {error}" for error in self.generation_errors]
+            lines.append("")
         for heading, body in self.sections:
             lines += [f"## {heading}", "", body.strip(), ""]
 
         lines += ["## Sources", ""]
         if self.sources:
+            from .live_research import EVIDENCE_LABELS, evidence_kind
+            # Numbered as the sections cite them, each saying whether the page
+            # was read or only its snippet or headline seen (Mark XXXX.9).
             for number, source in enumerate(self.sources[:MAX_CITATIONS], 1):
+                label = EVIDENCE_LABELS[evidence_kind(source)]
                 if source.url:
-                    lines.append(f"{number}. [{source.title}]({source.url})")
+                    lines.append(f"{number}. [{source.title}]({source.url}) — {label}")
                 else:
-                    lines.append(f"{number}. {source.title}")
+                    lines.append(f"{number}. {source.title} — {label}")
         else:
             # Said plainly rather than left as an empty heading: a dossier with
             # no sources is a dossier written from the model's own memory, and
@@ -162,12 +181,13 @@ class ResearchWorker:
 
     def __init__(self, agent: Any = None, mcp: Any = None, bus: Any = None,
                  reminders: Any = None, telephony: Any = None,
-                 root: Path | str | None = None) -> None:
+                 root: Path | str | None = None, *, announce_results: bool = True) -> None:
         self.agent = agent
         self.mcp = mcp
         self.bus = bus
         self.reminders = reminders
         self.telephony = telephony
+        self.announce_results = announce_results
         self.root = Path(root) if root else DOSSIER_DIR
 
     # ── gathering ────────────────────────────────────────────────────────────
@@ -197,10 +217,24 @@ class ResearchWorker:
 
     async def gather(self, question: str) -> tuple[list[Source], str]:
         """Sources for one question, and which gatherer found them."""
+        from .research import READ_PAGES, _accepts
+
         server = self.search_server()
         if server:
             found = await self._search_mcp(server, question)
             if found:
+                # A search server's results are extracts too; the top ones are
+                # opened and read like any other (Mark XXXX.9).
+                reader = getattr(self.agent, "read_sources", None)
+                if callable(reader):
+                    rows = [{"title": s.title, "url": s.url, "snippet": s.extract,
+                             "evidence": "snippet"} for s in found]
+                    try:
+                        await reader(question, rows, READ_PAGES)
+                    except Exception as exc:
+                        self._log(f"reading {server} results failed - {exc}")
+                    for source, row in zip(found, rows):
+                        source.extract, source.evidence = row["snippet"], row["evidence"]
                 return found, server
             # An empty result from a configured server is reported as such
             # rather than silently falling back — a search server that returns
@@ -210,16 +244,21 @@ class ResearchWorker:
         if self.agent is None:
             return [], server or "none"
         try:
-            raw = await self.agent.gather_sources(question)
+            gather = self.agent.gather_sources
+            # Pages opened and read, not just search snippets and headlines:
+            # "11 sources via the built-in encyclopaedia and news lookup" in
+            # the owner's log (30 Oct 2026) was not one page read.
+            raw = await (gather(question, read_pages=READ_PAGES)
+                         if _accepts(gather, keyword="read_pages") else gather(question))
         except Exception as exc:
             self._log(f"gathering failed - {exc}")
             return [], server or "none"
         return ([Source(title=str(row.get("title") or "").strip(),
                         url=str(row.get("url") or "").strip(),
-                        extract=str(row.get("summary") or row.get("extract") or ""),
-                        origin="builtin")
+                        extract=str(row.get("snippet") or row.get("summary") or row.get("extract") or ""),
+                        origin="builtin", evidence=str(row.get("evidence") or ""))
                  for row in (raw or []) if row.get("title")],
-                "the built-in encyclopaedia and news lookup")
+                "the built-in web search, encyclopaedia and news lookup")
 
     async def _search_mcp(self, server: str, question: str) -> list[Source]:
         """Ask a search MCP server, tolerating its tool being named anything."""
@@ -248,23 +287,77 @@ class ResearchWorker:
             return dossier
 
         self._log(f"investigating {topic!r}")
-        asked = await self._questions(topic, questions)
+        # The dossier's real start, current question and single finish, for
+        # the BRAIN and NEURAL pages (research_runs.ActivitySignal).
+        from .research_runs import ActivitySignal
+        activity = ActivitySignal(self.bus, topic, "dossier")
+        activity.start()
+        status = "failed"
+        try:
+            await self._investigate(dossier, topic, questions, activity)
+            status = ("done" if dossier.sources and not dossier.generation_errors
+                      else "draft")
+            return dossier
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        finally:
+            activity.finish(status)
 
+    async def _investigate(self, dossier: Dossier, topic: str, questions: int,
+                           activity: Any) -> None:
+        from .live_research import describe_evidence, evidence_kind
+
+        asked = await self._questions(topic, questions)
         collected: list[Source] = []
-        for question in asked:
+        evidence: list[tuple[str, str]] = []
+        #: One numbering for the dossier, the order its Sources list prints
+        #: (dedupe keeps first-seen order), so a section's [3] is entry 3.
+        numbers: dict[str, int] = {}
+        for index, question in enumerate(asked, 1):
+            activity.progress(question, index=index, total=len(asked))
             found, gatherer = await self.gather(question)
             dossier.gatherer = dossier.gatherer or gatherer
             collected.extend(found)
-            body = await self._write(topic, question, found)
+            for source in found:
+                if source.key and source.key not in numbers:
+                    numbers[source.key] = len(numbers) + 1
+            try:
+                body = await self._write(topic, question, found, numbers)
+                if not body:
+                    raise RuntimeError("No research note was produced")
+            except Exception as exc:
+                dossier.generation_errors.append(f"{question}: {str(exc)[:240]}")
+                body = ""
             if body:
                 dossier.sections.append((question, body))
+                evidence.append((question, "\n".join(
+                    f"Source [{numbers.get(source.key, '?')}] "
+                    f"({'page read' if evidence_kind(source) == 'page' else 'not opened'}): "
+                    f"{source.url or source.title}" for source in found[:8]) + "\n" + body))
 
-        dossier.sources = dedupe(collected)
-        dossier.summary = await self._summarise(topic, asked)
+        # The page read wins over an earlier snippet of the same page.
+        read = {s.key: s for s in collected if evidence_kind(s) == "page"}
+        dossier.sources = [read.get(s.key, s) for s in dedupe(collected)]
+        level, phrase = describe_evidence(dossier.sources)
+        dossier.evidence_level = level
+        if dossier.sources:
+            # What the sources really were, not just who was asked: an
+            # encyclopaedia-only or snippet-only dossier says so (Mark XXXX.9).
+            dossier.gatherer = f"{dossier.gatherer or 'the built-in lookup'} ({phrase})"
+        index_rows = [{"title": s.title, "url": s.url, "evidence": s.evidence, "n": n}
+                      for n, s in enumerate(dossier.sources, 1)]
+        try:
+            dossier.summary = await self._summarise(topic, asked, evidence, index_rows)
+            if not dossier.summary:
+                raise RuntimeError("No research summary was produced")
+        except Exception as exc:
+            dossier.generation_errors.append(f"Summary: {str(exc)[:240]}")
         dossier.takeaways = await self._takeaways(topic, dossier)
-        dossier.path = self.file(dossier)
-        await self.announce(dossier)
-        return dossier
+        from .research_runs import publish
+        dossier.path = await publish(self.file, dossier, artifact_paths=lambda path: [path] if path else [])
+        if self.announce_results:
+            await self.announce(dossier)
 
     async def _questions(self, topic: str, count: int) -> list[str]:
         agent = self.agent
@@ -283,35 +376,45 @@ class ResearchWorker:
                 f"What are the risks or open questions in {topic}?"][:count]
 
     async def _write(self, topic: str, question: str,
-                     sources: list[Source]) -> str:
+                     sources: list[Source], numbers: dict[str, int] | None = None) -> str:
         agent = self.agent
         if agent is None:
             return ""
         context = "\n\n".join(
             f"{s.title}\n{s.extract}".strip() for s in sources if s.title)
+        errors = []
         for method in ("_synthesise", "_write_section"):
             writer = getattr(agent, method, None)
             if writer is None:
                 continue
             try:
                 if method == "_synthesise":
-                    rows = [{"title": s.title, "url": s.url,
-                             "summary": s.extract} for s in sources]
+                    rows = [{"title": s.title, "url": s.url, "evidence": s.evidence,
+                             "snippet": s.extract, "summary": s.extract, "extract": s.extract,
+                             **({"n": numbers[s.key]} if numbers and s.key in numbers else {})}
+                            for s in sources]
                     return str(await writer(topic, question, rows) or "")
                 return str(await writer(topic, question, context) or "")
-            except Exception:
-                continue
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError(errors[-1])
         return ""
 
-    async def _summarise(self, topic: str, questions: list[str]) -> str:
+    async def _summarise(self, topic: str, questions: list[str],
+                         notes: list[tuple[str, str]],
+                         sources: list[dict[str, Any]] | None = None) -> str:
         agent = self.agent
+        grounded = getattr(agent, "_final_summary_from_notes", None) if agent else None
+        if grounded is not None:
+            from .research import _accepts
+            if sources and _accepts(grounded, 3):
+                return str(await grounded(topic, notes, sources) or "")
+            return str(await grounded(topic, notes) or "")
         summary = getattr(agent, "_final_summary", None) if agent else None
         if summary is None:
             return ""
-        try:
-            return str(await summary(topic, questions) or "")
-        except Exception:
-            return ""
+        return str(await summary(topic, questions) or "")
 
     async def _takeaways(self, topic: str, dossier: Dossier) -> list[str]:
         """The three or four things worth acting on."""
@@ -337,16 +440,26 @@ class ResearchWorker:
     # ── filing and telling ───────────────────────────────────────────────────
 
     def file(self, dossier: Dossier) -> Path | None:
-        """Write the dossier to research/dossiers/. Returns where it went."""
+        """Publish a complete new dossier; never overwrite an earlier report."""
+        from .research_docx import _publish_new
+
+        dossier.filing_error = ""
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             stamp = datetime.fromtimestamp(dossier.started_at).strftime(
                 "%Y-%m-%d_%H%M")
-            path = self.root / f"{slugify(dossier.topic)}_{stamp}.md"
-            path.write_text(dossier.as_markdown(), encoding="utf-8")
-            return path
+
+            def write(path: Path) -> None:
+                with path.open("w", encoding="utf-8") as handle:
+                    handle.write(dossier.as_markdown())
+                    handle.flush()
+                    os.fsync(handle.fileno())
+
+            stem = f"{slugify(dossier.topic)}_{stamp}"
+            return _publish_new(self.root, stem, ".md", write)
         except OSError as exc:
-            self._log(f"the dossier could not be filed - {exc}")
+            dossier.filing_error = f"Could not save the dossier in {self.root}: {exc}"
+            self._log(dossier.filing_error)
             return None
 
     async def announce(self, dossier: Dossier) -> None:
@@ -356,16 +469,29 @@ class ResearchWorker:
         unattended, so there is no moment where the user would notice by
         themselves.
         """
-        where = dossier.path.name if dossier.path else "memory"
-        line = (f"I've finished researching {dossier.topic}. "
-                f"{len(dossier.sources)} source"
-                f"{'s' if len(dossier.sources) != 1 else ''}, filed as {where}.")
+        saved = dossier.path is not None and dossier.path.is_file()
+        if saved and dossier.generation_errors:
+            line = (f"I saved an incomplete investigation on {dossier.topic} at {dossier.path}. "
+                    "Writing or summarising failed; the research is not complete.")
+        elif saved and dossier.sources:
+            line = (f"I've finished researching {dossier.topic}. "
+                    f"{len(dossier.sources)} source"
+                    f"{'s' if len(dossier.sources) != 1 else ''}, saved at {dossier.path}.")
+            if dossier.evidence_level in {"snippets_only", "encyclopaedia_only"}:
+                line += " No web page could be read, so treat it as unverified."
+        elif saved:
+            line = (f"I saved an unverified draft on {dossier.topic} at {dossier.path}. "
+                    "No external sources were retrieved, so the research is not complete.")
+        else:
+            line = (f"The research on {dossier.topic} is ready, but no report was saved. "
+                    + (dossier.filing_error or "No file location was returned."))
         self._log(line)
 
         if self.reminders is not None:
             try:
-                self.reminders.add(text=line, minutes=0.02)
-                return
+                result = await asyncio.to_thread(self.reminders.add, text=line, minutes=0.02)
+                if getattr(result, "ok", False):
+                    return
             except Exception:
                 pass
         if self.bus is not None:

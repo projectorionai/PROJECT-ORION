@@ -89,6 +89,11 @@ WALK_BUDGET_S = 25.0
 
 # ── the question ─────────────────────────────────────────────────────────────
 
+#: Orders that make a query on their own ("my biggest files", "newest files").
+RANKINGS = frozenset({"largest", "biggest", "size", "smallest", "newest", "latest",
+                      "recent", "oldest"})
+
+
 @dataclass
 class FileQuery:
     """What is being looked for. Every field optional; empty means "anything"."""
@@ -106,11 +111,18 @@ class FileQuery:
     include_system: bool = False
     sort: str = "relevance"          # relevance newest oldest largest smallest name
     limit: int = 40
+    direct_path: str = ""           # an explicit path or a recognised user-folder label
+    research_topic: str = ""        # find a folder from the reports it actually contains
 
     def is_empty(self) -> bool:
-        return not any((self.name, self.extensions, self.min_size, self.max_size,
+        # A ranking IS a question: "the biggest files on the PC" names no file
+        # and was refused twice (10 Oct, capability-gap ledger) with "tell me
+        # what to look for". Everything ranks the whole PC by size instantly.
+        return not any((self.name, self.extensions,
+                        self.min_size is not None, self.max_size is not None,
                         self.modified_after, self.modified_before,
-                        self.created_after, self.created_before, self.folder))
+                        self.created_after, self.created_before, self.folder,
+                        self.sort in RANKINGS, self.direct_path))
 
     def describe(self) -> str:
         bits = []
@@ -118,9 +130,9 @@ class FileQuery:
             bits.append(f"named like '{self.name}'")
         if self.extensions:
             bits.append("of type " + ", ".join("." + e for e in self.extensions[:8]))
-        if self.min_size:
+        if self.min_size is not None:
             bits.append(f"over {human_size(self.min_size)}")
-        if self.max_size:
+        if self.max_size is not None:
             bits.append(f"under {human_size(self.max_size)}")
         if self.modified_after or self.modified_before:
             bits.append("modified " + _range_text(self.modified_after, self.modified_before))
@@ -159,6 +171,8 @@ class FileResults:
     seconds: float = 0.0
     note: str = ""
     truncated: bool = False
+    #: True when these are the closest names, not exact matches.
+    relaxed: bool = False
 
     def summary(self) -> str:
         what = self.query.describe()
@@ -340,6 +354,11 @@ def extensions_for(kind: Any, extension: Any = None) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def _unquote_path(value: str) -> str:
+    value = value.strip()
+    return value[1:-1] if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0] else value
+
+
 def build_query(args: dict[str, Any]) -> FileQuery:
     """A FileQuery from tool arguments (which arrive from speech)."""
     kind_word = str(args.get("type") or args.get("kind") or "").strip().lower()
@@ -360,17 +379,70 @@ def build_query(args: dict[str, Any]) -> FileQuery:
         limit = max(1, min(500, int(args.get("limit") or 40)))
     except (TypeError, ValueError):
         limit = 40
+    sort = str(args.get("sort") or "relevance").strip().lower()
+    if not item_kind and not kind_word and sort in {"largest", "biggest", "size", "smallest"}:
+        item_kind = "file"           # "biggest files": a folder is not a file
+    raw_name = str(args.get("query") or args.get("name") or "").strip()
+    folder = _unquote_path(str(args.get("folder") or args.get("in") or ""))
+    from .app_resolver import known_folder
+    labelled = known_folder(folder, location=True) if folder else None
+    if labelled is not None:
+        folder = str(labelled)
+    direct = known_folder(raw_name, location=True) if raw_name else None
+    path_name = os.path.expandvars(os.path.expanduser(_unquote_path(raw_name)))
+    # A location supplied as the query is already an identity, not a basename
+    # pattern. Keep a missing explicit path missing rather than opening some
+    # unrelated file with the same basename elsewhere.
+    literal_path = (path_name if path_name and not any(ch in path_name for ch in "*?")
+                    and (os.path.isabs(path_name) or path_name.startswith(("./", ".\\", "../", "..\\")))
+                    else "")
+    research_topic = ""
+    name = raw_name
+    # Preserve quoted or wildcard names literally. Only remove grammatical
+    # wrappers from a spoken request; never turn a topic into an arbitrary path.
+    if raw_name and not any(ch in raw_name for ch in "*?\\/"):
+        if raw_name[:1] in {"'", '"'} and raw_name[-1:] == raw_name[:1]:
+            name = raw_name[1:-1]
+        else:
+            match = re.fullmatch(
+                r"(?:find\s+|open\s+|show\s+)?(?:my\s+|the\s+|a\s+)?"
+                r"research\s+(?:folder|directory)(?:\s+(?:about|on|for))?\s+(.+)",
+                raw_name, re.I)
+            if match:
+                name = research_topic = match.group(1).strip()
+                item_kind, kind_word = "folder", ""
+            else:
+                match = re.fullmatch(
+                    r"(?:find\s+|open\s+|show\s+)?(?:my\s+|the\s+|a\s+)?"
+                    r"(?:folder|directory|file)\s+(?:called\s+|named\s+|about\s+)?(.+)",
+                    raw_name, re.I)
+                if match:
+                    name = match.group(1).strip()
+                    item_kind = "file" if re.search(r"\bfile\b", raw_name, re.I) else "folder"
+                elif not Path(raw_name).suffix:
+                    name = re.sub(r"^(?:my|the)\s+", "", raw_name, flags=re.I)
+    if literal_path:
+        name = Path(literal_path).name
+    elif (direct is not None and item_kind != "file" and not kind_word
+            and not args.get("extension") and not args.get("ext")):
+        item_kind = "folder"
+        name = direct.name
+    elif re.fullmatch(r"(?:my\s+|the\s+)?research\s+(?:folder|directory)", raw_name, re.I):
+        item_kind, name = "folder", "research"
     return FileQuery(
-        name=str(args.get("query") or args.get("name") or "").strip(),
+        name=name,
         extensions=extensions_for(kind_word, args.get("extension") or args.get("ext")),
         min_size=min_size, max_size=max_size,
         modified_after=m_after, modified_before=m_before,
         created_after=c_after, created_before=c_before,
-        folder=os.path.expandvars(os.path.expanduser(str(args.get("folder") or args.get("in") or ""))),
-        kind=item_kind or ("file" if (min_size or max_size) and not kind_word else ""),
+        folder=os.path.expandvars(os.path.expanduser(folder)),
+        kind=item_kind or ("file" if (min_size is not None or max_size is not None)
+                          and not kind_word else ""),
         include_system=bool(args.get("system") or args.get("include_system")),
-        sort=str(args.get("sort") or "relevance").strip().lower(),
+        sort=sort,
         limit=limit,
+        direct_path=literal_path or (str(direct) if direct is not None and item_kind == "folder" else ""),
+        research_topic=research_topic,
     )
 
 
@@ -389,6 +461,12 @@ def _name_matches(name: str, pattern: str) -> bool:
 
 
 def matches(hit: FileHit, q: FileQuery) -> bool:
+    if q.folder:
+        try:
+            if not Path(hit.path).resolve().is_relative_to(Path(q.folder).resolve()):
+                return False
+        except (OSError, ValueError, RuntimeError):
+            return False
     if q.kind == "folder" and not hit.is_folder:
         return False
     if q.kind == "file" and hit.is_folder:
@@ -511,9 +589,9 @@ def _is_noise(path: str, q: FileQuery) -> bool:
     walk applies as it goes. Only the part of the path below the folder that
     was asked about is judged: asking inside a cache searches the cache.
     """
-    low = os.path.normcase(path)
-    base = os.path.normcase(q.folder.rstrip("\\/")) if q.folder else ""
-    if base and low.startswith(base):
+    low = os.path.normpath(path).replace("/", "\\").casefold()
+    base = os.path.normpath(q.folder).replace("/", "\\").rstrip("\\").casefold() if q.folder else ""
+    if base and (low == base or low.startswith(base + "\\")):
         low = low[len(base):]
     folders = [part for part in low.replace("/", "\\").split("\\")[:-1] if part]
     if any(part in NOISE_SKIP for part in folders):
@@ -522,15 +600,26 @@ def _is_noise(path: str, q: FileQuery) -> bool:
         return False
     if any(part in SYSTEM_SKIP or part.startswith("$") for part in folders):
         return True
-    if os.path.basename(low) in _ROOT_SYSTEM_FILES:
+    if low.rsplit("\\", 1)[-1] in _ROOT_SYSTEM_FILES:
         return True
     return any(fragment in low for fragment in _APP_NOISE)
 
 
 def search_everything(q: FileQuery, timeout: float = 15.0) -> tuple[list[FileHit], str]:
+    hits, note, _rows = _everything_query(q, timeout)
+    return hits, note
+
+
+#: Rows Everything is asked for; an answer shorter than this is complete.
+def _everything_cap(q: FileQuery) -> int:
+    return max(q.limit * 10, 500)
+
+
+def _everything_query(q: FileQuery, timeout: float = 15.0) -> tuple[list[FileHit], str, int]:
+    """(hits, note, rows Everything returned before noise filtering)."""
     exe = everything_cli()
     if not exe:
-        return [], "Everything is not installed"
+        return [], "Everything is not installed", 0
     sort = {"newest": "date-modified-descending", "recent": "date-modified-descending",
             "latest": "date-modified-descending", "oldest": "date-modified-ascending",
             "largest": "size-descending", "biggest": "size-descending",
@@ -541,7 +630,7 @@ def search_everything(q: FileQuery, timeout: float = 15.0) -> tuple[list[FileHit
     # filtered after it.
     command = [exe, "-csv", "-full-path-and-name", "-size", "-date-modified",
                "-date-created", "-attributes", "-size-format", "1",
-               "-date-format", "1", "-n", str(max(q.limit * 10, 500)),
+               "-date-format", "1", "-n", str(_everything_cap(q)),
                "-sort", sort or "date-modified-descending"]
     if q.folder:
         command += ["-path", q.folder]
@@ -558,13 +647,15 @@ def search_everything(q: FileQuery, timeout: float = 15.0) -> tuple[list[FileHit
         done = subprocess.run(command, capture_output=True, timeout=timeout,
                               creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return [], f"Everything did not answer ({type(exc).__name__})"
+        return [], f"Everything did not answer ({type(exc).__name__})", 0
     if done.returncode != 0:
         detail = (done.stderr or done.stdout or b"").decode("utf-8", "replace").strip()
-        return [], f"Everything is not running ({detail[:80] or done.returncode})"
+        return [], f"Everything is not running ({detail[:80] or done.returncode})", 0
     text = done.stdout.decode("utf-8-sig", "replace")
     hits: list[FileHit] = []
+    rows = 0
     for row in csv.DictReader(io.StringIO(text)):
+        rows += 1
         path = str(row.get("Filename") or row.get("Full Path & Name") or "")
         if len(path) > 3:
             path = path.rstrip("\\")         # folders arrive as "...\name\"
@@ -590,7 +681,7 @@ def search_everything(q: FileQuery, timeout: float = 15.0) -> tuple[list[FileHit
             size = 0
         hits.append(FileHit(path, folder, size, _stamp(row.get("Date Modified", "")),
                             _stamp(row.get("Date Created", ""))))
-    return hits, ""
+    return hits, "", rows
 
 
 # ── engine 2: the Windows Search index ───────────────────────────────────────
@@ -715,6 +806,8 @@ def search_walk(q: FileQuery, budget: float = WALK_BUDGET_S) -> tuple[list[FileH
                 return found, "the full-drive walk hit its time limit", True
             keep = []
             for d in dirnames:
+                if time.monotonic() > deadline:
+                    return found, "the full-drive walk hit its time limit", True
                 low = d.lower()
                 if low in NOISE_SKIP or low.startswith("$"):
                     continue
@@ -724,12 +817,16 @@ def search_walk(q: FileQuery, budget: float = WALK_BUDGET_S) -> tuple[list[FileH
             dirnames[:] = keep
             if q.kind != "file":
                 for d in dirnames:
+                    if time.monotonic() > deadline:
+                        return found, "the full-drive walk hit its time limit", True
                     if _name_matches(d, q.name):
                         hit = _stat_hit(os.path.join(base, d), True)
                         if hit and matches(hit, q):
                             found.append(hit)
             if q.kind != "folder":
                 for name in filenames:
+                    if time.monotonic() > deadline:
+                        return found, "the full-drive walk hit its time limit", True
                     if q.name and not _name_matches(name, q.name):
                         continue
                     if q.extensions and name.rsplit(".", 1)[-1].lower() not in q.extensions:
@@ -748,12 +845,48 @@ def search(q: FileQuery, *, engines: Iterable[str] = ("everything", "index", "wa
     """Answer *q* with the fastest engine that can, filtered and ordered here."""
     started = time.monotonic()
     result = FileResults(query=q)
+    if q.direct_path:
+        hit = _stat_hit(q.direct_path)
+        if hit is not None and matches(hit, q):
+            result.hits = [hit]
+        result.engine = "the configured user-folder location"
+        result.seconds = time.monotonic() - started
+        return result
+    if q.kind == "folder" and q.name.lower() == "research":
+        from .constants import BASE_DIR, CONFIG_DIR
+        roots = [CONFIG_DIR / "research", BASE_DIR / "research"]
+        if q.folder:
+            roots = [root for root in roots if root.resolve().is_relative_to(Path(q.folder).resolve())]
+        hits = _order(_dedupe([hit for root in roots
+                              if (hit := _stat_hit(str(root), True)) is not None
+                              and root.is_dir() and matches(hit, q)]), q)
+        result.hits = hits[:q.limit]
+        result.truncated = len(hits) > q.limit
+        if result.hits:
+            result.engine = "ORION's configured research locations"
+            result.seconds = time.monotonic() - started
+            return result
+    if q.research_topic:
+        related = find_research_folders(q.research_topic, folder=q.folder, limit=q.limit)
+        related = [hit for hit in related if matches(hit, replace(q, name=""))]
+        if related:
+            result.hits = related
+            result.engine = "ORION's saved research reports"
+            result.note = "These folders contain reports whose filenames or titles match the topic."
+            result.seconds = time.monotonic() - started
+            return result
     notes: list[str] = []
     for engine in engines:
         truncated = False
+        complete = False
         if engine == "everything":
-            raw, note = search_everything(q)
+            raw, note, rows = _everything_query(q)
             label = "Everything (whole-PC index)"
+            # Everything indexes every file on the PC: when it answered and
+            # was not cut off by its row cap, "nothing" is the answer. Going
+            # on to the index and a whole-drive walk cost ~25 s for every
+            # name that does not exist (measured 4 Oct 2026).
+            complete = not note and rows < _everything_cap(q)
         elif engine == "index":
             raw, note = search_windows_index(q)
             label = "the Windows Search index"
@@ -762,8 +895,8 @@ def search(q: FileQuery, *, engines: Iterable[str] = ("everything", "index", "wa
             label = "a walk of " + (q.folder or ", ".join(fixed_drives()))
         if note:
             notes.append(note)
-        hits = [h for h in raw if matches(h, q)]
-        if hits or engine == "walk":
+        hits = [h for h in raw if not _is_noise(h.path, q) and matches(h, q)]
+        if hits or engine == "walk" or complete:
             ordered = _order(_dedupe(hits), q)
             result.hits = ordered[:q.limit]
             result.truncated = truncated or len(ordered) > q.limit
@@ -775,6 +908,97 @@ def search(q: FileQuery, *, engines: Iterable[str] = ("everything", "index", "wa
                 result.note = "; ".join(n for n in notes if n)[:200]
             break
     result.seconds = time.monotonic() - started
+    return result
+
+
+# ── when nothing matches exactly ─────────────────────────────────────────────
+#
+# A name query needs EVERY word in the file name, which is right for "invoice
+# march" and wrong for how people talk: "my biology essay" misses "Bio Essay
+# Final.docx", "the tax stuff" misses everything (nothing is called "stuff"),
+# and "capabilities roadmap" misses "CAPABILITY_ROADMAP.md". When the exact
+# search finds nothing, one relaxed pass ranks names by how many of the
+# meaningful words they share — a word also matching its own abbreviation,
+# plural or a near spelling — and says plainly that these are the closest
+# matches, not exact ones.
+
+#: Words that say nothing about WHICH file.
+_VAGUE_WORDS = frozenset({
+    "my", "the", "a", "an", "our", "your", "his", "her", "their", "file", "files",
+    "document", "documents", "doc", "please", "up", "for", "me", "that", "this",
+    "stuff", "thing", "things", "one", "ones", "some", "with", "in", "it", "about",
+    "of", "and", "on", "from", "called", "named", "to", "is", "was", "had", "there",
+    "lost", "find", "where", "put", "saved", "folder"})
+
+
+def _content_terms(name: str) -> list[str]:
+    words = re.findall(r"[a-z0-9]+", str(name or "").lower())
+    return [w for w in dict.fromkeys(words) if len(w) > 1 and w not in _VAGUE_WORDS]
+
+
+def _name_tokens(name: str) -> list[str]:
+    stem = Path(name).stem if "." in name else name
+    # Split camelCase and snake/kebab case as well as spaces.
+    stem = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)
+    return [t for t in re.findall(r"[a-z0-9]+", stem.lower()) if t]
+
+
+def _term_hits(term: str, tokens: list[str]) -> bool:
+    for token in tokens:
+        if token == term:
+            return True
+        if len(token) >= 3 and term.startswith(token):          # biology <- "bio"
+            return True
+        common = max(4, min(len(term), len(token)) - 2)
+        if len(term) >= 4 and len(token) >= 4 and token[:common] == term[:common]:
+            return True                                           # essays/essay, capabilities/capability
+        if len(term) >= 5 and len(token) >= 5:
+            import difflib
+            if difflib.SequenceMatcher(None, term, token).ratio() >= 0.84:
+                return True                                       # spelling slips
+    return False
+
+
+def relaxed_score(name: str, terms: list[str]) -> float:
+    """Share of the meaningful words a file name answers (0..1)."""
+    if not terms:
+        return 0.0
+    tokens = _name_tokens(name)
+    return sum(_term_hits(term, tokens) for term in terms) / len(terms)
+
+
+def relaxed_search(q: FileQuery, *, engines: Iterable[str] = ("everything", "index")
+                   ) -> FileResults | None:
+    """The closest names when the exact search found none, or None.
+
+    Probes the indexes with a short prefix of the most distinctive words, then
+    keeps only names answering at least half of the meaningful words (all of
+    them for a one- or two-word request).
+    """
+    terms = _content_terms(q.name)
+    if not terms:
+        return None
+    from dataclasses import replace
+    started = time.monotonic()
+    need = 1.0 if len(terms) <= 2 else 0.5
+    candidates: list[FileHit] = []
+    engine_used = ""
+    for term in sorted(terms, key=len, reverse=True)[:3]:
+        probe = replace(q, name=term[:4] if len(term) > 4 else term, limit=400)
+        found = search(probe, engines=engines)
+        candidates += found.hits
+        engine_used = engine_used or found.engine
+    scored = [(relaxed_score(hit.name, terms), hit) for hit in _dedupe(candidates)]
+    kept = [(score, hit) for score, hit in scored if score >= need]
+    if not kept:
+        return None
+    kept.sort(key=lambda row: (-row[0], -row[1].modified))
+    result = FileResults(query=q, hits=[hit for _, hit in kept[:q.limit]],
+                         engine=engine_used or "the indexes")
+    result.note = ("no exact match — these are the closest names "
+                   f"(sharing the words of '{' '.join(terms)}')")
+    result.seconds = time.monotonic() - started
+    result.relaxed = True
     return result
 
 
@@ -793,13 +1017,41 @@ def _dedupe(hits: list[FileHit]) -> list[FileHit]:
 
 def orion_output_dirs() -> list[Path]:
     """Where ORION writes things he may be asked to bring up again."""
+    import sys
     from .constants import BASE_DIR, CONFIG_DIR
 
-    candidates = [CONFIG_DIR / "self_repair", CONFIG_DIR / "research", CONFIG_DIR / "exports",
-                  CONFIG_DIR / "reports", BASE_DIR / "research", BASE_DIR / "exports",
-                  BASE_DIR / "reports", BASE_DIR / "projects",
-                  Path.home() / "Documents" / "ORION"]
-    return [p for p in candidates if p.exists()]
+    # A redirected CONFIG_DIR does not move reports already written beside
+    # the app. Older Word exports also ignored the pointer and used its local
+    # config/research. A source launch must still find the installed app's
+    # genuine output folders, without walking its runtime or build payloads.
+    app_roots = [BASE_DIR]
+    config_roots = [CONFIG_DIR, BASE_DIR / "config"]
+    if not getattr(sys, "frozen", False):
+        installed = BASE_DIR / "dist" / "ORION"
+        app_roots.append(installed)
+        config_roots.append(installed / "config")
+    # Check research before broad report/project trees: source audit reports
+    # can otherwise consume the lookup's whole walk budget before it reaches
+    # a genuine research folder written by the installed app.
+    candidates = [root / "research" for root in (*config_roots, *app_roots)]
+    candidates += [root / name for root in config_roots
+                   for name in ("self_repair", "exports", "reports")]
+    candidates += [root / name for root in app_roots
+                   for name in ("exports", "reports", "projects")]
+    candidates.append(Path.home() / "Documents" / "ORION")
+    found: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            if not path.is_dir():
+                continue
+            key = os.path.normcase(str(path.resolve()))
+        except (OSError, RuntimeError):
+            continue
+        if key not in seen:
+            seen.add(key)
+            found.append(path)
+    return found
 
 
 def find_own_documents(name: str, limit: int = 10) -> list[FileHit]:
@@ -810,10 +1062,76 @@ def find_own_documents(name: str, limit: int = 10) -> list[FileHit]:
     """
     q = FileQuery(name=name, kind="file", limit=limit, sort="newest")
     found: list[FileHit] = []
+    deadline = time.monotonic() + 3.0
     for root in orion_output_dirs():
-        hits, _note, _cut = search_walk(replace(q, folder=str(root)), budget=3.0)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        hits, _note, _cut = search_walk(replace(q, folder=str(root)), budget=remaining)
         found.extend(hits)
     return _order(_dedupe(found), q)[:limit]
+
+
+def find_research_folders(topic: str, *, folder: str = "", limit: int = 10,
+                          budget: float = 2.0) -> list[FileHit]:
+    """Folders evidenced by saved research titles, not inferred model memory.
+
+    Read only bounded report headings under known output roots. A topic that
+    is absent from filenames and headings produces no guessed folder.
+    """
+    terms = _content_terms(topic)
+    if not terms:
+        return []
+    roots = [root for root in orion_output_dirs() if root.name.casefold() == "research"]
+    if folder:
+        scope = Path(folder).resolve()
+        roots = [scope if scope.is_relative_to(root.resolve()) else root for root in roots
+                 if scope.is_relative_to(root.resolve()) or root.resolve().is_relative_to(scope)]
+    deadline = time.monotonic() + max(0.0, budget)
+    found: list[FileHit] = []
+    inspected = 0
+    for root in roots:
+        if time.monotonic() >= deadline:
+            return _dedupe(found)[:limit]
+        for base, dirs, files in os.walk(root, onerror=lambda _e: None):
+            # Empty trees need the same deadline as reports: checking only
+            # filenames let a directory-only walk ignore the entire budget.
+            if time.monotonic() >= deadline:
+                return _dedupe(found)[:limit]
+            kept_dirs = []
+            for name in dirs:
+                if time.monotonic() >= deadline:
+                    return _dedupe(found)[:limit]
+                child = Path(base) / name
+                if (name.lower() not in NOISE_SKIP and not child.is_symlink()
+                        and not getattr(child, "is_junction", lambda: False)()):
+                    kept_dirs.append(name)
+            dirs[:] = kept_dirs
+            for name in files:
+                if time.monotonic() >= deadline or inspected >= 200:
+                    return _dedupe(found)[:limit]
+                path = Path(base) / name
+                suffix = path.suffix.lower()
+                if suffix not in {".md", ".txt", ".docx"} or path.is_symlink():
+                    continue
+                inspected += 1
+                matched = relaxed_score(name, terms) >= 1.0
+                # A Word export's topic is in its filename. Keep this lookup
+                # bounded and metadata-only for Word; never decode its ZIP
+                # container as a report heading.
+                if suffix == ".docx" and not matched:
+                    continue
+                if not matched:
+                    try:
+                        with path.open("r", encoding="utf-8", errors="replace") as handle:
+                            heading = handle.read(4096).splitlines()[:5]
+                        matched = any(relaxed_score(line.lstrip("# "), terms) >= 1.0
+                                      for line in heading if line.strip())
+                    except OSError:
+                        continue
+                if matched and (hit := _stat_hit(str(path.parent), True)) is not None:
+                    found.append(hit)
+    return _dedupe(found)[:limit]
 
 
 # ── acting on what was found ─────────────────────────────────────────────────
@@ -844,6 +1162,10 @@ def open_path(path: str, *, allow_programs: bool = False) -> str:
     A program or script is NOT run (see PROGRAM_EXTENSIONS): it is selected in
     File Explorer instead and the reason says so, unless *allow_programs*.
     """
+    from .execution_policy import require_foreground
+    blocked = require_foreground("shell_open_file")
+    if blocked is not None:
+        return blocked.text
     target = os.path.normpath(path)
     if not os.path.exists(target):
         return "that path does not exist"
@@ -853,18 +1175,83 @@ def open_path(path: str, *, allow_programs: bool = False) -> str:
         reveal_path(target)
         return ("it is a program or script, not a document, so I have not run "
                 "it — it is selected in File Explorer for you to decide")
+    before = _screen_windows() if VERIFY_OPENS else None
     try:
+        blocked = require_foreground("shell_open_file")
+        if blocked is not None:
+            return blocked.text
         os.startfile(target)  # type: ignore[attr-defined]
-        return ""
+        return _appeared(target, before)
     except OSError as exc:
         if os.path.isfile(target):
             try:
+                blocked = require_foreground("shell_open_file_fallback")
+                if blocked is not None:
+                    return blocked.text
                 subprocess.Popen(["notepad.exe", target],
                                  creationflags=0x08000000)
-                return ""
+                return _appeared(target, before)
             except OSError:
                 pass
         return str(exc)[:160]
+
+
+#: Whether open_path waits to see the file on screen (tests turn it off).
+VERIFY_OPENS = os.name == "nt"
+#: How long a file has to appear after Windows is asked to open it.
+OPEN_SEEN_TIMEOUT_S = 4.0
+
+
+def _screen_windows() -> tuple[dict[int, str], int] | None:
+    """(visible top-level windows -> title, the foreground window), or None."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        found: dict[int, str] = {}
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def each(hwnd: Any, _param: Any) -> bool:
+            if user32.IsWindowVisible(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length:
+                    buffer = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buffer, length + 1)
+                    found[int(hwnd)] = buffer.value
+            return True
+
+        user32.EnumWindows(each, 0)
+        return found, int(user32.GetForegroundWindow() or 0)
+    except Exception:
+        return None
+
+
+def _appeared(target: str, before: tuple[dict[int, str], int] | None) -> str:
+    """"" once *target* is visibly open, else why it is not.
+
+    Owner, 30 Oct 2026: "ORION needs to know if the file or folder ... I ask
+    him to open up actually opens up because if it doesn't he shouldn't be
+    rewarded for it." Seen means a window titled with its name, a new window,
+    or the front window changing - within OPEN_SEEN_TIMEOUT_S."""
+    if not VERIFY_OPENS or before is None:
+        return ""
+    windows_before, front_before = before
+    name = os.path.basename(target.rstrip("\\/")).lower()
+    stem = os.path.splitext(name)[0]
+    deadline = time.monotonic() + OPEN_SEEN_TIMEOUT_S
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        now = _screen_windows()
+        if now is None:
+            return ""                         # cannot look: do not call it a failure
+        windows, front = now
+        titled = any(stem and stem in title.lower() for title in windows.values())
+        if titled or set(windows) - set(windows_before) or (front and front != front_before):
+            return ""
+    return ("Windows was asked to open it, but nothing appeared on screen within "
+            f"{OPEN_SEEN_TIMEOUT_S:.0f} seconds")
 
 
 _FILLER_WORDS = frozenset({"my", "the", "a", "an", "our", "your", "his", "her",
@@ -883,14 +1270,8 @@ _NOT_USER_CONTENT = re.compile(
 
 
 def _user_folders() -> list[str]:
-    home = Path.home()
-    roots = [home / "Desktop", home / "Documents", home / "Downloads",
-             home / "Pictures", home / "Videos", home / "Music"]
-    try:
-        roots += [p for p in home.iterdir() if p.is_dir() and p.name.startswith("OneDrive")]
-    except OSError:
-        pass
-    return [str(r) for r in roots if r.exists()]
+    from .path_policy import user_roots
+    return list(dict.fromkeys(str(root) for _label, root in user_roots() if root.is_dir()))
 
 
 def find_document(spoken: str, budget: float = 3.0) -> str:
@@ -900,45 +1281,86 @@ def find_document(spoken: str, budget: float = 3.0) -> str:
     AppData/build/system folders), and every meaningful word must be a whole
     part of the file name — "cv" matches "CV 2026.docx", not "cv_debug.log".
     ORION's own documents first, then the fast index, then a short walk of
-    the user's own folders; newest first. "" rather than a guess.
+    the user's own folders. An exact filename takes precedence; otherwise
+    the match must be unique. "" rather than a guess.
     """
-    words = [w.strip(".") for w in re.findall(r"[\w'.-]+", str(spoken or "").lower())
-             if w not in _FILLER_WORDS]
-    words = [w for w in words if w]
+    requested = str(spoken or "").strip()
+    quoted = len(requested) >= 2 and requested[0] in {"'", '"'} and requested[-1] == requested[0]
+    parsed = build_query({"query": requested if quoted else re.sub(
+        r"^(?:open|show|bring up)\s+", "", requested, flags=re.IGNORECASE)})
+    raw_name = parsed.name
+    extension = Path(raw_name).suffix.lower().lstrip(".")
+    openable = {e for kind in OPENABLE_KINDS for e in KINDS[kind]}
+    explicit_extension = extension if extension in openable else ""
+    if explicit_extension and not quoted and not parsed.direct_path:
+        raw_name = re.sub(r"^(?:my|the|our|your|this|that)\s+", "", raw_name, flags=re.IGNORECASE)
+    stem = Path(raw_name).stem if explicit_extension else raw_name
+    # Match the same word boundaries in the request and the file. Keeping
+    # '.docx' or a hyphen inside a request token made exact filenames fail
+    # against an extension-free, punctuation-split filename stem.
+    words = [w for w in re.findall(r"[^\W_]+", stem.casefold()) if w not in _FILLER_WORDS]
+    if not words and explicit_extension:
+        words = re.findall(r"[^\W_]+", stem.casefold())
     if not words:
         return ""
-    name = " ".join(words)
+    if parsed.direct_path:
+        hit = _stat_hit(parsed.direct_path)
+        return hit.path if hit is not None and not hit.is_folder and explicit_extension else ""
+    name = raw_name if explicit_extension else " ".join(words)
     # Documents first; a picture or recording only when no document matches
     # ("my CV" is a document even though an icon somewhere is called cv.svg).
     for kinds in (("document", "spreadsheet", "presentation"), ("image", "video", "audio")):
         exts = tuple(dict.fromkeys(e for kind in kinds for e in KINDS.get(kind, ())))
-        found = _find_by_kind(name, words, exts, deadline=time.monotonic() + budget / 2)
+        if explicit_extension:
+            exts = tuple(e for e in exts if e == explicit_extension)
+            if not exts:
+                continue
+        found = _find_by_kind(name, words, exts, deadline=time.monotonic() + budget / 2,
+                              exact_name=raw_name, exact_only=bool(explicit_extension))
+        if found is None:
+            return ""               # ambiguous documents must not fall through to an image
         if found:
             return found
     return ""
 
 
 def _find_by_kind(name: str, words: list[str], extensions: tuple[str, ...],
-                  deadline: float) -> str:
+                  deadline: float, exact_name: str = "", exact_only: bool = False) -> str | None:
     def acceptable(hit: FileHit) -> bool:
         if hit.is_folder or is_program(hit.path) or _NOT_USER_CONTENT.search(hit.path):
             return False
         if Path(hit.path).suffix.lower().lstrip(".") not in extensions:
             return False
-        parts = set(re.split(r"[^a-z0-9]+", Path(hit.path).stem.lower()))
-        return all(any(part.startswith(w) for part in parts) for w in words)
+        if exact_only and hit.name.casefold() != exact_name.casefold():
+            return False
+        parts = set(re.findall(r"[^\W_]+", Path(hit.path).stem.casefold()))
+        return all(w in parts for w in words) and os.path.isfile(hit.path)
+
+    def choose(hits: list[FileHit]) -> str | None:
+        candidates = _dedupe([hit for hit in hits if acceptable(hit)])
+        if not candidates:
+            return ""
+        exact = [hit for hit in candidates if hit.name.casefold() == exact_name.casefold()]
+        if exact:
+            candidates = exact
+        else:
+            exact_stems = [hit for hit in candidates
+                           if Path(hit.path).stem.casefold() == name.casefold()]
+            if exact_stems:
+                candidates = exact_stems
+        return candidates[0].path if len(candidates) == 1 else None
 
     q = FileQuery(name=name, extensions=extensions, kind="file", limit=30, sort="newest")
-    for hit in find_own_documents(name, limit=5):
-        if acceptable(hit):
-            return hit.path
+    own = choose(find_own_documents(name, limit=30))
+    if own is None or own:
+        return own
     try:
         fast = search(q, engines=("everything", "index")).hits
     except Exception:
         fast = []
-    for hit in _order(list(fast), q):
-        if acceptable(hit):
-            return hit.path
+    indexed = choose(list(fast))
+    if indexed is None or indexed:
+        return indexed
     found: list[FileHit] = []
     for root in _user_folders():
         left = deadline - time.monotonic()
@@ -946,16 +1368,22 @@ def _find_by_kind(name: str, words: list[str], extensions: tuple[str, ...],
             break
         hits, _note, _cut = search_walk(replace(q, folder=root), budget=left)
         found.extend(h for h in hits if acceptable(h))
-    ordered = _order(_dedupe(found), q)
-    return ordered[0].path if ordered else ""
+    return choose(found)
 
 
 def reveal_path(path: str) -> str:
     """Show *path* selected in File Explorer."""
+    from .execution_policy import require_foreground
+    blocked = require_foreground("shell_reveal_file")
+    if blocked is not None:
+        return blocked.text
     target = os.path.normpath(path)
     if not os.path.exists(target):
         return "that path does not exist"
     try:
+        blocked = require_foreground("shell_reveal_file")
+        if blocked is not None:
+            return blocked.text
         subprocess.Popen(["explorer.exe", "/select,", target])
         return ""
     except OSError as exc:

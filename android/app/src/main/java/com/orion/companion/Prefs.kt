@@ -2,17 +2,16 @@ package com.orion.companion
 
 import android.content.Context
 import android.net.Uri
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 
 /**
  * Where the phone remembers how to reach ORION.
  *
- * Beyond the single manually-typed host, it stores the ordered **endpoint list**
- * the desktop reports at pairing time (Tailscale name first, then LAN). The app
- * auto-connects through these, so once you've paired you never type an IP again:
- * the Tailscale name reaches ORION at home and on mobile data alike, and the LAN
- * address is a low-latency fallback when you're on his Wi-Fi.
+ * Beyond the manually entered host, it stores the HTTPS endpoints reported at
+ * pairing time. Serve mode supplies the MagicDNS name on port 443; raw
+ * Tailscale IPs and cleartext endpoints are not used by the Android app.
  */
 object Prefs {
     const val NAME = "orion"
@@ -21,10 +20,11 @@ object Prefs {
     const val HTTPS = "https"
     const val ENDPOINTS = "endpoints"     // JSON array of base URLs, priority order
     const val DEVICE = "device_id"
-    const val REFRESH = "refresh_token"
+    const val REFRESH = "refresh_token"           // legacy plain text, migrated on read
+    const val REFRESH_SEALED = "refresh_token_sealed"   // Keystore AES-GCM ciphertext
     const val LITE = "lite"               // "auto" (metered-driven) | "on" | "off"
     const val CERT_PIN = "cert_sha256"    // SHA-256 of ORION's self-signed certificate
-    const val DEFAULT_PORT = 8765
+    const val DEFAULT_PORT = 443
 
     private fun sp(context: Context) =
         context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
@@ -34,11 +34,13 @@ object Prefs {
         val p = sp(context)
         val host = p.getString(HOST, "").orEmpty().trim()
         if (host.isEmpty()) return null
-        val port = p.getInt(PORT, DEFAULT_PORT)
-        val scheme = if (p.getBoolean(HTTPS, true)) "https" else "http"
+        val savedPort = p.getInt(PORT, DEFAULT_PORT)
+        val port = if (host.endsWith(".ts.net", ignoreCase = true) &&
+            savedPort in setOf(8765, 8000)) 443 else savedPort
+        val scheme = "https"
         // An IPv6 literal (Tailscale hands out fd7a:…) must be bracketed in a URL.
         val hostPart = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
-        return "$scheme://$hostPart:$port/"
+        return secureUrl("$scheme://$hostPart:$port/")
     }
 
     /** What the user typed into "PC address", split into its parts. */
@@ -63,7 +65,10 @@ object Prefs {
             }
             s = s.substring(schemeEnd + 3)
         }
-        s = s.substringBefore('/').substringBefore('?').substringBefore('#').substringAfterLast('@')
+        if ('@' in s || '?' in s || '#' in s) return null
+        val authority = s.substringBefore('/')
+        if (s.substring(authority.length) !in setOf("", "/")) return null
+        s = authority
         var port: Int? = null
         val host: String
         if (s.startsWith("[")) {                       // [IPv6]:port
@@ -72,6 +77,7 @@ object Prefs {
             host = s.substring(1, close)
             val rest = s.substring(close + 1)
             if (rest.startsWith(":")) port = rest.substring(1).toIntOrNull() ?: return null
+            else if (rest.isNotEmpty()) return null
         } else if (s.count { it == ':' } == 1) {       // host:port
             host = s.substringBefore(':')
             port = s.substringAfter(':').toIntOrNull() ?: return null
@@ -80,13 +86,15 @@ object Prefs {
         }
         if (host.isEmpty() || host.any { it.isWhitespace() }) return null
         if (port != null && port !in 1..65535) return null
+        val hostPart = if (host.contains(':')) "[$host]" else host
+        if (canonicalHttpsOrigin("https://$hostPart:${port ?: DEFAULT_PORT}/") == null) return null
         return Address(host, port, https)
     }
 
     fun host(context: Context): String =
         sp(context).getString(HOST, "").orEmpty().trim()
 
-    /** Ordered base URLs to try: learned endpoints first, then the manual host. */
+    /** Ordered HTTPS base URLs: learned endpoints first, then the manual host. */
     fun candidateUrls(context: Context): List<String> {
         val out = ArrayList<String>()
         val raw = sp(context).getString(ENDPOINTS, "").orEmpty()
@@ -95,7 +103,7 @@ object Prefs {
                 val arr = JSONArray(raw)
                 for (i in 0 until arr.length()) {
                     val url = arr.optString(i).trim()
-                    if (url.isNotEmpty() && !out.contains(url)) out.add(url)
+                secureUrl(url)?.let { if (!out.contains(it)) out.add(it) }
                 }
             } catch (_: Exception) {
             }
@@ -122,8 +130,26 @@ object Prefs {
         ""
     }
 
+    internal fun canonicalHttpsOrigin(value: String): String? {
+        if (value.length > 2048 || value.any { it.isWhitespace() || it.code < 32 }) return null
+        val parsed = value.toHttpUrlOrNull() ?: return null
+        if (parsed.scheme != "https" || parsed.username.isNotEmpty() || parsed.password.isNotEmpty() ||
+            parsed.encodedPath != "/" || parsed.query != null || parsed.fragment != null ||
+            parsed.host.matches(Regex("100\\.\\d+\\.\\d+\\.\\d+"))) return null
+        val port = if (parsed.host.endsWith(".ts.net", true) && parsed.port in setOf(8765, 8000))
+            DEFAULT_PORT else parsed.port
+        return parsed.newBuilder().port(port).build().toString()
+    }
+
+    private fun secureUrl(url: String): String? = canonicalHttpsOrigin(url)
+
     /** Persist the endpoint list the desktop reported (from /v1/auth/pair or
-     *  /v1/auth/token). Accepts a JSON array of {url,…} objects or bare strings. */
+     *  /v1/auth/token). Accepts a JSON array of {url,…} objects or bare strings.
+     *
+     *  Only ever called with an answer that arrived over a trusted HTTPS
+     *  connection (system CA or an existing pin) and authenticated by the
+     *  pairing: that is what makes a home Wi-Fi endpoint's `cert_sha256` safe
+     *  to pin. A pin is accepted only for a private LAN IPv4 literal. */
     fun saveEndpoints(context: Context, endpointsJson: String) {
         val urls = JSONArray()
         try {
@@ -134,7 +160,13 @@ object Prefs {
                     is JSONObject -> item.optString("url").trim()
                     else -> item.toString().trim()
                 }
-                if (url.isNotEmpty()) urls.put(url)
+                val secure = secureUrl(url) ?: continue
+                urls.put(secure)
+                if (item is JSONObject && item.has("cert_sha256")) {
+                    val parsed = secure.toHttpUrlOrNull() ?: continue
+                    if (LanTrust.isPrivateLanHost(parsed.host))
+                        LanTrust.savePin(context, parsed.host, parsed.port, item.optString("cert_sha256"))
+                }
             }
         } catch (_: Exception) {
             return
@@ -142,6 +174,23 @@ object Prefs {
         if (urls.length() > 0) {
             sp(context).edit().putString(ENDPOINTS, urls.toString()).apply()
         }
+    }
+
+    /** Put a home Wi-Fi address found by [LanDiscovery] (its certificate
+     *  already matched a pin) at the front of the learned endpoints. */
+    fun preferEndpoint(context: Context, url: String) {
+        val secure = secureUrl(url) ?: return
+        val next = JSONArray().put(secure)
+        try {
+            val arr = JSONArray(sp(context).getString(ENDPOINTS, "[]").orEmpty())
+            for (i in 0 until arr.length()) {
+                val old = arr.optString(i)
+                val host = old.toHttpUrlOrNull()?.host.orEmpty()
+                // A LAN address that moved is replaced, not kept beside the new one.
+                if (old != secure && !LanTrust.isPrivateLanHost(host)) next.put(old)
+            }
+        } catch (_: Exception) { }
+        sp(context).edit().putString(ENDPOINTS, next.toString()).apply()
     }
 
     /** Manual reconfiguration clears learned endpoints so the new host wins. */
@@ -158,13 +207,53 @@ object Prefs {
     fun credentials(context: Context): Pair<String, String>? {
         val p = sp(context)
         val device = p.getString(DEVICE, "").orEmpty()
-        val refresh = p.getString(REFRESH, "").orEmpty()
-        return if (device.isNotEmpty() && refresh.isNotEmpty()) device to refresh else null
+        if (device.isEmpty()) return null
+        val sealed = p.getString(REFRESH_SEALED, "").orEmpty()
+        if (sealed.isNotEmpty()) {
+            cached?.let { (text, plain) -> if (text == sealed) return device to plain }
+            val refresh = SecureStore.decrypt(sealed)
+            if (refresh.isNullOrEmpty()) {
+                // The key is gone or the value was altered. An unreadable
+                // credential must never look like a valid session: forget it
+                // and let the app pair again, as on a fresh install.
+                clearCredentials(context)
+                return null
+            }
+            cached = sealed to refresh
+            return device to refresh
+        }
+        // Stored in plain text by an earlier version: seal it now.
+        val legacy = p.getString(REFRESH, "").orEmpty()
+        if (legacy.isEmpty()) return null
+        saveCredentials(context, device, legacy)
+        return if (sp(context).getString(REFRESH_SEALED, "").isNullOrEmpty()) null else device to legacy
     }
 
+    /** The refresh credential is stored only as Keystore ciphertext. If the
+     *  Keystore refuses, nothing is stored (pair again) rather than falling
+     *  back to plain text. */
     fun saveCredentials(context: Context, deviceId: String, refreshToken: String) {
-        sp(context).edit().putString(DEVICE, deviceId).putString(REFRESH, refreshToken).apply()
+        val sealed = SecureStore.encrypt(refreshToken)
+        val edit = sp(context).edit().putString(DEVICE, deviceId).remove(REFRESH)
+        if (sealed != null) {
+            edit.putString(REFRESH_SEALED, sealed)
+            cached = sealed to refreshToken
+        } else {
+            edit.remove(REFRESH_SEALED)
+            cached = null
+        }
+        edit.apply()
     }
+
+    fun clearCredentials(context: Context) {
+        cached = null
+        sp(context).edit().remove(DEVICE).remove(REFRESH).remove(REFRESH_SEALED).apply()
+    }
+
+    /** (ciphertext, plain) of the last credential read or written, so the
+     *  frame uplink and page loads do not pay a Keystore round trip each time. */
+    @Volatile
+    private var cached: Pair<String, String>? = null
 
     /**
      * The certificate ORION's uplink presented the first time this phone

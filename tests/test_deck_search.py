@@ -54,8 +54,8 @@ def deck(qapp):
 def test_the_deck_has_a_visible_search_bar(deck):
     dashboard, _bus = deck
     assert hasattr(dashboard, "_search_btn")
-    assert dashboard._search_btn.isVisibleTo(dashboard) or True  # constructed
-    assert "Search" in dashboard._search_btn.text()
+    assert dashboard._search_btn.isVisibleTo(dashboard)
+    assert "Find a Page or Action" in dashboard._search_btn.text()
     assert "Ctrl+K" in dashboard._search_btn.text()
 
 
@@ -94,10 +94,7 @@ def test_the_swarm_clusters_still_match_the_deck_zones():
     """The exact coupling that made zone-consolidation unsafe. If these drift,
     the swarm graph and the deck disagree about what the zones are."""
     from orion_core.gui.unified_dashboard import UnifiedDashboard
-    try:
-        from orion_core.swarm.model import clusters as cl
-    except Exception:
-        pytest.skip("swarm model not importable in this environment")
+    from orion_core.swarm import clusters as cl
     assert set(cl.CLUSTER_ORDER) == set(UnifiedDashboard.ZONE_ORDER)
 
 
@@ -109,4 +106,8 @@ def test_the_bus_carries_the_palette_signal():
 def test_the_core_window_listens_for_the_deck_search():
     source = (Path(__file__).resolve().parents[1] / "orion_core" / "gui"
               / "core_window.py").read_text(encoding="utf-8", errors="replace")
-    assert "self.bus.open_palette.connect(self.open_command_palette)" in source
+    # Queued: the palette is modal (exec()), so it must never run inline
+    # inside an asyncio task (tests/test_face_form_and_camera.py guard).
+    import re
+    assert re.search(r"self\.bus\.open_palette\.connect\(self\.open_command_palette,\s*"
+                     r"Qt\.ConnectionType\.QueuedConnection\)", source)

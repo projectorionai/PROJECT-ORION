@@ -54,6 +54,15 @@ class ActionIntent(str, Enum):
     # ── spends the user's money, immediately and irreversibly ───────────────
     PLACE_CALL = "place_call"                # dial a real telephone number
     SEND_MESSAGE = "send_message"            # a billable SMS or equivalent
+    MCP_CONFIGURE = "mcp_configure"          # install or launch external executable code
+    SOFTWARE_INSTALL = "software_install"    # install a program with winget (Mark XXXX.4)
+    # ── the user's own files (path_policy.py: the "user" zone) ──────────────
+    FILE_DELETE = "file_delete"              # move a user's file/folder to the Recycle Bin
+    FILE_WRITE = "file_write"                # change an existing user file
+    # ── the owner's own memories: forgotten everywhere, no copy kept ────────
+    MEMORY_FORGET = "memory_forget"
+    # Everything he keeps about the owner (erase_all.py), at the next start.
+    DATA_ERASE = "data_erase"
     # ── could not resolve confidently ───────────────────────────────────────
     AMBIGUOUS = "ambiguous"
     UNKNOWN = "unknown"
@@ -74,10 +83,29 @@ DESTRUCTIVE_INTENTS = frozenset({
     # the model fills in for itself is a convention, not a gate.
     ActionIntent.PLACE_CALL,
     ActionIntent.SEND_MESSAGE,
+    ActionIntent.MCP_CONFIGURE,
+    # Installing a program runs its installer on this computer: the exact
+    # package is bound to the token and shown to the owner first.
+    ActionIntent.SOFTWARE_INSTALL,
+    # Deleting or rewriting the user's OWN files (Desktop, Documents, OneDrive
+    # ...) on model text alone is exactly what a mishearing must not be able
+    # to do: the target is bound to the token and shown on screen first.
+    # classify_intent never returns these - only file_controller arms them.
+    ActionIntent.FILE_DELETE,
+    ActionIntent.FILE_WRITE,
+    # Forgetting removes the owner's records from every store with no copy
+    # kept (forget.py); a mishearing must not be able to do that either.
+    ActionIntent.MEMORY_FORGET,
+    ActionIntent.DATA_ERASE,
 })
 
 # Human-readable descriptions used in the confirmation prompt.
 _INTENT_PHRASE = {
+    ActionIntent.SOFTWARE_INSTALL: "install software on",
+    ActionIntent.MEMORY_FORGET: "permanently forget records held on",
+    ActionIntent.DATA_ERASE: "erase everything ORION keeps about you on",
+    ActionIntent.FILE_DELETE: "move files to the Recycle Bin on",
+    ActionIntent.FILE_WRITE: "change an existing file on",
     ActionIntent.PLACE_CALL: "place a real phone call from",
     ActionIntent.SEND_MESSAGE: "send a real, billable message from",
     ActionIntent.PROCESS_KILL: "terminate a running program on",
@@ -146,22 +174,43 @@ _POWER_FILLERS = frozenset({
     "right", "away", "immediately", "everything", "all", "and", "then", "let",
     "us", "lets", "okay", "ok", "go", "ahead", "it", "down", "off", "please",
     "completely", "fully", "yourself", "self",
+    # How the owner's requests actually arrive. Measured on 1,841 transcribed
+    # turns (8 Oct 2026): "Orion" came through as "Ryan" 73 times and correctly
+    # 23 times, and 13 of 14 real shutdown requests ("Ryan, shut down.", "I
+    # want you to just shut down for now, please.", "shut down to please.")
+    # were left unrecognised because of words like these.
+    "ryan", "orian", "orien", "oreon", "rion", "o", "ri", "on", "kay",
+    "um", "uh", "er", "erm", "hmm", "so", "yeah", "yes", "well", "alright", "hey", "oh",
+    "i", "m", "im", "want", "need", "going", "gonna", "to", "too", "be", "we", "re",
+    "tomorrow", "tonight", "today", "again", "a", "bit", "while", "moment", "night",
+    "thanks", "thank", "place", "sir", "mate", "bro",
 })
+
+#: Clause boundaries. "Okay, shut down for now. We're going to work tomorrow."
+#: is a bare command followed by an unrelated sentence, not one long object.
+_CLAUSE_SPLIT = re.compile(r"[.,!?;:]+")
 
 
 def _is_bare_power(text: str, *triggers: str) -> bool:
-    """True when *text* is a BARE power command — the trigger verb plus only
-    filler/politeness words, with no concrete object.
+    """True when a clause of *text* is a BARE power command — the trigger verb
+    plus only filler/politeness words, with no concrete object.
 
     'shut down', 'shut it down', 'turn off now please' are bare (a power command
     addressed to ORION); 'turn off the lights', 'shut down the download', 'turn
     off notifications' carry a real object and are NOT power commands — they must
-    fall through to the model as ordinary device/app requests."""
-    remainder = " " + text.strip() + " "
-    for trig in triggers:
-        remainder = re.sub(rf"(?<!\w){re.escape(trig)}(?!\w)", " ", remainder)
-    leftover = [w for w in re.findall(r"[a-z]+", remainder) if w not in _POWER_FILLERS]
-    return not leftover
+    fall through to the model as ordinary device/app requests. Negations and
+    questions ("don't shut down", "why did you shut down") are never bare,
+    because none of their words are fillers."""
+    for clause in _CLAUSE_SPLIT.split(text):
+        remainder = " " + clause.strip() + " "
+        if not any(_has(remainder, trig) for trig in triggers):
+            continue
+        for trig in triggers:
+            remainder = re.sub(rf"(?<!\w){re.escape(trig)}(?!\w)", " ", remainder)
+        leftover = [w for w in re.findall(r"[a-z]+", remainder) if w not in _POWER_FILLERS]
+        if not leftover:
+            return True
+    return False
 
 
 def classify_intent(text: str) -> ActionIntent:

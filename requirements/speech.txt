@@ -1,0 +1,25 @@
+# ── O.R.I.O.N. requirements: speech ────────────────────────────────────────
+# Offline dictation, the offline voice and speaker recognition. Without this
+# group Gemini Live still hears and speaks; the offline fallbacks report that
+# their engine is not installed.
+
+pyttsx3>=2.90,<3                         # offline male voice (SAPI5)
+faster-whisper>=1.0,<2                   # offline dictation — preferred engine (ctranslate2, int8 CPU, no torch)
+# openai-whisper         # optional alternative dictation engine; install explicitly (pulls torch)
+# vosk                   # offline wake-word / streaming STT (optional; downloads a model on first use)
+# OfflineTranscriber (speech_offline.py) auto-selects: faster-whisper → openai-whisper → vosk.
+# Model size via ORION_WHISPER_MODEL (default base.en); models download on first use.
+
+# Voice speaker recognition (Mark XX architectural-audit pass, Track J) —
+# identifies a SPECIFIC known individual by voice, not just gender.
+# orion_core/voice_speaker_id.py prefers the supplied ONNX encoder, which
+# uses onnxruntime from requirements/core.txt and works without torch.
+# The optional resemblyzer fallback requires the webrtcvad distribution;
+# webrtcvad-wheels provides its import but does not satisfy pip's dependency
+# metadata. Do not install that fallback automatically on Windows, where the
+# source dependency needs MSVC. Existing resemblyzer profiles remain supported
+# when the optional engine has been installed with the required compiler.
+resemblyzer>=0.1,<1; sys_platform != "win32"  # optional pretrained speaker encoder fallback
+librosa>=0.10,<1; sys_platform != "win32"     # preprocessing for that optional fallback
+scipy>=1.11,<2
+aec-audio-processing==1.0.1; sys_platform == "win32" and python_version >= "3.11"  # optional speech group: WebRTC AEC/NS, prebuilt Windows wheels

@@ -29,7 +29,9 @@ class _Bus:
 
 
 def _gateway(tmp_path):
-    return RemoteGateway(object(), object(), _Bus(), config_dir=tmp_path)
+    gateway = RemoteGateway(object(), object(), _Bus(), config_dir=tmp_path)
+    gateway.host = "0.0.0.0"  # Explicit direct LAN mode needs inbound rules.
+    return gateway
 
 
 def _fake_run_factory(calls, *, show_stdout="", show_rc=0, add_rc=0):
@@ -61,9 +63,12 @@ def test_rule_added_when_absent(tmp_path, monkeypatch):
     asyncio.run(gw._ensure_firewall_access())
 
     add = [c for c in calls if "add" in c]
-    assert add, "an add-rule call is expected when the rule is absent"
-    assert any(f"localport={gw.port}" in tok for tok in add[0])
-    assert "profile=private,domain" in add[0]  # never opened on public networks
+    assert len(add) == 2, "LAN and Tailscale rules are expected when absent"
+    lan_rule, tailscale_rule = add
+    assert any(f"localport={gw.port}" in tok for tok in lan_rule)
+    assert "profile=private,domain" in lan_rule
+    assert "profile=public" in tailscale_rule
+    assert "remoteip=100.64.0.0/10,fd7a:115c:a1e0::/48" in tailscale_rule
 
 
 def test_rule_not_re_added_when_present(tmp_path, monkeypatch):
@@ -71,7 +76,9 @@ def test_rule_not_re_added_when_present(tmp_path, monkeypatch):
     calls: list[list[str]] = []
     monkeypatch.setattr(
         remote.subprocess, "run",
-        _fake_run_factory(calls, show_stdout="Rule Name: ORION Remote Uplink\nEnabled: Yes"))
+        _fake_run_factory(calls, show_stdout=(
+            "Rule Name: ORION Remote Uplink\nEnabled: Yes\n"
+            "Rule Name: ORION Remote Uplink (Tailscale)\nEnabled: Yes")))
 
     gw = _gateway(tmp_path)
     asyncio.run(gw._ensure_firewall_access())
@@ -100,5 +107,17 @@ def test_disable_flag_respected(tmp_path, monkeypatch):
 
     gw = _gateway(tmp_path)
     asyncio.run(gw._ensure_firewall_access())
+
+    assert calls == []
+
+
+def test_loopback_serve_does_not_open_an_inbound_port(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "_on_windows", lambda: True)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(remote.subprocess, "run", _fake_run_factory(calls))
+    gateway = _gateway(tmp_path)
+    gateway.host = "127.0.0.1"
+
+    asyncio.run(gateway._ensure_firewall_access())
 
     assert calls == []

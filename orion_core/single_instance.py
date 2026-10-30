@@ -281,20 +281,49 @@ def raise_existing_window(title_contains: str = "O.R.I.O.N") -> bool:
         return False
 
 
-def enforce(*, on_refused: Any = None) -> Claim:
+def _forward_shell_command(argv: Any = None, forward: Any = None) -> "bool | None":
+    """Hand this refused launch's shell command to the running ORION.
+
+    Explorer's "Ask ORION", the jump list and orion:// links all work by
+    launching ORION.exe with an argument, and this launch is the one being
+    refused - so without this every such click would just raise the window
+    and lose the request. None when the launch carries no shell command
+    (nothing is imported and nothing changes), else whether it was accepted.
+    Never raises: a refused launch must still exit cleanly.
+    """
+    try:
+        from . import windows_shell
+
+        args = sys.argv if argv is None else argv
+        if not windows_shell.argv_may_carry_command(args):
+            return None
+        return windows_shell.forward_launch(args, sender=forward)
+    except BaseException:           # noqa: BLE001 - see the docstring
+        return False
+
+
+def enforce(*, on_refused: Any = None, argv: Any = None, forward: Any = None) -> Claim:
     """Claim the lock, and if refused, surface the running ORION and exit.
 
     Called once, as early in start-up as possible — before audio devices are
     opened, before a live session is dialled, and certainly before anything
     writes to the databases. A second instance that gets as far as opening the
     microphone has already taken it from the first.
+
+    A refused launch that carries a shell command (an orion:// link, or
+    --ask-file / --summarise / --organise / --do) passes it to the running
+    ORION first (see windows_shell), then raises his window as before.
+    *argv* (default sys.argv) and *forward* are injectable for tests.
     """
     result = claim()
     if result.granted:
         return result
 
+    forwarded = _forward_shell_command(argv, forward)
     raised = raise_existing_window()
     message = ("O.R.I.O.N. is already running."
+               + (" Passed your request to him." if forwarded else
+                  " He could not take that request." if forwarded is False else "")
                + (" Bringing his window to the front." if raised else
                   " Look for him in the system tray."))
     if on_refused is not None:

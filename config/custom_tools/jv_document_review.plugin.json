@@ -1,0 +1,62 @@
+{
+  "name": "jv_document_review",
+  "description": "Review supplied document text or render structured findings with location, issue and suggestion.",
+  "module": "jv_document_review_tool.py",
+  "version": "33.0.0",
+  "tier": "confirm",
+  "permissions": [
+    "network"
+  ],
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "description": "Document title."
+      },
+      "text": {
+        "type": "string",
+        "description": "Document text to review; maximum 60,000 characters."
+      },
+      "summary": {
+        "type": "string",
+        "description": "Existing review summary, when supplying findings."
+      },
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "severity": {
+              "type": "string",
+              "description": "severity"
+            },
+            "location": {
+              "type": "string",
+              "description": "location"
+            },
+            "issue": {
+              "type": "string",
+              "description": "issue"
+            },
+            "suggestion": {
+              "type": "string",
+              "description": "suggestion"
+            }
+          }
+        },
+        "description": "Structured review findings."
+      },
+      "unclear": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Points requiring clarification."
+      }
+    },
+    "required": []
+  },
+  "secrets": []
+}

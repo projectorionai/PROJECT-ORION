@@ -94,12 +94,30 @@ class AudioStudioService:
         self.bus = bus
         self.telemetry = telemetry
         self.watch_dirs: list[Path] = [RAW_DIR] + list(watch_dirs or [])
-        self._ffmpeg: Optional[str] = shutil.which("ffmpeg")
+        # Resolved on first use, not here: shutil.which walks every PATH
+        # entry, MEASURED at ~1.6 s of the Qt thread on this machine's long
+        # PATH. run() resolves it on a worker thread and reports the backend.
+        self._ffmpeg_path: Optional[str] = None
+        self._ffmpeg_resolved = False
         self._inventory = StudioInventory()
         self._known: set[str] = set()
         self._stop = asyncio.Event()
         for directory in (RAW_DIR, PROCESSED_DIR, PACKAGES_DIR):
             directory.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def _ffmpeg(self) -> Optional[str]:
+        if not self._ffmpeg_resolved:
+            self._ffmpeg_path = shutil.which("ffmpeg")
+            self._ffmpeg_resolved = True
+        return self._ffmpeg_path
+
+    @_ffmpeg.setter
+    def _ffmpeg(self, value: Optional[str]) -> None:
+        self._ffmpeg_path = value
+        self._ffmpeg_resolved = True
+
+    def _report_backend(self) -> None:
         if self._ffmpeg is None:
             self.bus.log.emit(
                 "STUDIO: ffmpeg not found on PATH — using pure-Python WAV peak "
@@ -213,7 +231,7 @@ class AudioStudioService:
             "-af", f"loudnorm=I={self.LOUDNORM_I}:TP={target_dbfs}:LRA=11",
             "-ar", "44100", str(out_path),
         ]
-        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        completed = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=300)
         if completed.returncode != 0:
             raise RuntimeError((completed.stderr or "ffmpeg failed").strip()[:200])
         return {"summary": f"loudnorm to {self.LOUDNORM_I} LUFS, peak {target_dbfs} dBTP",
@@ -290,6 +308,7 @@ class AudioStudioService:
     async def run(self) -> None:
         if self.telemetry is not None:
             self.telemetry.health.register("audio_studio")
+        await asyncio.to_thread(self._report_backend)
         try:
             while not self._stop.is_set():
                 inventory = await asyncio.to_thread(self._scan)

@@ -3,15 +3,25 @@ package com.orion.companion
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Typeface
+import android.media.projection.MediaProjectionManager
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
-import android.net.http.SslCertificate
+import android.net.MailTo
 import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
 import android.text.InputType
 import android.view.MotionEvent
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -22,12 +32,18 @@ import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
+import android.widget.PopupMenu
+import android.widget.ScrollView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -43,27 +59,31 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.orion.companion.databinding.ActivityMainBinding
 import org.json.JSONObject
 import org.json.JSONTokener
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicIntegerArray
+import kotlin.math.min
+import kotlin.random.Random
 
 /**
  * The native shell: a full-screen WebView onto ORION's uplink. His voxel
  * orb/face, live emotion mirror, spoken replies and memory all come from the
  * uplink the desktop already serves — this app makes it a first-class Android
- * app: native config, microphone permission, self-signed-TLS handling, keep-
+ * app: native config, microphone permission, HTTPS validation, keep-
  * awake and immersive full-screen.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
+    private var pcControls: RemotePcControls? = null
 
     /** The endpoints that answered the last reachability probe, best first —
      *  what the WebView loads and fails over through. */
     private var candidates: List<String> = emptyList()
     private var candidateIndex = 0
-    private var trustedHosts: Set<String> = emptySet()
+    private var trustedOrigins: Set<String> = emptySet()
+    @Volatile private var trustedPageActive = false
 
     /** Bumped by every connect(), so a slow probe from an earlier attempt can't
      *  load over a newer one. */
@@ -74,6 +94,109 @@ class MainActivity : AppCompatActivity() {
     private var touchDownRawY = 0f
     private var credentialScript: ScriptHandler? = null
     private var pendingMicRequest: PermissionRequest? = null
+    private lateinit var intentRouter: IntentRouter
+    private var resumed = false
+    private var uplinkConnected = false
+    private var pingMs: Long? = null
+    private var modelRoute = "--"
+    private var micActive = false
+    private var speakingActive = false
+    private var phoneSpeech: RemoteSpeech? = null
+    private var phoneDictation: NativeDictation? = null
+    private var lastAudioStatus = ""
+    private var microphoneSwitch = 0
+    private var lastSentWatching: Boolean? = null
+    private var lastSentSpeaking: Boolean? = null
+    private var pendingPhonePermission: ((Boolean) -> Unit)? = null
+    private var afterNotificationPrompt: (() -> Unit)? = null
+    private var activeAuthorization: Authorization? = null
+    private var authorizationExpiry: Runnable? = null
+    private var authorizationOverlay: View? = null
+    private var approvedSnapshotId: String? = null
+    private var approvedSnapshot: JSONObject? = null
+    private var pendingSentinelAction: String? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var retryAttempt = 0
+    private var retryConnection: Runnable? = null
+    private var pageLoadTimeout: Runnable? = null
+    private var networkReconnect: Runnable? = null
+    private var networkCallbackRegistered = false
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = queueNetworkReconnect()
+        override fun onLost(network: Network) = queueNetworkReconnect()
+    }
+
+    private fun queueNetworkReconnect() {
+        mainHandler.post {
+            networkReconnect?.let(mainHandler::removeCallbacks)
+            networkReconnect = Runnable {
+                if (!isFinishing && !isDestroyed && ::binding.isInitialized) {
+                    OrionFrameTransport.stop()
+                    if (Prefs.credentials(this) != null) OrionFrameTransport.start(this)
+                    connect()
+                }
+            }.also { mainHandler.postDelayed(it, 1200) }
+        }
+    }
+    private val telemetryTicker = object : Runnable {
+        override fun run() {
+            if (!resumed || isDestroyed) return
+            updateTelemetry()
+            mainHandler.postDelayed(this, 200)
+        }
+    }
+
+    private data class Authorization(
+        val details: String,
+        val approve: () -> Unit,
+        val deny: () -> Unit,
+        val commandId: String? = null,
+    )
+
+    private val phonePermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            pendingPhonePermission?.let { callback ->
+                pendingPhonePermission = null
+                callback(granted)
+            }
+        }
+
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+            afterNotificationPrompt?.invoke()
+            afterNotificationPrompt = null
+        }
+
+    private val projectionConsent =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            result.data?.let { data ->
+                if (result.resultCode == RESULT_OK) {
+                    OrionProjectionService.start(this, result.resultCode, data)
+                }
+            }
+            updateTelemetry()
+        }
+
+    private fun withNotificationPermission(start: () -> Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            afterNotificationPrompt = start
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else start()
+    }
+
+    private val overlayPermission =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (Settings.canDrawOverlays(this)) {
+                withNotificationPermission {
+                    lastSentWatching = null
+                    OrionSentinelService.start(this)
+                }
+            }
+            updateTelemetry()
+        }
 
     /** Ask for the microphone when ORION's page first wants it (the mic button),
      *  not at launch — and ask again later if it was refused the first time. */
@@ -89,28 +212,199 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    private val backgroundMicPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted && Prefs.credentials(this) != null) startBackgroundListening()
+            else Toast.makeText(this, R.string.mic_denied, Toast.LENGTH_LONG).show()
+            updateTelemetry()
+        }
+
+    private val dictationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted && resumed) phoneDictation?.start()
+            else dictationEvent(JSONObject().put("state", "error")
+                .put("text", "Allow ORION's microphone permission in Android settings."))
+        }
+
+    private fun dictationEvent(event: JSONObject) {
+        if (!::binding.isInitialized || webViewGone || !isTrustedOrigin(binding.webView.url)) return
+        when (event.optString("state")) {
+            "listening" -> micActive = true
+            "transcribing", "finished", "error", "transcript" -> micActive = false
+        }
+        updateTelemetry()
+        binding.webView.evaluateJavascript("window.onNativeDictation&&window.onNativeDictation($event)", null)
+    }
+
+    private fun startPhoneDictation() {
+        if (!resumed || !isTrustedOrigin(binding.webView.url)) return
+        val wasListening = OrionAudioService.running
+        OrionAudioService.stop(this)
+        phoneSpeech?.stop()
+        if (phoneDictation == null) phoneDictation = NativeDictation(this, ::dictationEvent)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED) {
+            if (wasListening) waitForMicrophoneRelease { phoneDictation?.start() }
+            else phoneDictation?.start()
+        } else dictationPermission.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
+    private fun waitForMicrophoneRelease(ready: () -> Unit) {
+        val attempt = ++microphoneSwitch
+        val deadline = android.os.SystemClock.elapsedRealtime() + 2500
+        fun poll() {
+            if (attempt != microphoneSwitch || !resumed || isDestroyed) return
+            if (!OrionAudioService.captureActive && phoneDictation?.busy != true) ready()
+            else if (android.os.SystemClock.elapsedRealtime() < deadline) mainHandler.postDelayed(::poll, 40)
+            else dictationEvent(JSONObject().put("state", "error")
+                .put("text", "The previous microphone session has not stopped. Please try again."))
+        }
+        poll()
+    }
+
+    private fun startBackgroundListening() {
+        if (!resumed || !isTrustedOrigin(binding.webView.url)) return
+        phoneDictation?.cancel()
+        micActive = false
+        phoneSpeech?.stop()
+        withNotificationPermission {
+            waitForMicrophoneRelease { OrionAudioService.start(this) }
+        }
+    }
+
+    private fun showOptions() {
+        PopupMenu(this, binding.settingsButton).apply {
+            menu.add(0, 1, 0, if (OrionAudioService.running) "Stop background listening" else "Start background listening")
+            menu.add(0, 2, 1, "PC statistics")
+            menu.add(0, 3, 2, "Tasks")
+            menu.add(0, 4, 3, if (OrionProjectionService.isCapturing) "Stop screen sharing" else "Share phone screen")
+            menu.add(0, 5, 4, "Phone accessibility")
+            menu.add(0, 6, 5, if (OrionSentinelService.running) "Stop Sentinel overlay" else "Start Sentinel overlay")
+            menu.add(0, 7, 6, "Connection & microphone")
+            menu.add(0, 8, 7, getString(R.string.change_server))
+            menu.add(0, 9, 8, "Stop speaking")
+            menu.add(0, 10, 9, "Phone controls")
+            menu.add(0, 11, 10, "Use ORION on this phone")
+            menu.add(0, 12, 11, "PC controls")
+            setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    1 -> binding.audioButton.performClick()
+                    2 -> binding.webView.evaluateJavascript("window.openOrionHardware&&window.openOrionHardware()", null)
+                    3 -> binding.webView.evaluateJavascript("window.openOrionTasks&&window.openOrionTasks()", null)
+                    4 -> binding.visionButton.performClick()
+                    5 -> binding.accessButton.performClick()
+                    6 -> binding.sentinelButton.performClick()
+                    7 -> binding.webView.evaluateJavascript("window.openOrionDiagnostics&&window.openOrionDiagnostics()", null)
+                    8 -> openSetup()
+                    9 -> RemoteSpeech.stopAll()
+                    10 -> PhoneControls.show(this@MainActivity, ::routeNativeAction)
+                    11 -> {
+                        PhoneAiProfile.setPhoneMode(this@MainActivity, true)
+                        startActivity(Intent(this@MainActivity, PhoneConsoleActivity::class.java))
+                        finish()
+                    }
+                    12 -> {
+                        pcControls?.close()
+                        pcControls = RemotePcControls(this@MainActivity).also { it.show() }
+                    }
+                }
+                true
+            }
+            show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        if (PhoneAiProfile.isPhoneMode(this) && !intent.getBooleanExtra("desktop_mode", false)) {
+            startActivity(Intent(this, PhoneConsoleActivity::class.java).apply {
+                intent.getStringExtra(SentinelActionContract.EXTRA_ACTION)?.let {
+                    putExtra(SentinelActionContract.EXTRA_ACTION, it)
+                }
+            })
+            finish()
+            return
+        }
 
         if (Prefs.candidateUrls(this).isEmpty()) {
             startActivity(Intent(this, SetupActivity::class.java))
             finish()
             return
         }
-        trustedHosts = Prefs.trustedHosts(this)
+        trustedOrigins = Prefs.candidateUrls(this).mapNotNull(::originOf).toSet()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        makeApprovalScrollable()
+        pendingSentinelAction = intent.getStringExtra(SentinelActionContract.EXTRA_ACTION)
+            ?.takeIf(SentinelActionContract::isSupported)
+        phoneSpeech = RemoteSpeech(this, onSpeaking = { active ->
+            if (!isDestroyed && !webViewGone) {
+                speakingActive = active
+                updateTelemetry()
+                if (isTrustedOrigin(binding.webView.url)) {
+                    binding.webView.evaluateJavascript(
+                        "if(window.orionNativeSpeechState)orionNativeSpeechState($active);", null)
+                }
+            }
+        }, onVoice = { voice ->
+            if (voice.startsWith("Voice "))
+                Toast.makeText(this, voice, Toast.LENGTH_LONG).show()
+        })
+        intentRouter = IntentRouter(this)
+        installTransportListener()
 
         applyImmersiveKeepAwake()
         applyInsets()
         configureWebView()
         configurePullToRefresh()
         installCredentialSeed()
+        try {
+            (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager)
+                .registerDefaultNetworkCallback(networkCallback)
+            networkCallbackRegistered = true
+        } catch (_: Exception) { }
 
-        binding.settingsButton.setOnClickListener { openSetup() }
+        binding.settingsButton.setOnClickListener { showOptions() }
         binding.changeServerButton.setOnClickListener { openSetup() }
+        binding.connectingChangeServerButton.setOnClickListener { openSetup() }
         binding.retryButton.setOnClickListener { connect() }
+        binding.visionButton.setOnClickListener {
+            if (OrionProjectionService.isCapturing) {
+                OrionProjectionService.stop(this)
+            } else {
+                withNotificationPermission {
+                    val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    projectionConsent.launch(manager.createScreenCaptureIntent())
+                }
+            }
+            updateTelemetry()
+        }
+        binding.audioButton.setOnClickListener {
+            if (OrionAudioService.running) OrionAudioService.stop(this)
+            else if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED) {
+                if (Prefs.credentials(this) != null) startBackgroundListening()
+                else Toast.makeText(this, R.string.pair_message, Toast.LENGTH_LONG).show()
+            } else backgroundMicPermission.launch(Manifest.permission.RECORD_AUDIO)
+            updateTelemetry()
+        }
+        binding.accessButton.setOnClickListener {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+        binding.sentinelButton.setOnClickListener {
+            if (OrionSentinelService.running) OrionSentinelService.stop(this)
+            else if (Settings.canDrawOverlays(this)) withNotificationPermission {
+                lastSentWatching = null
+                OrionSentinelService.start(this)
+            }
+            else overlayPermission.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")))
+            updateTelemetry()
+        }
+        binding.authorizationDeny.setOnClickListener { finishAuthorization(false) }
+        updateTelemetry()
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -128,21 +422,84 @@ class MainActivity : AppCompatActivity() {
     /** Back from "Change server": reconnect with whatever was just saved. */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
+        if (PhoneAiProfile.isPhoneMode(this) && !intent.getBooleanExtra("desktop_mode", false)) {
+            startActivity(Intent(this, PhoneConsoleActivity::class.java).apply {
+                intent.getStringExtra(SentinelActionContract.EXTRA_ACTION)?.let {
+                    putExtra(SentinelActionContract.EXTRA_ACTION, it)
+                }
+            })
+            finish()
+            return
+        }
+        pendingSentinelAction = intent.getStringExtra(SentinelActionContract.EXTRA_ACTION)
+            ?.takeIf(SentinelActionContract::isSupported)
+        if (resumed) handleSentinelAction()
         if (intent.getBooleanExtra(EXTRA_RECONFIGURED, false) && ::binding.isInitialized) {
-            trustedHosts = Prefs.trustedHosts(this)
+            OrionFrameTransport.stop()
+            trustedOrigins = Prefs.candidateUrls(this).mapNotNull(::originOf).toSet()
             installCredentialSeed()
             connect()
+            if (Prefs.credentials(this) != null) OrionFrameTransport.start(this)
         }
     }
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         if (!::binding.isInitialized || webViewGone) return
+        mainHandler.removeCallbacks(telemetryTicker)
+        mainHandler.post(telemetryTicker)
+        activeAuthorization?.let { pending ->
+            if (authorizationOverlay != null) {
+                removeAuthorizationOverlay()
+                showForegroundAuthorization(pending)
+            }
+        }
         binding.webView.onResume()
         if (resumedOnce) recheckConnection() else resumedOnce = true
+        if (Prefs.credentials(this) != null) OrionFrameTransport.start(this)
+        updateTelemetry()
+        handleSentinelAction()
+    }
+
+    private fun handleSentinelAction() {
+        if (!resumed || !::binding.isInitialized) return
+        val action = pendingSentinelAction ?: return
+        pendingSentinelAction = null
+        when (action) {
+            SentinelActionContract.DICTATE -> {
+                if (isTrustedOrigin(binding.webView.url)) startPhoneDictation()
+                else Toast.makeText(this, "Connect the desktop console or open ORION on this phone before dictation", Toast.LENGTH_LONG).show()
+            }
+            SentinelActionContract.TOGGLE_LISTENING -> binding.audioButton.performClick()
+            SentinelActionContract.SCREEN_SHARING -> binding.visionButton.performClick()
+            SentinelActionContract.PHONE_CONTROLS -> PhoneControls.show(this, ::routeNativeAction)
+            SentinelActionContract.OPEN_ORION -> Unit
+        }
+    }
+
+    private fun makeApprovalScrollable() {
+        val details = binding.authorizationDetails
+        val parent = details.parent as? ViewGroup ?: return
+        val position = parent.indexOfChild(details)
+        parent.removeView(details)
+        parent.addView(ScrollView(this).apply { addView(details) }, position,
+            ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                (180 * resources.displayMetrics.density).toInt()))
     }
 
     override fun onPause() {
+        resumed = false
+        mainHandler.removeCallbacks(telemetryTicker)
+        phoneDictation?.finish()
+        activeAuthorization?.let { pending ->
+            if (authorizationOverlay == null && !isFinishing) {
+                binding.authorizationDeck.visibility = View.GONE
+                if (Settings.canDrawOverlays(this)) showOverlayAuthorization(pending)
+                else finishAuthorization(false)
+            }
+        }
         if (::binding.isInitialized && !webViewGone) {
             captureCredentials()
             binding.webView.onPause()
@@ -154,13 +511,23 @@ class MainActivity : AppCompatActivity() {
 
     /** Probe every known endpoint at once, then load the best one that answers. */
     private fun connect() {
+        trustedPageActive = false
         val attempt = ++connectAttempt
+        pageLoadTimeout?.let(mainHandler::removeCallbacks)
+        pageLoadTimeout = null
         val all = Prefs.candidateUrls(this)
         hideError()
         showConnecting(all.firstOrNull()?.let(::displayAddress).orEmpty())
         Thread {
-            val reachable = probe(all)
+            var reachable = probe(all)
+            if (reachable.isEmpty() && LanDiscovery.rediscover(this) != null) {
+                // The PC's LAN address moved; it was found by its pinned
+                // certificate on this Wi-Fi. Try again with the new address.
+                reachable = probe(Prefs.candidateUrls(this))
+            }
             runOnUiThread {
+                val origins = Prefs.candidateUrls(this).mapNotNull(::originOf).toSet()
+                if (origins != trustedOrigins && !isDestroyed) { trustedOrigins = origins; installCredentialSeed() }
                 if (attempt != connectAttempt || isFinishing || isDestroyed) return@runOnUiThread
                 if (reachable.isEmpty()) {
                     showError(getString(
@@ -176,7 +543,7 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * TCP-connect to every endpoint in parallel and return those that answered,
-     * in priority order (Tailscale name → Tailscale IP → LAN). Without this an
+     * in priority order (Tailscale name → LAN → public HTTPS). Without this an
      * unreachable LAN address — you're out on mobile data — left the WebView on a
      * black screen for the whole TCP timeout (minutes) before failing over.
      * Returns as soon as the best endpoint that answered has nothing better still
@@ -206,9 +573,22 @@ class MainActivity : AppCompatActivity() {
         val host = uri.host.orEmpty()
         val port = if (uri.port > 0) uri.port
         else if (uri.scheme.equals("https", ignoreCase = true)) 443 else 80
-        host.isNotEmpty() && Socket().use {
-            it.connect(InetSocketAddress(host, port), PROBE_TIMEOUT_MS)
-            true
+        if (host.isEmpty()) false else {
+            // A mobile network can advertise IPv6 while only its IPv4 path to
+            // the tunnel works (or vice versa). Try each resolved address within
+            // one bounded probe instead of rejecting the whole hostname after
+            // the first failed socket.
+            val deadline = android.os.SystemClock.elapsedRealtime() + PROBE_TIMEOUT_MS
+            InetAddress.getAllByName(host).any { address ->
+                val remaining = deadline - android.os.SystemClock.elapsedRealtime()
+                if (remaining <= 0) false else try {
+                    Socket().use { socket ->
+                        socket.connect(InetSocketAddress(address, port),
+                            min(1_500L, remaining).toInt())
+                        true
+                    }
+                } catch (_: Exception) { false }
+            }
         }
     } catch (_: Exception) {
         false
@@ -237,8 +617,22 @@ class MainActivity : AppCompatActivity() {
     /** Load the current candidate endpoint (adding ?lite=1 on metered data). */
     private fun loadCurrent() {
         val url = candidates.getOrNull(candidateIndex) ?: return
+        trustedPageActive = false
         loadFailed = false
         binding.connectingDetail.text = displayAddress(url)
+        pageLoadTimeout?.let(mainHandler::removeCallbacks)
+        pageLoadTimeout = Runnable {
+            if (isFinishing || isDestroyed || binding.connectingView.visibility != View.VISIBLE ||
+                candidates.getOrNull(candidateIndex) != url) return@Runnable
+            loadFailed = true
+            binding.webView.stopLoading()
+            if (candidateIndex < candidates.size - 1) {
+                candidateIndex++
+                loadCurrent()
+            } else {
+                showError(getString(R.string.error_load_timeout) + "\n" + displayAddress(url))
+            }
+        }.also { mainHandler.postDelayed(it, 20_000) }
         binding.webView.loadUrl(withLite(url))
     }
 
@@ -261,16 +655,10 @@ class MainActivity : AppCompatActivity() {
         false
     }
 
-    private fun isTrustedHost(host: String?): Boolean {
-        val h = host.orEmpty()
-        return h.isNotEmpty() && trustedHosts.any { it.equals(h, ignoreCase = true) }
-    }
-
-    private fun hostOf(url: String): String = try {
-        Uri.parse(url).host.orEmpty()
-    } catch (_: Exception) {
-        ""
-    }
+    private fun isTrustedOrigin(url: String?): Boolean =
+        originOf(url.orEmpty())?.let { candidate ->
+            trustedOrigins.any { it.equals(candidate, ignoreCase = true) }
+        } == true
 
     private fun displayAddress(url: String): String = url.substringBefore('?').trimEnd('/')
 
@@ -282,10 +670,22 @@ class MainActivity : AppCompatActivity() {
 
     /** Hand a non-web URI (tel:, sms:, mailto:, geo:, …) to the phone's app. */
     private fun launchExternal(uri: Uri) {
-        try {
-            startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (_: Exception) {
-            Toast.makeText(this, "No app to handle ${uri.scheme}: links.", Toast.LENGTH_LONG).show()
+        when (uri.scheme?.lowercase()) {
+            "http", "https" -> routeNativeAction(JSONObject().put("kind", "open_url").put("url", uri.toString()))
+            "mailto" -> {
+                val mail = runCatching { MailTo.parse(uri.toString()) }.getOrNull()
+                if (mail == null || !mail.cc.isNullOrBlank() || !mail.headers["bcc"].isNullOrBlank()) {
+                    Toast.makeText(this, "Use a single reviewed e-mail recipient in Phone controls", Toast.LENGTH_LONG).show()
+                } else routeNativeAction(JSONObject().put("kind", "compose_email").put("to", mail.to.orEmpty())
+                    .put("subject", mail.subject.orEmpty()).put("body", mail.body.orEmpty()))
+            }
+            "tel" -> routeNativeAction(JSONObject().put("kind", "make_call").put("number", uri.schemeSpecificPart))
+            "file", "content", "javascript", "data", "intent", null ->
+                Toast.makeText(this, "This link cannot be opened by ORION", Toast.LENGTH_LONG).show()
+            else -> requestAuthorization("PHONE APP LINK: $uri\nACTION: Open this exact link in a phone app", {
+                try { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                catch (_: Exception) { Toast.makeText(this, "No app can open this phone link", Toast.LENGTH_LONG).show() }
+            }, deny = {})
         }
     }
 
@@ -328,9 +728,18 @@ class MainActivity : AppCompatActivity() {
     private fun originOf(url: String): String? = try {
         val uri = Uri.parse(url)
         val scheme = uri.scheme?.lowercase()
-        val host = uri.host.orEmpty()
+        val host = uri.host.orEmpty().lowercase()
         if (scheme == null || host.isEmpty()) null
-        else "$scheme://$host" + (if (uri.port > 0) ":${uri.port}" else "")
+        else {
+            // WebView strips the default port from its callback URL even when
+            // the saved endpoint explicitly says :443. Both spellings are the
+            // same origin; comparing them literally kept the loading veil up
+            // and could discard the pairing prompt.
+            val port = uri.port
+            val defaultPort = (scheme == "https" && port == 443) ||
+                (scheme == "http" && port == 80)
+            "$scheme://$host" + (if (port > 0 && !defaultPort) ":$port" else "")
+        }
     } catch (_: Exception) {
         null
     }
@@ -339,7 +748,7 @@ class MainActivity : AppCompatActivity() {
     private fun captureCredentials() {
         if (webViewGone) return
         val web = binding.webView
-        if (!isTrustedHost(hostOf(web.url.orEmpty()))) return
+        if (!isTrustedOrigin(web.url)) return
         try {
             web.evaluateJavascript(READ_CREDENTIALS_JS) { raw ->
                 val json = try {
@@ -359,6 +768,8 @@ class MainActivity : AppCompatActivity() {
                 ) {
                     Prefs.saveCredentials(this, device, refresh)
                     installCredentialSeed()
+                    OrionFrameTransport.stop()
+                    OrionFrameTransport.start(this)
                 }
             }
         } catch (_: Exception) {
@@ -369,9 +780,323 @@ class MainActivity : AppCompatActivity() {
      *  keep a copy of the pairing for the other endpoints. */
     private fun onEndpointsSaved() {
         if (isFinishing || isDestroyed) return
-        trustedHosts = Prefs.trustedHosts(this)
+        trustedOrigins = Prefs.candidateUrls(this).mapNotNull(::originOf).toSet()
         installCredentialSeed()
         captureCredentials()
+    }
+
+    private fun installTransportListener() {
+        OrionFrameTransport.setListener(object : OrionFrameTransport.Listener {
+            override fun onConnectionChanged(connected: Boolean, latencyMs: Long?) {
+                runOnUiThread {
+                    uplinkConnected = connected
+                    if (!connected && activeAuthorization?.commandId != null) {
+                        finishAuthorization(false)
+                    }
+                    pingMs = if (connected) latencyMs ?: pingMs else null
+                    val origins = Prefs.candidateUrls(this@MainActivity)
+                        .mapNotNull(::originOf).toSet()
+                    if (origins != trustedOrigins) {
+                        trustedOrigins = origins
+                        installCredentialSeed()
+                    }
+                    updateTelemetry()
+                    if (connected) reportPhoneStatus()
+                }
+            }
+
+            override fun onCommandRequest(request: JSONObject) {
+                runOnUiThread { routeDeviceCommand(request) }
+            }
+        })
+    }
+
+    private fun reportPhoneStatus() {
+        OrionFrameTransport.sendJson(JSONObject().put("jsonrpc", "2.0")
+            .put("method", "device.status").put("params", JSONObject()
+                .put("accessibility", OrionAccessibilityService.isConnected())
+                .put("screen_capture", OrionProjectionService.isCapturing)
+                .put("background_audio", OrionAudioService.running)
+                .put("microphone", ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+                .put("calls", ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED)
+                .put("sms", ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED)
+                .put("sentinel", OrionSentinelService.running)
+                .put("native_speech", true)))
+    }
+
+    private fun updateTelemetry() {
+        if (::binding.isInitialized && !webViewGone && isTrustedOrigin(binding.webView.url)) {
+            val events = OrionAudioService.drainEvents()
+            for (event in events) {
+                binding.webView.evaluateJavascript(
+                    "window.onBackgroundAudio&&window.onBackgroundAudio($event)", null)
+            }
+            val status = OrionAudioService.status
+            if (events.isNotEmpty()) lastAudioStatus = status
+            else if (status != lastAudioStatus) {
+                lastAudioStatus = status
+                binding.webView.evaluateJavascript("window.onBackgroundAudio&&window.onBackgroundAudio($status)", null)
+            }
+            if (OrionAudioService.running) {
+                val meter = JSONObject().put("state", "level").put("level", OrionAudioService.level)
+                binding.webView.evaluateJavascript("window.onBackgroundAudio&&window.onBackgroundAudio($meter)", null)
+            }
+        }
+        if (!::binding.isInitialized || isDestroyed) return
+        val access = OrionAccessibilityService.isConnected()
+        val watching = OrionProjectionService.isCapturing
+        binding.telemetryText.text = if (uplinkConnected) "ORION · Connected" else "ORION · Connecting…"
+        binding.visionButton.setText(if (watching) R.string.vision_on else R.string.vision_off)
+        binding.audioButton.setText(if (OrionAudioService.running) R.string.audio_on else R.string.audio_off)
+        binding.accessButton.setText(if (access) R.string.access_on else R.string.access_off)
+        binding.sentinelButton.setText(if (OrionSentinelService.running)
+            R.string.sentinel_on else R.string.sentinel_off)
+        if (OrionSentinelService.running &&
+            (lastSentWatching != watching || lastSentSpeaking != speakingActive)) {
+            OrionSentinelService.update(this, watching, speakingActive)
+            lastSentWatching = watching
+            lastSentSpeaking = speakingActive
+        }
+    }
+
+    private fun requestPhonePermission(permission: String, callback: (Boolean) -> Unit) {
+        if (pendingPhonePermission != null) { callback(false); return }
+        pendingPhonePermission = callback
+        phonePermission.launch(permission)
+    }
+
+    private fun routeNativeAction(action: JSONObject) {
+        intentRouter.route(action,
+            authorize = { details, execute ->
+                requestAuthorization(details, execute, deny = {})
+            },
+            requestPermission = ::requestPhonePermission,
+            report = { outcome ->
+                val detail = outcome.optString("detail", outcome.optString("error", "Phone action failed"))
+                if (outcome.optBoolean("ok") && outcome.has("numbers")) {
+                    val numbers = outcome.optJSONArray("numbers")
+                    val emails = outcome.optJSONArray("emails")
+                    val text = buildString {
+                        append("Numbers:\n")
+                        if (numbers != null) for (index in 0 until numbers.length()) append(numbers.optString(index)).append('\n')
+                        append("\nE-mail addresses:\n")
+                        if (emails != null) for (index in 0 until emails.length()) append(emails.optString(index)).append('\n')
+                    }
+                    MaterialAlertDialogBuilder(this).setTitle(outcome.optString("name", "Phone contact"))
+                        .setMessage(text).setPositiveButton("Close", null).show()
+                } else Toast.makeText(this, detail, Toast.LENGTH_LONG).show()
+            },
+        )
+    }
+
+    private fun routeDeviceCommand(request: JSONObject) {
+        val id = request.optString("id")
+        val method = request.optString("method")
+        val params = request.optJSONObject("params") ?: JSONObject()
+        if (id.isBlank() || !request.optBoolean("requires_local_approval", false)) return
+        if (!OrionFrameTransport.isCommandPending(id)) return
+        fun reject(message: String) {
+            OrionFrameTransport.sendCommandError(id, -32001, message)
+        }
+        fun stillPending(): Boolean {
+            if (OrionFrameTransport.isCommandPending(id)) return true
+            reject("Command expired or disconnected")
+            return false
+        }
+        fun completed(result: JSONObject) {
+            if (!result.optBoolean("ok")) {
+                reject(result.optString("error", result.optString("detail", "Action failed")))
+            } else {
+                result.put("authorized", true)
+                OrionFrameTransport.sendCommandResult(id, result)
+            }
+        }
+        when (method) {
+            "viewport.capture_dom" -> requestAuthorization(
+                "TARGET: ACTIVE SCREEN\nACTION: Read visible UI labels and controls",
+                approve = {
+                    if (stillPending()) OrionAccessibilityService.requestSnapshot { snapshot ->
+                        if (!stillPending()) return@requestSnapshot
+                        if (snapshot.optBoolean("ok")) {
+                            approvedSnapshotId = snapshot.optString("snapshotId")
+                            approvedSnapshot = snapshot
+                            completed(JSONObject().put("ok", true).put("snapshot", snapshot))
+                        } else completed(snapshot)
+                    }
+                }, deny = { reject("Screen read denied") }, commandId = id,
+            )
+            "viewport.click", "viewport.scroll", "viewport.set_text" -> {
+                val snapshotId = params.optString("snapshotId")
+                val nodeId = params.optString("nodeId")
+                if (snapshotId.isBlank() || snapshotId != approvedSnapshotId) {
+                    reject("Approve a fresh screen snapshot first")
+                    return
+                }
+                if (method == "viewport.set_text" && (params.opt("text") !is String || params.optString("text").length > 4000)) {
+                    reject("Specify reviewed text of at most 4,000 characters"); return
+                }
+                val actionName = when (method) {
+                    "viewport.click" -> "Click"
+                    "viewport.set_text" -> "Enter reviewed text:\n${params.optString("text")}"
+                    else -> "Scroll ${params.optString("direction")}"
+                }
+                val target = snapshotNodeLabel(approvedSnapshot, nodeId)
+                requestAuthorization(
+                    "TARGET: ${approvedSnapshot?.optString("package").orEmpty()} / $nodeId\n" +
+                        "LABEL: $target\nACTION: $actionName",
+                    approve = {
+                        approvedSnapshotId = null
+                        approvedSnapshot = null
+                        if (!stillPending()) return@requestAuthorization
+                        if (method == "viewport.click") {
+                            OrionAccessibilityService.clickNode(snapshotId, nodeId, ::completed)
+                        } else if (method == "viewport.set_text") {
+                            OrionAccessibilityService.setNodeText(snapshotId, nodeId, params.optString("text"), ::completed)
+                        } else {
+                            OrionAccessibilityService.scrollNode(
+                                snapshotId, nodeId, params.optString("direction"), ::completed)
+                        }
+                    }, commandId = id,
+                    deny = {
+                        approvedSnapshotId = null
+                        approvedSnapshot = null
+                        reject("Gesture denied")
+                    },
+                )
+            }
+            in PhoneCommandContract.deviceMethods -> {
+                val kind = method.removePrefix("device.")
+                val action = JSONObject(params.toString()).put("kind", kind)
+                intentRouter.route(action,
+                    authorize = { details, execute ->
+                        if (stillPending()) requestAuthorization(details,
+                            approve = { if (stillPending()) execute() },
+                            deny = { reject("Device action denied") },
+                            commandId = id)
+                    },
+                    requestPermission = ::requestPhonePermission,
+                    report = ::completed,
+                    canExecute = { OrionFrameTransport.isCommandPending(id) },
+                )
+            }
+            else -> reject("Unsupported device command")
+        }
+    }
+
+    private fun snapshotNodeLabel(snapshot: JSONObject?, nodeId: String): String {
+        var node = snapshot?.optJSONObject("root") ?: return "[unavailable]"
+        for (part in nodeId.split('/').drop(1)) {
+            val children = node.optJSONArray("children") ?: return "[unavailable]"
+            val child = (0 until children.length()).mapNotNull { children.optJSONObject(it) }
+                .firstOrNull { it.optString("id").substringAfterLast('/') == part }
+                ?: return "[unavailable]"
+            node = child
+        }
+        fun visibleLabel(item: JSONObject): String {
+            item.optString("text").ifBlank { item.optString("contentDescription") }
+                .takeIf { it.isNotBlank() }?.let { return it }
+            val children = item.optJSONArray("children")
+            if (children != null) for (index in 0 until children.length()) {
+                children.optJSONObject(index)?.let { child ->
+                    visibleLabel(child).takeIf { it.isNotBlank() }?.let { return it }
+                }
+            }
+            return ""
+        }
+        return visibleLabel(node).ifBlank { node.optString("class") }.take(90)
+    }
+
+    private fun requestAuthorization(
+        details: String, approve: () -> Unit, deny: () -> Unit,
+        commandId: String? = null,
+    ) {
+        if (activeAuthorization != null) { deny(); return }
+        val request = Authorization(details, approve, deny, commandId)
+        activeAuthorization = request
+        authorizationExpiry = Runnable {
+            if (activeAuthorization === request) {
+                finishAuthorization(false)
+                Toast.makeText(this, R.string.authorization_expired,
+                    Toast.LENGTH_LONG).show()
+            }
+        }.also { mainHandler.postDelayed(it, AUTHORIZATION_TTL_MS) }
+        if (resumed) {
+            showForegroundAuthorization(request)
+        } else if (Settings.canDrawOverlays(this)) {
+            showOverlayAuthorization(request)
+        } else {
+            finishAuthorization(false)
+        }
+    }
+
+    private fun showForegroundAuthorization(request: Authorization) {
+        binding.authorizationDetails.text = request.details
+        binding.authorizationSliderSlot.removeAllViews()
+        binding.authorizationSliderSlot.addView(SlideToConfirmView(this).apply {
+            onConfirmed = { finishAuthorization(true) }
+        })
+        binding.authorizationDeck.visibility = View.VISIBLE
+    }
+
+    private fun removeAuthorizationOverlay() {
+        authorizationOverlay?.let {
+            try { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) }
+            catch (_: Exception) {}
+        }
+        authorizationOverlay = null
+    }
+
+    private fun showOverlayAuthorization(request: Authorization) {
+        val density = resources.displayMetrics.density
+        val pad = (16 * density).toInt()
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(Color.rgb(18, 18, 22))
+            addView(TextView(this@MainActivity).apply {
+                text = getString(R.string.authorization_required)
+                setTextColor(Color.rgb(211, 47, 47))
+                textSize = 12f
+                typeface = Typeface.MONOSPACE
+            })
+            addView(ScrollView(this@MainActivity).apply { addView(TextView(this@MainActivity).apply {
+                text = request.details
+                setTextColor(Color.rgb(242, 230, 232))
+                textSize = 12f
+                typeface = Typeface.MONOSPACE
+                setPadding(0, pad / 2, 0, pad / 2)
+            }) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (180 * density).toInt()))
+            addView(SlideToConfirmView(this@MainActivity).apply {
+                onConfirmed = { finishAuthorization(true) }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (56 * density).toInt()))
+            addView(Button(this@MainActivity).apply {
+                text = getString(R.string.deny)
+                setOnClickListener { finishAuthorization(false) }
+            })
+        }
+        val lp = WindowManager.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            android.graphics.PixelFormat.TRANSLUCENT,
+        ).apply { gravity = Gravity.BOTTOM }
+        try {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).addView(panel, lp)
+            authorizationOverlay = panel
+        } catch (_: Exception) {
+            finishAuthorization(false)
+        }
+    }
+
+    private fun finishAuthorization(approved: Boolean) {
+        val request = activeAuthorization ?: return
+        activeAuthorization = null
+        authorizationExpiry?.let(mainHandler::removeCallbacks)
+        authorizationExpiry = null
+        if (::binding.isInitialized) binding.authorizationDeck.visibility = View.GONE
+        removeAuthorizationOverlay()
+        if (approved) mainHandler.postDelayed(request.approve, 250)
+        else request.deny()
     }
 
     // ── WebView ───────────────────────────────────────────────────────────────
@@ -391,14 +1116,41 @@ class MainActivity : AppCompatActivity() {
 
         // Native phone actions for ORION's web UI (window.OrionNative.*): call,
         // text, e-mail, navigate, share — the "more advanced than the HTML" part.
-        web.addJavascriptInterface(NativeBridge(this) { onEndpointsSaved() }, "OrionNative")
+        web.addJavascriptInterface(NativeBridge(
+            this,
+            isTrustedPage = { trustedPageActive },
+            onEndpointsSaved = { onEndpointsSaved() },
+            onAction = { action -> routeNativeAction(action) },
+            onTelemetry = { model, microphone ->
+                if (model.isNotBlank()) modelRoute = model
+                if (microphone != null) micActive = microphone
+                updateTelemetry()
+            },
+            onSpeaking = { active ->
+                speakingActive = active
+                updateTelemetry()
+            },
+            onSpeak = { text ->
+                if (isTrustedOrigin(binding.webView.url)) phoneSpeech?.speak(text)
+            },
+            onStopSpeaking = { RemoteSpeech.stopAll() },
+            onPrepareDictation = {
+                if (isTrustedOrigin(binding.webView.url)) {
+                    OrionAudioService.stop(this)
+                    phoneSpeech?.stop()
+                    updateTelemetry()
+                }
+            },
+            onStartDictation = { startPhoneDictation() },
+            onFinishDictation = { phoneDictation?.finish() },
+        ), "OrionNative")
 
         web.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest) {
                 runOnUiThread {
                     // Only ORION's own page may open the microphone (getUserMedia).
                     val wantsMic = PermissionRequest.RESOURCE_AUDIO_CAPTURE in request.resources
-                    if (!wantsMic || !isTrustedHost(request.origin?.host)) {
+                    if (!wantsMic || !isTrustedOrigin(request.origin?.toString())) {
                         request.deny()
                         return@runOnUiThread
                     }
@@ -425,17 +1177,46 @@ class MainActivity : AppCompatActivity() {
                 view: WebView, url: String, message: String?,
                 defaultValue: String?, result: JsPromptResult,
             ): Boolean {
-                if (!isTrustedHost(hostOf(url)) || isFinishing) return false
+                if (!isTrustedOrigin(url) || isFinishing) return false
                 showPairingDialog(message, defaultValue, result)
                 return true
             }
         }
 
         web.webViewClient = object : WebViewClient() {
+            private fun failMainFrame(url: String, detail: String) {
+                if (loadFailed || originOf(url) !=
+                    originOf(candidates.getOrNull(candidateIndex).orEmpty())) return
+                trustedPageActive = false
+                loadFailed = true
+                if (candidateIndex < candidates.size - 1) {
+                    candidateIndex++
+                    binding.connectingView.visibility = View.VISIBLE
+                    loadCurrent()
+                } else showError(detail)
+                binding.swipeRefresh.isRefreshing = false
+            }
+
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                trustedPageActive = false
+            }
+
+            override fun onPageCommitVisible(view: WebView?, url: String?) {
+                if (!loadFailed && isTrustedOrigin(url) &&
+                    originOf(url.orEmpty()) ==
+                    originOf(candidates.getOrNull(candidateIndex).orEmpty())) {
+                    trustedPageActive = true
+                }
+            }
+
             override fun shouldOverrideUrlLoading(
                 view: WebView, request: WebResourceRequest
             ): Boolean {
                 val uri = request.url
+                // The JavaScript bridge is injected into frames as well as the
+                // main page. Never let a third-party frame load inside it or
+                // turn a frame navigation into a phone action.
+                if (!request.isForMainFrame) return !isTrustedOrigin(uri.toString())
                 return when (uri.scheme?.lowercase()) {
                     null -> false
                     "http", "https" -> {
@@ -444,7 +1225,7 @@ class MainActivity : AppCompatActivity() {
                         // native bridge. Any other site (a news article he opens)
                         // is handed to the system browser, so no third-party page
                         // can ever reach window.OrionNative.
-                        if (isTrustedHost(uri.host)) {
+                        if (isTrustedOrigin(uri.toString())) {
                             false
                         } else {
                             launchExternal(uri)
@@ -463,37 +1244,37 @@ class MainActivity : AppCompatActivity() {
             override fun onReceivedSslError(
                 view: WebView, handler: SslErrorHandler, error: SslError
             ) {
-                // ORION serves a self-signed certificate. Proceed only for one
-                // of his known hosts (LAN or Tailscale), and only for the
-                // certificate first accepted from them: the host name alone is
-                // something anyone on the same network can answer for.
-                if (!isTrustedHost(hostOf(error.url ?: ""))) {
-                    handler.cancel()
+                // Named HTTPS endpoints must pass Android's normal certificate
+                // and host checks. A saved fingerprint cannot make an invalid
+                // public certificate safe for the WebView to load. The one
+                // exception is ORION's home Wi-Fi link: a private LAN address
+                // whose certificate is exactly the one pinned at pairing.
+                if (isTrustedOrigin(error.url) &&
+                    LanTrust.webViewCertificateMatches(this@MainActivity, error.url, error.certificate)) {
+                    handler.proceed()
                     return
                 }
-                val presented = sha256Of(error.certificate)
-                val pinned = Prefs.certPin(this@MainActivity)
-                when {
-                    presented == null -> handler.cancel()
-                    pinned.isEmpty() -> {
-                        Prefs.setCertPin(this@MainActivity, presented)
-                        handler.proceed()
-                    }
-                    pinned.equals(presented, ignoreCase = true) -> handler.proceed()
-                    else -> {
-                        handler.cancel()
-                        showError(getString(R.string.error_cert_changed))
-                    }
-                }
+                handler.cancel()
+                if (isTrustedOrigin(error.url))
+                    failMainFrame(error.url, getString(R.string.error_https_certificate))
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 binding.swipeRefresh.isRefreshing = false
                 // A failed load also "finishes" (with the error page) — only a
                 // real page from the endpoint we asked for ends "Connecting…".
-                val expected = candidates.getOrNull(candidateIndex)?.let(::hostOf).orEmpty()
-                if (!loadFailed && hostOf(url.orEmpty()).equals(expected, ignoreCase = true)) {
+                if (!loadFailed && isTrustedOrigin(url) &&
+                    originOf(url.orEmpty()) ==
+                    originOf(candidates.getOrNull(candidateIndex).orEmpty())) {
+                    trustedPageActive = true
+                    pageLoadTimeout?.let(mainHandler::removeCallbacks)
+                    pageLoadTimeout = null
+                    retryAttempt = 0
+                    retryConnection?.let(mainHandler::removeCallbacks)
+                    retryConnection = null
                     hideConnecting()
+                    lastAudioStatus = ""
+                    captureCredentials()
                 }
             }
 
@@ -501,20 +1282,20 @@ class MainActivity : AppCompatActivity() {
                 view: WebView?, request: WebResourceRequest?, error: WebResourceError?
             ) {
                 if (request?.isForMainFrame == true) {
-                    loadFailed = true
-                    // Failover: try the next endpoint that answered (LAN ⇄
-                    // Tailscale) before surfacing an error — this is what makes
-                    // the app "just work" at home and away without reconfiguring.
-                    if (candidateIndex < candidates.size - 1) {
-                        candidateIndex++
-                        binding.connectingView.visibility = View.VISIBLE
-                        loadCurrent()
-                    } else {
-                        showError(describeFailure(
-                            request.url.toString(), error?.description?.toString().orEmpty()))
-                    }
+                    failMainFrame(request.url.toString(), describeFailure(
+                        request.url.toString(), error?.description?.toString().orEmpty()))
                 }
                 binding.swipeRefresh.isRefreshing = false
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?
+            ) {
+                if (request?.isForMainFrame == true && errorResponse != null &&
+                    errorResponse.statusCode >= 400) {
+                    failMainFrame(request.url.toString(),
+                        "${displayAddress(request.url.toString())} — HTTP ${errorResponse.statusCode}")
+                }
             }
 
             /** The page's renderer died — usually Android reclaiming memory from
@@ -523,6 +1304,7 @@ class MainActivity : AppCompatActivity() {
             override fun onRenderProcessGone(
                 view: WebView, detail: RenderProcessGoneDetail
             ): Boolean {
+                trustedPageActive = false
                 webViewGone = true
                 credentialScript = null
                 pendingMicRequest = null
@@ -532,24 +1314,6 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
         }
-    }
-
-    /** SHA-256 of a certificate's DER encoding, as lowercase hex. */
-    private fun sha256Of(certificate: SslCertificate?): String? {
-        if (certificate == null) return null
-        val der = try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                certificate.x509Certificate?.encoded
-            } else {
-                // Before API 29 the encoded certificate is only reachable
-                // through the state bundle SslCertificate saves itself to.
-                SslCertificate.saveState(certificate).getByteArray("x509-certificate")
-            }
-        } catch (_: Exception) {
-            null
-        } ?: return null
-        return MessageDigest.getInstance("SHA-256").digest(der)
-            .joinToString("") { "%02x".format(it) }
     }
 
     private fun showPairingDialog(message: String?, defaultValue: String?, result: JsPromptResult) {
@@ -650,22 +1414,51 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showError(detail: String) {
+        trustedPageActive = false
         connectAttempt++                          // drop any probe still in flight
+        pageLoadTimeout?.let(mainHandler::removeCallbacks)
+        pageLoadTimeout = null
         hideConnecting()
         binding.errorDetail.text = detail
         binding.errorDetail.visibility = if (detail.isEmpty()) View.GONE else View.VISIBLE
         binding.errorView.visibility = View.VISIBLE
         binding.swipeRefresh.visibility = View.GONE
-        binding.settingsButton.visibility = View.GONE
+        retryConnection?.let(mainHandler::removeCallbacks)
+        val ceiling = min(30_000L, 1_000L shl min(retryAttempt++, 5))
+        val delay = Random.nextLong(ceiling / 2, ceiling + 1)
+        retryConnection = Runnable {
+            if (!isFinishing && !isDestroyed) connect()
+        }.also { mainHandler.postDelayed(it, delay) }
     }
 
     private fun hideError() {
         binding.errorView.visibility = View.GONE
         binding.swipeRefresh.visibility = View.VISIBLE
-        binding.settingsButton.visibility = View.VISIBLE
     }
 
     override fun onDestroy() {
+        pcControls?.close()
+        trustedPageActive = false
+        phoneDictation?.close()
+        phoneDictation = null
+        phoneSpeech?.close()
+        phoneSpeech = null
+        if (networkCallbackRegistered) {
+            try {(getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager)
+                .unregisterNetworkCallback(networkCallback)} catch (_: Exception) { }
+        }
+        retryConnection?.let(mainHandler::removeCallbacks)
+        pageLoadTimeout?.let(mainHandler::removeCallbacks)
+        networkReconnect?.let(mainHandler::removeCallbacks)
+        mainHandler.removeCallbacks(telemetryTicker)
+        authorizationExpiry?.let(mainHandler::removeCallbacks)
+        authorizationExpiry = null
+        activeAuthorization?.deny?.invoke()
+        activeAuthorization = null
+        removeAuthorizationOverlay()
+        OrionFrameTransport.setListener(null)
+        OrionFrameTransport.stop()
+        if (OrionProjectionService.isCapturing) OrionProjectionService.stop(this)
         try {
             pendingMicRequest?.deny()
         } catch (_: Exception) {
@@ -684,8 +1477,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val AUTHORIZATION_TTL_MS = 80_000L
         const val EXTRA_RECONFIGURED = "com.orion.companion.RECONFIGURED"
-        private const val PROBE_TIMEOUT_MS = 2500
+        private const val PROBE_TIMEOUT_MS = 4000
         private const val PULL_ZONE_DP = 64
         private const val READ_CREDENTIALS_JS =
             "(function(){try{return JSON.stringify({d:localStorage.getItem('orion_device')||''," +

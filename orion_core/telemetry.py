@@ -275,6 +275,8 @@ class Telemetry:
         self.health = HealthRegistry()
         # Optional rolling on-disk history (Priority 3.1); enabled by the app.
         self.history: Optional[Any] = None
+        self._history_lock = RLock()
+        self._history_closed = False
 
     def snapshot(self) -> dict[str, Any]:
         """Full observability picture for the Command Centre."""
@@ -315,16 +317,30 @@ class Telemetry:
         """Attach a MetricsHistory store so trends persist over days/weeks."""
         try:
             from .metrics_history import MetricsHistory
-            self.history = MetricsHistory(Path(db_path), **kwargs)
+            history = MetricsHistory(Path(db_path), **kwargs)
+            with self._history_lock:
+                if self._history_closed:
+                    history.close()
+                    return None
+                previous = self.history
+                self.history = history
+            if previous is not None and previous is not history:
+                previous.close()
             self.health.register("metrics_history")
             self.health.beat("metrics_history", Health.OK.value, "rolling store attached")
         except Exception as exc:                        # degrade gracefully
-            self.history = None
             try:
                 self.log.warn("TELEMETRY", f"metrics history unavailable - {exc}")
             except Exception:
                 pass
         return self.history
+
+    def detach_history(self) -> Optional[Any]:
+        """Prevent late startup attachment; the caller closes the detached store."""
+        with self._history_lock:
+            self._history_closed = True
+            history, self.history = self.history, None
+            return history
 
     def _history_series(self) -> dict[str, float]:
         """Curated numeric series worth trending: aggregate counters, all

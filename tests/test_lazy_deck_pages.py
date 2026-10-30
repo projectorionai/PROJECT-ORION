@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,9 @@ sys.path.insert(0, str(ROOT))
 _PROBE = r'''
 import json, os, sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# A subprocess is outside conftest's redirect: navigating records recent
+# pages, which must land in a throwaway config, never the real one.
+os.environ["ORION_CONFIG_DIR"] = sys.argv[1]
 sys.path.insert(0, r"{root}")
 from PyQt6.QtWidgets import QApplication, QLabel
 app = QApplication([])
@@ -72,6 +76,9 @@ out["survived_a_broken_factory"] = deck.stack.count()
 out["mission_never_built"] = "MISSION" not in built
 out["failed_page_not_built"] = not deck.page_is_built("BAD")
 out["unknown_page_not_built"] = not deck.page_is_built("DOES_NOT_EXIST")
+_bad_holder = deck._pages[4][1]
+out["failure_is_explained"] = _bad_holder._status_label.text()
+out["failure_offers_retry"] = not _bad_holder._retry_button.isHidden()
 deck._factories["BAD"] = lambda: QLabel("recovered")
 out["failed_page_can_retry"] = deck.page_widget("BAD").text() == "recovered"
 out["retry_preserves_stack_count"] = deck.stack.count()
@@ -82,8 +89,9 @@ print("@@" + json.dumps(out))
 @pytest.fixture(scope="module")
 def probe():
     code = _PROBE.format(root=str(ROOT))
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                            text=True, timeout=300)
+    with tempfile.TemporaryDirectory(prefix="orion-deck-probe-") as config_dir:
+        result = subprocess.run([sys.executable, "-c", code, config_dir],
+                                capture_output=True, text=True, timeout=300)
     marker = [l for l in result.stdout.splitlines() if l.startswith("@@")]
     if not marker:
         pytest.fail(f"probe failed:\n{result.stdout[-1500:]}\n{result.stderr[-2500:]}")
@@ -143,3 +151,20 @@ def test_the_overview_stays_eager():
     source = (ROOT / "orion_core" / "app.py").read_text(encoding="utf-8")
     assert "swarm_view = CommandOverview(" in source
     assert "def swarm_view() -> Any:" not in source
+
+
+def test_a_page_that_fails_to_open_says_why_and_offers_a_retry(probe):
+    """'Opening...' for the rest of the session is not a state; a reason and
+    a way to try again is."""
+    assert "could not be opened" in probe["failure_is_explained"]
+    assert "kaboom" in probe["failure_is_explained"]
+    assert probe["failure_offers_retry"]
+
+
+def test_the_stateless_pages_are_deferred_too():
+    """MEASURED ~0.37 s (diagnostics) and ~0.33 s (library) of the Qt thread
+    on every boot, for pages most sessions never open."""
+    source = (ROOT / "orion_core" / "app.py").read_text(encoding="utf-8")
+    for name in ("diagnostics_centre", "library_deck", "plugin_deck",
+                 "development_deck", "cognition_deck"):
+        assert f"def {name}() -> Any:" in source, f"{name} is still built eagerly"

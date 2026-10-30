@@ -8,13 +8,15 @@ self-repair autonomy).
 * ResourceMonitor.observe queues a predictive notification before any level
   engages.
 * SelfRepairAgent.attempt_auto_repair: dependency installs are autonomous;
-  source fixes auto-apply ONLY with green tests and a small diff outside the
-  denylist; a crash loop gets one attempt; the session cap holds.
+  source fixes auto-apply ONLY with a reproduced baseline failure, the same
+  green candidate checks and a small diff outside the denylist; a crash loop
+  gets one attempt; the session cap holds.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sys
 from pathlib import Path
 
@@ -154,12 +156,27 @@ def test_source_fix_applies_only_with_green_tests(monkeypatch, tmp_path):
 
     agent = _agent()
     applied = []
-    agent._run_patched_tests = lambda t, c: (True, "test_widget.py: 3 passed")
+    verified = []
+    candidate = "x = 1\ny = 3\n"
+    original = target.read_bytes()
+    def verify(incident, path, before, after):
+        verified.append(path)
+        assert before == original.decode("utf-8")
+        assert after == candidate
+        return True, "synthetic same checks failed before and passed after"
+    agent._verify_auto_candidate = verify
     from orion_core.data import ToolResult
-    agent._apply_repaired = lambda inc, t: (applied.append(t), ToolResult("ok"))[1]
-    incident = _incident(file=str(target), repaired_content="x = 1\ny = 3\n")
+    def apply(incident, path, *, expected_digest, expected_source_digest):
+        assert expected_digest == hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        assert expected_source_digest == hashlib.sha256(original).hexdigest()
+        applied.append(path)
+        return ToolResult("ok")
+    agent._apply_repaired = apply
+    incident = _incident(file=str(target), repaired_content=candidate)
     asyncio.run(agent.attempt_auto_repair(incident))
+    assert verified == [target]
     assert applied == [target]
+    assert incident.tests_passed is True
     assert agent._auto_repairs == 1
 
 
@@ -173,11 +190,14 @@ def test_source_fix_declined_when_tests_fail_or_absent(monkeypatch, tmp_path):
 
     for verdict in (False, None):             # failing tests OR no tests
         agent = _agent()
-        agent._run_patched_tests = lambda t, c, v=verdict: (v, "detail")
-        agent._apply_repaired = lambda inc, t: (_ for _ in ()).throw(
-            AssertionError("must not apply"))
+        applied = []
+        agent._verify_auto_candidate = lambda *_, v=verdict: (v, "detail")
+        from orion_core.data import ToolResult
+        agent._apply_repaired = lambda *_, **__: (applied.append(True), ToolResult("unexpected apply"))[1]
         incident = _incident(file=str(target), repaired_content="x = 2\n")
         asyncio.run(agent.attempt_auto_repair(incident))
+        assert incident.tests_passed is verdict
+        assert applied == []
         assert agent._auto_repairs == 0
 
 
@@ -192,22 +212,26 @@ def test_denylisted_and_oversized_fixes_stay_gated(monkeypatch, tmp_path):
     sec = pkg / "security.py"
     sec.write_text("x = 1\n", encoding="utf-8")
     agent = _agent()
-    agent._apply_repaired = lambda inc, t: (_ for _ in ()).throw(
-        AssertionError("must not apply"))
+    applied = []
+    from orion_core.data import ToolResult
+    agent._apply_repaired = lambda *_, **__: (applied.append(True), ToolResult("unexpected apply"))[1]
     asyncio.run(agent.attempt_auto_repair(
         _incident(file=str(sec), repaired_content="x = 2\n")))
+    assert applied == []
     assert agent._auto_repairs == 0
 
     # A sweeping rewrite exceeds the diff budget.
     big = pkg / "widget.py"
     big.write_text("\n".join(f"line{i} = {i}" for i in range(30)), encoding="utf-8")
     agent2 = _agent()
-    agent2._run_patched_tests = lambda t, c: (True, "green")
-    agent2._apply_repaired = lambda inc, t: (_ for _ in ()).throw(
-        AssertionError("must not apply"))
+    verified = []
+    agent2._verify_auto_candidate = lambda *_: (verified.append(True), (True, "synthetic before/after proof"))[1]
+    agent2._apply_repaired = lambda *_, **__: (applied.append(True), ToolResult("unexpected apply"))[1]
     rewrite = "\n".join(f"line{i} = {i * 2}" for i in range(30))
     asyncio.run(agent2.attempt_auto_repair(
         _incident(file=str(big), repaired_content=rewrite)))
+    assert verified == []
+    assert applied == []
     assert agent2._auto_repairs == 0
 
 

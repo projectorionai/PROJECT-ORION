@@ -96,6 +96,9 @@ class ForgeArtefacts:
     # on the session so a drift back to the fragile path is visible in logs
     # rather than silent.
     transport: str = "blocks"
+    # Optional independent planning contract. Legacy generators remain valid;
+    # when present, its examples must pass before the candidate is accepted.
+    plan: dict[str, Any] | None = None
 
     @property
     def complete(self) -> bool:
@@ -284,6 +287,7 @@ def extract_from_json(raw: str) -> ForgeArtefacts:
             requirements=_clean_requirements(data.get("requirements") or []),
             notes=str(data.get("notes") or "")[:800],
             transport="json",
+            plan=data.get("plan"),
         )
     return ForgeArtefacts(transport="json")
 

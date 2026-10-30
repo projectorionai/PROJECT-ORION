@@ -1,0 +1,8 @@
+# Optional training/remote dependencies; install Torch with the CUDA build
+# matching the host driver. CPU-only Torch runs the mathematical tests only.
+chess>=1.11.2,<2
+aiohttp>=3.10,<4
+berserk>=0.14,<0.15
+numpy>=1.26,<3
+torch>=2.8,<3
+psutil>=5.9,<8

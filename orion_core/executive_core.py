@@ -188,9 +188,12 @@ class PriorityEngine:
                     reason = f"mentions '{term}'"
             due_raw = str(task.get("due") or "").strip()
             if due_raw:
-                due = _parse_stamp(due_raw)
-                if due is not None:
-                    hours = (due.replace(tzinfo=None) - now).total_seconds() / 3600.0
+                # The shared rule (owner_tasks): a UTC stamp stays UTC (this
+                # stripped its zone and was an hour out in summer) and a bare
+                # date is due at the end of that day.
+                from .owner_tasks import hours_until
+                hours = hours_until(due_raw, end=task.get("due_end"), now=now)
+                if hours is not None:
                     if hours < 0:
                         score, reason = score + 8.0, "OVERDUE"
                     elif hours <= 24:
@@ -232,12 +235,12 @@ class StrategicEngine:
             if age is not None and age > _STALL_DAYS_PROJECT:
                 recs.append(f"Project '{name}' has had no update in {age:.0f} days — "
                             "revive it or archive it deliberately.")
-        overdue = 0
-        for task in (state.get("pending_tasks") or {}).values():
-            if isinstance(task, dict):
-                due = _parse_stamp(str(task.get("due") or ""))
-                if due is not None and due < datetime.now(timezone.utc):
-                    overdue += 1
+        # The one overdue rule (owner_tasks): a bare date is due at the END
+        # of the day, not at midnight UTC as this copy had it.
+        from .owner_tasks import is_overdue
+        overdue = sum(1 for task in (state.get("pending_tasks") or {}).values()
+                      if isinstance(task, dict)
+                      and is_overdue(task.get("due"), end=task.get("due_end")))
         if overdue:
             recs.append(f"{overdue} task(s) are overdue — clear or reschedule them "
                         "before adding new work.")

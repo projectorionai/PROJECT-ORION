@@ -28,9 +28,12 @@ from orion_core.gui.style import APP_STYLESHEET  # noqa: E402
 CHROME = ("BG", "INK", "PANEL", "PANEL_HI", "BORDER", "ACCENT", "ACCENT_DIM",
           "ACCENT_DEEP", "WHITE", "MUTED", "FAINT", "SILVER", "GOOD", "WARN")
 
-#: The crimson family, plus the two the rendered face object uses. Nothing
-#: else in the palette is allowed to carry a hue.
-ALLOWED_HUES = {"PRI", "PRI_DIM", "PRI_HI", "CORE", "BAD", "AMBER", "GOLD"}
+#: The crimson family, the two the rendered face object uses, and (Mark XXXV,
+#: the owner's request for a warmer, more human interface) the one human tone
+#: for the user's own words and their greeting. Nothing else in the palette is
+#: allowed to carry a hue.
+ALLOWED_HUES = {"PRI", "PRI_DIM", "PRI_HI", "CORE", "BAD", "AMBER", "GOLD",
+                "HUMAN", "HUMAN_DIM"}
 
 
 def _rgb(hex_colour: str) -> tuple[int, int, int]:
@@ -146,7 +149,13 @@ def test_the_accent_is_reserved_for_state_focus_and_danger():
     allowed = ("deckStatePill", "deckVoiceLive", "degradedBanner",
                "stopButton", "quitButton", ":focus", "selection-background",
                "QTabBar::tab:selected", "QProgressBar::chunk",
-               "QPushButton#segItem:checked", "QLineEdit:focus")
+               "QPushButton#segItem:checked", "QLineEdit:focus",
+               # Mark XXXX HUD (owner, 27 Oct 2026: "more futuristic ... noticeable"):
+               # the lines a heads-up display is drawn with - the Mark tag, the
+               # header's edge, a panel's top hairline, the selected tab, a
+               # hovered control.
+               "QLabel#markTag", "QFrame#headerFrame", "QFrame#panelFrame, QGroupBox",
+               "border-top-color", "border-bottom-color", ":checked", ":hover")
     block, current = [], ""
     for line in APP_STYLESHEET.splitlines():
         if "{" in line:
@@ -172,9 +181,14 @@ def test_the_meter_is_not_a_slab_of_colour():
 
 def test_the_stylesheet_no_longer_fakes_depth_with_gradients():
     """QSS cannot blur or cast a shadow, so the old file simulated lit,
-    extruded edges with paired gradients. That is a picture of depth."""
-    assert APP_STYLESHEET.count("qlineargradient") == 0, (
-        "gradients are back, which means depth is being drawn again")
+    extruded edges with paired gradients. That is a picture of depth.
+    Mark XXXX draws HUD hairlines with gradients - a line fading in and out -
+    and the meter's fill; no SURFACE is filled with one."""
+    for fill in re.finditer(r"background(?:-color)?\s*:\s*qlineargradient", APP_STYLESHEET):
+        rule = APP_STYLESHEET[:fill.start()].rsplit("}", 1)[-1]
+        assert "QProgressBar::chunk" in rule, (
+            "a surface is filled with a gradient again, which means depth is being drawn: "
+            + rule.strip()[:80])
 
 
 def test_panels_are_translucent_so_they_sit_on_something():

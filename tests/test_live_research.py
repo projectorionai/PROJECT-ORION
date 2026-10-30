@@ -268,3 +268,171 @@ async def test_one_failing_question_does_not_sink_the_run(researcher, monkeypatc
     run = await researcher.investigate("spacing", questions=2, per_question=1, rounds=1)
     assert any("backend exploded" in reason for _q, reason in run.failed)
     assert run.notes, "the healthy question should still have produced a note"
+
+
+def test_a_page_is_capped_and_cleaned_off_the_event_loop():
+    # Mark XXXX: a 5 MB page took 117 ms to clean, on the loop beside his voice.
+    import inspect
+    from orion_core import live_research as lr
+    big = "<title>Big page</title>" + "<p>word</p>" * (lr.MAX_PAGE_BYTES // 10)
+    title, text = lr._digest(big)
+    assert title == "Big page" and text.startswith("Big page")
+    assert len(text) < lr.MAX_PAGE_BYTES
+    assert "asyncio.to_thread(_digest, body)" in inspect.getsource(lr.LiveResearcher.read)
+
+
+def test_a_page_sent_in_chunks_is_read_to_the_end(tmp_path):
+    """Mark XXXX.4: content.read(n) returned only the first chunk to arrive,
+    usually the <head>, so ordinary pages were dropped as thin."""
+    import asyncio
+    from aiohttp import web
+    from orion_core import live_research as lr
+
+    page = ("<html><head><title>T</title></head><body>" + "x" * 200_000
+            + "<p>THE END</p></body></html>").encode()
+
+    async def handler(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/html"})
+        await response.prepare(request)
+        for start in range(0, len(page), 20_000):
+            await response.write(page[start:start + 20_000])
+            await asyncio.sleep(0.005)
+        return response
+
+    async def run():
+        app = web.Application()
+        app.router.add_get("/", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            researcher = lr.LiveResearcher(ask=_ask, root=tmp_path)
+            return await researcher._fetch(f"http://127.0.0.1:{port}/", 10.0)
+        finally:
+            await runner.cleanup()
+
+    body = asyncio.run(run())
+    assert len(body) == len(page) and body.endswith("</html>")
+
+
+
+def test_a_second_run_on_the_research_already_running_is_not_started():
+    """30 Oct 2026: a dossier on "circadian rhythm and sleep strategies" started
+    90 s into a run on the same question and spent the quota twice."""
+    from types import SimpleNamespace
+    from orion_core.data import ToolResult
+    from orion_core.dispatch_knowledge import _overlapping_research
+
+    class Running:
+        def done(self):
+            return False
+
+    research = SimpleNamespace(
+        _active={"task": Running(), "topic": "circadian rhythm phase delay and practical "
+                                             "strategies for severe sleep schedule disruption"},
+        status=lambda: ToolResult("Researching it - 2.0 of 30 minutes elapsed."))
+    said = _overlapping_research(research, "circadian rhythm and sleep strategies")
+    assert said.startswith("That is already being researched.")
+    assert _overlapping_research(research, "the history of the printing press") == ""
+
+
+# -- accuracy (Mark XXXX.9, owner 30 Oct 2026: "if ORION's researching it must
+# be more accurate") ----------------------------------------------------------
+
+def test_a_claim_with_no_source_is_marked_and_an_invented_citation_removed():
+    """A note that cites a number it was never given, or states something no
+    source says, must not read as sourced."""
+    from orion_core.live_research import UNSOURCED, check_citations
+
+    text = ("Bright light after waking advanced the sleep phase by an hour [1].\n"
+            "Sources disagree: [1] says one hour while [2] reports no change at all.\n"
+            "Consistent wake times are widely recommended by most sleep clinicians.\n"
+            "Shift workers report similar improvements within a fortnight [9].")
+    checked, check = check_citations(text, {1: "page", 2: "snippet"})
+    lines = checked.splitlines()
+    assert lines[0].endswith("[1].") and UNSOURCED not in lines[0]
+    assert UNSOURCED not in lines[1], "a labelled disagreement is not a bare claim"
+    assert lines[2].endswith(f"clinicians {UNSOURCED}.")
+    assert "[9]" not in checked and lines[3].endswith(f"fortnight {UNSOURCED}.")
+    assert (check.claims, check.cited, check.on_pages, check.unsourced, check.removed,
+            check.disagreements) == (3, 1, 1, 2, 1, 1)
+    assert "1 of 3 claims cite a source" in check.line()
+
+
+def test_the_passage_that_answers_the_question_reaches_the_model():
+    """An excerpt used to be the first few hundred characters - menus and an
+    introduction - so a fact further down the page never reached the note."""
+    from orion_core.live_research import relevant_passages
+
+    filler = "\n".join("Readers often write in to ask about naps, caffeine and the best pillow to buy."
+                       for _ in range(60))
+    fact = "In a controlled trial, 30 minutes of bright light advanced the sleep phase by about an hour."
+    page = f"Home | News | Sleep\n{filler}\n{fact}\n{filler}"
+    passage = relevant_passages(page, "How does bright light shift a delayed sleep phase?", limit=300)
+    assert fact in passage and len(passage) <= 300
+    assert "Home | News" not in passage
+
+
+def test_what_the_sources_really_were_is_said_plainly():
+    from orion_core.live_research import describe_evidence
+
+    assert describe_evidence([]) == ("none", "no sources")
+    level, phrase = describe_evidence([{"title": "Wikipedia: Sleep", "snippet": "x"}])
+    assert level == "encyclopaedia_only" and "no web page was opened" in phrase
+    level, phrase = describe_evidence([{"title": "Hit", "url": "https://x", "evidence": "snippet"},
+                                       {"title": "News", "url": "https://y", "evidence": "headline"}])
+    assert level == "snippets_only" and "no web page was opened" in phrase
+    level, phrase = describe_evidence([{"title": "Hit", "url": "https://x", "evidence": "page"},
+                                       {"title": "News", "url": "https://y", "evidence": "headline"}])
+    assert level == "pages" and phrase.startswith("1 page read and 1 ")
+
+
+async def test_a_page_that_does_not_address_the_question_is_not_a_source(researcher):
+    """Its "note" was kept, numbered and listed under Sources, so an off-topic
+    page made the investigation look better sourced than it was."""
+    async def ask(prompt, persona="x"):
+        if persona == "research planner":
+            return "NOTHING" if "still missing" in prompt else "What does the evidence say?"
+        if persona == "research reader":
+            assert "NOT RELEVANT" in prompt
+            return "NOT RELEVANT"
+        return "Summary."
+
+    researcher.ask = ask
+    run = await researcher.investigate("spacing", questions=1, per_question=1, rounds=1)
+    assert run.notes == []
+    assert any(reason == "did not address the question" for _url, reason in run.failed)
+
+
+async def test_the_write_up_cannot_cite_a_note_that_does_not_exist(researcher):
+    run = await researcher.investigate("spacing", questions=1, per_question=1, rounds=1)
+    assert len(run.notes) == 1
+
+    async def writer(prompt, persona="x"):
+        return ("The page reports a measurable effect of spacing on recall [1]. "
+                "A second study found the same effect in older adults [4].")
+
+    researcher.ask = writer
+    summary = await researcher.summarise(run)
+    assert "[1]" in summary and "[4]" not in summary
+    assert summary.endswith("older adults [unsourced].")
+    folder = researcher.write_folder(run, summary)
+    assert "[1] " in (folder / "SUMMARY.md").read_text(encoding="utf-8").split("## Sources")[1]
+
+
+async def test_a_reading_run_reports_its_start_and_one_finish(researcher):
+    """The BRAIN and NEURAL pages show research only while it really runs."""
+    from orion_core import research_runs
+
+    seen = []
+    researcher.bus = SimpleNamespace(log=SimpleNamespace(emit=lambda *_: None),
+                                     dashboard_event=SimpleNamespace(emit=lambda *a: seen.append(a)))
+    await researcher.investigate("spacing", questions=1, per_question=1, rounds=1)
+    research = [payload for channel, payload in seen if channel == "research"]
+    assert research[0]["status"] == "running" and research[0]["engine"] == "browse"
+    assert any(p.get("question") for p in research[1:-1]), "the current question was reported"
+    assert [p["status"] for p in research].count("done") == 1 and research[-1]["status"] == "done"
+    assert all(p["run"] == research[0]["run"] for p in research)
+    assert not [row for row in research_runs.live_activity() if row["run"] == research[0]["run"]]

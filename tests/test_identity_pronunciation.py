@@ -42,3 +42,19 @@ def test_spoken_name_rule_is_hoisted_to_the_front(tmp_path, monkeypatch):
     assert "oh-ry-un" in low                     # phonetic anchor
     assert "o r i n" in low and "o r i o" in low  # the exact broken forms named
     assert "single flowing word 'orion'" in low
+
+
+def test_he_does_not_correct_the_user_for_the_transcribers_mistake(tmp_path, monkeypatch):
+    """4 Oct: "Ryan can you hear me?" -> "Just to clarify, it is 'Orion'"."""
+    monkeypatch.setattr(idm, "IDENTITY_PATH", tmp_path / "identity.json")
+    monkeypatch.setattr(idm, "CONFIG_DIR", tmp_path)
+    persona = idm.IdentityManager(_Bus()).persona_text()
+    assert "'Ryan'" in persona and "never correct the user" in persona
+
+
+def test_he_acts_on_the_everyday_meaning_rather_than_quizzing(tmp_path, monkeypatch):
+    """3 Oct: three clarifying questions in a row about "scan the network"."""
+    monkeypatch.setattr(idm, "IDENTITY_PATH", tmp_path / "identity.json")
+    monkeypatch.setattr(idm, "CONFIG_DIR", tmp_path)
+    persona = idm.IdentityManager(_Bus()).persona_text()
+    assert "COMMON-SENSE RULE" in persona and "never more than one in a row" in persona

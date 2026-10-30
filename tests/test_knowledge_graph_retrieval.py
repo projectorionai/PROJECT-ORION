@@ -110,6 +110,26 @@ def test_the_fts_query_is_not_ambiguous(graph):
     assert rows, "the qualified query returned nothing"
 
 
+def test_legacy_write_only_entity_index_is_retired_without_losing_entities(tmp_path):
+    path = tmp_path / "legacy.db"
+    engine = KnowledgeGraphEngine(_Bus(), _Memory(), path)
+    entity = engine.upsert_entity("Kidderminster", "concept")
+    before = [(row.id, row.name) for row in engine.search_entities("Kidderminster")]
+    engine.conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(name, kind, aliases, content='')")
+    for rowid in (11, 22, 33):
+        engine.conn.execute("INSERT INTO entities_fts(rowid,name,kind,aliases) VALUES (?,?,?,?)",
+                            (rowid, entity.name, entity.kind, ""))
+    engine.conn.commit()
+    engine.close()
+    migrated = KnowledgeGraphEngine(_Bus(), _Memory(), path)
+    try:
+        assert migrated.conn.execute("SELECT name FROM sqlite_master WHERE name LIKE 'entities_fts%'").fetchall() == []
+        assert [(row.id, row.name) for row in migrated.search_entities("Kidderminster")] == before
+        assert migrated.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        migrated.close()
+
+
 def test_unqualified_columns_would_still_be_ambiguous(graph):
     """Proves the bug was real rather than theoretical — this is the query that
     shipped, and it must still fail, which is why qualification is required."""
@@ -239,3 +259,27 @@ def test_the_migration_is_idempotent(tmp_path):
         assert [e.title for e in engine.semantic_retrieve("probe", limit=5)]
     finally:
         engine.close()
+
+
+def test_orions_misheard_name_is_folded_into_orion(tmp_path):
+    """"Ryan" was the most-linked concept from conversation (48 mentions
+    against 9 for ORION): it is how speech recognition hears his name."""
+    from orion_core.knowledge_graph import _canonical_name
+    assert _canonical_name("Ryan") == "ORION"
+    assert _canonical_name("O Ryan") == "ORION"
+    assert _canonical_name("Sir Ryan") == "ORION"
+    assert _canonical_name("Ryan Gosling") == "Ryan Gosling"
+    assert _canonical_name("Bryant") == "Bryant"
+    graph = KnowledgeGraphEngine(_Bus(), _Memory(), tmp_path / "kg.db")
+    names = {e.name for e in graph.extract_entities("Okay, Ryan, open Notepad please.")}
+    assert "ORION" in names and "Ryan" not in names
+
+
+def test_entities_are_found_without_the_unread_index(tmp_path):
+    """entities_fts was write-only with a per-process random rowid; entity
+    lookups never used it, so no longer writing it changes nothing found."""
+    graph = KnowledgeGraphEngine(_Bus(), _Memory(), tmp_path / "kg.db")
+    graph.upsert_entity("Raleigh", kind="product")
+    graph.upsert_entity("Raleigh", kind="product")
+    assert graph.conn.execute("SELECT name FROM sqlite_master WHERE name LIKE 'entities_fts%'").fetchall() == []
+    assert graph.conn.execute("SELECT mentions FROM entities WHERE name='Raleigh'").fetchone()[0] == 2

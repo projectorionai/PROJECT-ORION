@@ -11,20 +11,20 @@ transaction:
     3. capture *after*;
     4. compare — pixel-change ratio (cv2/numpy) and/or the appearance of an
        expected UI element / disappearance of a dialog;
-    5. on failure, recalculate coordinates from the live UIA tree and retry,
-       up to a bounded number of attempts;
+    5. allow bounded observations for delayed responses; repeat an action
+       only when the caller explicitly marks it repeatable;
     6. explain the outcome.
 
 It exposes two levels:
     • ``verify_action`` — wrap any control callable with a before/after diff.
     • ``click_element`` / ``click_text`` — locate a control by name via UIA,
-      click its centre, and verify the screen actually changed; recompute the
-      element position on retry (self-correcting coordinates).
+      click its current centre once, and observe whether the screen changed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
@@ -43,13 +43,34 @@ class VerificationResult:
     change_ratio: float
     attempts: int
     detail: str
+    receipt: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        self.receipt = copy.deepcopy(self.receipt)
 
     def to_tool_result(self) -> ToolResult:
-        return ToolResult(self.detail, ok=self.ok)
+        return ToolResult(self.detail, ok=self.ok, receipt=self.receipt)
+
+
+#: Longest a click-by-name may spend scrolling and looking (Mark XXXX.2): the
+#: live turn waits 45 s before giving up on a tool.
+CLICK_SEARCH_DEADLINE_S = 25.0
+
+
+def _refused(result: Any) -> bool:
+    """A typed policy deferral (execution_policy.require_foreground)."""
+    receipt = getattr(result, "receipt", None)
+    return isinstance(receipt, dict) and receipt.get("status") == "requires_foreground"
+
+
+@dataclass
+class _ClickResult(ToolResult):
+    # Failure to verify an issued click must not start a new scroll search.
+    target_found: bool = False
 
 
 class VisualVerificationEngine:
-    """Act → capture → verify → retry, with self-correcting coordinates."""
+    """Locate → act → observe, without replaying uncertain side effects."""
 
     def __init__(
         self,
@@ -130,7 +151,8 @@ class VisualVerificationEngine:
             before = await self._capture(target_region)
             result = await asyncio.to_thread(action) if not asyncio.iscoroutinefunction(action) else await action()
             if not result.ok:
-                return VerificationResult(False, 0.0, attempt, result.text)
+                return VerificationResult(False, 0.0, attempt, result.text,
+                                          receipt=result.receipt)
             last_detail = result.text
             waits = [settle_s] if repeatable else [settle_s, max(0.6, settle_s * 2)]
             for wait in waits:
@@ -162,72 +184,100 @@ class VisualVerificationEngine:
             f"({best_ratio*100:.2f}%); the action may not have registered]",
         )
 
-    # ── element-targeted, self-correcting click ───────────────────────────────
+    # ── element-targeted click ──────────────────────────────────────────────
 
     async def _click_and_verify(
         self, query: str, locate: Callable[[], Awaitable[dict[str, Any] | None]],
         attempts: int, strategy: str,
     ) -> ToolResult:
+        """Locate once, click once, then allow bounded observations to settle.
+
+        An unchanged screenshot does not prove a click failed: a toggle,
+        submission or navigation must not be issued again to test that theory.
         """
-        Shared click+verify+retry loop: re-locate via *locate* each attempt
-        (self-correcting coordinates), click, verify the screen actually
-        changed. Used by both the UIA path (click_element) and the OCR
-        fallback (click_via_ocr, Track D2) so they share one shape — and
-        every attempt is recorded to self.trace (Track D7).
-        """
-        for attempt in range(1, max(1, attempts) + 1):
-            element = await locate()
-            if element is None:
-                if attempt == 1:
-                    detail = await self._not_found_message(query, strategy)
-                    self.trace.record(query=query, strategy=strategy, found=False,
-                                      detail=detail)
-                    return ToolResult(detail, ok=False)
-                await asyncio.sleep(0.3)
-                continue
-            cx, cy = element["center"]
-            region = self._padded_region(element["rect"])
+        if not query.strip():
+            return _ClickResult("A non-empty control name is required.", ok=False)
+        element = await locate()
+        if element is None:
+            detail = await self._not_found_message(query, strategy)
+            self.trace.record(query=query, strategy=strategy, found=False, detail=detail)
+            return _ClickResult(detail, ok=False)
+        cx, cy = element["center"]
+        region = self._padded_region(element["rect"])
+        try:
             before = await self._capture(region)
-            click = await asyncio.to_thread(self.control.click, cx, cy)
-            if not click.ok:
-                self.trace.record(query=query, strategy=strategy, found=True,
-                                  coordinates=(cx, cy), verified=False, detail=click.text)
-                return click
-            await asyncio.sleep(0.4)
-            after = await self._capture(region)
+        except Exception as exc:
+            return _ClickResult(f"Could not inspect the target before clicking; no click was issued: {exc}",
+                                ok=False, target_found=True)
+        kwargs = {}
+        if hasattr(self.vision, "validate_element_sync"):
+            kwargs["target_check"] = lambda: self.vision.validate_element_sync(element)
+        try:
+            click = await asyncio.to_thread(self.control.click, cx, cy, **kwargs)
+        except Exception as exc:
+            return _ClickResult(f"Click result is uncertain; not repeated: {exc}",
+                                ok=False, target_found=True)
+        if not click.ok:
+            self.trace.record(query=query, strategy=strategy, found=True,
+                              coordinates=(cx, cy), verified=False, detail=click.text)
+            return _ClickResult(click.text, ok=False, receipt=click.receipt, target_found=True)
+        best_ratio = 0.0
+        for attempt in range(1, max(1, attempts) + 1):
+            await asyncio.sleep(0.4 if attempt == 1 else 0.6)
+            try:
+                after = await self._capture(region)
+            except Exception as exc:
+                return _ClickResult(f"Click issued, but the result could not be inspected; not repeated: {exc}",
+                                    ok=False, target_found=True)
             ratio = self._change_ratio(before, after)
+            best_ratio = max(best_ratio, ratio)
             if self.telemetry is not None:
                 self.telemetry.metrics.observe("verify.click_change_pct", ratio * 100.0)
             if ratio >= 0.003:
                 self.trace.record(query=query, strategy=strategy, found=True,
                                   coordinates=(cx, cy), verified=True, change_ratio=ratio)
-                return ToolResult(
+                return _ClickResult(
                     f"Clicked '{element['name']}' [{element['role']}] at ({cx},{cy}); "
-                    f"verified ({ratio*100:.2f}% change)."
+                    f"verified ({ratio*100:.2f}% change).", target_found=True,
                 )
             self.bus.log.emit(
                 f"VERIFY: click on '{element['name']}' showed {ratio*100:.2f}% change; "
-                f"recalculating (attempt {attempt})."
+                f"observing without repeating (observation {attempt})."
             )
-            await asyncio.sleep(0.3)
-        self.trace.record(query=query, strategy=strategy, found=True, verified=False)
-        return ToolResult(
+        self.trace.record(query=query, strategy=strategy, found=True, verified=False,
+                          coordinates=(cx, cy), change_ratio=best_ratio)
+        return _ClickResult(
             f"Clicked '{query}' but could not visually confirm a response after "
-            f"{attempts} attempts. It may be a no-op control, or the view did not change.",
-            ok=False,
+            f"{max(1, attempts)} observations. Not repeated: it may already have "
+            "taken effect. Inspect the current view before acting again.",
+            ok=False, target_found=True,
         )
 
     async def click_element(self, query: str, kinds: str = "all",
-                            attempts: int = 3) -> ToolResult:
+                            attempts: int = 3, automation_id: str = "") -> ToolResult:
         """
         Find a control by visible name, click its centre, and verify.
 
-        On each retry the element is re-located from the live UIA tree, so a
-        moved/re-laid-out control is clicked at its *new* position rather than
-        a stale coordinate — the self-correcting-coordinates requirement.
+        Coordinates come from the current UIA tree. Further attempts observe
+        a delayed response without repeating the click.
         """
+        if hasattr(self.vision, "resolve_element"):
+            resolved = await self.vision.resolve_element(query, kinds, automation_id)
+            return await self._resolved_click(query or automation_id, resolved, attempts)
         return await self._click_and_verify(
             query, lambda: self.vision.find_element(query, kinds=kinds), attempts, "uia")
+
+    async def _resolved_click(self, query: str, resolved: dict[str, Any],
+                              attempts: int) -> ToolResult:
+        if resolved["status"] == "ambiguous":
+            self.trace.record(query=query, strategy="uia", found=True,
+                              verified=False, detail=resolved["detail"])
+            # Ambiguity must not be treated as absence and bypassed through
+            # OCR or a scroll search for a different same-labelled control.
+            return _ClickResult(resolved["detail"], ok=False, target_found=True)
+        async def located():
+            return resolved["element"]
+        return await self._click_and_verify(query, located, attempts, "uia")
 
     async def click_via_ocr(self, query: str, attempts: int = 2) -> ToolResult:
         """
@@ -235,8 +285,7 @@ class VisualVerificationEngine:
         accessibility tree comes back empty for *query* across every role.
         Electron/canvas UIs, games and some installers expose an empty or
         unreliable UIA tree; this used to be a dead end with no second
-        strategy at all. Mirrors click_element's self-correcting retry
-        shape, re-locating via OCR each attempt instead.
+        strategy at all. Like click_element, it clicks once and then observes.
         """
         return await self._click_and_verify(
             query, lambda: self.vision.find_element_via_ocr(query), attempts, "ocr")
@@ -261,7 +310,8 @@ class VisualVerificationEngine:
             parts.append(f"The active window is {window}.")
         return " ".join(parts)
 
-    async def click_text(self, text: str, attempts: int = 3) -> ToolResult:
+    async def click_text(self, text: str, attempts: int = 3,
+                         automation_id: str = "") -> ToolResult:
         """
         Click a button/link/menu item by its visible text, scrolling to find
         it in both directions if necessary (Mark XXI, Track D3).
@@ -276,54 +326,84 @@ class VisualVerificationEngine:
         view is scrolled back to exactly where the search started, rather
         than left wherever the last, unsuccessful probe happened to land.
         """
-        located = await self._locate_and_click(text, attempts)
-        if located.ok:
+        if not text.strip() and not automation_id:
+            return ToolResult("A non-empty control name is required.", ok=False)
+        started = time.monotonic()
+        located = await self._locate_and_click(text, attempts, automation_id)
+        if automation_id:
+            # A native ID never becomes an OCR label on an unrelated screen.
+            return located
+        if located.ok or getattr(located, "target_found", False) or _refused(located):
+            # A policy refusal is not a missing button: scrolling ten times
+            # and reading the screen after each held a turn for 45 s+ (27 Oct
+            # 2026) and could not have helped.
             return located
 
         step = 4
         net_scrolled = 0
 
+        def out_of_time() -> bool:
+            return time.monotonic() - started > CLICK_SEARCH_DEADLINE_S
+
         for _ in range(5):
-            try:
-                self.control.scroll(-step)          # negative = scroll down
-            except Exception:
+            if out_of_time():
                 break
+            try:
+                scrolled = await asyncio.to_thread(self.control.scroll, -step)
+            except Exception as exc:
+                return ToolResult(f"Scroll search stopped: {exc}", ok=False)
+            if not scrolled.ok:
+                return scrolled
             net_scrolled -= step
             await asyncio.sleep(0.35)
-            probe = await self._locate_and_click(text, attempts)
-            if probe.ok:
+            probe = await self._locate_and_click(text, attempts, automation_id)
+            if probe.ok or getattr(probe, "target_found", False) or _refused(probe):
                 return probe
 
         if net_scrolled:
             try:
-                self.control.scroll(-net_scrolled)  # back to the starting point
+                scrolled = await asyncio.to_thread(self.control.scroll, -net_scrolled)
+                if not scrolled.ok:
+                    return scrolled
                 net_scrolled = 0
-            except Exception:
-                pass
+            except Exception as exc:
+                return ToolResult(f"Scroll search stopped: {exc}", ok=False)
             await asyncio.sleep(0.35)
 
         for _ in range(5):
-            try:
-                self.control.scroll(step)           # positive = scroll up
-            except Exception:
+            if out_of_time():
                 break
+            try:
+                scrolled = await asyncio.to_thread(self.control.scroll, step)
+            except Exception as exc:
+                return ToolResult(f"Scroll search stopped: {exc}", ok=False)
+            if not scrolled.ok:
+                return scrolled
             net_scrolled += step
             await asyncio.sleep(0.35)
-            probe = await self._locate_and_click(text, attempts)
-            if probe.ok:
+            probe = await self._locate_and_click(text, attempts, automation_id)
+            if probe.ok or getattr(probe, "target_found", False) or _refused(probe):
                 return probe
 
         if net_scrolled:
             try:
-                self.control.scroll(-net_scrolled)  # restore the original position
-            except Exception:
-                pass
+                scrolled = await asyncio.to_thread(self.control.scroll, -net_scrolled)
+                if not scrolled.ok:
+                    return scrolled
+            except Exception as exc:
+                return ToolResult(f"Scroll search stopped: {exc}", ok=False)
         return located  # the original, informative failure
 
-    async def _locate_and_click(self, text: str, attempts: int) -> ToolResult:
+    async def _locate_and_click(self, text: str, attempts: int,
+                              automation_id: str = "") -> ToolResult:
         """Try the most interactive roles first for a precise hit; no
         scrolling. Falls back to OCR (Track D2) only when UIA finds
         nothing under any role."""
+        if hasattr(self.vision, "resolve_element"):
+            resolved = await self.vision.resolve_element(text, "all", automation_id)
+            if resolved["status"] != "missing" or automation_id:
+                return await self._resolved_click(text or automation_id, resolved, attempts)
+            return await self.click_via_ocr(text, attempts=max(1, attempts - 1))
         for kinds in ("button", "link", "menu"):
             element = await self.vision.find_element(text, kinds=kinds)
             if element is not None:

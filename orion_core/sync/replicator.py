@@ -10,6 +10,7 @@ everything here is pure enough to unit-test without a network.
 
 from __future__ import annotations
 
+import logging
 from typing import Iterable
 
 from .conflict import group_by_key, resolve_key
@@ -30,16 +31,30 @@ def materialise_into(journal, matrix) -> int:
     Writes suppress journalling (``journal=False``) so materialisation never
     loops back into new journal entries. For additive tiers the newest payload
     becomes the matrix's current value; the full accumulated history remains in
-    the journal itself. Returns the number of keys written.
+    the journal itself. Returns the number of accepted non-empty writes;
+    explicit failed receipts are not counted. Legacy save methods that return
+    a success string or None keep their existing contract. Empty values are
+    not tombstones: the memory matrix does not support deletion via save().
     """
     written = 0
+    failed = 0
     for (_tier, category, key), payloads in reconcile(journal.all_entries()).items():
         if not payloads:
             continue
         current = payloads[-1]   # resolve_key orders newest-last
+        if not isinstance(current, str) or not current.strip():
+            failed += 1
+            continue
         try:
-            matrix.save(category, key, current, journal=False)
+            receipt = matrix.save(category, key, current, journal=False)
+            if receipt is False or getattr(receipt, "ok", True) is False:
+                failed += 1
+                continue
             written += 1
         except Exception:
+            failed += 1
             continue
+    if failed:
+        logging.getLogger(__name__).warning(
+            "Sync materialisation could not write %d key(s); journal history retained", failed)
     return written

@@ -42,7 +42,8 @@ def test_build_commands_maps_and_sorts_and_drops_nameless():
     assert names == sorted(names)                  # sorted by name
     assert "" not in names                         # nameless dropped
     breach = next(c for c in cmds if c.name == "breach_check")
-    assert breach.title == "breach check"          # underscores → spaces
+    assert breach.title == "Check for Exposed Credentials"
+    assert breach.name == "breach_check"          # callable identity is preserved
     assert breach.subtitle and len(breach.subtitle) <= 100
     assert "—" not in breach.subtitle or True      # first-sentence trimming applied
 

@@ -41,10 +41,10 @@ def test_connection_chip_reacts_to_state(app):
     bus = OrionBus()
     chip = ConnectionStatusChip(bus)
     bus.connection_state.emit({"state": "connected", "message": "synchronised"})
-    assert "CONNECTED" in chip.text()
+    assert "Connected" in chip.text()          # sentence case, like every deck label
     assert chip.property("state") == "good"
     bus.connection_state.emit({"state": "degraded_offline", "message": "no provider"})
-    assert "NO PROVIDER" in chip.text()
+    assert "No Provider" in chip.text()
     assert chip.property("state") == "bad"
     bus.connection_state.emit({"state": "reconnecting", "message": "reconnecting"})
     assert chip.property("state") == "warn"
@@ -78,7 +78,7 @@ def test_status_strip_composes_and_diagnoses(app):
     assert strip.accessibleName()
     bus.provider_diagnosed.emit({"category": "rate_limit", "provider": "openai",
                                  "remediation": "back off then retry"})
-    assert "RATE LIMIT" in strip.diag_chip.text()
+    assert "Rate limit" in strip.diag_chip.text()
     assert strip.diag_chip.property("state") == "bad"
     # A fake ledger drives the token mini.
     class _Ledger:
@@ -101,3 +101,20 @@ def test_stylesheet_includes_status_surfaces():
     assert "statusStrip" in APP_STYLESHEET
     assert "degradedBanner" in APP_STYLESHEET
     assert "statusChip" in APP_STYLESHEET
+
+
+def test_a_strip_built_late_starts_from_the_live_state():
+    """Deck pages are built on first open now. A status strip created after
+    the connection came up must say CONNECTED, not its OFFLINE default, and
+    an active degraded warning must already be showing."""
+    from orion_core.gui.status_widgets import ProviderStatusStrip
+
+    globals().setdefault("_QT_APP", QApplication.instance() or QApplication([]))  # held, or it is collected
+    bus = OrionBus()
+    bus.connection_state.emit({"state": "connected", "message": "Live"})
+    bus.provider_degraded.emit({"degraded": True, "reason": "all cooling down",
+                                "configured": ["groq"], "alternatives": []})
+    strip = ProviderStatusStrip(bus)
+    assert "Offline" not in strip.conn_chip.text()
+    assert not strip.degraded.isHidden() or strip.degraded.text()
+    assert bus.last_value("connection_state") == {"state": "connected", "message": "Live"}

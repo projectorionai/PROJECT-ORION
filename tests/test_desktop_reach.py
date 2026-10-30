@@ -105,9 +105,10 @@ def test_an_explicit_screen_is_still_honoured():
     assert cls._monitor(instance, _FakeCapture(), 1)["left"] == 0
 
 
-def test_an_out_of_range_screen_falls_back_to_everything():
+def test_an_out_of_range_screen_is_rejected_instead_of_capturing_another_screen():
     instance, cls = _grabber()
-    assert cls._monitor(instance, _FakeCapture(), 9)["width"] == 3840
+    with pytest.raises(ValueError, match="That monitor is not connected"):
+        cls._monitor(instance, _FakeCapture(), 9)
 
 
 # ── 3. OCR across screens ────────────────────────────────────────────────────
@@ -210,3 +211,47 @@ def test_ocr_reads_at_native_resolution():
     source = inspect.getsource(vision)
     assert "capture_image(max_side=1600)" not in source, (
         "a two-monitor capture is being downscaled before OCR")
+
+
+def test_a_near_miss_is_tried_only_after_every_screen_had_its_exact_search():
+    """A misread small label ("Fitter" for "Filter") is a last resort: an
+    exact read anywhere wins first, and the near-miss pass reuses the screens
+    already captured instead of grabbing them again."""
+    agent, cls = _agent()
+    order: list = []
+    grabs: list = []
+
+    class _Engine:
+        available = True
+
+        @staticmethod
+        def find_text_box(image, _query):
+            order.append(("exact", image))
+            return None
+
+        @staticmethod
+        def find_near_text_box(image, _query):
+            order.append(("near", image))
+            return (5, 6, 30, 10) if image == "screen-2" else None
+
+    class _Grab:
+        @staticmethod
+        def monitor_bounds(index=None):
+            return {1: (0, 0, 1920, 1080), 2: (1920, 0, 1920, 1080)}[index]
+
+        @staticmethod
+        def capture_image(max_side=0, monitor=None):
+            grabs.append(monitor)
+            return f"screen-{monitor}"
+
+        @staticmethod
+        def _grabber():
+            return _FakeCapture()
+
+    agent.grabber = _Grab()
+    agent.ocr_engine = _Engine()
+    hit = cls._find_element_via_ocr_sync(agent, "Filter", None)
+    assert hit is not None and hit["monitor"] == 2 and hit["center"] == (1920 + 5 + 15, 6 + 5)
+    assert order == [("exact", "screen-1"), ("exact", "screen-2"),
+                     ("near", "screen-1"), ("near", "screen-2")]
+    assert grabs == [1, 2]

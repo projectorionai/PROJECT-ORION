@@ -83,6 +83,8 @@ class SourceChangeTracker:
         self,
         root: Path | None = None,
         store_path: Path | None = None,
+        history: Any = None,
+        history_roots: dict[str, Path] | None = None,
     ) -> None:
         self.root = Path(root) if root is not None else PACKAGE_DIR
         self.store_path = (
@@ -90,6 +92,9 @@ class SourceChangeTracker:
             else CONFIG_DIR / "source_awareness.json"
         )
         self.last_change: ChangeSet | None = None
+        self.history = history
+        self.history_roots = dict(history_roots or {})
+        self.history_error = ""
 
     # ── fingerprinting ────────────────────────────────────────────────────────
 
@@ -122,13 +127,46 @@ class SourceChangeTracker:
             mtime = 0.0
         return {"hash": digest, "size": len(data), "mtime": round(mtime, 3)}
 
-    def scan(self) -> dict[str, dict[str, Any]]:
-        """A fresh manifest of the current source tree: relpath → fingerprint."""
+    def build_manifest(self) -> dict[str, dict[str, Any]] | None:
+        """In the installed app, the module hashes the build recorded
+        (build_freshness.module_hashes) - his real code, which the files on
+        disk are not. None when running from source or for another root."""
+        import sys
+        if not getattr(sys, "frozen", False) or self.root != PACKAGE_DIR:
+            return None
+        from .build_freshness import read_build_info
+        modules = (read_build_info() or {}).get("modules")
+        if not isinstance(modules, dict) or not modules:
+            return None
+        return {str(rel): {"hash": str(digest)} for rel, digest in modules.items()}
+
+    def scan(self, previous: dict[str, dict[str, Any]] | None = None
+             ) -> dict[str, dict[str, Any]]:
+        """A fresh manifest of the current source tree: relpath → fingerprint.
+
+        With *previous*, a file whose size and modification time both match
+        its previous entry keeps that entry's hash instead of being read and
+        hashed again. MEASURED at boot: re-reading and hashing all ~800 files
+        every launch was 4.5 s of the Qt thread on a first run and most of a
+        second on every run after it; stat alone costs a fraction of that.
+        """
+        previous = previous or {}
         manifest: dict[str, dict[str, Any]] = {}
         for path in self._iter_files():
+            rel = self._relpath(path)
+            known = previous.get(rel)
+            if known is not None and known.get("hash"):
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                if (st.st_size == known.get("size")
+                        and round(st.st_mtime, 3) == known.get("mtime")):
+                    manifest[rel] = dict(known)
+                    continue
             fp = self._fingerprint(path)
             if fp is not None:
-                manifest[self._relpath(path)] = fp
+                manifest[rel] = fp
         return manifest
 
     # ── persistence ───────────────────────────────────────────────────────────
@@ -177,10 +215,28 @@ class SourceChangeTracker:
         anything changed, an event is appended to the journal.  The result is
         cached on ``self.last_change``.
         """
+        if commit and self.history is not None:
+            # detect() is already offloaded by the composition root. A failed
+            # history store must not stop the existing boot/change report.
+            try:
+                self.history.observe_tree(self.root, self.root.name)
+                for namespace, root in self.history_roots.items():
+                    self.history.observe_tree(root, namespace)
+                self.history_error = ""
+            except Exception as exc:
+                self.history_error = f"{type(exc).__name__}: {exc}"
         store = self._load_store()
         baseline = store.get("manifest") or {}
-        current = self.scan()
+        built = self.build_manifest()
+        kind = "build" if built is not None else "files"
+        current = built if built is not None else self.scan(previous=baseline)
         now = time.strftime("%Y-%m-%d %H:%M:%S")
+        if store.get("kind", "files") != kind:
+            # A manifest of the other kind (files on disk vs the build's own
+            # record) is not comparable: start again rather than report every
+            # module as new.
+            baseline = {}
+        store["kind"] = kind
 
         if not baseline:
             # First ever run — adopt the current tree as the baseline silently.
@@ -279,6 +335,8 @@ class SourceChangeTracker:
             self.last_change = ChangeSet(total_files=0)
             return self.last_change
         try:
+            if self.history_error:
+                bus.log.emit(f"CHANGE: detailed history could not be recorded: {self.history_error}")
             if change.first_snapshot:
                 bus.log.emit(
                     f"CHANGE: source baseline mapped — {change.total_files} modules "

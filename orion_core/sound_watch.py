@@ -175,6 +175,8 @@ class SoundWatch:
         self.skipped = 0           # silent or missing windows skipped
         self.alerts: deque[Alert] = deque(maxlen=20)
         self.error = ""
+        self.context_service: Any = None
+        self._context_session: Any = None
 
     # -- lifecycle -------------------------------------------------------------
     @property
@@ -183,9 +185,24 @@ class SoundWatch:
 
     def start(self) -> tuple[bool, str]:
         if self.running:
+            if self._stop.is_set():
+                return False, "the previous sound watch is still stopping."
             return True, "already listening for alarms, sirens and the door."
-        if not self._prepare():
+        from .resource_governor import optional_work_allowed
+        if not optional_work_allowed():
+            return False, "memory pressure is limiting optional sensing."
+        if self.context_service is not None:
+            self._context_session = self.context_service.open_source("audio.local")
+        try:
+            prepared = self._prepare()
+        except Exception as exc:
+            self.error = str(exc)
+            prepared = False
+        if not prepared:
+            if self._context_session is not None:
+                self._context_session.close(failed=True)
             return False, self.error or "the sound classifier is not available."
+        self.error = ""
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="orion-sound-watch",
                                         daemon=True)
@@ -195,10 +212,14 @@ class SoundWatch:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._context_session is not None:
+            self._context_session.close()
+            self._context_session = None
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=3.0)
-        self._thread = None
+        if thread is None or not thread.is_alive():
+            self._thread = None
 
     # -- the work --------------------------------------------------------------
     def _prepare(self) -> bool:
@@ -218,7 +239,12 @@ class SoundWatch:
     def step(self, now: float | None = None) -> list[Alert]:
         """Classify the latest window once; returns (and delivers) new alerts."""
         assert self._watcher is not None and self._classify is not None
+        context_session = self._context_session
+        observed_at = (self.context_service.clock()
+                       if self.context_service is not None else None)
         pcm = self._source.snapshot(WINDOW_S) if self._source is not None else b""
+        if context_session is not None:
+            context_session.available(len(pcm) >= MIN_WINDOW_BYTES)
         if len(pcm) < MIN_WINDOW_BYTES or window_rms(pcm) < SILENCE_RMS:
             self.skipped += 1
             # Silence is evidence too: a sound that stopped is not still going.
@@ -226,9 +252,13 @@ class SoundWatch:
             return []
         wave = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype=np.int16).astype(np.float32) / 32768.0
         scores = np.asarray(self._classify(wave), dtype=np.float32)
+        if self._stop.is_set():
+            return []
         self.windows += 1
         alerts = self._watcher.observe(scores, now)
         for alert in alerts:
+            if context_session is not None:
+                context_session.audio(alert.category, alert.score, observed_at=observed_at)
             self.alerts.append(alert)
             try:
                 self.on_alert(alert)
@@ -237,13 +267,18 @@ class SoundWatch:
         return alerts
 
     def _run(self) -> None:
-        while not self._stop.wait(self.interval_s):
-            try:
-                self.step()
-            except Exception as exc:
-                self.error = str(exc)
-                self._say(f"SOUND: watch stopped - {exc}")
-                return
+        context_session = self._context_session
+        try:
+            while not self._stop.wait(self.interval_s):
+                try:
+                    self.step()
+                except Exception as exc:
+                    self.error = str(exc)
+                    self._say(f"SOUND: watch stopped - {exc}")
+                    return
+        finally:
+            if context_session is not None:
+                context_session.close(failed=not self._stop.is_set())
 
     def _say(self, message: str) -> None:
         if self.log is not None:
@@ -284,5 +319,11 @@ def rules_for(categories: Iterable[str]) -> tuple[AlertRule, ...]:
     return tuple(r for r in DEFAULT_RULES if r.category in wanted)
 
 
+def stop_if_running() -> None:
+    """Stop the existing watch at shutdown without creating or loading one."""
+    if _WATCH is not None:
+        _WATCH.stop()
+
+
 __all__ = ["Alert", "AlertRule", "DEFAULT_RULES", "SoundWatch", "SoundWatcher",
-           "rules_for", "watch", "window_rms"]
+           "rules_for", "watch", "window_rms", "stop_if_running"]

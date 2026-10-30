@@ -1,0 +1,33 @@
+{
+  "route": "https://designers-acid-programme-needed.trycloudflare.com",
+  "ok": true,
+  "health_http": 200,
+  "hardware_http": 200,
+  "hardware": {
+    "ok": true,
+    "sampled_at": 1790639656986,
+    "cpu": {
+      "name": "AMD Ryzen 5 5600X 6-Core Processor",
+      "load_percent": 63.5,
+      "temperature_c": null
+    },
+    "gpu": {
+      "available": true,
+      "name": "NVIDIA GeForce RTX 3060 Ti",
+      "load_percent": 39.0,
+      "vram_used_mb": 2197,
+      "vram_total_mb": 8192,
+      "temperature_c": 44
+    },
+    "memory": {
+      "used_percent": 94.2
+    }
+  },
+  "speech_http": 200,
+  "voice": "Charon",
+  "first_audio_seconds": 0.945,
+  "speech_stream_seconds": 1.576,
+  "audio_seconds": 2.64,
+  "frames": 66,
+  "complete": true
+}

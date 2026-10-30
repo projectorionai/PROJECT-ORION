@@ -1,0 +1,24 @@
+# Select this path when creating a Render Blueprint from a reviewed private
+# source repository. This is a disposable single-owner trial, not production.
+services:
+  - type: web
+    name: orion-cloud-trial
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./deploy/Dockerfile.render
+    dockerContext: .
+    autoDeployTrigger: "off"
+    healthCheckPath: /api/health
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: ORION_RENDER_EPHEMERAL_ACK
+        value: "1"
+      - key: ORION_GEMINI_API_KEY
+        sync: false
+      - key: ORION_CONFIG_DIR
+        value: /app/data/config
+      - key: ORION_REMOTE_PAIR_ON_START
+        value: "0"

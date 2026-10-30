@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from unittest.mock import patch
 
 from orion_core.bus import OrionBus
 from orion_core.maintenance import DatabaseHousekeeper
@@ -80,3 +81,37 @@ def test_run_loop_stops_cleanly(tmp_path):
         return 1
 
     assert asyncio.run(_drive()) == 1
+
+
+def test_checkpoint_does_not_report_success_while_reader_pins_wal(tmp_path):
+    """SQLite reports a busy TRUNCATE checkpoint in a row, without raising."""
+    db = tmp_path / "busy.db"
+    writer = sqlite3.connect(db)
+    reader = None
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE data (value INTEGER)")
+        writer.commit()
+        reader = sqlite3.connect(db)
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM data").fetchall()
+        writer.execute("INSERT INTO data VALUES (1)")
+        writer.commit()
+
+        keeper = DatabaseHousekeeper(OrionBus(), config_dir=tmp_path)
+        with patch("orion_core.maintenance._BUSY_TIMEOUT_MS", 25):
+            ok, detail = keeper._checkpoint_one(db)
+            assert (ok, detail) == (False, "checkpoint-busy")
+            assert keeper.checkpoint_all() == 0
+            sweep_ok, sweep_detail = keeper._sweep_one(db)
+            assert sweep_ok is False
+            assert "checkpoint-busy" in sweep_detail
+
+        reader.close()
+        reader = None
+        assert keeper._checkpoint_one(db) == (True, "checkpoint")
+        assert writer.execute("SELECT value FROM data").fetchone()[0] == 1
+    finally:
+        if reader is not None:
+            reader.close()
+        writer.close()

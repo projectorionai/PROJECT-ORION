@@ -23,6 +23,14 @@ is graceful degradation of the extras, not a quieter ORION.
 
 Thresholds: ORION_MEM_THRESHOLDS="85,92,96" (percent used). ORION_GOVERNOR=0
 turns acting off (it still reports).
+
+CPU load and GPU memory are sampled on the same tick, each through a gauge
+with its own hysteresis (busy after two samples at or above the upper
+threshold, clear after three below the lower one: ORION_CPU_BUSY="85,70",
+ORION_GPU_BUSY="85,75"). They do not shed anything themselves; admission
+reads them to defer optional work. A gauge with no reading is None — unknown —
+and GPU telemetry is only read once something else has initialised it, so the
+loop never pays for loading NVML or launching nvidia-smi.
 """
 
 from __future__ import annotations
@@ -73,6 +81,98 @@ def _read_memory() -> tuple[float, float] | None:
         return None
 
 
+def _load_thresholds(name: str, default: tuple[float, float]) -> tuple[float, float]:
+    raw = os.getenv(name, "").strip()
+    try:
+        values = tuple(float(v) for v in raw.split(",")) if raw else ()
+    except ValueError:
+        values = ()
+    if len(values) == 2 and 0 < values[1] < values[0] <= 100:
+        return values  # type: ignore[return-value]
+    return default
+
+
+class _CpuSampler:
+    """Whole-machine CPU percent from ``cpu_times`` deltas.
+
+    Not ``psutil.cpu_percent(interval=None)``: that keeps ONE module-wide
+    baseline, so every other caller (the telemetry panel samples it each
+    second) would silently shorten this reading's window.
+    """
+
+    def __init__(self) -> None:
+        self._last: tuple[float, float] | None = None
+
+    def __call__(self) -> float | None:
+        try:
+            import psutil
+            times = psutil.cpu_times()
+        except Exception:
+            return None
+        idle = float(getattr(times, "idle", 0.0)) + float(getattr(times, "iowait", 0.0))
+        total = float(sum(times))
+        previous, self._last = self._last, (idle, total)
+        if previous is None or total <= previous[1]:
+            return None
+        busy = 1.0 - (idle - previous[0]) / (total - previous[1])
+        return max(0.0, min(100.0, busy * 100.0))
+
+
+def _read_gpu_memory() -> float | None:
+    """GPU memory percent in use, or None when unknown.
+
+    Only reads telemetry something else already initialised (the core
+    window's sampler): the first NVML load, or an nvidia-smi launch, must never
+    land on the event loop just because the governor ticked.
+    """
+    try:
+        from . import gpu_stats
+        if not gpu_stats._state.get("init"):
+            return None
+        reading = gpu_stats.latest()
+    except Exception:
+        return None
+    if not reading or not reading.get("available"):
+        return None
+    try:
+        return float(reading.get("mem_percent"))
+    except (TypeError, ValueError):
+        return None
+
+
+class LoadGauge:
+    """A busy flag with hysteresis — True, False, or None while unknown."""
+
+    ENTER_SAMPLES = 2
+    LEAVE_SAMPLES = 3
+
+    def __init__(self, enter: float, leave: float) -> None:
+        self.enter = float(enter)
+        self.leave = float(leave)
+        self.state: bool | None = None
+        self.value: float | None = None
+        self._above = 0
+        self._below = 0
+
+    def observe(self, value: float | None) -> bool | None:
+        if value is None:
+            # No reading is not the same as an idle device: say unknown.
+            self.value, self.state, self._above, self._below = None, None, 0, 0
+            return None
+        self.value = float(value)
+        if self.state is None:
+            self.state = False
+        if not self.state:
+            self._above = self._above + 1 if value >= self.enter else 0
+            if self._above >= self.ENTER_SAMPLES:
+                self.state, self._above = True, 0
+        else:
+            self._below = self._below + 1 if value < self.leave else 0
+            if self._below >= self.LEAVE_SAMPLES:
+                self.state, self._below = False, 0
+        return self.state
+
+
 class ResourceGovernor:
     SAMPLE_S = 5.0
     ENTER_SAMPLES = 2
@@ -81,14 +181,22 @@ class ResourceGovernor:
     RECOVERY_S = 30.0
 
     def __init__(self, bus: Any = None, *, reader: Callable[[], Any] = _read_memory,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 cpu_reader: Callable[[], float | None] | None = None,
+                 gpu_reader: Callable[[], float | None] | None = _read_gpu_memory) -> None:
         self.bus = bus
         self.reader = reader
         self.clock = clock
+        self.cpu_reader = cpu_reader if cpu_reader is not None else _CpuSampler()
+        self.gpu_reader = gpu_reader
+        self.cpu = LoadGauge(*_load_thresholds("ORION_CPU_BUSY", (85.0, 70.0)))
+        self.gpu = LoadGauge(*_load_thresholds("ORION_GPU_BUSY", (85.0, 75.0)))
+        self._listeners: list[Callable[["ResourceGovernor"], Any]] = []
         self.thresholds = _thresholds()
         self.level = Pressure.NORMAL
         self.recovering_until = 0.0
         self.last_reading: tuple[float, float] | None = None
+        self.memory_sample_fresh = False
         self.shedders: list[Shedder] = []
         self._above = 0
         self._below = 0
@@ -102,6 +210,10 @@ class ResourceGovernor:
     def register(self, name: str, level: Pressure, shed: Callable[[], Any],
                  restore: Callable[[], Any] | None = None) -> None:
         self.shedders.append(Shedder(name, Pressure(level), shed, restore))
+
+    def add_listener(self, listener: Callable[["ResourceGovernor"], Any]) -> None:
+        """Called with the governor after every sample (admission re-plans)."""
+        self._listeners.append(listener)
 
     # ── queries ─────────────────────────────────────────────────────────────
 
@@ -118,6 +230,12 @@ class ResourceGovernor:
     def optional_work_allowed(self) -> bool:
         return not self.acting or self.effective() < Pressure.PRESSURED
 
+    def cpu_busy(self) -> bool | None:
+        return self.cpu.state
+
+    def gpu_busy(self) -> bool | None:
+        return self.gpu.state
+
     def state_name(self) -> str:
         return "recovery" if self.recovering and self.level < Pressure.PRESSURED \
             else self.level.name.lower()
@@ -131,6 +249,10 @@ class ResourceGovernor:
             "thresholds": list(self.thresholds),
             "shedding": [s.name for s in self.shedders if s.active],
             "acting": self.acting,
+            "cpu_percent": None if self.cpu.value is None else round(self.cpu.value, 1),
+            "cpu_busy": self.cpu.state,
+            "gpu_memory_percent": None if self.gpu.value is None else round(self.gpu.value, 1),
+            "gpu_busy": self.gpu.state,
         }
 
     # ── the state machine ───────────────────────────────────────────────────
@@ -191,9 +313,14 @@ class ResourceGovernor:
             result = fn()
             if asyncio.iscoroutine(result):
                 try:
-                    asyncio.get_running_loop().create_task(result)
+                    asyncio.get_running_loop()
                 except RuntimeError:
                     result.close()
+                else:
+                    # Owned and observed: a bare create_task could be
+                    # collected mid-flight, and its failure went unreported.
+                    from . import background
+                    background.spawn(result, name=f"resource: {what}")
         except Exception as exc:
             self._log(f"RESOURCE: could not {what} - {exc}")
 
@@ -220,12 +347,35 @@ class ResourceGovernor:
 
     # ── the loop ────────────────────────────────────────────────────────────
 
+    def observe_load(self, cpu_percent: float | None = None,
+                     gpu_memory_percent: float | None = None) -> None:
+        """Feed one CPU / GPU-memory reading (None = unknown)."""
+        self.cpu.observe(cpu_percent)
+        self.gpu.observe(gpu_memory_percent)
+
+    def _read(self, reader: Callable[[], float | None] | None) -> float | None:
+        if reader is None:
+            return None
+        try:
+            value = reader()
+            return None if value is None else float(value)
+        except Exception:
+            return None
+
     def tick(self) -> None:
+        self.memory_sample_fresh = False
         reading = self.reader()
+        self.memory_sample_fresh = reading is not None
         if reading is not None:
             self.observe(*reading)
         elif self.recovering is False:
             self._apply()
+        self.observe_load(self._read(self.cpu_reader), self._read(self.gpu_reader))
+        for listener in list(self._listeners):
+            try:
+                listener(self)
+            except Exception as exc:
+                self._log(f"RESOURCE: listener failed - {exc}")
 
     async def run(self) -> None:
         while not self._stop.is_set():
@@ -256,5 +406,5 @@ def optional_work_allowed() -> bool:
     return GOVERNOR is None or GOVERNOR.optional_work_allowed()
 
 
-__all__ = ["GOVERNOR", "Pressure", "ResourceGovernor", "Shedder",
+__all__ = ["GOVERNOR", "LoadGauge", "Pressure", "ResourceGovernor", "Shedder",
            "optional_work_allowed", "release_python_memory"]

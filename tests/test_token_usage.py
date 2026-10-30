@@ -61,7 +61,7 @@ def test_duplicate_request_id_is_deduped():
 def test_streamed_response_counts_once_after_reconcile():
     led = _ledger()
     # Streaming: record an estimate at request start...
-    led.record(UsageRecord("stream-1", "anthropic", "claude-sonnet-5",
+    led.record(UsageRecord("stream-1", "openai", "gpt-4.1",
                            input_tokens=estimate_tokens("a" * 4000), estimated=True,
                            tokenizer="heuristic", tokenizer_version="1.0", streaming=True))
     # ...then reconcile with authoritative usage when the stream finishes.
@@ -107,7 +107,7 @@ def test_unknown_model_context_is_not_fabricated():
 
 
 def test_context_window_is_not_confused_with_quota():
-    report = TokenUsageLedger(":memory:").context_report("claude-sonnet-5", 1000)
+    report = TokenUsageLedger(":memory:").context_report("o3", 1000)
     assert "not account" in report["note"].lower()
     assert report["context_window"] == 200_000
 
@@ -125,7 +125,7 @@ def test_aggregation_by_dimension_and_time():
     led = _ledger()
     led.record(UsageRecord("a", "openai", "gpt-4o-mini", session_id="s1", input_tokens=100, output_tokens=50, at=1_700_000_000))
     led.record(UsageRecord("b", "openai", "gpt-4o-mini", session_id="s2", input_tokens=200, output_tokens=60, at=1_700_000_000))
-    led.record(UsageRecord("c", "anthropic", "claude-sonnet-5", session_id="s1", input_tokens=300, output_tokens=70, at=1_700_100_000))
+    led.record(UsageRecord("c", "xai", "grok-4", session_id="s1", input_tokens=300, output_tokens=70, at=1_700_100_000))
     by_provider = {r["key"]: r for r in led.by_dimension("provider")}
     assert by_provider["openai"]["requests"] == 2
     by_session = {r["key"]: r for r in led.by_dimension("session_id")}

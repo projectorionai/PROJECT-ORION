@@ -76,8 +76,17 @@ class SecuritySentinel:
     COOLDOWN = 600.0
     SAMPLE_INTERVAL = 20.0
     PROCESS_SURGE = 40      # new processes in one interval → possible fork storm
+    #: Downloads, auto-start entries and the hosts file: every third pass.
+    SWEEP_EVERY = 3
+    #: Defender's own health (real-time protection, definitions): ~15 minutes.
+    DEFENDER_EVERY = 45
+    #: A note that is not a confirmed threat is spoken at most this often; the
+    #: rest are shown on the banner and logged. On 29 Oct 2026 the owner heard
+    #: six notes in three minutes and switched ORION off.
+    SPOKEN_GAP_S = 1800.0
 
-    def __init__(self, bus: OrionBus, telemetry: Any | None = None) -> None:
+    def __init__(self, bus: OrionBus, telemetry: Any | None = None,
+                 guard: Any | None = None) -> None:
         self.bus = bus
         self.telemetry = telemetry
         self.enabled = os.getenv("ORION_SECURITY_WATCH", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -87,6 +96,19 @@ class SecuritySentinel:
         self._known_drives: set[str] = set()
         self._baseline = False
         self._stop = asyncio.Event()
+        self._guard = guard
+        self._notes: list[str] = []          # this pass's alerts, told together
+        self._findings: list[Any] = []       # this pass's threat-guard findings
+        self._passes = 0
+        self._spoken_at = float("-inf")      # monotonic time of the last spoken note
+
+    @property
+    def guard(self) -> Any:
+        """The threat guard (threat_guard.py), built on first use."""
+        if self._guard is None:
+            from .threat_guard import ThreatGuard
+            self._guard = ThreatGuard()
+        return self._guard
 
     # ── alerting ──────────────────────────────────────────────────────────────
 
@@ -95,17 +117,77 @@ class SecuritySentinel:
         if now - self._last_alert.get(key, 0.0) < self.COOLDOWN:
             return
         self._last_alert[key] = now
-        self.bus.banner.emit(f"🛡 {message}", 4)
-        self.bus.speak_request.emit(f"Security note: {message}.")
+        self._notes.append(message)
         if self.telemetry is not None:
             self.telemetry.metrics.incr(f"security.alert.{key.split(':')[0]}")
+
+    def _flush(self) -> None:
+        """Tell this pass's alerts and findings as ONE message. Each used to be
+        spoken on its own, so one installer (setup.exe + setup.tmp) was two
+        identical-sounding notes (27 Oct 2026). A note that is not a confirmed
+        threat is spoken at most once per SPOKEN_GAP_S; the rest are shown."""
+        from .threat_guard import compose
+        notes, self._notes = self._notes, []
+        findings, self._findings = self._findings, []
+        spoken: list[str] = []
+        advice: list[str] = []
+        shown: list[str] = []
+        threat = False
+        if findings:
+            told = self.guard.tell(findings)
+            spoken, advice, shown, threat = list(told.spoken), list(told.advice), list(told.shown), told.threat
+        for line in shown:
+            self.bus.log.emit(f"SECURITY: {line}.")
+        lines = [*notes, *shown]
+        if lines:
+            self.bus.banner.emit("Security: " + "; ".join(lines), 4)
+        # Held from a pass inside the spoken gap: the guard has already marked
+        # them told, so dropping them meant "Defender real-time protection is
+        # OFF" could never be spoken at all (review, 29 Oct 2026).
+        held_parts, held_advice = getattr(self, "_held", ([], []))
+        parts = [*held_parts, *notes, *spoken]
+        advice = [*held_advice, *advice]
+        message = compose(parts, advice, threat=threat)
+        if not message:
+            return
+        now = time.monotonic()
+        if not threat and now - self._spoken_at < self.SPOKEN_GAP_S:
+            if notes or spoken:
+                self.bus.log.emit("SECURITY: shown, not spoken yet - a security note was spoken "
+                                  f"{int((now - self._spoken_at) // 60)} min ago.")
+            self._held = (parts[-self.HELD_MAX:], advice[-self.HELD_MAX:])
+            return
+        self._held = ([], [])
+        self._spoken_at = now
+        self.bus.speak_request.emit(message)
+
+    #: Notes kept for the end of the spoken gap, newest first to go.
+    HELD_MAX = 6
 
     # ── sampling ──────────────────────────────────────────────────────────────
 
     def _sample(self) -> None:
+        self._passes += 1
         self._check_ports()
         self._check_processes()
         self._check_drives()
+        if self._baseline and self._passes % self.SWEEP_EVERY == 0:
+            try:
+                self._findings.extend(self.guard.sweep())
+            except Exception as exc:
+                self.bus.log.emit(f"SECURITY: guard sweep skipped - {str(exc).splitlines()[0][:100]}")
+        if self._passes % self.DEFENDER_EVERY == 3:     # first a minute after boot
+            self._check_defender()
+        self._flush()
+
+    def _check_defender(self) -> None:
+        """Real-time protection off or definitions out of date (antivirus.py)."""
+        try:
+            from .antivirus import proactive_check_sync
+            for key, message in proactive_check_sync():
+                self._alert(key, message)
+        except Exception:
+            pass
 
     def _check_ports(self) -> None:
         try:
@@ -113,21 +195,111 @@ class SecuritySentinel:
         except Exception:
             return
         listening: set[int] = set()
-        details: dict[int, str] = {}
+        owners: dict[int, int] = {}
         for c in conns:
             if c.status == psutil.CONN_LISTEN and c.laddr:
                 ip = c.laddr.ip
                 if ip not in {"127.0.0.1", "::1", "localhost"}:
                     listening.add(c.laddr.port)
-                    details[c.laddr.port] = ip
+                    if c.pid:
+                        owners[c.laddr.port] = c.pid
         if not self._baseline:
             self._known_ports = listening
             return
-        for port in sorted(listening - self._known_ports):
-            self._alert(f"port:{port}",
-                        f"a service is now listening on port {port} "
-                        f"({details.get(port, '?')}) — reachable beyond this machine")
+        new = sorted(listening - self._known_ports)
+        if new:
+            own = self._own_pids()
+            by_owner: dict[int | None, list[int]] = {}
+            for port in new:
+                if owners.get(port) not in own:
+                    by_owner.setdefault(owners.get(port), []).append(port)
+            for pid, ports in by_owner.items():        # one finding per program
+                finding = self._port_finding(ports, pid)
+                if finding is not None:
+                    self._findings.append(finding)
         self._known_ports = listening
+
+    @staticmethod
+    def _own_pids() -> set[int]:
+        """ORION, and the processes he started that are his own files (his web
+        views, the globe's renderer): their ports are his own business. A
+        program he launched for the owner - an app, an installer, a forged
+        tool, an MCP server - is checked like any other: every descendant
+        used to be skipped, so none of those was ever port-checked."""
+        from .threat_guard import is_own_file
+        try:
+            me = psutil.Process()
+            own = {me.pid}
+            for child in me.children(recursive=True):
+                try:
+                    exe = child.exe()
+                except psutil.Error:
+                    continue
+                if exe and is_own_file(exe):
+                    own.add(child.pid)
+            return own
+        except psutil.Error:
+            return {os.getpid()}
+
+    #: Windows' own networking: a new port of theirs is ordinary.
+    _WINDOWS_LISTENERS = frozenset({"system", "svchost.exe", "lsass.exe", "wininit.exe",
+                                    "services.exe", "spoolsv.exe",
+                                    # Windows Defender is part of Windows: "MsMpEng.exe is
+                                    # accepting connections" was a security note about the
+                                    # antivirus itself (29 Oct 2026).
+                                    "msmpeng.exe", "nissrv.exe", "mpdefendercoreservice.exe",
+                                    # Windows' own shell (30 Oct 2026: "explorer.exe is
+                                    # accepting connections ... on port 51810").
+                                    "explorer.exe"})
+
+    def _port_finding(self, ports: int | list[int], pid: int | None) -> Any:
+        """New ports open to the network, judged by the program that opened
+        them (Mark XXXX.1): named; Windows' and ORION's own left alone; a
+        signed program shown, an unsigned one told once (threat_guard's seen
+        store).
+
+        A program that cannot be named or checked is shown, never spoken (29
+        Oct 2026). It was "an unknown program has started accepting
+        connections ... on port 49730", keyed by the port - and Windows hands
+        out a new port every time, so it was a new spoken note every 20
+        seconds. Reading the name and the path together also lost the name
+        whenever only the path was protected, and a program already gone (its
+        port with it) was "unknown" too."""
+        from .threat_guard import Finding, family, is_own_file, signature_state
+        ports = [ports] if isinstance(ports, int) else sorted(ports)
+        where = (f"port {ports[0]}" if len(ports) == 1
+                 else "ports " + ", ".join(str(p) for p in ports[:-1]) + f" and {ports[-1]}")
+        proc = None
+        if pid:
+            try:
+                proc = psutil.Process(pid)
+            except psutil.NoSuchProcess:
+                return None
+            except (psutil.Error, OSError):
+                proc = None
+        read: dict[str, str] = {}
+        for what in ("name", "exe"):
+            try:
+                read[what] = str(getattr(proc, what)() or "") if proc is not None else ""
+            except psutil.NoSuchProcess:
+                return None                      # gone already, and its port with it
+            except (psutil.Error, OSError):
+                read[what] = ""
+        name, exe = read["name"], read["exe"]
+        if name.lower() in self._WINDOWS_LISTENERS or (exe and is_own_file(exe)):
+            return None
+        if not name:
+            return Finding("listen:unknown", "info", "a program I couldn't identify is accepting "
+                           f"connections from the network on {where}")
+        key = f"listen:{family(name)}"
+        if not exe:
+            return Finding(key, "info", f"{name} is accepting connections from the network on "
+                           f"{where}; Windows would not let me check its signature")
+        if signature_state(exe) == "signed":
+            return Finding(key, "info", f"{name} is accepting connections from the network "
+                           f"on {where}; it is properly signed")
+        return Finding(key, "warn", f"{name} has started accepting connections from the network "
+                       f"on {where}", advice="If you didn't expect that, block it in Windows Firewall")
 
     def _check_processes(self) -> None:
         try:
@@ -142,17 +314,25 @@ class SecuritySentinel:
         if len(new) > self.PROCESS_SURGE:
             self._alert("surge", f"{len(new)} new processes started at once — "
                         "worth a glance in case something is spawning uncontrolled")
+        from .threat_guard import family
+        from_temp: list[tuple[str, str]] = []
         for p in procs:
             if p.info["pid"] not in new:
                 continue
             name = str(p.info.get("name") or "")
             exe = str(p.info.get("exe") or "")
             if SUSPICIOUS_NAME_RE.search(name) or SUSPICIOUS_NAME_RE.search(exe):
-                self._alert(f"proc:{name}", f"a process named '{name}' started, which "
+                self._alert(f"proc:{family(name)}", f"a process named '{name}' started, which "
                             "matches a remote-access or mining pattern")
-            elif exe and SUSPICIOUS_PATH_RE.search(exe):
-                self._alert(f"temp:{name}", f"'{name}' is running from a temp directory — "
-                            "unusual for trusted software")
+            elif exe and (SUSPICIOUS_PATH_RE.search(exe) or "\\downloads\\" in exe.lower()):
+                from_temp.append((name, exe))
+        if from_temp:
+            # Signed? Defender's verdict? One finding per program family.
+            try:
+                self._findings.extend(self.guard.judge_processes(from_temp))
+            except Exception as exc:
+                self.bus.log.emit(f"SECURITY: could not judge {from_temp[0][0]} - "
+                                  f"{str(exc).splitlines()[0][:100]}")
         self._known_procs = current
 
     def _check_drives(self) -> None:
@@ -200,7 +380,7 @@ class SecuritySentinel:
         try:
             out = subprocess.run(
                 ["netsh", "advfirewall", "show", "allprofiles", "state"],
-                capture_output=True, text=True, timeout=8.0,
+                capture_output=True, text=True, errors="replace", timeout=8.0,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             ).stdout
         except Exception:

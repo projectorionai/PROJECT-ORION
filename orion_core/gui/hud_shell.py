@@ -49,16 +49,23 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..constants import C, ELEV, GLASS
+from ..constants import C, ELEV, GLASS, SPACE
 from .widgets import describe_control
 
-#: The rail's width. Wide enough for "MEM  100%" without eliding, narrow
+#: The rail's width. Wide enough for "Graphics  100%" with the meter's own
+#: padding round it (132 px put the name and the value edge to edge), narrow
 #: enough that the face keeps the room it needs.
-RAIL_WIDTH = 132
+RAIL_WIDTH = 152
 
 #: The right column's width. This one holds readable log lines, so it is
-#: measured from text rather than chosen: ~46 monospace characters.
-COLUMN_WIDTH = 310
+#: measured from text rather than chosen: ~46 monospace characters, plus the
+#: panels' padding.
+COLUMN_WIDTH = 320
+
+#: Padding inside every HUD panel (left, top, right, bottom): one value, so
+#: the meters, the feed, the drop zone and the command bar share an inner
+#: edge instead of four (6, 8, 8 and 6 px before).
+PANEL_PADDING = (SPACE.SM + SPACE.XS, SPACE.SM, SPACE.SM + SPACE.XS, SPACE.SM)
 
 #: Most log lines kept. The activity log is a view of the last few minutes;
 #: the journals on disk are the record.
@@ -96,11 +103,33 @@ def mono(size: int = 9, *, bold: bool = False) -> QFont:
     return font
 
 
+#: The friendly face for words (Mark XXXV): headings, labels and the feed are
+#: read, not scanned, so they are set in a humanist sans rather than the
+#: terminal monospace the HUD used for everything.
+UI_FAMILIES = ("Segoe UI Variable Text", "Segoe UI", "Inter", "Helvetica Neue", "Arial")
+_UI_FONTS: dict[tuple[int, bool], QFont] = {}
+
+
+def ui(size: int = 9, *, bold: bool = False) -> QFont:
+    """ORION's reading typeface at *size*."""
+    key = (int(size), bool(bold))
+    font = _UI_FONTS.get(key)
+    if font is None:
+        font = QFont()
+        font.setFamilies(list(UI_FAMILIES))
+        font.setPointSize(int(size))
+        if bold:
+            font.setWeight(QFont.Weight.DemiBold)
+        _UI_FONTS[key] = font
+    return font
+
+
 def _section(title: str) -> QLabel:
-    """The little ▸ SECTION NAME caption above each panel."""
-    label = QLabel(f"▸ {title.upper()}")
+    """The caption above each panel - a name in Title Case, as you would say it
+    ("Your PC", not "▸ SYS MONITOR")."""
+    label = QLabel(title)
     label.setObjectName("hudSection")
-    label.setFont(mono(8, bold=True))
+    label.setFont(ui(9, bold=True))
     return label
 
 
@@ -134,9 +163,9 @@ class Meter(QFrame):
         self.setObjectName("hudMeter")
         self._percent = -1.0                      # forces the first paint
 
-        self.name_label = QLabel(name.upper())
+        self.name_label = QLabel(name)
         self.name_label.setObjectName("hudMeterName")
-        self.name_label.setFont(mono(8))
+        self.name_label.setFont(ui(8))
         self.value_label = QLabel("N/A")
         self.value_label.setObjectName("hudMeterValue")
         self.value_label.setFont(mono(8, bold=True))
@@ -145,7 +174,7 @@ class Meter(QFrame):
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
-        top.setSpacing(4)
+        top.setSpacing(SPACE.SM)
         top.addWidget(self.name_label)
         top.addStretch(1)
         top.addWidget(self.value_label)
@@ -158,8 +187,8 @@ class Meter(QFrame):
         self.fill.setGeometry(0, 0, 0, 3)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(5)
+        layout.setContentsMargins(*PANEL_PADDING)
+        layout.setSpacing(SPACE.SM)
         layout.addLayout(top)
         layout.addWidget(self.track)
 
@@ -217,23 +246,26 @@ class SysMonitorRail(QWidget):
 
         self.meters: dict[str, Meter] = {}
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
-        layout.addWidget(_section("sys monitor"))
+        # No margin of its own: the meters line up with the header's edge
+        # and the window's margin is the gutter, rather than a second one.
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(SPACE.SM)
+        layout.addWidget(_section("Your PC"))
 
-        for key, name in (("cpu", "CPU"), ("ram", "MEM"), ("net", "NET"),
-                          ("gpu", "GPU"), ("tmp", "TMP")):
+        for key, name in (("cpu", "Processor"), ("ram", "Memory"), ("net", "Network"),
+                          ("gpu", "Graphics"), ("tmp", "Heat")):
             meter = Meter(name)
             self.meters[key] = meter
             layout.addWidget(meter)
 
-        self.facts = QLabel("UP   --:--\nPROC  ---\nOS    ---")
+        self.facts = QLabel("ORION has just started")
         self.facts.setObjectName("hudFacts")
-        self.facts.setFont(mono(8))
+        self.facts.setFont(ui(8))
+        self.facts.setWordWrap(True)
         facts_frame = QFrame()
         facts_frame.setObjectName("hudMeter")
         facts_layout = QVBoxLayout(facts_frame)
-        facts_layout.setContentsMargins(8, 6, 8, 6)
+        facts_layout.setContentsMargins(*PANEL_PADDING)
         facts_layout.addWidget(self.facts)
         layout.addWidget(facts_frame)
         layout.addStretch(1)
@@ -267,12 +299,12 @@ class SysMonitorRail(QWidget):
             self.meters["tmp"].set_value(
                 thermal_percent, f"{thermal_percent:.0f}% {temp:.0f}°C")
 
-    def set_facts(self, uptime: str = "", processes: Any = "",
-                  system: str = "") -> None:
-        self.facts.setText(
-            f"UP   {uptime or '--:--'}\n"
-            f"PROC  {processes if processes != '' else '---'}\n"
-            f"OS    {system or '---'}")
+    def set_active(self, duration: str = "") -> None:
+        """How long ORION has been running: the one fact under the meters
+        (owner, 26 Oct 2026 - the PC's uptime, process count and OS were noise)."""
+        duration = str(duration or "").strip()
+        self.facts.setText(f"ORION has been active for {duration}" if duration
+                           else "ORION has just started")
 
 
 def _rate(bytes_per_second: float) -> str:
@@ -312,14 +344,75 @@ class ActivityLog(QWidget):
         _styled_background(self)
         self.view: QPlainTextEdit | None = None
         self._pending: list[str] = []
+        # Every line as written, so "Details" can show the engineering log and
+        # switching back re-tells it in the human version (gui/humane.py).
+        from collections import deque
+        self._raw: deque[str] = deque(maxlen=LOG_LINES)
+        self._details = False
 
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(6, 6, 6, 6)
-        self._layout.setSpacing(4)
-        self._layout.addWidget(_section("activity log"))
+        self._layout.setContentsMargins(*PANEL_PADDING)
+        self._layout.setSpacing(SPACE.SM)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(_section("Terminal"))
+        header.addStretch(1)
+        self.details_btn = QPushButton("Details")
+        self.details_btn.setObjectName("hudDetails")
+        self.details_btn.setCheckable(True)
+        self.details_btn.setFont(ui(8))
+        self.details_btn.toggled.connect(self.set_details)
+        describe_control(self.details_btn, "Show every detail",
+                         "Show ORION's full technical log instead of the summary.")
+        header.addWidget(self.details_btn)
+        self._layout.addLayout(header)
         self._layout.addStretch(1)
 
         QTimer.singleShot(0, self._build_view)
+
+    # ── the human version of a line ──────────────────────────────────────────
+
+    @staticmethod
+    def _render(said: Any) -> str:
+        """One line of the feed as HTML: you in the human tone, ORION in light,
+        events quietly, trouble a step brighter - never in crimson."""
+        import html
+        text = html.escape(said.text)
+        label = html.escape(said.label)
+        if said.kind == "you":
+            return (f'<span style="color:{C.HUMAN}; font-weight:600;">You</span>'
+                    f'&nbsp;&nbsp;<span style="color:{C.WHITE};">{text}</span>')
+        if said.kind == "orion":
+            return (f'<span style="color:{C.ACCENT}; font-weight:600;">ORION</span>'
+                    f'&nbsp;&nbsp;<span style="color:{C.SILVER};">{text}</span>')
+        lead = f"{label} &middot; " if label else ""
+        if said.kind == "trouble":
+            return f'<span style="color:{C.WARN};">&#9888;&nbsp;{lead}{text}</span>'
+        return f'<span style="color:{C.MUTED};">{lead}{text}</span>'
+
+    def _show(self, line: str) -> None:
+        """Put one raw line into the view, in the current mode."""
+        if self.view is None:
+            return
+        if self._details:
+            self.view.appendPlainText(line)
+            return
+        from .humane import humanise
+        said = humanise(line)
+        if said is not None:
+            self.view.appendHtml(self._render(said))
+
+    def set_details(self, on: bool) -> None:
+        """Switch between the human summary and the full technical log."""
+        self._details = bool(on)
+        if self.details_btn.isChecked() != self._details:
+            self.details_btn.setChecked(self._details)
+        if self.view is None:
+            return
+        self.view.clear()
+        for line in self._raw:
+            self._show(line)
+        self._scroll_to_end()
 
     def _build_view(self) -> None:
         """Create the real text widget and flush anything that arrived first."""
@@ -328,19 +421,20 @@ class ActivityLog(QWidget):
         view = QPlainTextEdit()
         view.setObjectName("hudLog")
         view.setReadOnly(True)
-        view.setFont(mono(8))
+        view.setFont(ui(9))
         view.setMaximumBlockCount(LOG_LINES)
         view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         view.setFrameShape(QFrame.Shape.NoFrame)
-        describe_control(view, "Activity log",
-                         "What ORION has been doing, most recent last.")
+        describe_control(view, "What's been happening",
+                         "Your conversation with ORION and what he has done, most recent last.")
         # Replace the stretch that was holding the space open.
         item = self._layout.takeAt(self._layout.count() - 1)
         del item
         self._layout.addWidget(view, 1)
         self.view = view
         if self._pending:
-            view.setPlainText("\n".join(self._pending[-LOG_LINES:]))
+            for line in self._pending[-LOG_LINES:]:
+                self._show(line)
             self._pending.clear()
             self._scroll_to_end()
 
@@ -348,14 +442,18 @@ class ActivityLog(QWidget):
         text = str(line or "").rstrip()
         if not text:
             return
+        self._raw.append(text)
         if self.view is None:
             # Buffered, not dropped. Boot is the noisiest moment in ORION's
             # life and it happens before this widget exists.
             self._pending.append(text)
             del self._pending[:-LOG_LINES]
             return
-        self.view.appendPlainText(text)
-        self._scroll_to_end()
+        bar = self.view.verticalScrollBar()
+        following = bar is None or bar.value() >= bar.maximum() - 2
+        self._show(text)
+        if following:            # a reader scrolled back up keeps their place
+            self._scroll_to_end()
 
     def _scroll_to_end(self) -> None:
         if self.view is None:
@@ -366,6 +464,7 @@ class ActivityLog(QWidget):
 
     def clear(self) -> None:
         self._pending.clear()
+        self._raw.clear()
         if self.view is not None:
             self.view.clear()
 
@@ -392,29 +491,29 @@ class DropZone(QFrame):
         self.setAcceptDrops(True)
         self.setMinimumHeight(72)
 
-        self.prompt = QLabel("Drop a file here, or click to browse")
+        self.prompt = QLabel("Drop a file")
         self.prompt.setObjectName("hudDropPrompt")
-        self.prompt.setFont(mono(8))
+        self.prompt.setFont(ui(9))
         self.prompt.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.prompt.setWordWrap(True)
-        self.kinds = QLabel("images · video · audio · pdf · docs · code · data")
-        self.kinds.setObjectName("hudDropKinds")
-        self.kinds.setFont(mono(7))
-        self.kinds.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(*PANEL_PADDING)
         layout.setSpacing(2)
         layout.addWidget(self.prompt)
-        layout.addWidget(self.kinds)
         describe_control(self, "File drop area",
                          "Drop a file for ORION to look at.")
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802  (Qt naming)
-        if event.mimeData().hasUrls():
+        # A local file only, as the Command Deck already checks: a link
+        # dragged from a browser was accepted here and then dropped silently.
+        data = event.mimeData()
+        if data.hasUrls() and any(url.isLocalFile() for url in data.urls()):
             event.acceptProposedAction()
             self.setProperty("active", "true")
             self._restyle()
+        else:
+            event.ignore()
 
     def dragLeaveEvent(self, event) -> None:  # noqa: N802  (Qt naming)
         self.setProperty("active", "false")
@@ -438,6 +537,11 @@ class DropZone(QFrame):
             style.polish(self)
 
 
+#: The microphone button, said plainly.
+MIC_ON_TEXT = "●  Mic on - I'm listening"
+MIC_OFF_TEXT = "○  Mic off"
+
+
 class CommandBar(QWidget):
     """Type at ORION, stop him, or mute the microphone.
 
@@ -458,11 +562,11 @@ class CommandBar(QWidget):
 
         self.input = QLineEdit()
         self.input.setObjectName("hudInput")
-        self.input.setFont(mono(9))
-        self.input.setPlaceholderText("Type a command or question…")
+        self.input.setFont(ui(10))
+        self.input.setPlaceholderText("Message ORION…")
         self.input.returnPressed.connect(self._submit)
-        describe_control(self.input, "Command input",
-                         "Type a command or question and press Enter.")
+        describe_control(self.input, "Talk to ORION",
+                         "Type a question or something for ORION to do, then press Enter.")
 
         self.send_btn = QPushButton("▶")
         self.send_btn.setObjectName("hudSend")
@@ -472,28 +576,29 @@ class CommandBar(QWidget):
 
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
+        row.setSpacing(SPACE.SM)
         row.addWidget(self.input, 1)
         row.addWidget(self.send_btn)
 
-        self.interrupt_btn = QPushButton("■  INTERRUPT   [ESC]")
+        self.interrupt_btn = QPushButton("■  Stop Talking   ·   Esc")
         self.interrupt_btn.setObjectName("hudInterrupt")
-        self.interrupt_btn.setFont(mono(8, bold=True))
+        self.interrupt_btn.setFont(ui(9, bold=True))
         self.interrupt_btn.clicked.connect(self.interrupted.emit)
         describe_control(self.interrupt_btn, "Interrupt",
                          "Stop ORION mid-sentence and return to listening.")
 
-        self.mic_btn = QPushButton("●  MICROPHONE ACTIVE")
+        self.mic_btn = QPushButton(MIC_ON_TEXT)
         self.mic_btn.setObjectName("hudMic")
-        self.mic_btn.setFont(mono(8, bold=True))
+        self.mic_btn.setFont(ui(9, bold=True))
         self.mic_btn.clicked.connect(self._toggle_mic)
         describe_control(self.mic_btn, "Microphone",
                          "Turn ORION's microphone on or off.")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(5)
-        layout.addWidget(_section("command input"))
+        layout.setContentsMargins(*PANEL_PADDING)
+        layout.setSpacing(SPACE.SM)
+        # No caption: the box says what it is (owner, 30 Oct 2026: "get rid of
+        # this 'Talk to ORION' heading"). Its accessible name stays.
         layout.addLayout(row)
         layout.addWidget(self.interrupt_btn)
         layout.addWidget(self.mic_btn)
@@ -518,8 +623,7 @@ class CommandBar(QWidget):
         no button.
         """
         self._mic_on = bool(active)
-        self.mic_btn.setText("●  MICROPHONE ACTIVE" if self._mic_on
-                             else "○  MICROPHONE MUTED")
+        self.mic_btn.setText(MIC_ON_TEXT if self._mic_on else MIC_OFF_TEXT)
         self.mic_btn.setProperty("muted", "false" if self._mic_on else "true")
         style = self.mic_btn.style()
         if style is not None:
@@ -534,25 +638,40 @@ class CommandBar(QWidget):
 # ── status ────────────────────────────────────────────────────────────────────
 
 class StatusChips(QWidget):
-    """The bottom-left stack: three things that are either true or not."""
+    """The stack under the meters, shown only for what needs attention.
+
+    A chip in its "good" state (mind ready, security clear, no routine, not
+    recording) is hidden, and with none left the stack is hidden too: four
+    tiles saying all is well were clutter (owner, 26 Oct 2026). Recording, a
+    security finding, a running routine or a mind that is not ready appear
+    the moment they happen."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("hudChips")
+        # As wide as the rail above it, always: a chip given a longer label
+        # widened the whole left column and so RESIZED the face beside it - a
+        # resize clears its WebGL canvas, which is a black flash (measured:
+        # 942 -> 894 -> 876 px, and it never shrank back).
+        self.setFixedWidth(RAIL_WIDTH)
         self.chips: dict[str, QLabel] = {}
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(5)
-        for key, text in (("core", "AI CORE\nACTIVE"),
-                          ("security", "SEC\nCLEARED"),
-                          ("protocol", "PROTOCOL\n—")):
+        layout.setContentsMargins(0, 0, 0, 0)        # the rail's edges, not a second gutter
+        layout.setSpacing(SPACE.SM)
+        for key, text in (("core", "Mind\nready"),
+                          ("security", "Security\nall clear"),
+                          ("protocol", "Routine\nnone running"),
+                          ("recording", "Recording\noff")):
             chip = QLabel(text)
             chip.setObjectName("hudChip")
-            chip.setFont(mono(7, bold=True))
+            chip.setFont(ui(8))
             chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            chip.setWordWrap(True)
             chip.setProperty("tone", "good")
+            chip.setVisible(False)
             self.chips[key] = chip
             layout.addWidget(chip)
+        self.setVisible(False)
 
     def set_chip(self, key: str, text: str, tone: str = "good") -> None:
         chip = self.chips.get(key)
@@ -564,6 +683,8 @@ class StatusChips(QWidget):
         if style is not None:
             style.unpolish(chip)
             style.polish(chip)
+        chip.setVisible(tone != "good")
+        self.setVisible(any(c.property("tone") != "good" for c in self.chips.values()))
 
 
 # ── the controls list ─────────────────────────────────────────────────────────
@@ -583,16 +704,18 @@ class ControlsPanel(QWidget):
         self.setObjectName("hudControls")
         self._buttons: dict[str, QPushButton] = {}
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(6, 6, 6, 6)
-        self._layout.setSpacing(3)
-        self._layout.addWidget(_section("controls"))
+        self._layout.setContentsMargins(SPACE.SM, SPACE.SM, SPACE.SM, SPACE.SM)
+        self._layout.setSpacing(SPACE.XS)
+        self._layout.addWidget(_section("Controls"))
         self._layout.addStretch(1)
 
     def add(self, key: str, label: str, callback: Callable[[], Any],
             *, icon: str = "▪", hint: str = "",
             primary: bool = False) -> QPushButton:
         """Add one control. Returns the button so a caller can restyle it."""
-        button = QPushButton(f"{icon}  {label}")
+        from .line_icons import NAMES, apply
+        button = QPushButton(label)
+        apply(button, icon if icon in NAMES else "sliders")
         button.setObjectName("hudControlPrimary" if primary else "hudControl")
         button.setFont(mono(8, bold=primary))
         button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -607,9 +730,10 @@ class ControlsPanel(QWidget):
         button = self._buttons.get(key)
         if button is None:
             return
-        current = button.text()
-        prefix = current.split("  ", 1)[0] if "  " in current else "▪"
-        button.setText(f"{icon or prefix}  {label}")
+        button.setText(label)
+        if icon:
+            from .line_icons import apply
+            apply(button, icon)
         describe_control(button, label, f"{label}.")
 
     def button(self, key: str) -> QPushButton | None:
@@ -651,23 +775,27 @@ class HudShell(QWidget):
         self.command = CommandBar()
         self.controls = ControlsPanel()
 
+        # The chips sit directly under the meters they qualify rather than at
+        # the foot of the column: the foot is where ORION's toggle pill docks
+        # (HolographicToggle.dock), and a warning there would be covered.
         left = QVBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(6)
-        left.addWidget(self.rail, 1)
+        left.setSpacing(SPACE.SM)
+        left.addWidget(self.rail)
         left.addWidget(self.chips)
+        left.addStretch(1)
 
         self.centre = centre
         centre.setSizePolicy(QSizePolicy.Policy.Expanding,
                              QSizePolicy.Policy.Expanding)
         self.centre_stack = QVBoxLayout()
         self.centre_stack.setContentsMargins(0, 0, 0, 0)
-        self.centre_stack.setSpacing(6)
+        self.centre_stack.setSpacing(SPACE.SM)
         self.centre_stack.addWidget(centre, 1)
 
         right = QVBoxLayout()
         right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(6)
+        right.setSpacing(SPACE.SM)
         right.addWidget(self.log, 1)
         right.addWidget(self.drop)
         right.addWidget(self.command)
@@ -679,10 +807,35 @@ class HudShell(QWidget):
 
         body = QHBoxLayout(self)
         body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(8)
+        body.setSpacing(SPACE.MD)
         body.addLayout(left)
         body.addLayout(self.centre_stack, 1)
         body.addWidget(self.right_column)
+
+    def attach_recorder(self, recorder: Any, stop: Callable[[], Any]) -> None:
+        """Read the recorder's in-memory state; no capture or filesystem work here."""
+        self._recorder = recorder
+        self._recording_stop = self.controls.add(
+            "stop_recording", "Stop Recording", stop,
+            icon="stop", hint="Stop saving conversation audio and finalise the local recording.")
+        self._recording_timer = QTimer(self)
+        self._recording_timer.setInterval(500)
+        self._recording_timer.timeout.connect(self._refresh_recording)
+        self._recording_timer.start()
+        self._refresh_recording()
+
+    def _refresh_recording(self) -> None:
+        state = self._recorder.snapshot()
+        active = bool(state.get("active"))
+        if active:
+            seconds = int(state.get("audio_seconds", 0))
+            detail = "waiting for mic" if state.get("waiting_for_audio") else f"{seconds // 60}:{seconds % 60:02d} saved"
+            tone = "warn" if state.get("dropped_blocks") or state.get("errors") else "good"
+            self.chips.set_chip("recording", f"Recording\n{detail}", tone)
+        else:
+            detail = str(state.get("state", "off"))
+            self.chips.set_chip("recording", f"Recording\n{detail}", "good" if detail in {"off", "complete"} else "warn")
+        self._recording_stop.setEnabled(active)
 
     def add_below_centre(self, widget: QWidget, stretch: int = 0) -> None:
         """Put something under the face — the content panel goes here."""
@@ -752,22 +905,30 @@ def hud_stylesheet(primary: str = "", panel: str = "", background: str = "",
     /* Section labels are furniture — you read past them to the reading
        underneath, so they get weight and spacing rather than colour. */
     QLabel#hudSection {{
-        color: {C.FAINT}; letter-spacing: 1.4px; padding: 2px 2px;
-        font-weight: 600;
+        color: {C.MUTED}; padding: 2px 2px; font-weight: 600;
+    }}
+    /* "Details" swaps the human summary for the full technical log. */
+    QPushButton#hudDetails {{
+        background: transparent; color: {C.FAINT}; border: 0;
+        border-radius: {radius}px; padding: 2px 8px;
+    }}
+    QPushButton#hudDetails:hover {{ color: {C.SILVER}; }}
+    QPushButton#hudDetails:checked {{
+        color: {C.WHITE}; background: {rgba(C.WHITE, 0.08)};
     }}
 
     #hudMeter, #hudLogPanel, #hudCommandBar, #hudDrop {{
         background: {glass}; border: {edge}; border-top: {lip};
         border-radius: {radius}px;
     }}
-    QLabel#hudMeterName {{ color: {C.FAINT}; letter-spacing: 0.6px; }}
+    QLabel#hudMeterName {{ color: {C.MUTED}; }}
     QLabel#hudMeterValue {{ color: {C.WHITE}; font-weight: 600; }}
     QLabel#hudFacts {{ color: {C.MUTED}; }}
     #hudTrack {{ background: {rgba(C.WHITE, 0.07)}; border-radius: 2px; }}
     #hudFill {{ background: {C.SILVER}; border-radius: 2px; }}
 
     QPlainTextEdit#hudLog {{
-        background: transparent; color: {C.MUTED}; border: 0;
+        background: transparent; color: {C.SILVER}; border: 0;
         selection-background-color: {pri};
     }}
     QScrollBar:vertical {{ background: transparent; width: 8px; }}
@@ -782,7 +943,6 @@ def hud_stylesheet(primary: str = "", panel: str = "", background: str = "",
         border: 1px dashed {pri}; background: {rgba(pri, 0.10)};
     }}
     QLabel#hudDropPrompt {{ color: {C.MUTED}; }}
-    QLabel#hudDropKinds {{ color: {C.FAINT}; }}
 
     QLineEdit#hudInput {{
         background: {well}; color: {C.WHITE};
@@ -848,7 +1008,7 @@ def hud_stylesheet(primary: str = "", panel: str = "", background: str = "",
 
 
 __all__ = [
-    "COLUMN_WIDTH", "LOG_LINES", "RAIL_WIDTH",
+    "COLUMN_WIDTH", "LOG_LINES", "PANEL_PADDING", "RAIL_WIDTH",
     "ActivityLog", "CommandBar", "ControlsPanel", "DropZone", "HudShell",
     "Meter", "StatusChips", "SysMonitorRail",
     "hud_stylesheet", "mono",

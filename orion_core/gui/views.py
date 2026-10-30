@@ -10,7 +10,6 @@ from urllib.parse import quote_plus, urlparse
 
 import psutil
 from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QCalendarWidget,
     QCheckBox,
@@ -27,12 +26,13 @@ from PyQt6.QtWidgets import (
 )
 
 from ..bus import OrionBus
-from ..constants import BASE_DIR
+from ..constants import BASE_DIR, SPACE
 from ..memory import MemoryAgent
 from ..security import SecuritySanitiser, SecurityViolation
 from ..utils import now_stamp
 from ..browser import open_url
 from .hud import CentralHud
+from .line_icons import apply as apply_icon
 from .widgets import MetricBar, MetricGraph
 from .. import background
 
@@ -54,58 +54,64 @@ class LogConsoleView(QWidget):
         super().__init__(parent)
         self.bus    = bus
         self.worker: Any = None
+        # The record first, filling the page; the two things you can DO here
+        # below it, one row each, with one primary action (Send). The two
+        # shouted section titles and four capitalised buttons are gone; the
+        # placeholders say what each row is for.
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-
-        heading = QLabel("INTELLIGENCE MONITOR")
-        heading.setObjectName("panelHeading")
+        layout.setContentsMargins(SPACE.MD, SPACE.SM, SPACE.MD, SPACE.MD)
+        layout.setSpacing(SPACE.SM + 2)
 
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumBlockCount(2000)
         self.log_box.setObjectName("logBox")
-
-        browser_heading = QLabel("RESEARCH BROWSER")
-        browser_heading.setObjectName("panelHeading")
+        self.log_box.setAccessibleName("ORION's log")
 
         self.browser_line = QLineEdit()
-        self.browser_line.setPlaceholderText("Search query or URL")
+        self.browser_line.setPlaceholderText("Search the web, or type an address to open")
+        self.browser_line.setAccessibleName("Web search or address")
         self.browser_line.returnPressed.connect(self._browser_search)
-        self.browser_search_btn = QPushButton("SEARCH")
+        self.browser_search_btn = QPushButton("Search the Web")
+        apply_icon(self.browser_search_btn, "search")
         self.browser_search_btn.clicked.connect(self._browser_search)
-        self.browser_open_btn   = QPushButton("OPEN")
+        self.browser_open_btn   = QPushButton("Open Address")
         self.browser_open_btn.clicked.connect(self._browser_open)
 
         browser_row = QHBoxLayout()
+        browser_row.setSpacing(SPACE.SM)
         browser_row.addWidget(self.browser_line, 1)
         browser_row.addWidget(self.browser_search_btn)
         browser_row.addWidget(self.browser_open_btn)
 
         self.input_line = QLineEdit()
-        self.input_line.setPlaceholderText("Manual command uplink  (Enter / Ctrl+Return)")
+        self.input_line.setPlaceholderText("Message ORION…")
+        self.input_line.setAccessibleName("Message to ORION")
         self.input_line.returnPressed.connect(self._send_manual)
-        self.send_btn  = QPushButton("SEND")
+        self.send_btn  = QPushButton("Send")
+        self.send_btn.setObjectName("primaryButton")
+        apply_icon(self.send_btn, "send", tone="inverse")
         self.send_btn.clicked.connect(self._send_manual)
-        self.file_btn  = QPushButton("SCAN FILE")
+        self.file_btn  = QPushButton("Scan a File…")
+        apply_icon(self.file_btn, "document")
         self.file_btn.clicked.connect(self._scan_file)
 
-        self.mic_toggle = QCheckBox("MICROPHONE ACTIVE")
+        self.mic_toggle = QCheckBox("Microphone On")
         self.mic_toggle.setChecked(True)
         self.mic_toggle.stateChanged.connect(self._toggle_microphone)
         self.bus.mic_enabled.connect(self.mic_toggle.setChecked)
 
         input_row = QHBoxLayout()
+        input_row.setSpacing(SPACE.SM)
         input_row.addWidget(self.input_line, 1)
         input_row.addWidget(self.send_btn)
         input_row.addWidget(self.file_btn)
+        browser_row.addSpacing(SPACE.MD)
+        browser_row.addWidget(self.mic_toggle)
 
-        layout.addWidget(heading)
         layout.addWidget(self.log_box, 1)
-        layout.addWidget(browser_heading)
-        layout.addLayout(browser_row)
         layout.addLayout(input_row)
-        layout.addWidget(self.mic_toggle)
+        layout.addLayout(browser_row)
 
         self.bus.log.connect(self.write_log)
 
@@ -113,11 +119,27 @@ class LogConsoleView(QWidget):
         self.worker = worker
         worker.set_microphone_enabled(self.mic_toggle.isChecked())
 
+    #: Within this many lines of the end counts as "following the log".
+    FOLLOW_SLACK_LINES = 2
+
     def write_log(self, message: str) -> None:
+        """Append a line. The view follows new lines only if the reader was
+        already at the end: it used to jump to the end on every line, so
+        anyone reading back was thrown to the bottom by the next event
+        (audit 6 Oct 2026, A10). Their selection is left alone too."""
         line = f"{now_stamp()}  {message}"
+        bar = self.log_box.verticalScrollBar()
+        following = bar.value() >= bar.maximum() - self.FOLLOW_SLACK_LINES
+        held = bar.value()
+        blocks = self.log_box.document().blockCount()
         self.log_box.appendPlainText(line)
-        self.log_box.moveCursor(QTextCursor.MoveOperation.End)
-        self.log_box.ensureCursorVisible()
+        if following:
+            bar.setValue(bar.maximum())
+            return
+        # At the retention cap the oldest lines are pruned from the top;
+        # move up with the text being read rather than drift past it.
+        pruned = max(0, blocks + 1 - self.log_box.document().blockCount())
+        bar.setValue(max(0, held - pruned))
 
     def _send_manual(self) -> None:
         text = self.input_line.text().strip()
@@ -131,12 +153,16 @@ class LogConsoleView(QWidget):
         background.spawn(self.worker.submit_text(text))
 
     def _scan_file(self) -> None:
+        from ..file_review import supported_suffixes
+
+        # 30 Oct 2026: the filter listed fifteen types and hid Word, Excel,
+        # PowerPoint, audio, video and most code - all of which ORION reads.
+        patterns = " ".join(f"*{suffix}" for suffix in supported_suffixes())
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select file for Orion scan",
+            "Select File for ORION Scan",
             str(BASE_DIR),
-            "All supported files (*.txt *.md *.py *.json *.csv *.tsv *.pdf "
-            "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff);;All files (*.*)",
+            f"Files ORION Can Read ({patterns});;All Files (*.*)",
         )
         if not file_path:
             return
@@ -147,7 +173,16 @@ class LogConsoleView(QWidget):
         if self.worker is None:
             self.write_log("FILE: Live session not ready.")
             return
-        background.spawn(self.worker.submit_file_for_review(file_path, focus))
+        background.spawn(self._review_chosen_file(self.worker, file_path, focus))
+
+    @staticmethod
+    async def _review_chosen_file(worker: Any, file_path: str, focus: str) -> None:
+        """The owner chose this file himself: the Live model reviews the
+        extraction it is sent, so no second model reads it first."""
+        from .. import file_review
+
+        with file_review.handed_over(offer=False):
+            await worker.submit_file_for_review(file_path, focus)
 
     def _browser_search(self) -> None:
         query = self.browser_line.text().strip()
@@ -205,55 +240,76 @@ class MemoryMatrixView(QWidget):
         super().__init__(parent)
         self.memory = memory
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-
-        heading = QLabel("MEMORY MATRIX — SESSION + PERSISTENT INTELLIGENCE STORE")
-        heading.setObjectName("panelHeading")
+        layout.setContentsMargins(SPACE.MD, SPACE.SM, SPACE.MD, SPACE.MD)
+        layout.setSpacing(SPACE.SM + 2)
 
         self.search_line = QLineEdit()
-        self.search_line.setPlaceholderText("Full-text search (leave blank to list all)")
+        self.search_line.setPlaceholderText("Search memories")
+        self.search_line.setAccessibleName("Search saved records")
         self.search_line.returnPressed.connect(self.refresh)
-        self.search_btn  = QPushButton("SEARCH")
+        self.search_btn  = QPushButton("Search")
+        self.search_btn.setObjectName("primaryButton")
+        apply_icon(self.search_btn, "search", tone="inverse")
         self.search_btn.clicked.connect(self.refresh)
-        self.clear_btn   = QPushButton("CLEAR FILTER")
+        self.clear_btn   = QPushButton("Clear")
+        self.clear_btn.setAccessibleName("Clear the search")
         self.clear_btn.clicked.connect(self._clear_filter)
 
         filter_row = QHBoxLayout()
+        filter_row.setSpacing(SPACE.SM)
         filter_row.addWidget(self.search_line, 1)
         filter_row.addWidget(self.search_btn)
         filter_row.addWidget(self.clear_btn)
 
+        from PyQt6.QtWidgets import QHeaderView
+
         self.table = QTableWidget()
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["Category", "Key", "Value", "Updated"])
-        self.table.horizontalHeader().setStretchLastSection(False)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        # The value is what you came to read: it takes the width, the rest fit.
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        # Fit the columns to the first 40 rows, not all 500: measuring every
+        # cell took 59-106 ms of the GUI thread at boot (28 Oct 2026).
+        header.setResizeContentsPrecision(40)
+        self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
 
-        self.status_label = QLabel("Awaiting query.")
+        self.status_label = QLabel("")
         self.status_label.setObjectName("mutedLabel")
 
-        layout.addWidget(heading)
+        # His memory by category, as Orion's stars (28 Oct 2026).
+        from .hud_instruments import MemoryConstellation
+        self.constellation = MemoryConstellation()
+        self.constellation.setFixedHeight(240)
+        layout.addWidget(self.constellation)
         layout.addLayout(filter_row)
         layout.addWidget(self.table, 1)
         layout.addWidget(self.status_label)
 
     def refresh(self) -> None:
         query   = self.search_line.text().strip()
+        counts = getattr(self.memory, "category_counts", None)
+        if callable(counts):
+            try:
+                self.constellation.set_categories(counts().items())
+            except Exception:
+                pass
         records = self.memory.records(query=query, limit=500)
-        self.table.setRowCount(0)
-        for row in records:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            for col, key in enumerate(("category", "key_ref", "value", "updated_at")):
-                item = QTableWidgetItem(str(row.get(key, "")))
-                self.table.setItem(r, col, item)
-        self.table.resizeColumnsToContents()
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.setRowCount(len(records))
+            for r, row in enumerate(records):
+                for col, key in enumerate(("category", "key_ref", "value", "updated_at")):
+                    self.table.setItem(r, col, QTableWidgetItem(str(row.get(key, ""))))
+            self.table.resizeColumnsToContents()
+        finally:
+            self.table.setUpdatesEnabled(True)
+        found = f"{len(records)} record{'' if len(records) == 1 else 's'}"
         self.status_label.setText(
-            f"{len(records)} record(s) retrieved."
-            + (f"  Filter: '{query}'" if query else "  Displaying all records.")
-        )
+            f"{found} matching “{query}”." if query else f"{found} — everything saved.")
 
     def _clear_filter(self) -> None:
         self.search_line.clear()
@@ -268,51 +324,63 @@ class TelemetryView(QWidget):
         self.bus    = bus
         self.worker: Any = None
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(12)
+        layout.setContentsMargins(SPACE.MD, SPACE.SM, SPACE.MD, SPACE.MD)
+        layout.setSpacing(SPACE.SM + 2)
 
-        heading = QLabel("SYSTEM TELEMETRY & PROCESS GOVERNOR")
-        heading.setObjectName("panelHeading")
-        sub = QLabel(
-            "Live host graphs and the process governor. Host bars, calendar and "
-            "the geographical node keep their home in the left panel."
-        )
-        sub.setObjectName("mutedLabel")
-        sub.setWordWrap(True)
+        # Real-time scrolling graphs — the detailed system-telemetry view. In
+        # sentence case and named as a person would ("Processor", not "CPU
+        # LOAD"), matching the Brain page and the Command Centre.
+        self.cpu_graph = MetricGraph("Processor")
+        self.ram_graph = MetricGraph("Memory")
+        self.net_graph = MetricGraph("Network")
 
-        # Real-time scrolling graphs — the detailed system-telemetry view (the
-        # compact bars, calendar and environment stay in the persistent left
-        # panel; they are no longer duplicated here).
-        self.cpu_graph = MetricGraph("CPU LOAD")
-        self.ram_graph = MetricGraph("RAM CONSUMPTION")
-        self.net_graph = MetricGraph("NETWORK ACTIVITY")
+        # Quick action the user asked to keep on this page, at its top right.
+        self.env_refresh_btn = QPushButton("Refresh Environment")
+        self.env_refresh_btn.setObjectName("ghostButton")
+        apply_icon(self.env_refresh_btn, "refresh")
+        self.env_refresh_btn.setToolTip("Refresh the weather and location readings.")
+        lead_row = QHBoxLayout()
+        lead_row.addStretch(1)
+        lead_row.addWidget(self.env_refresh_btn)
 
-        # Quick-action buttons the user asked to keep on this page — environment
-        # and calendar themselves live in the left panel.
-        self.env_refresh_btn = QPushButton("⟳ REFRESH ENVIRONMENT")
-        self.env_refresh_btn.setToolTip("Refresh the geographical node in the left panel.")
-        action_row = QHBoxLayout()
-        action_row.addWidget(self.env_refresh_btn)
-        action_row.addStretch(1)
+        # Process governor: its heading and its one action on one row.
+        from PyQt6.QtWidgets import QHeaderView
 
-        # Process governor
-        proc_heading = QLabel("PROCESS INVENTORY")
+        proc_heading = QLabel("Processes")
         proc_heading.setObjectName("panelHeading")
         self.proc_table = QTableWidget()
         self.proc_table.setColumnCount(4)
         self.proc_table.setHorizontalHeaderLabels(["PID", "Name", "CPU %", "RAM %"])
+        self.proc_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self.proc_table.verticalHeader().setVisible(False)
         self.proc_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.proc_table.setMinimumHeight(240)
-        self.proc_refresh_btn = QPushButton("⟳ REFRESH PROCESSES")
+        self.proc_refresh_btn = QPushButton("Refresh")
+        self.proc_refresh_btn.setObjectName("ghostButton")
+        self.proc_refresh_btn.setAccessibleName("Refresh the process list")
+        apply_icon(self.proc_refresh_btn, "refresh")
         self.proc_refresh_btn.clicked.connect(self._refresh_processes)
+        proc_head = QHBoxLayout()
+        proc_head.addWidget(proc_heading)
+        proc_head.addStretch(1)
+        proc_head.addWidget(self.proc_refresh_btn)
 
-        for widget in [heading, sub,
-                       self.cpu_graph, self.ram_graph, self.net_graph]:
-            layout.addWidget(widget)
-        layout.addLayout(action_row)
-        for widget in [proc_heading, self.proc_table, self.proc_refresh_btn]:
-            layout.addWidget(widget)
-        layout.addStretch(1)
+        layout.addLayout(lead_row)
+        from .hud_instruments import ReactorGauge
+        self.reactor = ReactorGauge(bus)
+        self.reactor.setFixedHeight(230)
+        gauges = QHBoxLayout()
+        gauges.setSpacing(SPACE.MD)
+        gauges.addWidget(self.reactor, 2)
+        graphs = QVBoxLayout()
+        for widget in (self.cpu_graph, self.ram_graph, self.net_graph):
+            graphs.addWidget(widget)
+        gauges.addLayout(graphs, 3)
+        layout.addLayout(gauges)
+        layout.addSpacing(SPACE.SM)
+        layout.addLayout(proc_head)
+        layout.addWidget(self.proc_table, 1)
 
         # Keep the governor live while the page is on screen; the guard makes it
         # a no-op behind the face view so it never costs CPU when hidden.
@@ -342,17 +410,51 @@ class TelemetryView(QWidget):
     def attach_env_refresh(self, slot: Callable) -> None:
         self.env_refresh_btn.clicked.connect(slot)
 
-    def _refresh_processes(self) -> None:
-        self.proc_table.setRowCount(0)
+    @staticmethod
+    def _read_processes() -> list[tuple[str, str, str, str]]:
+        rows = []
         for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
             try:
                 info = proc.info
-                r    = self.proc_table.rowCount()
-                self.proc_table.insertRow(r)
-                self.proc_table.setItem(r, 0, QTableWidgetItem(str(info.get("pid", ""))))
-                self.proc_table.setItem(r, 1, QTableWidgetItem(str(info.get("name") or "")))
-                self.proc_table.setItem(r, 2, QTableWidgetItem(f"{info.get('cpu_percent') or 0:.1f}"))
-                self.proc_table.setItem(r, 3, QTableWidgetItem(f"{info.get('memory_percent') or 0:.1f}"))
+                rows.append((str(info.get("pid", "")), str(info.get("name") or ""),
+                             f"{info.get('cpu_percent') or 0:.1f}",
+                             f"{info.get('memory_percent') or 0:.1f}"))
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-        self.proc_table.resizeColumnsToContents()
+        return rows
+
+    def _refresh_processes(self) -> None:
+        """Read the process list off the GUI thread, then fill the table.
+
+        28 Oct 2026: process_iter took 330-360 ms on the GUI thread every
+        five seconds while this page was open; the table itself is ~12 ms."""
+        if getattr(self, "_proc_busy", False):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:                      # no loop (tests, early start)
+            self._fill_processes(self._read_processes())
+            return
+        self._proc_busy = True
+
+        async def read() -> None:
+            try:
+                rows = await asyncio.to_thread(self._read_processes)
+                self._fill_processes(rows)
+            except RuntimeError:                  # the page was closed meanwhile
+                pass
+            finally:
+                self._proc_busy = False
+        background.spawn(read(), name="orion-process-list")
+
+    def _fill_processes(self, rows: list[tuple[str, str, str, str]]) -> None:
+        table = self.proc_table
+        table.setUpdatesEnabled(False)
+        try:
+            table.setRowCount(len(rows))
+            for r, row in enumerate(rows):
+                for c, text in enumerate(row):
+                    table.setItem(r, c, QTableWidgetItem(text))
+            table.resizeColumnsToContents()
+        finally:
+            table.setUpdatesEnabled(True)

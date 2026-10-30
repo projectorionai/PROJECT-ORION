@@ -29,8 +29,12 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from orion_core import undo
+from orion_core import recycle_bin, undo
 from orion_core.dispatch_files import FilesDispatchMixin
+
+# Bound at import, before conftest swaps in its private bin: the real one,
+# called only on items it must refuse, so the owner's bin is never touched.
+_REAL_SEND = recycle_bin.send_to_recycle_bin
 
 
 class _Files(FilesDispatchMixin):
@@ -133,11 +137,13 @@ def test_an_oversized_write_is_not_undoable_and_says_so(files, tmp_path, monkeyp
 
 
 # ── deletes ──────────────────────────────────────────────────────────────────
+# Every delete waits for the owner's on-screen approval (30 Oct 2026); these
+# run the step that follows it.
 
 def test_deleting_a_file_can_be_taken_back(files, tmp_path):
     target = tmp_path / "gone.txt"
     target.write_text("PRECIOUS", encoding="utf-8")
-    result = files.file_controller({"action": "delete", "path": str(target)})
+    result = files._file_controller_execute({"action": "delete", "path": str(target)})
     assert not target.exists()
     assert "undo" in result.text.lower()
     ok, _message = undo.undo_last()
@@ -145,19 +151,79 @@ def test_deleting_a_file_can_be_taken_back(files, tmp_path):
     assert target.read_text(encoding="utf-8") == "PRECIOUS"
 
 
-def test_an_oversized_delete_is_honest_about_being_final(files, tmp_path, monkeypatch):
+def test_a_file_the_bin_refuses_is_kept_not_deleted_for_good(files, tmp_path, monkeypatch):
+    # Audit 6 Oct 2026 (A01): a refusal fell through to path.unlink().
     monkeypatch.setattr("orion_core.dispatch_files.UNDO_MAX_BYTES", 16)
+    monkeypatch.setattr("orion_core.recycle_bin.refusal",
+                        lambda path: "the bin is set to delete immediately")
+    sent = []
+    monkeypatch.setattr("orion_core.recycle_bin.send_to_recycle_bin", lambda path: sent.append(path))
+    target = tmp_path / "important.bin"
+    target.write_bytes(b"personal data" * 10)
+    result = files._file_controller_execute({"action": "delete", "path": str(target)})
+    assert target.read_bytes() == b"personal data" * 10
+    assert result.ok is False and "delete immediately" in result.text
+    assert sent == [], "a refused item must never reach the shell"
+    assert undo.can_undo() is False
+
+
+def test_a_failed_move_to_the_bin_keeps_the_file(files, tmp_path, monkeypatch):
+    monkeypatch.setattr("orion_core.recycle_bin.send_to_recycle_bin", lambda path: False)
     target = tmp_path / "huge.txt"
     target.write_text("y" * 500, encoding="utf-8")
-    result = files.file_controller({"action": "delete", "path": str(target)})
-    assert "final" in result.text
-    assert undo.can_undo() is False, "nothing should be registered it cannot do"
+    result = files._file_controller_execute({"action": "delete", "path": str(target)})
+    assert target.exists() and result.ok is False
+    assert "Nothing was deleted" in result.text
+    assert undo.can_undo() is False
+
+
+def test_a_file_gone_but_not_found_in_the_bin_is_reported_unverified(files, tmp_path, monkeypatch):
+    def vanished(path):             # what the shell does when it destroys instead
+        pathlib.Path(path).unlink()
+        return False
+    monkeypatch.setattr("orion_core.recycle_bin.send_to_recycle_bin", vanished)
+    target = tmp_path / "small.bin"
+    target.write_bytes(b"\x00\xffkeep")
+    result = files._file_controller_execute({"action": "delete", "path": str(target)})
+    assert result.ok is False and "could not confirm" in result.text
+    assert undo.undo_last()[0] is True, "the held copy is still a way back"
+    assert target.read_bytes() == b"\x00\xffkeep"
+
+
+def test_a_folder_with_contents_is_never_removed(files, tmp_path):
+    folder = tmp_path / "full"
+    (folder / "inner").mkdir(parents=True)
+    (folder / "inner" / "photo.jpg").write_bytes(b"\xff\xd8")
+    result = files.file_controller({"action": "delete", "path": str(folder)})
+    assert result.ok is False and (folder / "inner" / "photo.jpg").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the Windows Recycle Bin")
+def test_a_folder_the_bin_cannot_hold_is_refused_not_destroyed(tmp_path):
+    # Measured: one path of 260+ characters inside a folder and the shell
+    # DESTROYS the whole folder under FOF_ALLOWUNDO, silently.
+    folder = tmp_path / "gradle_build"
+    deep = str(folder)
+    while len(deep) < recycle_bin.MAX_PATH:
+        deep += "\\" + "intermediates"
+    pathlib.Path("\\\\?\\" + deep).mkdir(parents=True)
+    (folder / "keep.txt").write_text("still here", encoding="utf-8")
+
+    reason = recycle_bin.refusal(folder)
+    assert reason and "characters" in reason
+    assert _REAL_SEND(folder) is False
+    assert (folder / "keep.txt").read_text(encoding="utf-8") == "still here"
+    assert pathlib.Path("\\\\?\\" + deep).is_dir()
+
+    ordinary = tmp_path / "ordinary.txt"
+    ordinary.write_text("x", encoding="utf-8")
+    assert recycle_bin.refusal(ordinary) is None
 
 
 def test_removing_an_empty_folder_can_be_taken_back(files, tmp_path):
     folder = tmp_path / "empty"
     folder.mkdir()
-    files.file_controller({"action": "delete", "path": str(folder)})
+    files._file_controller_execute({"action": "delete", "path": str(folder)})
     assert not folder.exists()
     undo.undo_last()
     assert folder.is_dir()

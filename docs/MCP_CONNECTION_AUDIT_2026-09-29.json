@@ -1,0 +1,97 @@
+{
+  "servers": {
+    "brave_search": {
+      "state": "disabled"
+    },
+    "calcom": {
+      "state": "disabled"
+    },
+    "context7": {
+      "state": "connected",
+      "tools": 2
+    },
+    "duckduckgo": {
+      "state": "connected",
+      "tools": 3
+    },
+    "fetch": {
+      "state": "connected",
+      "tools": 1
+    },
+    "filesystem": {
+      "state": "connected",
+      "tools": 14
+    },
+    "git": {
+      "state": "connected",
+      "tools": 12
+    },
+    "github": {
+      "state": "disabled"
+    },
+    "gmail": {
+      "state": "disabled"
+    },
+    "google_calendar": {
+      "state": "disabled"
+    },
+    "google_drive": {
+      "state": "disabled"
+    },
+    "google_maps": {
+      "state": "disabled"
+    },
+    "home_assistant": {
+      "state": "disabled"
+    },
+    "markitdown": {
+      "state": "connected",
+      "tools": 1
+    },
+    "matrix": {
+      "state": "disabled"
+    },
+    "memory": {
+      "state": "connected",
+      "tools": 9
+    },
+    "notion": {
+      "state": "connected",
+      "tools": 24
+    },
+    "obsidian": {
+      "state": "disabled"
+    },
+    "orion_network": {
+      "state": "connected",
+      "tools": 2,
+      "read_probe": "ok"
+    },
+    "orion_telemetry": {
+      "state": "connected",
+      "tools": 2,
+      "read_probe": "ok"
+    },
+    "playwright": {
+      "state": "connected",
+      "tools": 25
+    },
+    "postgres": {
+      "state": "disabled"
+    },
+    "slack": {
+      "state": "disabled"
+    },
+    "sqlite": {
+      "state": "connected",
+      "tools": 2
+    },
+    "tavily_search": {
+      "state": "disabled"
+    },
+    "twilio": {
+      "state": "waiting for TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN or TWILIO_API_KEY + TWILIO_API_SECRET"
+    }
+  },
+  "scope": "Stdio handshake and tool discovery. No account tools executed."
+}

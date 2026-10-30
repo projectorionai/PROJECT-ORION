@@ -1,0 +1,30 @@
+{
+  "name": "jv_calorie_counter",
+  "description": "Estimate food nutrition from a user-requested webcam photo or image file through ORION's vision router. Estimates state portion uncertainty and are never measurements.",
+  "module": "jv_calorie_counter_tool.py",
+  "version": "33.0.0",
+  "tier": "confirm",
+  "permissions": [
+    "network",
+    "screen",
+    "filesystem"
+  ],
+  "requires": [
+    "PIL"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "User's nutrition question."
+      },
+      "path": {
+        "type": "string",
+        "description": "Optional image file; omit for the selected webcam."
+      }
+    },
+    "required": []
+  },
+  "secrets": []
+}

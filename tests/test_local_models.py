@@ -20,6 +20,29 @@ from orion_core.local_models import OllamaManager, RECOMMENDED_PULLS
 from orion_core.providers import OrionProviderSettings
 
 
+def test_mode_report_does_not_confuse_absent_language_models_with_no_local_brain():
+    from types import SimpleNamespace
+    from orion_core.local_models import AIModeInfo
+    router = SimpleNamespace(provider_snapshot=lambda: {
+        "mode": "MODE B", "online": False, "available_live": [],
+        "available_text": [], "available_local": [],
+    })
+    result = AIModeInfo(router).report()
+    assert result.ok
+    assert "Local rule-based conversation and commands: available without an API key or language model" in result.text
+    assert "use supplied data without a network" in result.text
+    assert "web searches and cloud integrations still require their services" in result.text
+
+
+def test_mode_report_distinguishes_a_deferred_cached_dictation_model():
+    from types import SimpleNamespace
+    from orion_core.local_models import AIModeInfo
+    router = SimpleNamespace(provider_snapshot=lambda: {})
+    transcriber = SimpleNamespace(status=lambda: {"engine": "none"}, cached_available=True)
+    result = AIModeInfo(router, offline_stt=transcriber).report()
+    assert "Offline dictation: cached model available; loads on first use" in result.text
+
+
 class _Signal:
     def __init__(self) -> None:
         self.messages: list[str] = []
@@ -152,6 +175,10 @@ def test_register_reports_no_server_detected(monkeypatch):
         raise urllib.error.URLError("refused")
 
     monkeypatch.setattr(urllib.request, "urlopen", _raise)
+    # No Ollama on this machine either (an installed-but-stopped one is told
+    # so instead - test_mark37_lag_fixes).
+    from orion_core import local_mind
+    monkeypatch.setattr(local_mind, "ollama_binary", lambda: None)
     bus = _StubBus()
     manager = OllamaManager(bus)
     settings = OrionProviderSettings(active_provider="none", provider_order=[], providers={})

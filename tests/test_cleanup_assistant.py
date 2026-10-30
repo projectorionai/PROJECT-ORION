@@ -51,6 +51,29 @@ def _assistant(root: Path, trash_sink=None, git_tracked=None):
     )
 
 
+def test_scan_budgets_and_cancellation_are_explicit(tmp_path):
+    root = _project(tmp_path)
+    assistant = _assistant(root)
+    cancelled = assistant.scan(cancelled=lambda: True)
+    assert not cancelled.complete and cancelled.stop_reason == "cancelled"
+    assert cancelled.inspected == 0
+    limited = assistant.scan(max_entries=2)
+    assert not limited.complete and limited.inspected == 2
+    assert limited.stop_reason == "scan budget reached"
+    assert root.joinpath("main.py").exists()
+
+
+def test_large_build_size_is_reported_as_partial(tmp_path):
+    root = _project(tmp_path)
+    for index in range(2100):
+        (root / "build" / f"{index}.tmp").write_bytes(b"x")
+    report = _assistant(root).scan()
+    build = next(c for c in report.candidates if c.file_type == "build output")
+    assert not build.size_complete
+    assert build.size_bytes < 2101
+    assert not build.as_dict()["size_complete"]
+
+
 def test_scan_detects_artifacts_and_assigns_risk(tmp_path):
     root = _project(tmp_path)
     report = _assistant(root).scan()
@@ -194,3 +217,61 @@ def test_used_token_cannot_be_replayed(tmp_path):
     a.confirm_and_delete(plan.token)
     with pytest.raises(CleanupError):
         a.confirm_and_delete(plan.token)
+
+
+def test_an_approved_cleanup_runs_off_the_gui_thread(monkeypatch):
+    """Recycling walks every path under each target; on the GUI thread (which
+    is also the event loop) a big folder froze everything (audit 6 Oct 2026)."""
+    import asyncio
+    import os
+    import threading
+    from types import SimpleNamespace
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from orion_core.data import ToolResult
+    from orion_core.gui import core_window
+
+    class _ApprovingBox:                      # the modal dialog, approved
+        class Icon:
+            Warning = 0
+
+        class ButtonRole:
+            AcceptRole, RejectRole = 0, 1
+
+        def __init__(self, _parent):
+            self._buttons = []
+
+        def addButton(self, _text, _role):
+            self._buttons.append(object())
+            return self._buttons[-1]
+
+        def buttons(self):
+            return self._buttons
+
+        def clickedButton(self):
+            return self._buttons[0]
+
+        def __getattr__(self, _name):          # setIcon, setText, exec, ...
+            return lambda *a, **k: None
+
+    monkeypatch.setattr(core_window, "QMessageBox", _ApprovingBox)
+    ran_on, logged = [], []
+
+    def confirm_cleanup(token):
+        ran_on.append(threading.current_thread() is threading.main_thread())
+        return ToolResult(f"Removed 3 file(s) for {token}")
+
+    window = SimpleNamespace(
+        bus=SimpleNamespace(log=SimpleNamespace(emit=logged.append)),
+        worker=SimpleNamespace(dispatcher=SimpleNamespace(confirm_cleanup=confirm_cleanup)))
+
+    async def approve():
+        core_window.OrionCoreWindow._on_confirm_action(
+            window, {"token": "t1", "intent": "file_cleanup", "message": "Delete?"})
+        for _ in range(200):
+            if any("Removed 3" in line for line in logged):
+                return
+            await asyncio.sleep(0.01)
+    asyncio.run(approve())
+    assert ran_on == [False], "the deletion ran on the GUI thread"
+    assert any("Removed 3 file(s) for t1" in line for line in logged)

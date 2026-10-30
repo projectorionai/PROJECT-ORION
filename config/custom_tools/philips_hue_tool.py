@@ -25,6 +25,16 @@ import urllib.request
 from pathlib import Path
 
 TIMEOUT = 10
+
+
+MAX_RESPONSE_BYTES = 1_000_000
+
+
+def _bounded_http_body(response) -> bytes:
+    data = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise ValueError("Remote response exceeded its size limit; completion is unverified")
+    return data
 CONFIG_NAME = "philips_hue.json"
 DISCOVERY = "https://discovery.meethue.com/"
 
@@ -64,7 +74,7 @@ def _request(url: str, payload: dict | None = None,
         url, data=body, method=method,
         headers={"Content-Type": "application/json", "User-Agent": "ORION/1.0"})
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        text = response.read().decode("utf-8")
+        text = _bounded_http_body(response).decode("utf-8")
     return json.loads(text) if text.strip() else {}
 
 

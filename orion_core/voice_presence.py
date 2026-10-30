@@ -82,7 +82,15 @@ class Presence:
         """
         parts = []
         if self.is_known_person:
-            parts.append(f"The person speaking is {self.speaker}, not the usual user")
+            owner = False
+            try:
+                from .voice_enrolment import turns
+                latest = turns().latest()
+                owner = latest is not None and latest.kind == "owner" and latest.name == self.speaker
+            except Exception:
+                pass
+            if not owner:
+                parts.append(f"The person speaking is {self.speaker}, not the usual user")
         if self.emotion.certain_enough_to_mention:
             parts.append(f"they sound {self.emotion.emotion} "
                          f"({self.emotion.because})")
@@ -140,12 +148,16 @@ class VoicePresence:
         presence = Presence()
 
         # Identify FIRST: the tone reading needs to know whose baseline to use.
-        if seconds >= MIN_ID_SECONDS and self.speaker_id is not None:
+        from . import voice_enrolment
+
+        if (seconds >= MIN_ID_SECONDS or voice_enrolment.learning()) and self.speaker_id is not None:
             name, confidence = self._identify(samples, sample_rate)
             if name:
                 presence.speaker = name
                 presence.speaker_confidence = confidence
                 presence.identified = True
+        elif seconds < MIN_ID_SECONDS:
+            voice_enrolment.note_short_utterance(seconds)
 
         presence.emotion = self.emotion.read(
             samples, sample_rate, speaker=presence.speaker, learn=learn)

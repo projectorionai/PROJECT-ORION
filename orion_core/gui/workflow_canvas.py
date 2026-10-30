@@ -64,7 +64,7 @@ class WorkflowChainCanvas(QGraphicsView):
             tool = str(step.get("tool") or "?")
             args_preview = json.dumps(step.get("args") or {})
             if len(args_preview) > 30:
-                args_preview = args_preview[:27] + "..."
+                args_preview = args_preview[:27] + "…"
             rect = self._scene.addRect(
                 0, 0, self._NODE_W, self._NODE_H,
                 QPen(QColor(_NODE_EDGE), 2), QBrush(QColor(C.PANEL_HI)))

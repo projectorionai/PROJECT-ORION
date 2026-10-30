@@ -17,14 +17,37 @@ integration on top; everything here is deterministic and unit-tested.
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional, Sequence
 
 # Monday=0 … Sunday=6; the default working week.
 DEFAULT_WORKDAYS = frozenset({0, 1, 2, 3, 4})
 DEFAULT_WORK_HOURS = (9, 18)          # 09:00–18:00 local
 DEFAULT_GRANULARITY = timedelta(minutes=15)
+
+
+def _instant(when: datetime) -> datetime:
+    return when.astimezone(timezone.utc) if when.utcoffset() is not None else when
+
+
+def _require_same_awareness(*values: datetime) -> None:
+    if len({value.utcoffset() is not None for value in values}) > 1:
+        raise ValueError("Scheduling dates must either all include timezones or all be naive")
+
+
+def _local_boundary(wall: datetime, *, closing: bool = False) -> datetime:
+    """Use the full repeated hour; move missing work-hour boundaries forward."""
+    if wall.utcoffset() is None:
+        return wall
+    candidates = [wall.replace(fold=fold).astimezone(timezone.utc).astimezone(wall.tzinfo)
+                  for fold in (0, 1)]
+    valid = [candidate for candidate in candidates
+             if candidate.replace(tzinfo=None) == wall.replace(tzinfo=None)]
+    if valid:
+        return (max if closing else min)(valid, key=_instant)
+    return max(candidates, key=lambda candidate: candidate.replace(tzinfo=None))
 
 
 @dataclass(frozen=True)
@@ -34,15 +57,18 @@ class TimeSlot:
 
     @property
     def duration(self) -> timedelta:
-        return self.end - self.start
+        _require_same_awareness(self.start, self.end)
+        return _instant(self.end) - _instant(self.start)
 
     def overlaps(self, other: "TimeSlot") -> bool:
-        return self.start < other.end and other.start < self.end
+        _require_same_awareness(self.start, self.end, other.start, other.end)
+        return _instant(self.start) < _instant(other.end) and _instant(other.start) < _instant(self.end)
 
 
 def _merge(intervals: Iterable[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
     """Merge overlapping/adjacent (start, end) intervals into a minimal set."""
-    ordered = sorted((s, e) for s, e in intervals if s < e)
+    normalised = [(_instant(s), _instant(e)) for s, e in intervals]
+    ordered = sorted((s, e) for s, e in normalised if s < e)
     merged: list[tuple[datetime, datetime]] = []
     for start, end in ordered:
         if merged and start <= merged[-1][1]:
@@ -60,27 +86,41 @@ def _working_windows(window_start: datetime, window_end: datetime,
     start_hour, end_hour = work_hours
     windows: list[tuple[datetime, datetime]] = []
     day = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
-    last = window_end
-    while day <= last:
+    last = window_end.astimezone(window_start.tzinfo) if window_start.utcoffset() is not None else window_end
+    while day.date() <= last.date():
         if day.weekday() in workdays:
-            day_open = day.replace(hour=start_hour)
-            day_close = day.replace(hour=end_hour)
-            lo = max(day_open, window_start)
-            hi = min(day_close, window_end)
+            day_open = _local_boundary(day.replace(hour=start_hour))
+            if end_hour == 24:
+                try:
+                    day_close = _local_boundary(day + timedelta(days=1), closing=True)
+                except OverflowError:
+                    day_close = last
+            else:
+                day_close = _local_boundary(day.replace(hour=end_hour), closing=True)
+            lo = max(_instant(day_open), _instant(window_start))
+            hi = min(_instant(day_close), _instant(window_end))
             if lo < hi:
                 windows.append((lo, hi))
+        if day.date() == last.date():
+            break
         day += timedelta(days=1)
     return windows
 
 
 def _subtract(window: tuple[datetime, datetime],
              busy: Sequence[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
-    """Return the parts of *window* not covered by any *busy* interval."""
+    """Subtract sorted, merged busy intervals without scanning the calendar.
+
+    Disjoint intervals have increasing ends. Locate the first possible
+    overlap, then stop at the first interval beyond this working window.
+    """
     free: list[tuple[datetime, datetime]] = []
     cursor, end = window
-    for b_start, b_end in busy:
-        if b_end <= cursor or b_start >= end:
-            continue
+    first = bisect_right(busy, cursor, key=lambda interval: interval[1])
+    for index in range(first, len(busy)):
+        b_start, b_end = busy[index]
+        if b_start >= end:
+            break
         if b_start > cursor:
             free.append((cursor, min(b_start, end)))
         cursor = max(cursor, b_end)
@@ -93,8 +133,12 @@ def _subtract(window: tuple[datetime, datetime],
 
 def _ceil_to(dt: datetime, granularity: timedelta) -> datetime:
     day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    steps = math.ceil((dt - day_start) / granularity)
-    return day_start + steps * granularity
+    # An elapsed-time grid from local midnight includes both autumn folds and
+    # never manufactures a missing spring clock time.
+    origin = _instant(_local_boundary(day_start))
+    steps = math.ceil((_instant(dt) - origin) / granularity)
+    aligned = origin + steps * granularity
+    return aligned.astimezone(dt.tzinfo) if dt.utcoffset() is not None else aligned
 
 
 def free_intervals(busy: Iterable[tuple[datetime, datetime]],
@@ -102,12 +146,26 @@ def free_intervals(busy: Iterable[tuple[datetime, datetime]],
                    work_hours: tuple[int, int] = DEFAULT_WORK_HOURS,
                    workdays: frozenset[int] = DEFAULT_WORKDAYS
                    ) -> list[TimeSlot]:
-    """Every free stretch inside working hours across the search window."""
-    merged = _merge(busy)
+    """Free stretches in the start date's timezone; busy intervals use instants."""
+    _require_same_awareness(window_start, window_end)
+    start_hour, end_hour = work_hours
+    if (type(start_hour) is not int or type(end_hour) is not int
+            or not 0 <= start_hour < end_hour <= 24):
+        raise ValueError("Working hours must be increasing whole hours between 0 and 24")
+    if any(type(day) is not int or not 0 <= day <= 6 for day in workdays):
+        raise ValueError("Workdays must be weekday integers from 0 to 6")
+    intervals = list(busy)
+    for start, end in intervals:
+        _require_same_awareness(window_start, start, end)
+    if _instant(window_start) >= _instant(window_end):
+        return []
+    merged = _merge(intervals)
     result: list[TimeSlot] = []
     for window in _working_windows(window_start, window_end, work_hours, workdays):
         for lo, hi in _subtract(window, merged):
             if lo < hi:
+                if window_start.utcoffset() is not None:
+                    lo, hi = lo.astimezone(window_start.tzinfo), hi.astimezone(window_start.tzinfo)
                 result.append(TimeSlot(lo, hi))
     return result
 
@@ -122,16 +180,29 @@ def find_slots(busy: Iterable[tuple[datetime, datetime]],
                limit: Optional[int] = 3) -> list[TimeSlot]:
     """Propose up to *limit* free slots of *duration*, earliest first, spread one
     per free gap so the options span the window rather than clustering. Slots are
-    aligned up to *granularity* and never end after *deadline*."""
+    aligned to elapsed steps after local midnight and never end after *deadline*.
+    Durations are elapsed time, including on days when the clocks change."""
+    if granularity <= timedelta(0):
+        raise ValueError("Scheduling granularity must be positive")
+    if limit is not None and (type(limit) is not int or limit < 0):
+        raise ValueError("Scheduling limit must be a non-negative integer or None")
+    _require_same_awareness(window_start, window_end, *([deadline] if deadline else []))
+    if limit == 0:
+        return []
     if duration <= timedelta(0):
         return []
-    hard_end = min(window_end, deadline) if deadline else window_end
+    hard_end = min(window_end, deadline, key=_instant) if deadline else window_end
     proposals: list[TimeSlot] = []
     for gap in free_intervals(busy, window_start, hard_end,
                               work_hours=work_hours, workdays=workdays):
-        start = _ceil_to(gap.start, granularity)
-        end = start + duration
-        if end <= gap.end and (deadline is None or end <= deadline):
+        try:
+            start = _ceil_to(gap.start, granularity)
+            end = _instant(start) + duration
+        except OverflowError:
+            continue
+        if start.utcoffset() is not None:
+            end = end.astimezone(start.tzinfo)
+        if _instant(end) <= _instant(gap.end):
             proposals.append(TimeSlot(start, end))
             if limit is not None and len(proposals) >= limit:
                 break

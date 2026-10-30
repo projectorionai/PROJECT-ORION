@@ -1,0 +1,33 @@
+{
+  "route": "http://127.0.0.1:8000",
+  "ok": true,
+  "health_http": 200,
+  "hardware_http": 200,
+  "hardware": {
+    "ok": true,
+    "sampled_at": 1790639447063,
+    "cpu": {
+      "name": "AMD Ryzen 5 5600X 6-Core Processor",
+      "load_percent": 33.1,
+      "temperature_c": null
+    },
+    "gpu": {
+      "available": true,
+      "name": "NVIDIA GeForce RTX 3060 Ti",
+      "load_percent": 29.0,
+      "vram_used_mb": 2229,
+      "vram_total_mb": 8192,
+      "temperature_c": 45
+    },
+    "memory": {
+      "used_percent": 92.0
+    }
+  },
+  "speech_http": 200,
+  "voice": "Charon",
+  "first_audio_seconds": 0.881,
+  "speech_stream_seconds": 1.499,
+  "audio_seconds": 2.52,
+  "frames": 63,
+  "complete": true
+}

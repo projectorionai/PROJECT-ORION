@@ -82,3 +82,41 @@ def test_add_creates_parent_directory(tmp_path):
     add_authorized_target("127.0.0.1", path)
     assert path.exists()
     assert load_authorized_targets(path) == {"127.0.0.1"}
+
+
+# ── "scan my network" from someone at home (lan_devices) ─────────────────────
+
+_ARP = """
+Interface: 10.115.15.69 --- 0x5
+  Internet Address      Physical Address      Type
+  10.115.0.1            48-8f-5a-11-22-33     dynamic
+  10.115.2.100          da-a1-19-44-55-66     dynamic
+  10.115.255.255        ff-ff-ff-ff-ff-ff     static
+  224.0.0.22            01-00-5e-00-00-16     static
+  239.255.255.250       01-00-5e-7f-ff-fa     static
+"""
+
+
+def test_the_neighbour_table_becomes_devices_not_multicast():
+    """3 Oct: "scan the network real quick" got three clarifying questions and
+    a refusal - the only scan needed an authorised target and nmap."""
+    from orion_core.lan_devices import describe, parse_arp
+    devices = parse_arp(_ARP)
+    assert [d.ip for d in devices] == ["10.115.0.1", "10.115.2.100"]
+    assert devices[1].private_mac and not devices[0].private_mac
+    said = describe(read_table=lambda: _ARP, name_devices=lambda found: None)
+    assert "2 devices" in said and "likely your router" in said
+    assert "phone or tablet" in said and "passive" in said
+
+
+def test_lan_devices_needs_no_authorisation_and_is_routed(monkeypatch):
+    import asyncio
+    import types
+    from orion_core import dispatch_schema, lan_devices
+    from orion_core.dispatch_knowledge import KnowledgeDispatchMixin
+    monkeypatch.setattr(lan_devices, "describe", lambda: "I can see 2 devices.")
+    me = types.SimpleNamespace(security_recon=types.SimpleNamespace())  # no targets authorised
+    result = asyncio.run(KnowledgeDispatchMixin.security_recon_tool(me, {"action": "lan_devices"}))
+    assert result.ok and "2 devices" in str(result.response_payload())
+    schema = next(t for t in dispatch_schema.TOOL_DECLARATIONS if t["name"] == "security_recon")
+    assert "'lan_devices'" in schema["description"] and "scan my network" in schema["description"]

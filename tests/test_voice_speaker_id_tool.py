@@ -239,3 +239,51 @@ async def test_the_new_actions_are_listed_when_one_is_wrong(tmp_path, monkeypatc
     result = await d.voice_speaker_id_tool({"action": "explode"})
     for action in ("owner", "only_me", "anyone"):
         assert action in result.text
+
+
+async def test_guided_learn_never_opens_a_second_microphone(tmp_path, monkeypatch):
+    from orion_core import voice_enrolment, voiceprint
+
+    _isolate(tmp_path, monkeypatch)
+    _isolate_voiceprints(tmp_path, monkeypatch)
+    monkeypatch.setattr(voice_enrolment, "_SESSION", None)
+    monkeypatch.setattr(voiceprint, "available", lambda: True)
+    monkeypatch.setattr(vid, "record_enrollment_clip", lambda *a: (_ for _ in ()).throw(
+        AssertionError("guided learning opened a microphone")))
+    service = vid.SpeakerIdentificationService()
+    result = await _dispatcher(service).voice_speaker_id_tool(
+        {"action": "learn", "name": "SampleUser", "consent": True})
+    assert result.ok and "twenty" in result.text
+    assert voice_enrolment.holding_model()
+    assert service.list_profiles() == []
+    cancelled = await _dispatcher(service).voice_speaker_id_tool({"action": "cancel"})
+    assert cancelled.ok and not voice_enrolment.learning()
+
+
+async def test_guided_consent_requires_a_real_boolean(tmp_path, monkeypatch):
+    from orion_core import voice_enrolment
+
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(voice_enrolment, "_SESSION", None)
+    service = vid.SpeakerIdentificationService()
+    result = await _dispatcher(service).voice_speaker_id_tool(
+        {"action": "learn", "name": "SampleUser", "consent": "false"})
+    assert not result.ok and voice_enrolment.current() is None
+
+
+def test_guided_first_profile_receives_samples_through_existing_service(tmp_path, monkeypatch):
+    from orion_core import voice_enrolment, voiceprint
+
+    _isolate(tmp_path, monkeypatch)
+    store = _isolate_voiceprints(tmp_path, monkeypatch)
+    monkeypatch.setattr(voice_enrolment, "_SESSION", None)
+    monkeypatch.setattr(voice_enrolment, "assess", lambda *a: voice_enrolment.Assessment(True))
+    monkeypatch.setattr(voiceprint, "available", lambda: True)
+    monkeypatch.setattr(voiceprint, "embed", lambda *a: np.array([1., 0., 0.]))
+    service = vid.SpeakerIdentificationService()
+    session = voice_enrolment.start("SampleUser", store=store, target=3, minimum=3,
+                                    owner_only_after=False)
+    for _ in range(3):
+        assert service.identify(_fake_clip(), 16000) == ("", 0.0)
+    assert session.state == "complete"
+    assert service.list_profiles() == ["SampleUser"]

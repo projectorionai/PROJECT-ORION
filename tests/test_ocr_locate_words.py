@@ -183,3 +183,106 @@ def test_locate_words_never_raises_on_a_malformed_tesseract_response(monkeypatch
     _install_fake_pytesseract(monkeypatch, {"text": ["Save"]})   # missing conf/left/etc
     # Falls through to the rapidocr attempt (also unavailable) and returns [].
     assert _engine().locate_words(_FakeImage()) == []
+
+
+# ── ranking: the best match on screen, not the first in reading order ───────
+
+import pytest
+
+from orion_core import ocr_engine as _ocr
+
+
+def _words(*items):
+    return [{"text": text, "rect": rect, "confidence": 0.9} for text, rect in items]
+
+
+def _only_reader(monkeypatch, engine, words, calls=None):
+    def read(image):
+        if calls is not None:
+            calls.append(image)
+        return list(words)
+    monkeypatch.setattr(engine, "word_readers", lambda: (("only", read),))
+    return engine
+
+
+def test_an_exact_label_beats_a_longer_word_read_before_it(monkeypatch):
+    """'Save' used to click 'Autosave' whenever Autosave came first (31 of 32
+    rendered test screens)."""
+    engine = _only_reader(monkeypatch, _engine(), _words(
+        ("Autosave", (0, 0, 80, 15)), ("Save", (100, 0, 40, 15))))
+    assert engine.find_text_box(_FakeImage(), "Save") == (100, 0, 40, 15)
+
+
+def test_a_whole_word_inside_a_line_beats_a_longer_word(monkeypatch):
+    """Line-level readers (RapidOCR) return 'File Edit View' as one box. The
+    query lands on its own part of the line, not on 'Editor' and not on the
+    line's middle."""
+    engine = _only_reader(monkeypatch, _engine(), _words(
+        ("Editor", (0, 100, 60, 16)), ("File Edit View", (200, 50, 140, 16))))
+    x, y, w, h = engine.find_text_box(_FakeImage(), "Edit")
+    assert (x, y, w, h) == (250, 50, 40, 16)
+    assert 245 <= x + w / 2 <= 295
+
+
+def test_a_longer_word_is_still_the_last_resort_aimed_at_the_matching_letters(monkeypatch):
+    """Kept for words OCR ran together ("Closewindow"), aimed at the part
+    that matched rather than the middle of the run."""
+    engine = _only_reader(monkeypatch, _engine(), _words(("Closewindow", (0, 0, 110, 15))))
+    x, y, w, h = engine.find_text_box(_FakeImage(), "Close")
+    assert (x, y, h) == (0, 0, 15) and 45 <= w <= 55
+
+
+def test_a_multi_word_label_never_joins_the_end_of_one_line_to_the_next(monkeypatch):
+    engine = _only_reader(monkeypatch, _engine(), _words(
+        ("Save", (900, 0, 40, 15)), ("As", (0, 40, 20, 15))))
+    assert engine.find_text_box(_FakeImage(), "Save As") is None
+    engine = _only_reader(monkeypatch, _engine(), _words(
+        ("Save", (900, 0, 40, 15)), ("As", (0, 40, 20, 15)),
+        ("Save", (10, 80, 40, 15)), ("As", (60, 80, 20, 15))))
+    assert engine.find_text_box(_FakeImage(), "Save As") == (10, 80, 70, 15)
+
+
+# ── near misses of small text ────────────────────────────────────────────────
+
+@pytest.mark.parametrize("read,wanted,expected", [
+    ("fitter", "filter", True), ("fiter", "filter", True), ("filer", "filter", True),
+    ("appy", "apply", True), ("edt", "edit", True), ("0pen", "open", True),
+    ("clone", "close", False), ("sale", "save", False), ("cbse", "close", False),
+    ("delte", "delete", False), ("fnd", "find", True), ("ru", "run", False),
+    ("filter", "filter", False),
+])
+def test_only_thin_stroke_slips_count_as_the_same_word(read, wanted, expected):
+    assert _ocr._ocr_confusable(read, wanted) is expected
+
+
+def test_a_misread_label_is_found_only_by_the_near_miss_pass(monkeypatch):
+    engine = _only_reader(monkeypatch, _engine(), _words(
+        ("Search", (0, 0, 60, 15)), ("Fitter", (100, 0, 50, 15))))
+    assert engine.find_text_box(_FakeImage(), "Filter") is None
+    assert engine.find_near_text_box(_FakeImage(), "Filter") == (100, 0, 50, 15)
+
+
+@pytest.mark.parametrize("items,query", [
+    ([("Fitter", (0, 0, 50, 15)), ("Fiter", (300, 0, 40, 15))], "Filter"),   # two places
+    ([("Clone", (0, 0, 50, 15))], "Close"),                                  # another word
+    ([("Rn", (0, 0, 20, 15))], "Run"),                                       # too short
+    ([("Fitter", (0, 0, 50, 15))], "Filter now"),                            # several words
+])
+def test_a_near_miss_that_could_be_a_guess_is_not_offered(monkeypatch, items, query):
+    engine = _only_reader(monkeypatch, _engine(), _words(*items))
+    assert engine.find_near_text_box(_FakeImage(), query) is None
+
+
+def test_one_screenshot_is_read_once_per_reader(monkeypatch):
+    """find_text_box then find_near_text_box on the same capture used to be a
+    second full recognition pass; a NEW capture is always read afresh."""
+    calls: list = []
+    engine = _only_reader(monkeypatch, _engine(), _words(("Fitter", (1, 2, 30, 10))), calls)
+    shot = _FakeImage()
+    assert engine.find_text_box(shot, "Filter") is None
+    assert engine.find_near_text_box(shot, "Filter") == (1, 2, 30, 10)
+    assert engine.locate_words(shot)
+    assert calls == [shot]
+    fresh = _FakeImage()
+    engine.find_text_box(fresh, "Filter")
+    assert calls == [shot, fresh]

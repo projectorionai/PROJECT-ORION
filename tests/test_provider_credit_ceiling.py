@@ -79,12 +79,18 @@ def test_credit_is_checked_before_quota():
 
 # ── the request is bounded ───────────────────────────────────────────────────
 
-def test_a_ceiling_is_always_sent():
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_ceiling_is_always_sent(stream):
     """The root cause: no max_tokens meant the provider reserved the model's
-    entire completion budget against the balance."""
-    import inspect
-    source = inspect.getsource(ProviderRouter)
-    assert '"max_tokens": self.output_budget(profile)' in source
+    entire completion budget against the balance. Checked on the payload each
+    transport actually sends, streamed or not."""
+    from orion_core.provider_transport import (
+        ChatRequest, OllamaChatTransport, OpenAIChatTransport)
+
+    request = ChatRequest("m", "system", "prompt", 777, stream=stream)
+    assert OpenAIChatTransport("https://x.invalid/v1").payload(request)["max_tokens"] == 777
+    native = OllamaChatTransport("http://127.0.0.1:11434").payload(request)
+    assert native["options"]["num_predict"] == 777
 
 
 def test_the_default_ceiling_is_proportionate():

@@ -35,17 +35,21 @@ import os
 import sys
 import time
 import traceback
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from .providers import OrionProviderSettings
 
 _APP_IMPORT_STARTED_AT = time.perf_counter()
 
 import qasync
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication, QDialog, QWidget
 
 # NOTE: the ~80 service imports that used to sit here now load inside
-# run_application(), immediately after the window has PAINTED. They cost about
+# run_application(), after showing the shell and yielding to Qt. They cost about
 # 160 ms and pull in 113 of ORION's 292 modules — antivirus, breach_monitor,
 # the cyber curriculum, the forge — none of which the shell needs in order to
 # appear. Paying for them here made every launch wait for subsystems the user
@@ -64,6 +68,7 @@ from .gui import (
 # Defined beside the window it configures, not here — see its docstring.
 from .gui.core_window import unified_shell_enabled
 from . import background
+from . import startup_resources as _startup_resources
 from .dynamic_loader import ReflectiveModuleLoader
 from .dependencies import DynamicPackageResolver
 from .sandbox import SandboxVerificationHarness
@@ -74,6 +79,56 @@ from .memory import MemoryAgent, OrionMemoryMatrix
 # deferred block in run_application. See tests/test_startup_imports.py.
 from .telemetry import Telemetry
 from .startup_budget import StartupBudget
+
+
+def _create_optional_remote_gateway(factory: Any, bus: Any, **kwargs: Any) -> Any | None:
+    """A corrupt optional uplink configuration must not abort desktop startup."""
+    try:
+        return factory(bus=bus, **kwargs)
+    except Exception as exc:
+        # Exception text may contain configured values. Report the failure
+        # class and the files to check, without logging credential contents.
+        try:
+            bus.log.emit(
+                f"REMOTE: phone access unavailable ({type(exc).__name__}). "
+                "Check remote configuration, remote_secret.key and remote_devices.json. "
+                "Desktop startup will continue.")
+        except Exception:
+            pass
+        return None
+
+
+def _install_optional_neural_planner(dispatcher: Any, router: Any, executor: Any,
+                                     memory: Any, bus: OrionBus, telemetry: Any) -> Any | None:
+    """Attach objective-only local planning when the owner enabled it.
+
+    Leave the normal boot path free of planner imports and feedback files. A
+    bad optional planner setup must not prevent ORION from starting.
+    """
+    switch = os.environ.get("ORION_NEURAL_PLANNER", "").strip().lower()
+    if switch in {"0", "false", "no", "off"}:
+        return None
+    if (switch not in {"1", "true", "yes", "on"}
+            and not (CONFIG_DIR / "neural" / "planner.json").is_file()):
+        return None
+    try:
+        from .neural_planner import NeuralPlanner, install_autoplan_route, planner_enabled
+        if not planner_enabled():
+            return None
+        from .neural_feedback import FeedbackStore
+        planner = NeuralPlanner(
+            router, executor, dispatch=dispatcher.dispatch, memory=memory,
+            bus=bus, telemetry=telemetry, feedback=FeedbackStore(),
+            declarations=lambda: dispatcher.TOOL_DECLARATIONS,
+        )
+        if not install_autoplan_route(dispatcher, planner):
+            return None
+        bus.log.emit("PLANNER: local objective planning enabled "
+                     f"({planner.settings.mode}, {planner.settings.scope}).")
+        return planner
+    except Exception as exc:
+        bus.log.emit(f"PLANNER: optional setup unavailable ({type(exc).__name__}).")
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -152,6 +207,277 @@ def _apply_unified_layout(
     bus.log.emit(
         f"DISPLAY: unified shell — face + Command Deck in one window "
         f"({monitors} monitor(s) detected; the second is left free).")
+
+
+def _start_in_tray() -> bool:
+    """`--tray` (the sign-in entry since Windows integration Phase 1): ORION's
+    core starts with his windows hidden - only the tray icon is on screen (the
+    docked Screen Face waits until he is asked for it: tray "Show Dock",
+    Preferences, or "show your dock") - and the windows are laid out the first
+    time he is summoned (hotkey, tray, dock, a link or a notification)."""
+    return "--tray" in sys.argv[1:]
+
+
+#: What ORION says when the owner unlocks the PC (greet_on_unlock).
+_WELCOME_BACK = ("Welcome back.", "Good to see you again.",
+                 "Welcome back. I'm here when you need me.")
+
+
+class _WindowsIntegration:
+    """The running Phase 1 pieces, stopped together at shutdown."""
+
+    def __init__(self) -> None:
+        self.shell: Any = None
+        self.presence: Any = None
+        self.dock: Any = None
+
+    def stop(self) -> None:
+        for part in (self.dock, self.presence, self.shell):
+            stop = getattr(part, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    pass
+
+
+def _start_windows_integration(bus: OrionBus, window: Any, worker: Any) -> _WindowsIntegration:
+    """ORION's places in Windows itself (Phase 1): orion:// links, Explorer's
+    "Ask ORION", taskbar jump-list tasks (windows_shell), and the global
+    hotkey, the docked Screen Face, notifications with buttons and lock /
+    sleep / busy awareness (windows_presence). Every part is a switch in
+    Preferences (windows_settings). Never raises: a part that cannot start
+    says so in the log and the rest carry on."""
+    import random
+
+    from . import background, windows_settings
+    from .constants import C
+    from .utils import first_line
+
+    parts = _WindowsIntegration()
+
+    def summon() -> None:
+        try:
+            pending = getattr(window, "_pending_layout", None)
+            if pending is not None:          # a --tray start: lay out once, now
+                window._pending_layout = None
+                pending()
+            else:
+                if window.isMinimized():
+                    window.showNormal()
+                else:
+                    window.show()
+                window.raise_()
+                window.activateWindow()
+            if getattr(window, "_overlay_active", False):
+                window.exit_overlay_mode()
+        except Exception as exc:
+            bus.log.emit(f"WINDOWS: could not bring ORION forward - {first_line(exc)}")
+
+    window._summon = summon      # the tray's Show uses it too (system_tray.show_window)
+
+    def set_form(form: str) -> None:
+        window.set_face_form(form)
+        window._sync_form_menu()
+
+    # ── the docked Screen Face: only when asked for ──────────────────────────
+    # It is NOT on screen at start (windows_settings "dock_on_startup" is off by
+    # default) and, until somebody asks, it is not even built - a hidden dock
+    # would still own a face render thread. It is asked for by the tray's Show
+    # Dock, the "Show Dock at Startup" switch in Preferences (next start), or
+    # "show your dock" (interface_control -> window._dock_control).
+    def make_dock() -> Any:
+        if parts.dock is not None:
+            return parts.dock
+        presence = parts.presence
+        if presence is None:
+            return None
+        dock = presence.make_dock(
+            on_activate=summon, on_show=summon, on_face_form=set_form,
+            # "Hide Dock" in its own menu also means: not at the next start.
+            on_hide=lambda: windows_settings.set_value("dock_on_startup", False))
+        dock.connect_bus(bus)
+        parts.dock = dock
+        return dock
+
+    def dock_visible() -> bool:
+        return bool(getattr(parts.dock, "wanted", False))
+
+    def dock_control(show: bool | None = None) -> bool:
+        """Show (True), hide (False) or toggle (None) the docked Screen Face.
+        Returns whether it is now wanted on screen. Never raises. Asking for the
+        dock is asking for it: a "dock_enabled" that had been switched off is
+        switched back on."""
+        try:
+            if show is None:
+                show = not dock_visible()
+            if not show:
+                if parts.dock is not None:
+                    parts.dock.hide_dock()
+                return False
+            if not windows_settings.get("dock_enabled"):
+                windows_settings.set_value("dock_enabled", True)
+            dock = make_dock()
+            if dock is None:
+                bus.log.emit("WINDOWS: the dock is unavailable (notifications and "
+                             "presence did not start).")
+                return False
+            dock.show_dock()
+            return True
+        except Exception as exc:
+            bus.log.emit(f"WINDOWS: the dock could not be shown - {first_line(exc)}")
+            return False
+
+    window._dock_control = dock_control          # the tray menu and "show your dock"
+    window._dock_visible = dock_visible
+
+    def on_command(cmd: dict) -> None:
+        """A command from a link, Explorer, the jump list or a second launch.
+        Already validated by windows_shell (allowlisted, typed, bounded)."""
+        action = cmd.get("action")
+        try:
+            if action == "show":
+                summon()
+            elif action == "page":
+                summon()
+                window._open_deck_page(cmd["page"])
+            elif action == "briefing":
+                window.run_morning_brief()
+            elif action in ("mute", "unmute"):
+                bus.voice_mute_request.emit(action == "mute")
+            elif action == "face":
+                set_form(cmd["form"])
+            elif action == "dock":
+                dock_control(cmd["state"] == "show")      # the jump list's Show Dock
+            elif action == "prefill":
+                # From a link anyone can make: filled in, never sent.
+                summon()
+                box = window.hud.command.input
+                box.setText(cmd["text"])
+                box.setFocus()
+            elif action == "toast":
+                if parts.presence is not None:
+                    parts.presence.toasts.handle_action(cmd["token"], cmd["verb"])
+            elif action == "ask_file":
+                summon()
+                window._hud_files_dropped([cmd["path"]])
+            elif action == "summarise":
+                summon()
+                background.spawn(worker.submit_text(f"Summarise {cmd['path']}"))
+            elif action == "organise":
+                summon()
+                background.spawn(worker.submit_text(
+                    f"Preview how you would organise the folder {cmd['path']}. "
+                    "Show me the plan only - don't move anything yet."))
+            elif action == "last_task":
+                summon()
+                window._open_deck_page("TASKS")
+        except Exception as exc:
+            bus.log.emit(f"WINDOWS: '{action}' could not be done - {first_line(exc)}")
+
+    try:
+        from . import windows_shell
+        parts.shell = windows_shell.start_windows_shell(bus, on_command)
+    except Exception as exc:
+        bus.log.emit(f"WINDOWS: links and Explorer menu unavailable - {first_line(exc)}")
+
+    paused_by_lock = {"on": False}
+
+    def on_session(event: str) -> None:
+        presence = parts.presence
+        try:
+            if event == "locked" and presence is not None and presence.pause_hearing_when_locked:
+                if getattr(worker, "microphone_enabled", False):
+                    worker.set_microphone_enabled(False)
+                    paused_by_lock["on"] = True
+                    bus.log.emit("WINDOWS: PC locked - listening paused.")
+            elif event in ("unlocked", "resumed"):
+                if paused_by_lock["on"]:
+                    paused_by_lock["on"] = False
+                    worker.set_microphone_enabled(True)
+                    bus.log.emit("WINDOWS: welcome back - listening again.")
+                if (event == "unlocked" and presence is not None
+                        and presence.greet_on_unlock and not presence.quiet()):
+                    bus.speak_request.emit(random.choice(_WELCOME_BACK))
+            elif event == "suspending":
+                bus.log.emit("WINDOWS: the PC is going to sleep.")
+        except Exception as exc:
+            bus.log.emit(f"WINDOWS: {event} handling failed - {first_line(exc)}")
+
+    def mic_toggle() -> None:
+        """Win+Alt+M: the microphone off or back on, from any window."""
+        on = not bool(getattr(worker, "microphone_enabled", True))
+        worker.set_microphone_enabled(on)
+        bus.banner.emit("Microphone on" if on else "Microphone muted", 3)
+        bus.log.emit(f"WINDOWS: microphone {'on' if on else 'muted'} (hotkey).")
+
+    try:
+        from . import windows_presence
+        parts.presence = windows_presence.start_windows_presence(
+            bus, on_hotkey=summon, on_session_event=on_session, on_mic_hotkey=mic_toggle,
+            palette=(C.PRI, C.ACCENT), refresh_identity=True)
+        tray = getattr(window, "_tray", None)
+        if tray is not None:
+            parts.presence.toasts.set_tray(tray)
+        if windows_settings.get("dock_enabled") and windows_settings.get("dock_on_startup"):
+            dock_control(True)       # off by default: the owner asks for the dock
+    except Exception as exc:
+        bus.log.emit(f"WINDOWS: hotkey / dock / notifications unavailable - {first_line(exc)}")
+
+    _toast_approvals(bus, parts, summon, window)
+
+    if getattr(sys, "frozen", False):
+        # The sign-in entry gains (or loses) --tray when that switch changes;
+        # ensure_current() repairs a stale entry without turning autostart on.
+        try:
+            from . import autostart
+            background.spawn(asyncio.to_thread(autostart.ensure_current))
+        except Exception:
+            pass
+    return parts
+
+
+def _toast_approvals(bus: OrionBus, parts: _WindowsIntegration, summon: Any, window: Any) -> None:
+    """A job that stops for the owner's go-ahead raises a Windows notification
+    with Review / Later buttons - so a plan waiting on a decision is noticed
+    even when ORION's windows are hidden. Review opens the Tasks page, where
+    the step is approved or declined; the notification itself never approves."""
+    from PyQt6.QtCore import QObject, pyqtSignal
+
+    presence = parts.presence
+    if presence is None:
+        return
+
+    class _Relay(QObject):
+        record = pyqtSignal(dict)        # job-store events arrive on any thread
+
+    relay = _Relay()
+    seen: set[str] = set()
+
+    def on_record(record: dict) -> None:
+        job_id = str(record.get("id") or "")
+        if record.get("state") != "waiting_for_approval" or not job_id or job_id in seen:
+            return
+        seen.add(job_id)
+
+        def on_action(verb: str) -> None:
+            if verb == "review":
+                summon()
+                window._open_deck_page("TASKS")
+
+        presence.toasts.show(
+            "ORION needs your go-ahead",
+            f"{record.get('label') or 'A task'} is waiting for your approval.",
+            actions=[("Review", "review"), ("Later", "later")], on_action=on_action)
+
+    relay.record.connect(on_record)
+    window._approval_relay = relay       # held for the life of the window
+    try:
+        from .job_store import default_store
+        default_store().subscribe(lambda record: relay.record.emit(dict(record or {})))
+    except Exception as exc:
+        from .utils import first_line
+        bus.log.emit(f"WINDOWS: approval notifications unavailable - {first_line(exc)}")
 
 
 def _apply_startup_layout(
@@ -236,6 +562,8 @@ def _configured_provider_settings() -> "OrionProviderSettings | None":
     """The saved provider settings if any provider is usable, else None."""
     from .providers import read_provider_settings, write_provider_settings
     settings = read_provider_settings()
+    if getattr(settings, "configuration_error", ""):
+        return settings  # Retain damaged bytes; router reports degraded state.
     if any(profile.enabled and (profile.api_key or profile.base_url) for profile in settings.providers.values()):
         write_provider_settings(settings)
         return settings
@@ -243,22 +571,32 @@ def _configured_provider_settings() -> "OrionProviderSettings | None":
 
 
 def _settings_from_key(key: str) -> "OrionProviderSettings":
-    from .providers import (_default_provider_payload, _settings_from_payload,
-                            write_provider_settings)
-    settings = _settings_from_payload(_default_provider_payload(key))
-    write_provider_settings(settings)
-    return settings
+    from .providers import read_provider_settings, write_api_key
+    write_api_key(key)
+    return read_provider_settings()
+
+
+def _settings_for_offline_session() -> "OrionProviderSettings":
+    """Select local routing for this run without rewriting saved credentials."""
+    from .providers import read_provider_settings
+    os.environ["ORION_MODE"] = "offline"
+    return read_provider_settings()
 
 
 def ensure_provider_settings(window: Optional[QWidget] = None) -> "OrionProviderSettings":
     """Blocking form, for callers outside the event loop. Inside a coroutine
     use ``ensure_provider_settings_async``: a modal dialog's own loop nests
     inside the coroutine there."""
+    if os.getenv("ORION_MODE", "").strip().lower() == "offline":
+        return _settings_for_offline_session()
     settings = _configured_provider_settings()
     if settings is not None:
         return settings
     dialog = ApiKeyDialog(window)
-    if dialog.exec() != QDialog.DialogCode.Accepted:
+    result = dialog.exec()
+    if result == getattr(dialog, "OFFLINE_RESULT", 2):
+        return _settings_for_offline_session()
+    if result != QDialog.DialogCode.Accepted:
         raise SystemExit(0)
     return _settings_from_key(dialog.key())
 
@@ -272,18 +610,49 @@ async def ensure_provider_settings_async(window: Optional[QWidget] = None) -> "O
     being executed"): on every first run, before a key was saved, the stall
     detector and the metrics-history sampler started just before this died on
     the spot. ``open()`` is still modal to the window but returns at once.
+    Provider configuration reads and persistence also run off the GUI loop;
+    constructing, reading and dismissing the dialog stay on its owner thread.
     """
-    settings = _configured_provider_settings()
+    if os.getenv("ORION_MODE", "").strip().lower() == "offline":
+        return await asyncio.to_thread(_settings_for_offline_session)
+    settings = await asyncio.to_thread(_configured_provider_settings)
     if settings is not None:
         return settings
     dialog = ApiKeyDialog(window)
     answered: asyncio.Future[int] = asyncio.get_running_loop().create_future()
-    dialog.finished.connect(
-        lambda result: answered.done() or answered.set_result(int(result)))
-    dialog.open()
-    if await answered != QDialog.DialogCode.Accepted:
-        raise SystemExit(0)
-    return _settings_from_key(dialog.key())
+    def finished(result: int) -> None:
+        if not answered.done():
+            answered.set_result(int(result))
+
+    dialog.finished.connect(finished)
+    try:
+        dialog.open()
+        result = await answered
+        if result == getattr(dialog, "OFFLINE_RESULT", 2):
+            return await asyncio.to_thread(_settings_for_offline_session)
+        if result != QDialog.DialogCode.Accepted:
+            raise SystemExit(0)
+    except asyncio.CancelledError:
+        # A parented modal dialog otherwise survives its cancelled boot task.
+        try:
+            dialog.reject()
+        except RuntimeError:  # its Qt parent may already have been destroyed
+            pass
+        raise
+    finally:
+        try:
+            dialog.finished.disconnect(finished)
+        except (TypeError, RuntimeError):
+            pass
+    key = dialog.key()
+    return await asyncio.to_thread(_settings_from_key, key)
+
+
+async def _load_remote_gateway_type() -> Any:
+    """Load the optional phone stack only when access is actually requested."""
+    import importlib
+    module = await asyncio.to_thread(importlib.import_module, ".remote", __package__)
+    return module.RemoteGateway
 
 
 def ensure_api_key(window: Optional[QWidget] = None) -> str:
@@ -294,6 +663,72 @@ def ensure_api_key(window: Optional[QWidget] = None) -> str:
 
 
 _shutdown_watchdog_armed = False
+
+# Timed-out teardown stays owned until it actually ends. Cancelling a task is
+# a request, not proof that a service has closed its devices or connections.
+_SHUTDOWN_TASKS: set[asyncio.Task] = set()
+
+
+async def _await_shutdown_phase(label: str, awaitable: Any, log: Any,
+                                timeout: float = 2.0, trace: Any = None) -> Any:
+    """Bound an asynchronous phase without awaiting cancellation forever.
+
+    wait_for waits for the target's cancellation to finish. A third-party
+    close that catches CancelledError therefore defeated its old deadline.
+    Keep strong ownership and observe any late outcome instead of calling
+    that an ordinary clean close. Cancellation of our caller still propagates.
+
+    With *trace* (the shutdown trace), the step being awaited is published
+    for the watchdog's report, and a step that hits its budget is recorded
+    as "gave up after X s" with where it was suspended, so last_shutdown.txt
+    names it rather than only the in-app log.
+    """
+    async def run() -> Any:
+        return await awaitable
+
+    task = asyncio.create_task(run(), name=f"shutdown: {label}")
+    _SHUTDOWN_TASKS.add(task)
+    if trace is not None:
+        trace.awaiting = task
+
+    def settled(done: asyncio.Task) -> None:
+        _SHUTDOWN_TASKS.discard(done)
+        if done.cancelled():
+            # Also covers cancellation before run() got its first turn.
+            if isinstance(awaitable, asyncio.Future):
+                awaitable.cancel()
+            elif asyncio.iscoroutine(awaitable):
+                awaitable.close()
+        elif (error := done.exception()) is not None:
+            log(f"SYS: {label} shutdown reported - {type(error).__name__}: {error}")
+
+    task.add_done_callback(settled)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=max(0.0, float(timeout)))
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    finally:
+        if trace is not None and trace.awaiting is task:
+            trace.awaiting = None
+    if done:
+        if task.cancelled():
+            return None
+        try:
+            return task.result()
+        except Exception:
+            return None                       # settled() reports it once
+    # Where it was stuck, taken before cancelling moves it.
+    where = trace.waiting_at(task) if trace is not None else ""
+    task.cancel()
+    _done, pending = await asyncio.wait({task}, timeout=0.1)
+    status = "still running after cancellation" if pending else "cancelled"
+    if trace is not None:
+        trace.note_gave_up(trace.current or label, timeout, where,
+                           still_running=bool(pending))
+    log(f"SYS: {label} gave up after {timeout:.1f} s - shutdown deadline reached; {status}"
+        + (f"; waiting at {where}" if where else "") + ".")
+    return None
 
 
 def _arm_shutdown_watchdog(grace: float = 25.0) -> None:
@@ -326,13 +761,19 @@ def _arm_shutdown_watchdog(grace: float = 25.0) -> None:
         # a thread that will not let the interpreter exit on its own. Say
         # WHICH step it was stuck in first: os._exit leaves no other trace.
         TRACE.write(CONFIG_DIR / "diagnostics" / "last_shutdown.txt", forced=True)
-        os._exit(0)
+        try:
+            from . import session_log
+            session_log.flush()
+        except Exception:
+            pass
+        _terminate_process(0)
 
     threading.Thread(target=_force_exit, name="orion-shutdown-watchdog",
                      daemon=True).start()
 
 
-async def _sample_metrics_history(telemetry: Any, period: float = 30.0) -> None:
+async def _sample_metrics_history(telemetry: Any, period: float = 30.0,
+                                  initialize_path: Path | None = None) -> None:
     """Record ORION's metrics history whether or not any page is on screen.
 
     The only desktop caller of ``tick_history()`` used to be the Command
@@ -343,12 +784,20 @@ async def _sample_metrics_history(telemetry: Any, period: float = 30.0) -> None:
     a history. ``tick_history`` is throttled internally (about once a minute)
     and writes one WAL row, so polling it here costs nothing noticeable.
     """
-    while True:
-        await asyncio.sleep(period)
-        try:
-            telemetry.tick_history()
-        except Exception:
-            pass          # a metrics write must never take the app down
+    try:
+        if initialize_path is not None:
+            await asyncio.to_thread(telemetry.enable_history, initialize_path)
+        while True:
+            await asyncio.sleep(period)
+            try:
+                await asyncio.to_thread(telemetry.tick_history)
+            except Exception:
+                pass          # a metrics write must never take the app down
+    finally:
+        if initialize_path is not None:
+            history = telemetry.detach_history()
+            if history is not None:
+                await asyncio.to_thread(history.close)
 
 
 def _release_portaudio_atexit() -> None:
@@ -374,7 +823,7 @@ def _release_portaudio_atexit() -> None:
         atexit.unregister(handler)
 
 
-async def _await_farewell(speech: Any, limit: float = 16.0) -> None:
+async def _await_farewell(speech: Any, limit: float = 8.0) -> None:
     """Let ORION actually FINISH saying goodbye before teardown continues.
 
     The previous version waited a flat 2.5 s, which cut him off mid-sentence
@@ -385,7 +834,10 @@ async def _await_farewell(speech: Any, limit: float = 16.0) -> None:
     still queued) and returns the moment it goes idle, so a short goodbye is
     still quick. `limit` is a hard ceiling so a wedged audio device can never
     hold shutdown open: the same bounded-wait guarantee as before, just
-    driven by the real end of speech rather than a guess.
+    driven by the real end of speech rather than a guess. 8 s (was 16): the
+    longest farewell line is about 4 s in the system voice, and since
+    SpeechQueueManager.say_goodbye nothing queued ahead of it or after it is
+    waited for, so only a wedged device can reach the ceiling.
 
     It AWAITS rather than pumping Qt. It used to call processEvents() in a
     time.sleep() loop, on the belief that the asyncio side had already stopped
@@ -397,6 +849,8 @@ async def _await_farewell(speech: Any, limit: float = 16.0) -> None:
     stays up until teardown returns (see _run_until_torn_down), so a plain
     await keeps Qt painting and every task stepping in turn.
     """
+    if bool(getattr(speech, "muted", False)):
+        return
     deadline = time.monotonic() + max(0.0, float(limit))
     # A brief grace period first: speak_text queues asynchronously, so
     # is_busy() can still read False for a moment after the call returns and
@@ -418,13 +872,39 @@ async def _await_farewell(speech: Any, limit: float = 16.0) -> None:
             return          # no usable pipeline — do not hold shutdown open
 
 
+def _close_shutdown_stores(stores: Any, log: Any) -> bool:
+    """Close thread-safe stores in order on one worker, attempting every close.
+
+    A timed-out native call remains in the executor. Its incomplete
+    result must not be followed by a checkpoint racing those same stores.
+    """
+    complete = True
+    for label, close in stores:
+        try:
+            close()
+        except Exception as exc:
+            complete = False
+            log(f"SYS: {label} shutdown reported - {exc}")
+    return complete
+
+
 def _take_off_screen(window: Any) -> None:
     """Hide every top-level window and the tray icon.
 
     Hidden, not closed: closing the core window emits request_shutdown again,
     and a closed widget can be deleted under teardown steps that still hold it.
     The tray goes first so no ghost icon outlives the process.
+
+    The page hosts (face, globe, Brain instruments) go before ORION's own
+    windows: hiding the core window only hid the embedded face along with it,
+    and when the process exited Qt un-embedded the face's window, which then
+    flashed up on its own until its process had quit (owner, 12 Oct 2026).
     """
+    try:
+        from .gui import page_host
+        page_host.shutdown_all()
+    except Exception:
+        pass
     tray = getattr(window, "_tray", None)
     if tray is not None:
         tray.hide()
@@ -432,6 +912,30 @@ def _take_off_screen(window: Any) -> None:
     if qapp is not None:
         for widget in qapp.topLevelWidgets():
             widget.hide()
+        # Nothing may come back on screen once ORION has said goodbye. The
+        # owner saw "his face screen pop up for a split second right after
+        # shutting down" (12 Oct) and no exit order reproduced it here, so
+        # any window shown from now on is hidden again AND named in the log.
+        if not hasattr(qapp, "_orion_stay_off_screen"):
+            qapp._orion_stay_off_screen = _StayOffScreen(qapp)
+            qapp.installEventFilter(qapp._orion_stay_off_screen)
+
+
+class _StayOffScreen(QObject):
+    """After shutdown has taken ORION off screen: hide any window that shows
+    again, and say which one it was."""
+
+    def eventFilter(self, obj: Any, event: Any) -> bool:  # noqa: N802 - Qt override
+        try:
+            if (event.type() == QEvent.Type.Show and isinstance(obj, QWidget)
+                    and obj.isWindow()):
+                from . import session_log
+                session_log.write(f"SYS: {type(obj).__name__} showed during shutdown - "
+                                  "hidden again.")
+                QTimer.singleShot(0, obj.hide)
+        except Exception:
+            pass
+        return False
 
 
 #: A boot phase slower than this is reported, always.  Startup was previously
@@ -510,11 +1014,45 @@ from .console_hygiene import QASYNC_STOPPED as _QASYNC_STOPPED  # noqa: E402
 from .console_hygiene import is_clean_shutdown  # noqa: E402,F401
 
 
+def _make_startup_memory(bus: OrionBus) -> MemoryAgent:
+    matrix = OrionMemoryMatrix(CORE_DB_PATH, CONFIG_DIR, bus)
+    try:
+        return MemoryAgent(matrix, bus)
+    except BaseException:
+        matrix.close()
+        raise
+
+
+class _FirstShellPaint(QObject):
+    """Observe the core shell's first Paint dispatch on its Qt owner thread.
+
+    Showing a widget or yielding asyncio does not prove it received a paint.
+    This records the actual event, independently of GPU or face readiness.
+    """
+    def __init__(self, window: QWidget, budget: StartupBudget) -> None:
+        super().__init__(window)
+        self._window, self._budget = window, budget
+        self._seen = False
+        window.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self._window and event.type() == QEvent.Type.Paint and not self._seen:
+            self._seen = True
+            self._window.removeEventFilter(self)
+            self._budget.milestone("first_paint")
+        return False
+
+
+@_startup_resources.startup_lifetime
 async def run_application(app: QApplication, *, started_at: float | None = None) -> bool:
     """Runs ORION until shutdown; returns True when a self-restart was asked."""
     _boot_t0 = time.perf_counter() if started_at is None else started_at
     budget = StartupBudget(target_seconds=5.0, started_at=_boot_t0)
     budget.mark("launcher + imports + Qt")
+    # The microphone and the model become ready inside the audio engine and
+    # the Live worker; they report readiness through this, not a parameter.
+    from . import startup_budget as _startup_budget
+    _startup_budget.set_current(budget)
     # ── observability + memory before windows ───────────────────────────────
     bus       = OrionBus()
     # The budget carries the bus so _boot_phase can name a slow phase in the
@@ -524,13 +1062,12 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     for component in ("live_worker", "audio", "dispatcher", "vision", "control",
                       "proactive", "self_repair", "workspace"):
         telemetry.health.register(component)
-    matrix = OrionMemoryMatrix(CORE_DB_PATH, CONFIG_DIR, bus)
-    memory = MemoryAgent(matrix, bus)
+    memory = await _startup_resources.construct_startup_resource(_make_startup_memory, bus)
+    matrix = memory.matrix
     # Meaning-based recall (semantic.py): the sentence-embedding model loads
     # in a worker thread once start-up has settled, then everything already
     # remembered is embedded. Until then — and on a machine without the
     # model — recall runs on words exactly as before.
-    import threading as _sem_threading
     from . import semantic as _semantic
 
     #: Stores indexed once the encoder is warm, filled in as they are built.
@@ -558,11 +1095,16 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         from . import tool_resolver as _tool_resolver
         _tool_resolver.warm_semantic()
 
-    _sem_timer = _sem_threading.Timer(
-        25.0, lambda: _semantic.warm_in_background(on_ready=_semantic_ready,
-                                                   log=bus.log.emit))
-    _sem_timer.daemon = True
-    _sem_timer.start()
+    # Not on a blind 25 s timer: building the encoder freezes every Python
+    # thread for a moment (1184 ms on 12 Oct, mid-answer, and the microphone
+    # dropped audio), so it waits for a quiet moment - ORION not mid-turn or
+    # speaking, and the user not talking (ADMISSION hears their words).
+    from .admission import ADMISSION as _sem_admission
+    _sem_conversation = _semantic.ConversationQuiet()
+    bus.state.connect(_sem_conversation.note_state)
+    _semantic.warm_when_quiet(
+        lambda: _sem_conversation.quiet() and not _sem_admission.foreground_active(),
+        on_ready=_semantic_ready, log=bus.log.emit)
     # C2: opt-in change journal for desktop⇄cloud memory continuity. Off by
     # default until the /v1/sync replicator lands (an append-only log needs a
     # consumer before it earns its keep); ORION_SYNC_JOURNAL=1 turns it on.
@@ -575,10 +1117,12 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     await _boot_phase(budget, "observability + memory")
 
     window = OrionCoreWindow(bus, memory)
-    window.show()
+    window._startup_paint_observer = _FirstShellPaint(window, budget)
+    if not _start_in_tray():
+        window.show()
 
     toggle = HolographicToggle(window)
-    toggle.move(28, 28)
+    toggle.dock()          # bottom-left: (28, 28) sat on the header's wordmark
     toggle.show()
 
     # System-tray presence (Mark XXII): ORION stays resident in the notification
@@ -603,21 +1147,26 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         except Exception:
             pass
 
-    # BOOT: hand the event loop a beat so Qt PAINTS the window now, before the
-    # ~350 lines of service construction below run — the shell appears in a
-    # fraction of the time instead of after everything is wired.
+    # Give Qt a scheduling opportunity before loading the later services.
+    # Only the shell's Paint event observer records first_paint readiness.
     await asyncio.sleep(0)
     budget.mark("core window visible")
     telemetry.metrics.gauge("startup.window_visible_seconds", budget.total)
 
+    # Give the native audio enumerator and Python import worker the whole
+    # deferred-service interval as a head start, before those imports ask for
+    # their dependencies on the Qt thread.
+    from .lazy_import import warm as _warm_imports
+    _warm_imports(log=lambda msg: bus.log.emit(f"BOOT: {msg}"))
+
     from .providers import OrionProviderSettings, ProviderRouter  # noqa: F401
     # ── deferred service imports ────────────────────────────────────────────
-    # The shell is on screen and painted; everything below is needed only to
+    # The shell has been shown; everything below is needed only to
     # build the services that follow, so it is imported HERE rather than at
     # module level. Python caches modules, so this costs the same total work —
     # what changes is that the user is looking at ORION while it happens
     # instead of at nothing. Keep these together and keep them after the
-    # paint: moving any one of them back to the header silently restores the
+    # yield: moving any one of them back to the header silently restores the
     # cost this block exists to defer (tests/test_startup_imports.py guards it).
     from .briefing import MorningBriefingService
     from .control import AutonomousControlLayer
@@ -640,6 +1189,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     from .knowledge_graph import KnowledgeGraphEngine
     from .learning import LearningService
     from .reporting import ProactiveReportingService
+    await asyncio.sleep(_BOOT_YIELD_S)
     from .gui.cursor_overlay import CursorOverlay
     from .gui.diagnostics_centre import DiagnosticsCentreView
     from .gui.entrepreneur import EntrepreneurDeck
@@ -673,7 +1223,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     from .notion import NotionService
     from .outlook import OutlookService
     from .proactive import ProactiveIntelligence
-    from .remote import RemoteGateway
+    await asyncio.sleep(_BOOT_YIELD_S)
     from .selfrepair import SelfRepairAgent
     from .connectivity import ConnectivityMonitor
     from .local_models import OllamaManager, AIModeInfo
@@ -699,31 +1249,33 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     from .pattern_detector import WorkflowPatternDetector
     from .gaming import GamingClientService
     from .entertainment import EntertainmentService
+    await asyncio.sleep(_BOOT_YIELD_S)
 
-
-    # The window exists; now pull the heavy third-party imports in on a daemon
-    # thread. google.genai alone is ~1.28 s and is imported lazily so it does
-    # not delay this moment — but it is first NEEDED inside connect(), which
-    # runs on the qasync loop, so warming it here is what stops that cost
-    # simply reappearing as a freeze. See orion_core/lazy_import.warm.
-    from .lazy_import import warm as _warm_imports
-    _warm_imports(log=lambda msg: bus.log.emit(f"BOOT: {msg}"))
-
-    # Historical telemetry opens/migrates SQLite. It is not required to paint
-    # the shell; wait off the GUI thread now that the window is visible. The
-    # in-memory metrics registry already collects the early startup timings.
-    await asyncio.to_thread(telemetry.enable_history, CONFIG_DIR / "metrics_history.db")
-    background.spawn(_sample_metrics_history(telemetry), name="orion-metrics-history")
-    await _boot_phase(budget, "telemetry history")
+    # Opening/migrating the optional history store must not delay commands or
+    # audio. In-memory metrics already collect the early startup timings.
+    background.spawn(_sample_metrics_history(telemetry, initialize_path=CONFIG_DIR / "metrics_history.db"),
+                     name="orion-metrics-history")
+    await _boot_phase(budget, "telemetry history scheduled")
 
     # Watch the event loop for stalls. Every lag bug in ORION's history was
     # something blocking this thread; the watchdog catches it live and names the
     # function, so "he stuttered" becomes a measurement instead of a hunt.
     # Ask him via diagnostics(action='latency'). ORION_STALL_WATCH=0 disables.
+    # Mark XXXV W1.1: every block over ORION_STALL_LOG_MS (100 ms) reaches
+    # session.log as a PERF: line with its final length and the ORION frame;
+    # the window log still shows only the ones of 250 ms and over.
     if os.getenv("ORION_STALL_WATCH", "1").strip().lower() not in {"0", "false", "off", "no"}:
-        from .latency import DETECTOR as _stall_detector
-        _stall_detector.on_stall = lambda s: bus.log.emit(
-            f"PERF: event loop blocked {s.ms:.0f} ms by {s.culprit()}")
+        from . import session_log as _session_log
+        from .latency import (DETECTOR as _stall_detector, LOG_THRESHOLD_MS,
+                              StallReporter)
+        try:
+            _stall_detector.threshold_ms = max(
+                20.0, float(os.getenv("ORION_STALL_LOG_MS", "") or LOG_THRESHOLD_MS))
+        except ValueError:
+            _stall_detector.threshold_ms = LOG_THRESHOLD_MS
+        _stall_reporter = StallReporter(bus.log.emit, _session_log.write)
+        _stall_detector.on_stall = _stall_reporter.finished
+        _stall_detector.on_stall_progress = _stall_reporter.ongoing
         _stall_detector.start()
         window._stall_detector = _stall_detector      # keep it alive with the window
     bus.log.emit(f"BOOT: window visible at {time.perf_counter() - _boot_t0:.2f}s.")
@@ -734,7 +1286,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
 
     await _boot_phase(budget, "identity")
     # ── personality consistency engine: one persona across every channel ─────
-    identity = IdentityManager(bus, telemetry)
+    identity = await _startup_resources.construct_startup_resource(IdentityManager, bus, telemetry)
     identity.announce()
 
     await _boot_phase(budget, "identity announce")
@@ -757,6 +1309,20 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     await _boot_phase(budget, "connectivity + local models")
     # ── core services ────────────────────────────────────────────────────────
     router     = ProviderRouter(settings, bus, memory, connectivity=connectivity)
+    # The local brain (brain_mode.py) withholds every cloud model — Live,
+    # cloud text, vision and speech — BEFORE the worker can dial Live.
+    from . import brain_mode as _brain_mode
+    router.set_local_only(_brain_mode.effective_mode() == _brain_mode.LOCAL)
+    bus.log.emit(f"BRAIN: {_brain_mode.describe()}")
+    # Speech runs on a worker thread. Its connectivity check must read the
+    # monitor's cached result, never launch a blocking internet probe there.
+    from .voice_charon import shared_voice
+    shared_voice().attach(
+        online=lambda: (not router.local_only) and (
+            router.mode_override == "cloud" or
+            (router.mode_override != "offline" and connectivity.cached_online())),
+        log=bus.log.emit,
+    )
     # "No AI text provider available" should be something ORION tries to FIX.
     # If the user has Ollama installed but not running, this starts it and
     # registers a local model rather than simply reporting the dead end.
@@ -775,9 +1341,11 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     memory.fact_harvester = fact_harvester
     # Token-usage ledger (Section 6): records authoritative usage per text turn,
     # deduped by request id.  Degrades to a no-op if the DB can't be opened.
+    usage_ledger = None
     try:
         from .token_usage import TokenUsageLedger
-        router.attach_token_ledger(TokenUsageLedger())
+        usage_ledger = await _startup_resources.construct_startup_resource(TokenUsageLedger)
+        router.attach_token_ledger(usage_ledger)
     except Exception as exc:
         bus.log.emit(f"TELEMETRY: token ledger unavailable - {exc}")
     grabber    = VolatileScreenGrabber(bus)
@@ -805,7 +1373,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     await _boot_phase(budget, "knowledge base")
     # ── Mark IX autonomy stack ───────────────────────────────────────────────
     display   = DisplayTopologyManager(telemetry)
-    control   = AutonomousControlLayer(bus, display, telemetry, desktop)
+    control = await _startup_resources.construct_startup_resource(
+        AutonomousControlLayer, bus, display, telemetry, desktop)
     # Mark XXI, Track D7: one shared trace of every UI-targeting attempt,
     # built first so D1-D6's navigation-accuracy fixes could be measured
     # against real data rather than a feeling — also readable from
@@ -822,8 +1391,11 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # Fed by the dispatcher on every tool call; read by the proactive survey,
     # which offers to name any run of tools that keeps recurring.
     pattern_detector = WorkflowPatternDetector()
+    from .context_service import ContextService
+    context_service = ContextService(bus)
     proactive = ProactiveIntelligence(bus, outlook, notion, memory, telemetry, workspace,
-                                       pattern_detector=pattern_detector)
+                                       pattern_detector=pattern_detector,
+                                       context_service=context_service)
     bus.log.emit("SYS: " + display.summary())
 
     await _boot_phase(budget, "autonomy stack")
@@ -833,6 +1405,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # needs offline transcription in the first seconds of a session. Warmed in
     # the background; any earlier caller triggers the load itself.
     offline_stt = OfflineTranscriber(bus, telemetry, defer=True)
+    from . import listening_vocabulary as _listening
+    offline_stt.vocabulary_source = lambda: _listening.vocabulary(memory)
     from . import speech_offline as _speech_offline
     _speech_offline.SHARED = offline_stt     # one model per process, not one per caller
     conversation = ConversationMemoryEngine(bus, memory, router, telemetry)
@@ -887,7 +1461,11 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # ── Mark X.5: second brain + durable cognitive state ─────────────────────
     cognition = CognitiveStateManager(bus, memory, telemetry=telemetry)
     proactive.cognition = cognition
-    graph = KnowledgeGraphEngine(bus, memory, telemetry=telemetry)
+    # Finished/removed tasks must not be read out again (17 Oct 2026).
+    briefing.cognition = cognition
+    notion.cognition = cognition
+    graph = await _startup_resources.construct_startup_resource(
+        KnowledgeGraphEngine, bus, memory, telemetry=telemetry)
     _semantic_targets["graph"] = graph
     if sync_journal is not None:
         graph.journal = sync_journal          # C2: share the node's one journal
@@ -938,6 +1516,32 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     from .live_worker import GenAILiveWorker
     worker = GenAILiveWorker(settings, bus, memory, dispatcher, router, telemetry, local_brain)
     dispatcher.live_worker = worker    # for the live self-description (capabilities)
+    # The local agent: a local model choosing and using ORION's tools
+    # (local_agent.py). Cloud brain: tried before the rules when the cloud
+    # text path fails. Hybrid/local: answers first. Ollama is started and
+    # registered off the GUI thread when a mode that needs it is chosen.
+    from .local_agent import LocalAgent
+
+    async def _prepare_local_model() -> bool:
+        return bool(await asyncio.to_thread(ollama.recover, settings))
+
+    worker.local_agent = LocalAgent(router, dispatcher, bus=bus, telemetry=telemetry,
+                                    prepare=_prepare_local_model)
+    dispatcher.apply_brain_mode = worker.apply_brain_mode
+    if _brain_mode.effective_mode() in (_brain_mode.HYBRID, _brain_mode.LOCAL):
+        background.spawn(worker._prepare_local_brain(), name="orion-local-brain-prepare")
+    from . import conversation_recorder
+    conversation_recording = conversation_recorder.recorder()
+    def _recording_capture_allowed() -> bool:
+        from .push_to_talk import gate_allows_capture
+        return bool(worker.microphone_enabled and not worker.paused
+                    and not worker.standby_mode and not worker._standby
+                    and not worker.stop_event.is_set() and gate_allows_capture())
+    conversation_recording.set_capture_check(_recording_capture_allowed)
+    def _stop_conversation_recording() -> None:
+        background.spawn(conversation_recorder.handle(action="stop"),
+                         name="orion-stop-conversation-recording")
+    window.hud.attach_recorder(conversation_recording, _stop_conversation_recording)
     # Speaker gender recognition (#14): expose the worker's tracker to the tool
     # layer so "who was just talking?" can be answered.
     dispatcher.speaker_tracker = worker.speaker_tracker
@@ -947,9 +1551,26 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # compared against anything, and the only-my-voice gate cannot apply to
     # the path most conversations actually take.
     worker.voice_presence = voice_presence
+    voice_loop = asyncio.get_running_loop()
+
+    def voice_learning_event(message: str) -> None:
+        # Enrolment inference finishes on a worker; speech/control belongs
+        # to the application's event loop.
+        if not worker.stop_event.is_set() and not voice_loop.is_closed():
+            voice_loop.call_soon_threadsafe(worker._say, message)
+
+    dispatcher.voice_learning_event = voice_learning_event
+    from .voice_enrolment import turns as voice_turns
+
+    def voice_listener_changed(note: str) -> None:
+        if not voice_loop.is_closed():
+            voice_loop.call_soon_threadsafe(worker._on_listener_changed, note)
+
+    worker._voice_listener_callback = voice_listener_changed
+    voice_turns().add_listener(voice_listener_changed)
     # The HUD's mute button (and Ctrl+Shift+M) — the spoken "mute yourself"
     # reaches the same method from inside the worker.
-    bus.voice_mute_request.connect(worker.set_voice_muted)
+    bus.voice_mute_request.connect(worker.set_voice_muted, Qt.ConnectionType.QueuedConnection)
     if os.environ.get("ORION_START_MUTED", "").strip().lower() in {"1", "true", "yes", "on"}:
         # Start with the voice muted (a late-night launch, a demo, a check
         # run): replies arrive as text until "unmute" or the speaker button.
@@ -984,8 +1605,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     dispatcher.corpus = corpus
     web.router = router
     web.set_narrator(worker._say)          # ORION narrates browsing aloud
-    # Build the 50 MB knowledge corpus once (idempotent), off the event loop.
-    background.spawn(asyncio.to_thread(corpus.build, memory))
+    # The builder is usable now. Its optional first-run generation is queued
+    # after command readiness below, avoiding CPU/disk competition with Qt.
 
     await _boot_phase(budget, "research + mind expansion")
     # ── JARVIS layer: protocols, reminders, sentinel, presence ───────────────
@@ -1003,7 +1624,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     health = HealthModel(bus)
     emergency.health = health
     dispatcher.health_model = health
-    reminders = ReminderService(bus, telemetry)
+    reminders = await asyncio.to_thread(ReminderService, bus, telemetry)
     sentinel = SentinelAgent(bus, telemetry)
     presence = PresenceMonitor(bus, telemetry)
     dispatcher.protocols = protocols
@@ -1043,6 +1664,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     exporter = DocumentExporterService(bus, telemetry)
     cognitive_loop = CognitiveLoopManager(
         bus, memory, cognition, graph=graph, workspace=workspace, telemetry=telemetry,
+        context_service=context_service,
     )
     # Free-thinking stream: ORION's inner monologue on its own provider slot —
     # periodic reflections plus 'why I did that' decision commentary, surfaced
@@ -1070,12 +1692,28 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     dispatcher.reporting = reporting
     dispatcher.cognition = cognition
     dispatcher.cognitive_loop = cognitive_loop
+    dispatcher.context_service = context_service
     dispatcher.graph = graph
     dispatcher.companion = companion
     dispatcher.companion_agent = companion_agent
     dispatcher.executive = executive_mode
     # Momentum: turns tracked goals/tasks into decisive "ship this next" pressure.
     dispatcher.momentum = MomentumEngine(bus, memory, cognition, router=router, telemetry=telemetry)
+    # Personal goals (goals.py): one engine with the bus for the goals tool, the
+    # morning briefing and the idle at-risk nudges (a banner, never spoken).
+    # Built off the loop: it opens goals.db and imports the older goal records.
+    from . import goals as _goals
+    try:
+        goal_tracker = await asyncio.to_thread(
+            _goals.GoalsEngine, reminders=reminders, router=router,
+            companion=companion, cognition=cognition, bus=bus)
+    except Exception as exc:
+        goal_tracker = None       # the goals tool opens its own engine on first use
+        bus.log.emit(f"GOALS: not started at boot - {type(exc).__name__}: {str(exc)[:120]}")
+    else:
+        dispatcher.goal_tracker = goal_tracker
+        briefing.goal_tracker = goal_tracker
+        background.spawn(_goals.GoalNudges(goal_tracker, bus).run(), name="orion-goal-nudges")
 
     await _boot_phase(budget, "AI operating system layer")
     # ── Realistic-improvements batch ─────────────────────────────────────────
@@ -1090,7 +1728,20 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     )
     dispatcher.ingestion = ingestion
     _semantic_targets["library"] = ingestion
+    # One durable owner for plans, workflows and background tool jobs. Opening
+    # it marks whatever the last run left unfinished as INTERRUPTED — listed
+    # with the tasks and resumable, never replayed on its own.
+    from . import job_store as _job_store
+    _interrupted_jobs = _job_store.install_store(
+        _job_store.JobStore(_job_store.default_path()))
+    if _interrupted_jobs:
+        bus.log.emit(f"JOB: {len(_interrupted_jobs)} job(s) were interrupted by the last "
+                     "shutdown; they are listed with the tasks and can be resumed.")
+    _job_store.default_store().subscribe(
+        lambda record: bus.dashboard_event.emit("task", record))
     plan_executor = PlanExecutor(bus, dispatcher.dispatch, verifier, telemetry)  # (#3)
+    neural_planner = _install_optional_neural_planner(
+        dispatcher, router, plan_executor, memory, bus, telemetry)
     # Track B: long read-only work detaches from the conversation turn instead
     # of holding the microphone in PROCESSING until it finishes.  It routes
     # through dispatch_chain so a backgrounded tool behaves exactly as it would
@@ -1137,18 +1788,27 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # instead of being rediscovered; and repairs are aimed by diagnosis, which
     # lets a broken TEST be fixed rather than the module being rewritten
     # forever to satisfy it.
+    from .evolution import EvolutionStore
+    change_history = EvolutionStore(CONFIG_DIR / "self_improvement" / "evolution.sqlite3", memory)
     forge_lessons = ForgeLessonStore()
-    forge_brain = LlmForgeBrain(bus, router, lessons=forge_lessons)
+    forge_brain = LlmForgeBrain(bus, router, lessons=forge_lessons, history=change_history)
     forge = ForgeOrchestrationManager(
         bus,
         code_generator=forge_brain.generate,
         llm_fixer=forge_brain.fix,
         llm_repairer=forge_brain.repair,
         lessons=forge_lessons,
+        history=change_history,
     )
+    await _boot_phase(budget, "forge: engine objects")
     forge.dispatcher = dispatcher     # verified tools register live, no restart
     forge.repair = selfrepair         # failed sessions become visible incidents
     dispatcher.forge = forge
+    # Reviewed JV adapters use explicit native services; discovering them must
+    # never start microphones, polling, timers or cloud synchronisation.
+    from .jv_plugins import configure as configure_jv_plugins
+    configure_jv_plugins(bus=bus, router=router, dispatcher=dispatcher, memory=memory,
+                         loop=asyncio.get_running_loop())
     # The reviewed plugins bundled with this build go into the live plugin
     # folder first, so the reload below picks up the delivered versions.
     from .plugin_registry import seed_shipped
@@ -1156,12 +1816,10 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     if shipped:
         bus.log.emit(f"PLUGIN: installed {len(shipped)} bundled plugin(s) - "
                      f"{', '.join(shipped)}")
-    # Previously forged tools come back to life at startup (ADA parity) —
-    # in the background, so a slow import never delays the boot path.
-    background.spawn(forge.reload_persisted_tools(), name="orion-forge-reload")
     # Third-party plugins (config/custom_tools/*.plugin.json) — the
     # integration step plugin_manifest.py's own docstring calls for.  Reuses
     # forge's loader so a loaded plugin shows up in forge.health() too.
+    await _boot_phase(budget, "forge: shipped plugins")
     from .plugin_manifest import load_plugins
     from .plugin_registry import PluginRegistry
     plugins = PluginRegistry(bus, CONFIG_DIR / "custom_tools", telemetry)
@@ -1182,7 +1840,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # an on_event() handler), not only be called as tools. The bridge isolates
     # every handler — a faulting plugin is muted, never allowed to break ORION.
     from .plugin_events import PluginEventBridge
-    plugin_events = PluginEventBridge(bus=bus)
+    await _boot_phase(budget, "forge: plugin registry")
+    plugin_events = PluginEventBridge(bus=bus, registry=plugins)
     dispatcher.plugin_events = plugin_events
 
     # The boot roll-call. A silent boot is indistinguishable from a broken
@@ -1207,13 +1866,22 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
             bus.log.emit(f"MIND: could not be checked - {exc}")
 
     background.spawn(_check_local_mind(), name="orion-local-mind-check")
+    await _boot_phase(budget, "forge: events + local mind")
 
-    try:
-        from .startup_report import report
+    # The roll-call names the audio host APIs, and the first question put to
+    # sounddevice starts PortAudio: MEASURED 1.66 s, which the boot paid on
+    # this thread whenever the roll-call beat the import warm-up to it. It is
+    # only logging, so it runs beside the boot (bus signals are thread-safe).
+    async def _roll_call() -> None:
+        try:
+            from .startup_report import report
 
-        report(dispatcher, bus=bus)
-    except Exception as exc:
-        bus.log.emit(f"BOOT: roll-call skipped - {exc}")
+            await asyncio.to_thread(report, dispatcher, bus=bus)
+        except Exception as exc:
+            bus.log.emit(f"BOOT: roll-call skipped - {exc}")
+
+    background.spawn(_roll_call(), name="orion-roll-call")
+    await _boot_phase(budget, "forge: roll-call")
     # Scheduled plugins: a manifest may declare when it wants to run rather
     # than waiting to be called. The supervisor is created before the load so
     # a plugin can be handed to it the moment its manifest is parsed.
@@ -1228,9 +1896,13 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     except Exception as exc:
         bus.log.emit(f"VAULT: unavailable - {exc}")
         plugin_vault = None
-    scheduler = PluginScheduler(dispatcher, bus, vault=plugin_vault)
+    scheduler = PluginScheduler(dispatcher, bus, vault=plugin_vault, registry=plugins)
     dispatcher.plugin_scheduler = scheduler
     dispatcher.plugin_vault = plugin_vault
+
+    # The registry and live preference gates must exist before a persisted
+    # manifestless tool can be imported. A slow import remains in background.
+    background.spawn(forge.reload_persisted_tools(), name="orion-forge-reload")
 
     background.spawn(
         load_plugins(forge.loader, dispatcher, CONFIG_DIR / "custom_tools", bus,
@@ -1240,6 +1912,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     )
     background.spawn(scheduler.run(), name="orion-plugin-scheduler")
     improvement = ImprovementHeartbeat(bus, router, forge, telemetry, memory=memory)
+    # forge(action='review') runs this heartbeat's review on request.
+    dispatcher.improvement = improvement
     await _boot_phase(budget, "forge engine")
     # ── MCP host: connect ORION to Model Context Protocol servers (Gmail,
     # Google Calendar, filesystem, …) declared in config/mcp_servers.json.
@@ -1268,7 +1942,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
 
     # ── Living Memory: patch notes, learning intake, programming expertise ────
     changelog = Changelog()
-    change_tracker = SourceChangeTracker()              # file-level self-awareness (#15)
+    change_tracker = SourceChangeTracker(history=change_history,
+        history_roots={"custom_tools": CONFIG_DIR / "custom_tools"})
     learning = LearningService(bus, memory, router, telemetry)
     programming = ProgrammingKnowledgeBase(telemetry)   # seeded off the boot path below
     cyber = CyberKnowledgeBase(telemetry)               # seeded off the boot path below
@@ -1320,14 +1995,34 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # remaining a blind persona-only prompt while the real capability sat
     # unused behind the separate, rarer `reason` tool.
     agents.attach_toolbelt_factory(lambda: reasoning.toolbelt(BUDGETS[ReasoningTier.STANDARD]))
+    # Autonomous specialist runs (agents.SpecialistRun): the real dispatcher
+    # for their pinned instruments and gated acts, a read-only tray sized to
+    # each playbook's step budget, and the crash trigger. Reliability looks
+    # into a recorded crash in the background, read-only, at most once per
+    # session, and only after the last boot phase below has been marked.
+    from dataclasses import replace as _sized_budget
+    from .agents import SpecialistTriggers
+    agents.attach_dispatch(dispatcher.dispatch)
+    agents.attach_specialist_tray(lambda lookups: reasoning.toolbelt(_sized_budget(
+        BUDGETS[ReasoningTier.STANDARD], lookups=max(1, int(lookups)))))
+    specialist_triggers = SpecialistTriggers(
+        bus, agents, jobs,
+        ready=lambda: any(phase.name == "services + background tasks"
+                          for phase in budget.phases))
+    specialist_triggers.install()
     # Track D: exhaustive option-space search. Given the reasoning engine, its
     # final recommendation gets a panel and a red team rather than one prompt.
     strategy = StrategyEngine(bus, router, reasoning=reasoning, telemetry=telemetry)
-    skills = SkillManager(bus, memory=memory, telemetry=telemetry)
+    skills = await _startup_resources.construct_startup_resource(
+        SkillManager, bus, memory=memory, telemetry=telemetry)
+    router.skills = skills
     workflow_engine = WorkflowEngine(
         bus, dispatcher=dispatcher, cognition=cognition, telemetry=telemetry,
     )
     automation = AutomationManager(workflow_engine)
+    # Scheduled workflows ("run morning_check every weekday at 7:30"): the first
+    # check is 90 s from now, after boot, and runs wait for a quiet moment.
+    automation.start_scheduler()
     creator_intel = CreatorIntelSuite(
         bus, router=router, memory=memory, telemetry=telemetry,
     )
@@ -1361,10 +2056,13 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         GestureEngine(
             bus, peripherals, desktop.media_control,
             frame_source=face_tracker.latest_frame if face_tracker is not None else None,
+            frame_source_active=face_tracker.is_capturing if face_tracker is not None else None,
+            pointer_action=control.gesture_pointer,
         )
         if GestureEngine.available else None
     )
     dispatcher.gestures = gestures
+    window.attach_orb_controls(gestures, face_tracker)
     # Let on-demand camera analysis BORROW the tracker's live frame instead of
     # opening a second handle on the same webcam (Windows refuses that with the
     # -1072873821 MSMF grab failure).  Harmless when the tracker is idle: it
@@ -1420,14 +2118,27 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         rules=vision_rules,
         camera=face_tracker,
         on_workflow=workflow_engine.start,
+        context_service=context_service,
     )
     dispatcher.perception = perception
+    recorder = getattr(worker, "scene_recorder", None)
+    if recorder is not None:
+        perception.scene_recorder = recorder
+        recorder.detector = perception.objects
+        recorder.ocr = getattr(vision, "ocr_engine", None)
     live_camera.attach_perception(perception)
     # The language→action network (intent_brain): built off the loop, and late
-    # enough not to compete with start-up — seeding it the first time is ~2 s
-    # of CPU, and it is not needed until the first tool call has happened.
+    # enough not to compete with start-up — seeding it the first time is ~5 s
+    # of CPU (later starts load it in ~0.3 s), and it is not needed until the
+    # first tool call has happened.
     import threading as _threading
     from . import intent_brain as _intent_brain
+    # Its trainer stands aside mid-conversation, by the same test the meaning
+    # model's start uses: the probe was written (16 Oct, after it re-learned
+    # straight through the greeting and briefing beside four 106-250 ms loop
+    # blocks and a microphone overflow) but never handed over until now.
+    _intent_brain.set_quiet_probe(
+        lambda: _sem_conversation.quiet() and not _sem_admission.foreground_active())
     _intent_timer = _threading.Timer(20.0, _intent_brain.warm)
     _intent_timer.daemon = True
     _intent_timer.start()
@@ -1469,7 +2180,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         ("desktop", desktop, "OS-level app/window/cursor control", ()),
         ("outlook", outlook, "email read/summarise/draft", ()),
         ("notion", notion, "tasks, scheduling, calendar, project tracking", ()),
-        ("agents", agents, "the six specialist agents + toolbelt-driven investigation", ("router",)),
+        ("agents", agents, "the nine specialist agents + toolbelt-driven investigation", ("router",)),
         ("control", control, "verified autonomous desktop control", ("desktop", "telemetry")),
         ("proactive", proactive, "unprompted email/deadline/calendar surfacing", ("outlook", "notion", "memory", "telemetry")),
         ("companion", companion, "continuity ledger — goals, habits, achievements", ("memory", "cognition")),
@@ -1553,24 +2264,46 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # Chromium subprocesses and a GL context, and nothing touches it between
     # here and the user opening the page. Built on first navigation instead.
     from .gui.globe import GlobeView
+    globe_views: list[Any] = []
     def globe() -> Any:                 # town-accurate geocoding on the globe
-        return GlobeView(bus, geo=geo)
+        # Cesium in its own process (Mark XXXV W1.2, gui/page_host.py):
+        # ORION_GLOBE_PROCESS=0 keeps it in this one.
+        view = GlobeView(bus, geo=geo, remote=True)
+        # The page's route form runs the same geo action=route as "show me
+        # the route from Leeds to London" (it draws via dashboard_event).
+        view.route_handler = lambda origin, destination: dispatcher.dispatch(
+            "geo", {"action": "route", "query": destination, "from": origin})
+        globe_views.append(view)
+        return view
     toolkit = EntrepreneurDeck(bus, memory, reminders=reminders, protocols=protocols)
     # Mark XXXI: the STUDIO page is gone. It drew two file counts, a text log
     # and a kanban nobody used; the audio studio, literature intake and agency
     # pipeline behind it are all still live and reachable by voice.
     await _boot_phase(budget, "deck: toolkit")
-    diagnostics_centre = DiagnosticsCentreView(bus, telemetry, dispatcher, worker)
-    library_deck = LibraryDeckView(bus, engine=ingestion)
+    # DEFERRED, like the globe: these pages hold no event history of their
+    # own. MEASURED on a warm boot at ~0.37 s (diagnostics) and ~0.33 s
+    # (library) of the Qt thread before anyone had opened either. The status
+    # strip starts from the bus's last-known state (OrionBus.last_value), so a
+    # page opened late still shows the live connection, not "OFFLINE".
+    def diagnostics_centre() -> Any:
+        # Mark XXXVIII: one page for the machine's health - the checks, and the
+        # live load graphs that used to be a Telemetry page of their own.
+        from .gui.deck_tabs import DeckTabs
+        return DeckTabs([("Health", lambda: DiagnosticsCentreView(bus, telemetry, dispatcher, worker)),
+                         ("Load", telemetry_view)])
+    await _boot_phase(budget, "deck: diagnostics centre")
+    def library_deck() -> Any:
+        return LibraryDeckView(bus, engine=ingestion)
+    await _boot_phase(budget, "deck: library")
     # The plugin ecosystem's visible face — enable/disable, health and
     # scaffolding, backed by the SAME registry the 'plugin' tool uses so the
     # two paths can never disagree.
     from .gui.plugin_deck import PluginDeckView
-    plugin_deck = PluginDeckView(bus, plugins)
+    def plugin_deck() -> Any:
+        return PluginDeckView(bus, plugins)
     await _boot_phase(budget, "deck: diagnostics + library + plugins")
-    # LOG/MEMORY/TELEMETRY used to live on the Core Window; that window is
-    # face-only now, so these three become ordinary deck pages like every
-    # other view here.
+    # LOG and MEMORY are ordinary deck pages; the telemetry graphs are the
+    # Load tab of the Diagnostics page (Mark XXXVIII).
     log_view = LogConsoleView(bus)
     memory_view = MemoryMatrixView(memory)
     telemetry_view = TelemetryView(bus)
@@ -1619,7 +2352,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     from .gui.automation_deck import AutomationDeckView
     from .gui.development_deck import DevelopmentDeckView
     automation_deck = AutomationDeckView(bus, workflow_engine, dispatcher=dispatcher)
-    development_deck = DevelopmentDeckView(bus, dispatcher=dispatcher)
+    def development_deck() -> Any:     # DEFERRED — no bus state of its own
+        return DevelopmentDeckView(bus, dispatcher=dispatcher)
     await _boot_phase(budget, "deck: automation + development")
 
     # Mark XX design-spec §6: each specialist gets a real professional
@@ -1636,8 +2370,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # page and note of a run is shown as it happens.
     from .gui.agent_workspace import AgentWorkspaceView
     from .gui.research_console import ResearchConsole
-    agent_workspaces = {
-        "MARKETING": AgentWorkspaceView(
+    agent_workspaces = {       # DEFERRED — built when the page is opened
+        "MARKETING": lambda: AgentWorkspaceView(
             bus, agents, "marketing", "Digital Marketing Agent", (
                 "Draft a launch campaign", "Improve this ad copy",
                 "Suggest a content calendar", "Analyse this funnel")),
@@ -1652,6 +2386,9 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     swarm_view = CommandOverview(
         bus,
         on_open_page=lambda page: window._open_deck_page(str(page)),
+        # The Iris and Lanes drawn by a Brain host (Mark XXXV W1.2), started
+        # on the page's first opening; ORION_BRAIN_PROCESS=0 keeps them here.
+        remote_instruments=True,
     )
     dispatcher.swarm_view = swarm_view   # Track B5: pulse() on every tool call
     # Keep the point-cloud fallback only when the separate face needs it.
@@ -1683,21 +2420,59 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         dispatcher.study = StudyEngine(generate=dispatcher._study_generator())
     if getattr(dispatcher, "focus", None) is None:
         dispatcher.focus = FocusEngine()
-    cognition_deck = CognitionDeckView(bus, study=dispatcher.study, focus=dispatcher.focus)
+    # TASKS: the durable job store's view — plans, workflows, background jobs,
+    # approvals. Deferred; it reads the store when opened, so nothing is lost.
+    from .gui.tasks_view import TasksView
+    def tasks_view() -> Any:
+        return TasksView(bus, jobs=dispatcher.jobs, dispatcher=dispatcher, router=router)
+    def cognition_deck() -> Any:       # DEFERRED — the engines above are live
+        # Mark XXXVIII: Cognition and the Toolkit were two pages with a focus
+        # timer each; now one Toolkit page - the business tools, and focus and
+        # study beside them (built the first time that tab opens).
+        from .gui.deck_tabs import DeckTabs
+        return DeckTabs([("Tools", toolkit),
+                         ("Focus", lambda: CognitionDeckView(bus, study=dispatcher.study,
+                                                             focus=dispatcher.focus))])
+    def goals_deck() -> Any:
+        from .gui.goals_deck import GoalsDeckView
+        return GoalsDeckView(bus, dispatcher)
+    def home_deck() -> Any:            # DEFERRED - reads the house when opened
+        from .gui.home_deck import HomeDeckView
+        return HomeDeckView(bus, dispatcher)
+    def neural_deck() -> Any:          # DEFERRED - Mark XXXX.4: his stats as graphs
+        from .gui.neural_stats import NeuralStatsView
+        return NeuralStatsView(bus, telemetry=telemetry, router=router)
+    # The owner's own day: the same reminder service, focus engine and goals
+    # the voice tools use, so the pages and the tools never disagree.
+    def calendar_deck() -> Any:
+        from .gui.calendar_deck import CalendarDeckView
+        return CalendarDeckView(bus, dispatcher)
+    def focus_deck() -> Any:
+        from .gui.focus_deck import FocusDeckView
+        return FocusDeckView(bus, dispatcher.focus, reminders=reminders)
+    def fitness_deck() -> Any:
+        from .gui.fitness_deck import FitnessDeckView
+        return FitnessDeckView(bus, dispatcher)
     await _boot_phase(budget, "deck: cognition")
 
     deck = UnifiedDashboard(bus, [
         ("BRAIN", swarm_view),
+        ("NEURAL", neural_deck),
         ("WORKBENCH", electronics_workbench),
         ("MISSION", mission_deck),
         ("RESEARCH", research_console),
         ("DEVELOPMENT", development_deck),
         ("WIDGETS", dashboard),
-        ("TOOLKIT", toolkit),
         ("MARKETING", agent_workspaces["MARKETING"]),
         ("LIBRARY", library_deck),
         ("OPS", ops_deck),
+        ("TASKS", tasks_view),
         ("COGNITION", cognition_deck),
+        ("CALENDAR", calendar_deck),
+        ("FOCUS", focus_deck),
+        ("FITNESS", fitness_deck),
+        ("GOALS", goals_deck),
+        ("HOME", home_deck),
         ("AUTOMATION", automation_deck),
         ("COMMAND CENTRE", command_centre),
         ("PLUGINS", plugin_deck),
@@ -1705,7 +2480,6 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         ("GLOBE", globe),
         ("LOG", log_view),
         ("MEMORY", memory_view),
-        ("TELEMETRY", telemetry_view),
         ("CHESS", chess_view),
         ("SECURITY", security_centre),
     ])
@@ -1727,10 +2501,50 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
             health_model=health,
         )
     deck.attach_status_provider(_op_status)
+    # Voice reaching the globe. The GlobeView is built on first open, and it
+    # connects globe_request / globe_zoom / globe_max_zoom in its own
+    # constructor - so until somebody had opened the page by hand, "take me to
+    # Tokyo" was emitted to nobody while ORION said he was taking you there,
+    # and even afterwards the globe was never brought on screen. Each request
+    # now puts the page up; if that is what built the view, the request is
+    # handed to it (a slot connected during an emission is not called for it).
+    # Mark XXXV W1.1: decided at emission, done on the next loop turn, so
+    # building the globe (its page host, or Chromium here: 275-512 ms) and
+    # raising the deck no longer run inside the tool's task. Whether the view
+    # existed is captured NOW: a view built after this emission never got it
+    # through its own connection, so it is replayed - even when two requests
+    # arrive before the first deferred open has run.
+    def _globe_on_screen(replay: Any) -> None:
+        from PyQt6.QtCore import QTimer
+        existed = bool(globe_views)
+        QTimer.singleShot(0, lambda: _globe_open(existed, replay))
+
+    def _globe_open(existed: bool, replay: Any) -> None:
+        try:
+            window._open_deck_page("globe")
+        except Exception as exc:
+            bus.log.emit(f"GLOBE: could not open the page - {exc}")
+            return
+        if not existed and globe_views:
+            try:
+                replay(globe_views[-1])
+            except Exception as exc:
+                bus.log.emit(f"GLOBE: request not handed over - {exc}")
+    bus.globe_request.connect(lambda place: _globe_on_screen(lambda view: view.go_to_place(place)))
+    bus.globe_zoom.connect(lambda direction: _globe_on_screen(lambda view: view.zoom(direction)))
+    bus.globe_max_zoom.connect(
+        lambda options: _globe_on_screen(lambda view: view.on_max_zoom_request(options)))
+    bus.dashboard_event.connect(
+        lambda channel, payload: _globe_on_screen(lambda view: view.apply_overlay(payload))
+        if channel == "globe_overlay" else None)
+    bus.dashboard_event.connect(
+        lambda channel, payload: _globe_on_screen(lambda view: view.show_route(payload))
+        if channel == "globe_route" else None)
     # Voice-triggered scans land on the same visible camera/report surface as
     # the Capture button, including when the deck was previously hidden.
     bus.electronics_scan_started.connect(
-        lambda _payload: window._toggle_deck_page("WORKBENCH", "Electronics workbench"))
+        lambda _payload: window._toggle_deck_page("WORKBENCH", "Electronics workbench"),
+        Qt.ConnectionType.QueuedConnection)
     deck.setStyleSheet(window.styleSheet())
     # So interface_control can tell a real page from a misheard one BEFORE it
     # reports success. Without these it emitted onto the bus and said "done"
@@ -1778,7 +2592,13 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     window.attach_command_centre(deck)
     # Mark X.5 dual-screen startup: core window on monitor 0, deck on
     # monitor 1 (or docked as a workspace panel on single-monitor hosts).
-    _apply_startup_layout(window, deck, display, bus)
+    if _start_in_tray():
+        # Signed in: the core runs, the windows wait until he is summoned.
+        window._pending_layout = lambda: _apply_startup_layout(window, deck, display, bus)
+        bus.log.emit("WINDOWS: started in the tray - use the hotkey or the tray icon "
+                     "to open ORION (tray menu: Show Dock puts his face on the screen edge).")
+    else:
+        _apply_startup_layout(window, deck, display, bus)
 
     # The avatar controller takes over the face rig (cross-fades, lip
     # envelope, breathing, blink, head follow) on a 20 Hz behaviour tick.
@@ -1786,6 +2606,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
 
     window.attach_worker(worker)
     worker.companion_agent = companion_agent   # passive "working on X" observer
+    windows_integration = _start_windows_integration(bus, window, worker)
 
     # ── real commands, real health (brief §20, §23) ───────────────────────────
     # The Command Palette used to only ever prefill a text box.  Every entry
@@ -1793,6 +2614,7 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # result comes back to the UI as an event rather than by touching widgets.
     TRACES.attach_bus(bus)
     background.attach_bus(bus)   # background failures become visible, not silent
+    await _boot_phase(budget, "deck window")
     command_router = CommandRouter(
         bus, dispatcher=dispatcher, protocols=protocols, health=health,
         recovery=worker.recovery, worker=worker, deck=deck)
@@ -1819,6 +2641,8 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     window.attach_log_view(log_view)
     window.attach_environment_panel(ops_deck.environment_panel)
     memory_view.refresh()
+    await _boot_phase(budget, "command router + memory view")
+    budget.milestone("command_ready")
     telemetry_view.attach_env_refresh(
         lambda: background.spawn(ops_deck.environment_panel.refresh_environment_widgets())
     )
@@ -1833,40 +2657,59 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # separately (server.py) — that is its whole reason to exist.
     gateway: RemoteGateway | None = None
     if os.getenv("ORION_REMOTE_ACCESS", "0").strip().lower() in {"1", "true", "yes", "on"}:
-        gateway = RemoteGateway(
-            router, memory, bus,
+        RemoteGateway = await _load_remote_gateway_type()
+        gateway = _create_optional_remote_gateway(
+            RemoteGateway, bus, router=router, memory=memory,
             identity=identity, local_brain=local_brain,
             conversation=conversation, telemetry=telemetry,
             dispatcher=dispatcher, knowledge=knowledge,
         )
-        try:
-            await gateway.start()
-            ops_deck.attach_gateway(gateway)   # Security Centre: QR pairing + devices
-        except Exception as exc:
-            gateway = None
-            bus.log.emit(f"REMOTE: uplink unavailable - {exc}")
+
+        # Started beside the boot rather than on it (MEASURED 582 ms): nothing
+        # needs the phone in the first seconds, and the window was waiting.
+        async def _start_phone_gateway(started: RemoteGateway) -> None:
+            nonlocal gateway
+            try:
+                await started.start()
+                ops_deck.attach_gateway(started)   # Security Centre: QR pairing + devices
+                security_centre.attach_gateway(started)
+            except Exception as exc:
+                if getattr(dispatcher, "gateway", None) is started:
+                    dispatcher.gateway = None
+                if gateway is started:
+                    gateway = None
+                bus.log.emit(f"REMOTE: uplink unavailable - {exc}")
+
+        if gateway is not None:
+            background.spawn(_start_phone_gateway(gateway), name="orion-phone-gateway")
 
     # "Turn on/off phone access" reads dispatcher.gateway and calls
     # dispatcher.start_remote_gateway; neither was ever set, so "phone off"
     # always answered "already off" (while the uplink was running) and
     # "phone on" always asked for a restart.
+    _remote_start_lock = asyncio.Lock()
+
     async def _start_remote_gateway() -> None:
         nonlocal gateway
-        if getattr(dispatcher, "gateway", None) is not None:
-            return
-        started = RemoteGateway(
-            router, memory, bus,
-            identity=identity, local_brain=local_brain,
-            conversation=conversation, telemetry=telemetry,
-            dispatcher=dispatcher, knowledge=knowledge,
-        )
-        await started.start()
-        ops_deck.attach_gateway(started)
-        gateway = dispatcher.gateway = started
+        async with _remote_start_lock:
+            if getattr(dispatcher, "gateway", None) is not None:
+                return
+            RemoteGateway = await _load_remote_gateway_type()
+            started = RemoteGateway(
+                router, memory, bus,
+                identity=identity, local_brain=local_brain,
+                conversation=conversation, telemetry=telemetry,
+                dispatcher=dispatcher, knowledge=knowledge,
+            )
+            await started.start()
+            ops_deck.attach_gateway(started)
+            security_centre.attach_gateway(started)
+            gateway = dispatcher.gateway = started
 
     dispatcher.gateway = gateway
     dispatcher.start_remote_gateway = _start_remote_gateway
 
+    await _boot_phase(budget, "phone gateway")
     shutdown_event = asyncio.Event()
     restart_requested = False
 
@@ -1880,6 +2723,11 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         # Mark X.6: ORION restarts himself — same clean teardown as shutdown,
         # then main() respawns the process once the loop has closed.
         nonlocal restart_requested
+        if not restart_requested:
+            # So the next process says "I'm back" instead of greeting as if
+            # it were a first launch (restart_note.py).
+            from . import restart_note
+            restart_note.remember()
         restart_requested = True
         request_shutdown()
 
@@ -1890,6 +2738,12 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # Self-healing runtime: capture faults on this loop and via sys.excepthook.
     loop = asyncio.get_running_loop()
     selfrepair.install(loop)
+    # Every "Cannot enter into task" - a Windows message pump inside a task,
+    # which leaves the other task dead - goes to the log with the task that
+    # pumped and its line; selfrepair still receives the fault afterwards.
+    # After selfrepair.install: an exception handler replaces, never chains.
+    from .latency import install_reentry_watch as _install_reentry_watch
+    _install_reentry_watch(loop, bus.log.emit)
     # Black-box crash recorder: writes plain-text reports to config/crash_reports
     # for the failures selfrepair can't see — Qt/WebEngine/GPU fatals and hard
     # C-level render-process crashes (the globe's usual culprits).  Installed
@@ -1906,19 +2760,78 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     from . import audio_devices as _audio_devices
     _audio_devices.log_startup(bus)
     # Fingerprint ORION's own source so he knows which of his files changed this
-    # update — reported by the self_changes tool (#15).
-    change_tracker.log_startup(bus)
+    # update — reported by the self_changes tool (#15). On a worker thread:
+    # MEASURED at 4.5 s of the Qt thread on a first launch (every file read
+    # and hashed), which is the face and the deck frozen for all of it.
+    background.spawn(asyncio.to_thread(change_tracker.log_startup, bus),
+                     name="orion-change-awareness")
+    # A standalone build older than its own project says so, instead of
+    # silently running without a week of fixes (3 Oct 2026).
+    from . import build_freshness as _build_freshness
+    background.spawn(asyncio.to_thread(_build_freshness.check, bus),
+                     name="orion-build-freshness")
 
     worker_task = asyncio.create_task(worker.run(), name="orion-live-worker")
+    # A restart the previous process asked for, a quick relaunch or an update:
+    # the startup turn says he is back instead of greeting and offering the
+    # briefing, or names the new Mark (restart_note.py). Off the loop: the
+    # read blocked it for 122 ms on a cold OneDrive file (27 Oct 2026 log).
+    from . import restart_note as _restart_note
+    try:
+        worker.restart_note = await asyncio.to_thread(_restart_note.take_return)
+    except Exception as exc:
+        from .utils import first_line as _first_line
+        worker.restart_note = None
+        bus.log.emit(f"SYS: restart note unreadable - {_first_line(exc)}")
     briefing_task = asyncio.create_task(
         worker.offer_startup_briefing(), name="orion-startup-briefing"
     )
     proactive_task = asyncio.create_task(proactive.run(), name="orion-proactive")
+    # Mark XXXIX: the Telegram remote (the jv_telegram_remote plugin, rebuilt).
+    # Off unless a bot token and an allow-list of chats are configured; each
+    # message is a remote turn through the phone gateway's own gate.
+    telegram_stop = asyncio.Event()
+
+    async def _telegram_answer(text: str, chat_id: str) -> str:
+        live = getattr(dispatcher, "gateway", None)
+        if live is None or not callable(getattr(live, "answer_text", None)):
+            return ("My remote gateway is switched off, so I can't act from here. "
+                    "Turn it on in the OPS page and ask again.")
+        return await live.answer_text(text, f"telegram:{chat_id}")
+
+    # Mark XXXX.3: approvals with buttons - the chat's own confirmations only.
+    def _telegram_pending(chat_id: str) -> list:
+        live = getattr(dispatcher, "gateway", None)
+        pending = getattr(live, "pending_for_channel", None)
+        return pending(f"telegram:{chat_id}") if callable(pending) else []
+
+    async def _telegram_decide(chat_id: str, conf_id: str, token: str, approve: bool) -> str:
+        live = getattr(dispatcher, "gateway", None)
+        decide = getattr(live, "decide_for_channel", None)
+        if not callable(decide):
+            return "My remote gateway is switched off, so nothing ran."
+        return await decide(f"telegram:{chat_id}", conf_id, token, approve)
+
+    try:
+        from .telegram_remote import TelegramRemote
+        telegram_remote = await asyncio.to_thread(
+            TelegramRemote.from_config, _telegram_answer, log=bus.log.emit,
+            pending=_telegram_pending, decide=_telegram_decide)
+    except Exception as exc:
+        from .utils import first_line as _first_line
+        telegram_remote = None
+        bus.log.emit(f"TELEGRAM: remote not started - {_first_line(exc)}")
+    if telegram_remote is not None:
+        background.spawn(telegram_remote.run(telegram_stop), name="orion-telegram-remote")
+    # Mark XXXX.4: the phone's activity record is kept for 90 days, not forever.
+    from . import phone_control as _phone_control
+    background.spawn(asyncio.to_thread(_phone_control.prune), name="orion-phone-activity-prune")
     connectivity_task = asyncio.create_task(connectivity.run(), name="orion-connectivity")
     # Mark XXVI: the learning-loop proactivity engine — volunteers a break-due
     # focus block or a review backlog aloud, gated by the shared speech policy.
     # Opt-in (ORION_PROACTIVE_ENGINE): off by default so runtime is unchanged.
     from .proactivity_engine import ProactivityEngine, engine_enabled as _proactive_engine_enabled
+    proactivity_engine_task: asyncio.Task | None = None
     if _proactive_engine_enabled():
         proactivity_engine = ProactivityEngine(
             bus, focus=getattr(dispatcher, "focus", None),
@@ -1962,6 +2875,9 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # decision, and a decision outranks a default.
     from .audio_follow import AudioFollower
     audio_follower = AudioFollower(bus=bus)
+    # Where the owner usually listens, so a display that IS his speakers is
+    # followed rather than refused (25 Oct 2026: "I can't hear you").
+    audio_follower.habit_path = CONFIG_DIR / "audio_output_habit.json"
     audio_task = asyncio.create_task(
         audio_follower.run(), name="orion-audio-follow")
     # Capture a workspace baseline so proactive change-tracking has a reference.
@@ -1973,9 +2889,27 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     # black (see resource_governor). Voice, face and the task are never shed.
     from . import resource_governor as _rg
     governor = _rg.ResourceGovernor(bus)
+    # Shared admission reads memory/CPU/GPU pressure from the governor, so
+    # background, training and interactive work are admitted by one policy.
+    from . import admission as _admission
+    _admission.ADMISSION.attach(governor=governor, metrics=telemetry.metrics, bus=bus)
+    governor.add_listener(_admission.ADMISSION.on_resources)
+    governor.add_listener(context_service.observe_resources)
     _rg.GOVERNOR = governor
+    # Model destruction runs off Qt; process-wide collection stays on its
+    # owning loop. The reaper retains the pressure limit after a busy attempt.
     governor.register("the idle speech-to-text model", _rg.Pressure.CONSTRAINED,
-                      lambda: offline_stt.release_if_idle(limit_s=60.0))
+                      lambda: offline_stt.release_if_idle_async())
+    # Mark XXXX.4: the offline voice (~350 MB) and the screen-text reader
+    # (~95 MB) only had their own idle timers, or none.
+    def _release_offline_voice():
+        from . import voice_kokoro
+        voice = voice_kokoro._SHARED
+        return voice.release() if voice is not None else False
+
+    governor.register("the idle offline voice", _rg.Pressure.CONSTRAINED, _release_offline_voice)
+    governor.register("the screen-text reader", _rg.Pressure.CONSTRAINED,
+                      lambda: ocr_engine.release())
     def _park_mcp_sooner():
         # Idle MCP servers normally pause after half an hour; short of memory,
         # after two minutes, starting now. Each restarts on its next call.
@@ -1985,6 +2919,21 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
     governor.register("idle MCP servers", _rg.Pressure.CONSTRAINED, _park_mcp_sooner,
                       lambda: mcp_host.set_pressure_parking(None))
     governor.register("self-review", _rg.Pressure.PRESSURED, lambda: None)
+    # The resident local model: a short keep-alive normally, unloaded once no
+    # request is using it when memory runs short (never mid-answer).
+    governor.register("the resident local model", _rg.Pressure.CONSTRAINED,
+                      lambda: router.relieve_memory_pressure("memory pressure"),
+                      lambda: router.set_memory_pressure(False))
+    if neural_planner is not None:
+        governor.register("local neural planner", _rg.Pressure.CONSTRAINED,
+                          neural_planner.shed)
+    async def _shed_context_sensing():
+        await perception.stop()
+        from .sound_watch import stop_if_running
+        await asyncio.to_thread(stop_if_running)
+
+    governor.register("optional camera and sound watching", _rg.Pressure.PRESSURED,
+                      _shed_context_sensing)
     governor.register("the Command Deck's 3-D pages while it is hidden",
                       _rg.Pressure.PRESSURED,
                       lambda: getattr(deck, "_release_heavy_pages", lambda: None)())
@@ -2046,17 +2995,41 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
             except Exception as exc:
                 bus.log.emit(f"KNOWLEDGE: {label} corpus seed deferred-fail - {exc}")
     background.spawn(_seed_corpora(), name="orion-seed-corpora")
+    # Typed commands are already available. This idempotent optional corpus
+    # may still be building; command readiness does not certify corpus readiness.
+    background.spawn(asyncio.to_thread(corpus.build, memory), name="orion-knowledge-corpus")
 
     budget.mark("services + background tasks")
     bus.log.emit(
         f"BOOT: all services constructed and background tasks launched at "
         f"{time.perf_counter() - _boot_t0:.2f}s.")
+    budget.apply_start_kind()       # Mark XXXX.3: warm starts held to 4 s, cold to 9 s
     bus.log.emit(budget.report())   # §5.1 per-phase startup budget
+    # Kept beside last_shutdown.txt: "the load-up feels slower" is otherwise
+    # a feeling, because the in-app log that carries this report is not saved.
+    _boot_ready_s = time.perf_counter() - (started_at or _boot_t0)
+    _boot_stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+
+    def _write_boot_report(*_args: Any) -> None:
+        try:
+            _boot_file = CONFIG_DIR / "diagnostics" / "last_boot.txt"
+            _boot_file.parent.mkdir(parents=True, exist_ok=True)
+            _boot_file.write_text(
+                f"{_boot_stamp}  process start to ready: {_boot_ready_s:.2f} s\n"
+                f"{budget.report()}\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    _write_boot_report()
+    # The microphone and the model usually become ready AFTER this report:
+    # rewrite it as each arrives, so the file answers "ready for what, when".
+    budget.on_milestone(_write_boot_report)
     telemetry.metrics.gauge("startup.total_seconds", budget.total)
     if budget.over_budget():
         telemetry.metrics.incr("startup.over_budget")
         bus.log.emit(f"BOOT: WARN - {budget.breach_summary()}")
 
+    _startup_resources.handoff_startup_resources()
     try:
         await shutdown_event.wait()
     finally:
@@ -2071,20 +3044,46 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         # the function always reaches its return.
         from .shutdown_trace import TRACE as _trace
 
-        def _safe(label: str, fn) -> None:
+        def _safe(label: str, fn, budget: float = 1.0) -> None:
+            # Synchronous: it cannot be interrupted, only measured and named.
+            began = time.monotonic()
             with _trace.phase(label):
                 try:
                     fn()
                 except Exception as exc:
                     bus.log.emit(f"SYS: {label} shutdown reported - {exc}")
+            took = time.monotonic() - began
+            if _trace.note_slow(label, took, budget):
+                bus.log.emit(f"SYS: {label} took {took:.1f} s at shutdown "
+                             f"(budget {budget:.1f} s; it cannot be interrupted).")
 
-        async def _safe_async(label: str, coro) -> None:
+        async def _safe_async(label: str, coro, timeout: float = 2.0) -> Any:
+            # Each step's own budget, cut to what is left of the teardown's
+            # deadline, so several slow steps cannot add up past the watchdog.
+            # Returns the step's result (None when it failed or gave up).
             with _trace.phase(label):
-                try:
-                    await coro
-                except Exception as exc:
-                    bus.log.emit(f"SYS: {label} shutdown reported - {exc}")
+                return await _await_shutdown_phase(label, coro, bus.log.emit,
+                                                   timeout=_trace.budget(timeout), trace=_trace)
 
+        def _left_behind(label: str, budget: float, what: Any) -> None:
+            # A drain bounds itself and says what it could not finish; that
+            # is "gave up" too, and the report should name what resisted.
+            if isinstance(what, int) and not isinstance(what, bool) and what > 0:
+                detail = f"{what} still running"
+            elif isinstance(what, (list, tuple, set)) and what:
+                detail = "still running: " + ", ".join(sorted(map(str, what))[:8])
+            else:
+                return
+            _trace.note_gave_up(label, budget, detail=detail)
+            bus.log.emit(f"SYS: {label} gave up after {budget:.1f} s - {detail}.")
+
+        # Budgets count from the request; begin() is idempotent (the watchdog
+        # normally called it already). The heartbeat records any stretch the
+        # event loop could not run, so the report can tell a step that is
+        # waiting from one during which the loop itself was blocked.
+        _trace.begin()
+        _heartbeat = asyncio.create_task(_trace.watch_loop(),
+                                         name="orion-shutdown-heartbeat")
         bus.state.emit("SHUTTING DOWN")
         # BEFORE the farewell. The farewell wait used to PUMP QT, and under
         # qasync pumping Qt from inside run_application() dispatches pending
@@ -2101,12 +3100,25 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         # wait awaits now and no longer pumps, but a repair must still not
         # START on the way out, so self-repair is disarmed first regardless.
         _safe("self-repair", selfrepair.shutdown)
+        await _safe_async("conversation recording", asyncio.to_thread(conversation_recording.close),
+                          timeout=3.5)
+        if neural_planner is not None:
+            _safe("neural planner", neural_planner.cancel)
         _safe("background tasks", background.cancel_all)
         # Cancelling only SCHEDULES cancellation. Awaiting the cancelled tasks
         # is what consumes their CancelledError and stops Python printing
         # "Task was destroyed but it is pending!" once per task at exit.
-        await _safe_async("self-repair drain", selfrepair.drain(timeout=3.0))
-        await _safe_async("background drain", background.drain(timeout=2.0))
+        _left_behind("self-repair drain", 3.0, await _safe_async(
+            "self-repair drain", selfrepair.drain(timeout=3.0), timeout=3.1))
+        _left_behind("background drain", 2.0, await _safe_async(
+            "background drain", background.drain(timeout=2.0), timeout=2.1))
+        from .jv_plugins import shutdown as shutdown_jv_plugins
+        await _safe_async("JV plugin sessions", shutdown_jv_plugins())
+        # Live jobs are recorded as interrupted (so they can be resumed next
+        # time) before they are cancelled; then no new work is admitted.
+        from . import jobs as _jobs_mod
+        await _safe_async("jobs", _jobs_mod.suspend_all(timeout=2.0), timeout=2.1)
+        _safe("admission", _admission.ADMISSION.close)
         # Mark XXI: a spoken farewell on EVERY shutdown path, not only the
         # voice-initiated one (live_worker.py already speaks its own before
         # this ever runs, and sets _farewell_spoken so this doesn't repeat
@@ -2114,9 +3126,19 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         # of a goodbye. Must run before worker.stop() (further below) tears
         # down self.speech — and is itself bounded so a wedged audio device
         # can never block shutdown.
+        # Every clean exit leaves a note for the next start: a quick return
+        # or an update is not a new day (restart_note.remember_exit).
+        from . import restart_note as _exit_note
+        _safe("exit note", lambda: _exit_note.remember_exit(
+            "restart" if restart_requested else "shutdown"))
         if not restart_requested and not getattr(worker, "_farewell_spoken", False):
             try:
-                worker.speech.speak_text(worker.compose_farewell())
+                # say_goodbye, not speak_text: it drops what was still queued
+                # (29 Oct: a security note queued 3 s before the quit held the
+                # goodbye to the 16 s ceiling) and never waits on the network.
+                goodbye = getattr(worker.speech, "say_goodbye", None)
+                (goodbye if callable(goodbye) else worker.speech.speak_text)(
+                    worker.compose_farewell())
             except Exception as exc:
                 bus.log.emit(f"SYS: farewell speech failed - {exc}")
             else:
@@ -2128,6 +3150,10 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         # frame sat there frozen until the interpreter finished exiting.
         _safe("off screen", lambda: _take_off_screen(window))
         _safe("proactive", proactive.stop)
+        _safe("telegram remote", telegram_stop.set)
+        _safe("context", context_service.close)
+        from . import sound_watch as _sound_watch
+        await _safe_async("sound watch", asyncio.to_thread(_sound_watch.stop_if_running))
         _safe("connectivity", connectivity.stop)
         _safe("reminders", reminders.stop)
         _safe("sentinel", sentinel.stop)
@@ -2139,48 +3165,75 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         _safe("cognitive loop", cognitive_loop.stop)
         _safe("reporting", reporting.stop)
         _safe("housekeeper", housekeeper.stop)
-        # One last fold before the process goes, so a clean exit always leaves
-        # a database that is complete on its own.
-        _safe("wal checkpoint", housekeeper.checkpoint_all)
+        # (The last WAL checkpoint is the final step below, once the stores
+        # ORION closes himself are closed.)
         _safe("improvement", improvement.stop)
         _safe("cursor overlay", cursor_overlay.stop)
         await _safe_async("electronics inspection", electronics_controller.shutdown())
         _safe("electronics camera", electronics_workbench.shutdown)
         await _safe_async("perception", perception.stop())   # release the frame loop before the camera
+        if gestures is not None:
+            _safe("hand gestures", gestures.stop)
         if face_tracker is not None:
             _safe("face tracker", face_tracker.stop)
         _safe("MCP supervisor", mcp_host.stop_supervising)
         await _safe_async("MCP host", mcp_host.close())
+        for view in globe_views:
+            _safe("Globe renderer", view.shutdown)
+        _safe("Brain instruments", swarm_view.shutdown)
+        # Only if this session ever loaded the feeds: importing world_feeds
+        # just to close it blocked the loop 0.51-0.54 s on EVERY shutdown in
+        # the owner's 25 Oct sessions ("PERF: ... from <module>() at
+        # world_feeds.py:17"), for feeds that had never been opened.
+        _world_feeds = sys.modules.get(f"{__package__}.world_feeds")
+        if _world_feeds is not None:
+            await _safe_async("world feeds", _world_feeds.shutdown_world_feeds())
         await _safe_async("browser co-pilot", web_copilot.close())          # #11 — release any driven browser
         await _safe_async("social automation", social.close())              # release any driven social-automation browser
-        await _safe_async("chess engine", asyncio.to_thread(chess_service.shutdown))   # quit the Stockfish subprocess
-        for task in (telemetry_task, diagnostics_task, briefing_task, proactive_task,
-                     connectivity_task, reminders_task, sentinel_task, presence_task,
-                     audio_studio_task, pipeline_task, security_task,
-                     cognitive_loop_task, thoughts_task, reporting_task, housekeeping_task,
-                     improvement_task):
+        await _safe_async("messaging browser", asyncio.to_thread(messaging.close), timeout=5.2)
+        await _safe_async("chess engine", chess_service.aclose())  # drain streams, workers and native engine
+        background_shutdown_tasks = (
+            telemetry_task, diagnostics_task, briefing_task, proactive_task,
+            connectivity_task, reminders_task, sentinel_task, presence_task,
+            audio_studio_task, pipeline_task, security_task, cognitive_loop_task,
+            thoughts_task, reporting_task, housekeeping_task, improvement_task,
+        ) + ((proactivity_engine_task,) if proactivity_engine_task is not None else ())
+        for task in background_shutdown_tasks:
             _safe(f"cancel {getattr(task, 'get_name', lambda: 'task')()}", task.cancel)
         _safe("thought stream", thoughts.stop)
-        await _safe_async("worker", worker.stop())
+        _safe("windows integration", lambda: windows_integration.stop())
+        await _safe_async("worker", worker.stop(), timeout=5.0)
         # The dispatcher's reference is current if phone access was turned
         # on or off by voice; stop() is idempotent, so stopping both is safe.
         for live_gateway in {id(g): g for g in (gateway, getattr(dispatcher, "gateway", None))
                              if g is not None}.values():
-            await _safe_async("remote gateway", live_gateway.stop())
+            # stop() bounds itself at RemoteGateway._STOP_TIMEOUT_S (2.0 s) plus
+            # a short cancel grace; with phones connected it MEASURED 0.02-0.09 s
+            # (0.25 s for a phone that stopped reading).
+            await _safe_async("remote gateway", live_gateway.stop(), timeout=2.5)
+            _trace.lingering.extend(
+                f"remote cleanup task: {task.get_name()}"
+                for task in getattr(live_gateway, "_shutdown_tasks", ())
+                if not task.done())
+        # Nothing asks the router for text after the worker and gateways are
+        # down. Free the local model's VRAM now rather than leaving it
+        # resident until Ollama's own timer expires, then close the pooled
+        # HTTP sessions so none is left for the loop's teardown to complain about.
+        await _safe_async("local model release", router.unload_local_models("shutdown"))
+        await _safe_async("provider router", router.aclose())
         worker_task.cancel()
         wal_task.cancel()
         audio_task.cancel()
         _safe("audio follower", audio_follower.stop)
-        for task in (wal_task, audio_task, telemetry_task, briefing_task, worker_task, proactive_task,
-                     connectivity_task, reminders_task, sentinel_task, presence_task,
-                     audio_studio_task, pipeline_task, security_task,
-                     cognitive_loop_task, thoughts_task, reporting_task, improvement_task):
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                bus.log.emit(f"SYS: shutdown task reported - {exc}")
+        draining = (wal_task, audio_task, worker_task, *background_shutdown_tasks)
+        await _safe_async("cancelled task drain",
+                          asyncio.gather(*draining, return_exceptions=True))
+        for task in draining:
+            if not task.done():
+                bus.log.emit(f"SYS: shutdown task still running: {task.get_name()}.")
+                _trace.lingering.append(f"async task: {task.get_name()}")
+            elif not task.cancelled() and (error := task.exception()) is not None:
+                bus.log.emit(f"SYS: shutdown task reported - {error}")
         # The bulk executor holds non-daemon worker threads. Nothing shut it
         # down, so concurrent.futures' atexit hook was left to join them — which
         # means a stuck bulk job (a large ingest, OCR over a folder) would hang
@@ -2188,14 +3241,46 @@ async def run_application(app: QApplication, *, started_at: float | None = None)
         # simply never wired in. wait=False: shutdown must not block on work.
         from .executors import shutdown_bulk_executor as _shutdown_bulk
         _safe("bulk executor", lambda: _shutdown_bulk(wait=False))
-        _safe("companion session", companion.end_session)
-        _safe("companion", companion.close)
-        _safe("evidence store", evidence.close)
-        _safe("knowledge graph", graph.close)
-        _safe("geo cache", geo.close)
+        # The intent network learns on its own threads; it must not be inside
+        # a numpy step when the process ends (every native-exit fault of
+        # 11-26 Oct 2026 had its feeder in learn_now at that moment).
+        from . import intent_brain as _intent_brain_stop
+        await _safe_async("intent learning", asyncio.to_thread(_intent_brain_stop.shutdown, 3.0),
+                          timeout=4.0)
+        stores = [
+            ("companion session", companion.end_session),
+            ("companion", companion.close),
+            ("evidence store", evidence.close),
+            ("knowledge graph", graph.close),
+            ("geo cache", geo.close),
+        ]
         if getattr(commerce, "signals", None) is not None:
-            _safe("commerce signals", commerce.signals.close)
-        _safe("memory", memory.close)
+            stores.append(("commerce signals", commerce.signals.close))
+        if neural_planner is not None:
+            stores.append(("neural feedback", neural_planner.feedback.close))
+        if usage_ledger is not None:
+            stores.append(("token usage", usage_ledger.close))
+        if getattr(dispatcher, "goal_tracker", None) is not None:
+            stores.append(("goals", dispatcher.goal_tracker.close))
+        stores.extend((("memory", memory.close), ("job store", _job_store.default_store().close)))
+        stores_closed = await _safe_async("data stores", asyncio.to_thread(
+            _close_shutdown_stores, stores, bus.log.emit), timeout=3.0)
+        # Last-ish by design: one fold of every store's write-ahead log after
+        # the stores above are closed, so a clean exit leaves each database
+        # complete on its own (config/ syncs .db and .db-wal as separate
+        # files). On a worker thread, as maintenance.py intends: it opens one
+        # connection per store, each of which may wait 5 s on a busy lock, and
+        # on the event-loop thread (where it ran until now) that was teardown
+        # frozen for as long, per store, beyond any budget.
+        if stores_closed:
+            await _safe_async("wal checkpoint",
+                              asyncio.to_thread(housekeeper.checkpoint_all), timeout=3.0)
+        else:
+            bus.log.emit("SYS: skipped final WAL checkpoint because store closes did not finish cleanly.")
+        _heartbeat.cancel()
+        await asyncio.gather(_heartbeat, return_exceptions=True)
+        _trace.lingering.extend(f"async task: {task.get_name()}"
+                                for task in _SHUTDOWN_TASKS if not task.done())
         _trace.write(CONFIG_DIR / "diagnostics" / "last_shutdown.txt")
     return restart_requested
 
@@ -2239,7 +3324,10 @@ def _note_lingering_threads() -> None:
         from .shutdown_trace import TRACE, lingering_threads
         if TRACE.started is None:
             return
-        TRACE.lingering = lingering_threads()
+        TRACE.lingering = list(dict.fromkeys(
+            [*TRACE.lingering, *lingering_threads(),
+             *(f"async task: {task.get_name()}" for task in _SHUTDOWN_TASKS
+               if not task.done())]))
         if TRACE.lingering:
             TRACE.write(CONFIG_DIR / "diagnostics" / "last_shutdown.txt")
     except Exception:
@@ -2312,8 +3400,42 @@ def _cap_web_heaps() -> None:
         f"{flags} --js-flags=--max-old-space-size={max(64, cap)}").strip()
 
 
+#: Chromium features switched off for ORION's own pages. Native window
+#: occlusion tracking stops a covered window producing frames and can present
+#: a blank (black) one when it is uncovered - the face flashing black in the
+#: Core Window while other windows moved over it.
+DISABLED_WEB_FEATURES = ("CalculateNativeWinOcclusion",)
+
+
+def _steady_web_surfaces() -> None:
+    """Add DISABLED_WEB_FEATURES to the Chromium flags, merged into any
+    --disable-features already there. Must run before the web engine starts.
+    ORION_WEB_OCCLUSION=1 leaves Chromium's default."""
+    if os.getenv("ORION_WEB_OCCLUSION", "").strip() == "1":
+        return
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+    wanted = list(DISABLED_WEB_FEATURES)
+    for index, flag in enumerate(flags):
+        if flag.startswith("--disable-features="):
+            have = [f for f in flag.split("=", 1)[1].split(",") if f]
+            flags[index] = "--disable-features=" + ",".join(
+                dict.fromkeys([*have, *wanted]))
+            break
+    else:
+        flags.append("--disable-features=" + ",".join(wanted))
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags)
+
+
 def main(*, started_at: float | None = None) -> None:
+    # An erase the owner approved runs before anything opens a store or a log
+    # (erase_all.py): a live database cannot be moved while it is open.
+    try:
+        from . import erase_all
+        erase_all.run_pending(log=lambda line: print(line, flush=True))
+    except Exception as exc:
+        print(f"PRIVACY: the approved erase could not run - {exc}", flush=True)
     _cap_web_heaps()
+    _steady_web_surfaces()
     # Before anything can log: keeps known-benign third-party chatter off the
     # console and in config/reports/console/ instead. Nothing is discarded.
     from . import console_hygiene
@@ -2356,6 +3478,9 @@ def main(*, started_at: float | None = None) -> None:
     app.setApplicationName(APP_NAME)
     # His face in the taskbar, Alt-Tab and title bars.
     desktop_app.apply_window_icon(app)
+    # Mark XXXV: headings across every page in sentence case, not shouted.
+    from .gui.humane import install_heading_voice
+    app._heading_voice = install_heading_voice(app)
 
     # Terminal Ctrl+C should stop ORION cleanly. When launched with `py orion.py`
     # from a console, the Qt/asyncio loop spends most of its time in C code, which
@@ -2461,8 +3586,69 @@ def main(*, started_at: float | None = None) -> None:
         # is ORION.exe too, so the old form launched him with his own path as
         # a positional argument.
         arguments = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
+        # Not the link, Explorer or jump-list request that started this run
+        # (it would be replayed), and not --tray: a restart he was asked for
+        # should come back on screen.
+        try:
+            from .windows_shell import strip_shell_args
+            arguments = [a for a in strip_shell_args(arguments) if a != "--tray"]
+        except Exception:
+            pass
         print("O.R.I.O.N. restarting…")
         subprocess.Popen([sys.executable] + arguments)
+    _exit_past_native_teardown()
+
+
+def _exit_past_native_teardown() -> None:
+    """End the installed app without the interpreter's native teardown.
+
+    25 Oct 2026, 12:05:09: "Clean shutdown after 0.9 s" - and then faulthandler
+    logged "Windows fatal exception: access violation" with no Python frame,
+    the watchdog still asleep: interpreter finalisation releasing COM pointers
+    after comtypes' own atexit CoUninitialize, and unloading Qt, WebEngine and
+    the onnxruntime DirectML DLLs (crash_reports: a native-exit on 11, 13, 14,
+    17, 18 and 21 Oct too). By this point the teardown has closed every data
+    store and checkpointed the WAL, so nothing is left for finalisation to do
+    but crash: the session log is flushed and the process ends here. Frozen
+    builds only; a source run still exits normally, so tests and tools that
+    import ORION keep ordinary interpreter semantics.
+    """
+    if not getattr(sys, "frozen", False) or os.getenv("ORION_NATIVE_TEARDOWN") == "1":
+        return
+    try:
+        from . import session_log
+        session_log.flush()
+    except Exception:
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:
+            pass
+    _terminate_process(0)
+
+
+def _terminate_process(code: int = 0) -> None:
+    """End this process now, running no library's unload code.
+
+    os._exit still calls ExitProcess, which kills the other threads where they
+    stand and then runs every DLL's unload routine - Qt, WebEngine, numpy's
+    BLAS, onnxruntime's DirectML - against state those threads left half-done.
+    That is where the native-exit access violations of 11-26 Oct 2026 came
+    from, even after the interpreter's own teardown was skipped.
+    TerminateProcess runs none of them. Only called once everything has been
+    saved, closed and flushed."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            kernel32.TerminateProcess(kernel32.GetCurrentProcess(), int(code))
+        except Exception:
+            pass
+    os._exit(code)
 
 
 if __name__ == "__main__":

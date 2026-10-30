@@ -1,0 +1,422 @@
+{
+  "files_checked": 499,
+  "syntax_errors": [],
+  "hardcoded_ipv4": [
+    {
+      "file": "android/app/src/main/java/com/orion/companion/Prefs.kt",
+      "line": 50,
+      "address": "192.168.1.5",
+      "kind": "private"
+    },
+    {
+      "file": "android/app/src/main/java/com/orion/companion/Prefs.kt",
+      "line": 50,
+      "address": "192.168.1.5",
+      "kind": "private"
+    },
+    {
+      "file": "deploy/configure_tailscale_firewall.ps1",
+      "line": 46,
+      "address": "100.64.0.0",
+      "kind": "CGNAT"
+    },
+    {
+      "file": "deploy/configure_tailscale_firewall.ps1",
+      "line": 62,
+      "address": "0.0.0.0",
+      "kind": "wildcard"
+    },
+    {
+      "file": "deploy/start_apk_download_tunnel.ps1",
+      "line": 36,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "deploy/start_apk_download_tunnel.ps1",
+      "line": 38,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "deploy/start_apk_download_tunnel.ps1",
+      "line": 48,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "deploy/start_orion.ps1",
+      "line": 15,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "deploy/start_quick_https_tunnel.ps1",
+      "line": 19,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "deploy/start_quick_https_tunnel.ps1",
+      "line": 20,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "deploy/start_quick_https_tunnel.ps1",
+      "line": 31,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "deploy/start_tailscale_remote.ps1",
+      "line": 50,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "deploy/start_tailscale_remote.ps1",
+      "line": 65,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/app.py",
+      "line": 790,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/authorized_targets.py",
+      "line": 11,
+      "address": "192.168.1.50",
+      "kind": "private"
+    },
+    {
+      "file": "orion_core/browser_copilot.py",
+      "line": 371,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/connectivity.py",
+      "line": 23,
+      "address": "1.1.1.1",
+      "kind": "public or example"
+    },
+    {
+      "file": "orion_core/connectivity.py",
+      "line": 24,
+      "address": "8.8.8.8",
+      "kind": "public or example"
+    },
+    {
+      "file": "orion_core/connectivity.py",
+      "line": 25,
+      "address": "208.67.222.222",
+      "kind": "public or example"
+    },
+    {
+      "file": "orion_core/cyber_curriculum.py",
+      "line": 375,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/cyber_curriculum.py",
+      "line": 375,
+      "address": "0.0.0.0",
+      "kind": "wildcard"
+    },
+    {
+      "file": "orion_core/cyber_teaching.py",
+      "line": 170,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/local_brain.py",
+      "line": 611,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/local_mind.py",
+      "line": 52,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/local_models.py",
+      "line": 11,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/local_models.py",
+      "line": 67,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/local_models.py",
+      "line": 76,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/mcp_network.py",
+      "line": 61,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/mcp_network.py",
+      "line": 61,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/neural_planner.py",
+      "line": 256,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/pentest_lab.py",
+      "line": 150,
+      "address": "0.0.0.0",
+      "kind": "wildcard"
+    },
+    {
+      "file": "orion_core/pentest_lab.py",
+      "line": 197,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/provider_diagnostics.py",
+      "line": 138,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/provider_transport.py",
+      "line": 24,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/provider_transport.py",
+      "line": 481,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/provider_transport.py",
+      "line": 481,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/providers.py",
+      "line": 326,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/providers.py",
+      "line": 326,
+      "address": "0.0.0.0",
+      "kind": "wildcard"
+    },
+    {
+      "file": "orion_core/providers.py",
+      "line": 3452,
+      "address": "0.0.0.0",
+      "kind": "wildcard"
+    },
+    {
+      "file": "orion_core/providers.py",
+      "line": 3489,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/providers.py",
+      "line": 3504,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 15,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1754,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1754,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1765,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1767,
+      "address": "0.0.0.0",
+      "kind": "wildcard"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1768,
+      "address": "0.0.0.0",
+      "kind": "wildcard"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1772,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1922,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1924,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1933,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1941,
+      "address": "100.64.0.0",
+      "kind": "CGNAT"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 1946,
+      "address": "100.64.0.0",
+      "kind": "CGNAT"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 2057,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 2242,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 2251,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 2260,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote.py",
+      "line": 3227,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/remote_endpoints.py",
+      "line": 102,
+      "address": "10.0.0.0",
+      "kind": "private"
+    },
+    {
+      "file": "orion_core/remote_endpoints.py",
+      "line": 102,
+      "address": "172.16.0.0",
+      "kind": "private"
+    },
+    {
+      "file": "orion_core/remote_endpoints.py",
+      "line": 102,
+      "address": "192.168.0.0",
+      "kind": "private"
+    },
+    {
+      "file": "orion_core/remote_endpoints.py",
+      "line": 120,
+      "address": "8.8.8.8",
+      "kind": "public or example"
+    },
+    {
+      "file": "orion_core/runtime_selection.py",
+      "line": 70,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/security_sentinel.py",
+      "line": 120,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/security_sentinel.py",
+      "line": 182,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/security_sentinel.py",
+      "line": 229,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/telephony_server.py",
+      "line": 201,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/telephony_server.py",
+      "line": 209,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    },
+    {
+      "file": "orion_core/telephony_server.py",
+      "line": 314,
+      "address": "127.0.0.1",
+      "kind": "loopback"
+    }
+  ],
+  "direct_blocking_calls_in_async_functions": [],
+  "scope": "Direct calls only; review indirect synchronous helpers separately. Package versions are not IP addresses."
+}

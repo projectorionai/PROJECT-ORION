@@ -84,6 +84,37 @@ def test_importing_vision_does_not_pull_in_opencv():
     assert out.stdout.strip() == "False", "importing orion_core.vision must not import cv2"
 
 
+def test_constructing_screen_grabber_does_not_import_capture_backend():
+    import subprocess
+    code = (
+        "import sys; from orion_core.vision import VolatileScreenGrabber; "
+        "VolatileScreenGrabber(None); print('mss' in sys.modules)"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False", "Startup must leave desktop capture uninitialized"
+
+
+def test_capture_backend_resolves_once_on_first_capture_worker(monkeypatch):
+    from types import SimpleNamespace
+    from orion_core import vision
+    from orion_core.lazy_import import LazyModule
+    calls = []
+    capture = object()
+    proxy = LazyModule("mss")
+    monkeypatch.setattr(vision, "mss", proxy)
+    def load(name):
+        assert name == "mss"
+        calls.append(name)
+        return SimpleNamespace(mss=lambda: capture)
+    monkeypatch.setattr("orion_core.lazy_import.importlib.import_module", load)
+    grabber = vision.VolatileScreenGrabber(None)
+    assert calls == [] and not proxy.loaded
+    assert grabber._grabber() is capture
+    assert grabber._grabber() is capture
+    assert calls == ["mss"] and proxy.loaded
+
+
 def test_importing_gesture_control_does_not_pull_in_mediapipe():
     import subprocess
     code = (

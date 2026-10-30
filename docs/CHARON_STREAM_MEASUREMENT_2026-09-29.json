@@ -1,0 +1,11 @@
+{
+  "model": "gemini-3.1-flash-tts-preview",
+  "first_audio_seconds": 1.139,
+  "stream_seconds": 2.064,
+  "audio_seconds": 3.4,
+  "chunks": 85,
+  "words_per_minute": 229,
+  "complete_wav_seconds": 2.784,
+  "wav_audio_seconds": 3.48,
+  "ok": true
+}

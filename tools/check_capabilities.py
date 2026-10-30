@@ -26,12 +26,36 @@ def inventory(root: Path, reference: dict) -> dict[str, list[str]]:
     for node in tree.body:
         if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "TOOL_DECLARATIONS":
             found["tools"] = [row["name"] for row in ast.literal_eval(node.value)]
+    # The lightweight presentation package supplies a second schema group.
+    # Read its literal specification without importing Qt or executing code.
+    if any(isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+           and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "extend"
+           and getattr(node.value.func.value, "id", "") == "TOOL_DECLARATIONS" for node in tree.body):
+        presentation = _tree(root, "orion_core/presentation.py")
+        for node in ast.walk(presentation):
+            if isinstance(node, ast.Assign) and any(getattr(target, "id", "") == "specs" for target in node.targets):
+                found["tools"].extend(key.value for key in node.value.keys if isinstance(key, ast.Constant))
+        if (root / "orion_core/planning_schema.py").is_file() and any(
+            isinstance(node, ast.ImportFrom) and node.module == "planning_schema" for node in tree.body
+        ):
+            planning = _tree(root, "orion_core/planning_schema.py")
+            for node in planning.body:
+                if isinstance(node, ast.FunctionDef) and node.name == "declarations":
+                    for child in ast.walk(node):
+                        if isinstance(child, ast.Return) and child.value is not None:
+                            found["tools"].extend(row["name"] for row in ast.literal_eval(child.value))
     for node in ast.walk(_tree(root, "orion_core/dispatcher.py")):
         if isinstance(node, ast.FunctionDef) and node.name == "handler_table":
             for child in ast.walk(node):
                 if isinstance(child, ast.Dict):
                     found["handlers"].extend(f"{key.value}:{value.attr}" for key, value in zip(child.keys, child.values)
                         if isinstance(key, ast.Constant) and isinstance(key.value, str) and isinstance(value, ast.Attribute))
+                    # Lambda-valued routes (find_tool, use_tool) are real handlers too.
+                    # They were once skipped, so the count read 143 against 145 keys;
+                    # they appear as "name:<lambda>" and, being absent from older
+                    # baselines, report as added — never masking a removal.
+                    found["handlers"].extend(f"{key.value}:<lambda>" for key, value in zip(child.keys, child.values)
+                        if isinstance(key, ast.Constant) and isinstance(key.value, str) and isinstance(value, ast.Lambda))
     for node in ast.walk(_tree(root, "orion_core/app.py")):
         if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "UnifiedDashboard":
             if len(node.args) > 1 and isinstance(node.args[1], (ast.List, ast.Tuple)):

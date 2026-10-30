@@ -24,6 +24,7 @@ import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .constants import CONFIG_DIR
 from .utils import utc_stamp
@@ -55,6 +56,36 @@ def _polarity(text: str) -> bool:
 
 def _numbers(text: str) -> set[str]:
     return set(re.findall(r"\d+(?:\.\d+)?", str(text or "")))
+
+
+def _source_identity(source: str, url: str) -> set[tuple[str, str]]:
+    """Known provenance keys; a renamed note cannot hide the same publisher."""
+    keys: set[tuple[str, str]] = set()
+    label = " ".join(str(source or "").casefold().split())
+    if label and label != "unknown":
+        keys.add(("source", label))
+    try:
+        parsed = urlsplit(str(url or ""))
+        if parsed.scheme.casefold() in {"http", "https"} and parsed.hostname:
+            host = parsed.hostname.casefold().rstrip(".").removeprefix("www.")
+            keys.add(("publisher", host))
+    except ValueError:
+        pass  # Malformed provenance is not evidence of independence.
+    return keys
+
+
+def _contributor_count(own: set[tuple[str, str]],
+                       peers: list[set[tuple[str, str]]]) -> int:
+    """Count source groups, joining aliases transitively and excluding our own."""
+    groups = [set(own)]
+    for keys in peers:
+        joined = set(keys)
+        matching = [group for group in groups if group & joined]
+        for group in matching:
+            joined.update(group)
+            groups.remove(group)
+        groups.append(joined)
+    return len(groups) - 1
 
 
 def score_confidence(claim: str, base: float = 0.6) -> float:
@@ -141,24 +172,44 @@ class EvidenceEngine:
         return claim_id
 
     def _corroborate_locked(self, topic: str, claim_id: int, claim: str) -> None:
-        """Same-polarity overlapping claims from other sources raise confidence."""
+        """Each agreeing known source contributes once, including across reopen."""
         mine = _tokens(claim)
         if not mine:
             return
-        polarity = _polarity(claim)
-        for row in self._db.execute(
-                "SELECT id, claim, confidence FROM claims WHERE topic=? AND id!=?",
-                (topic, claim_id)):
-            theirs = _tokens(row["claim"])
-            if not theirs:
-                continue
-            overlap = len(mine & theirs) / max(1, min(len(mine), len(theirs)))
-            if overlap >= _OVERLAP_THRESHOLD and _polarity(row["claim"]) == polarity \
-                    and not (_numbers(claim) and _numbers(row["claim"])
-                             and _numbers(claim) != _numbers(row["claim"])):
+        own = self._db.execute("SELECT source, url FROM claims WHERE id=?", (claim_id,)).fetchone()
+        identities = _source_identity(own["source"], own["url"])
+        if not identities:
+            return
+        polarity, numbers = _polarity(claim), _numbers(claim)
+        rows = list(self._db.execute(
+                "SELECT id, claim, confidence, source, url FROM claims WHERE topic=? AND id!=?",
+                (topic, claim_id)))
+        # Retained claims are the durable credit history. This avoids a new
+        # schema or rewriting old confidences whose original prior is unknown.
+        records = [(int(row["id"]), _source_identity(row["source"], row["url"]),
+                    _tokens(row["claim"]), _polarity(row["claim"]), _numbers(row["claim"]))
+                   for row in rows]
+        incoming = (claim_id, identities, mine, polarity, numbers)
+
+        def agrees(a, b):
+            return bool(a[2] and b[2]) and a[3] == b[3] \
+                and len(a[2] & b[2]) / min(len(a[2]), len(b[2])) >= _OVERLAP_THRESHOLD \
+                and not (a[4] and b[4] and a[4] != b[4])
+
+        matching = [row for row in records if row[1] and agrees(incoming, row)]
+        contributors = _contributor_count(identities, [row[1] for row in matching])
+        if contributors:
+            self._db.execute("UPDATE claims SET confidence=MIN(0.95, confidence+?) WHERE id=?",
+                             (0.1 * contributors, claim_id))
+        for row in matching:
+            peers = [other[1] for other in records
+                     if other[0] != row[0] and other[1] and agrees(row, other)]
+            before = _contributor_count(row[1], peers)
+            after = _contributor_count(row[1], [*peers, identities])
+            if after > before:
                 self._db.execute(
-                    "UPDATE claims SET confidence=MIN(0.95, confidence+0.1) "
-                    "WHERE id IN (?,?)", (claim_id, int(row["id"])))
+                    "UPDATE claims SET confidence=MIN(0.95, confidence+0.1) WHERE id=?",
+                    (row[0],))
 
     # ── reading ───────────────────────────────────────────────────────────────
 

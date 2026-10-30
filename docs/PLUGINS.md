@@ -1,5 +1,10 @@
 # Writing an ORION plugin
 
+Mark XXXIII includes `orion_latency_report` for supplied duration samples and
+`orion_batch_planner` for proposed task batches. Neither calls a model or runs
+the proposed actions. See [targeting, speed and customer Forge](DESKTOP_ACCURACY_AND_SPEED_2026-09-30.md)
+for limits and the contained customer candidate workflow.
+
 A **plugin** is Python code that adds a new tool to ORION at runtime — no restart,
 no editing `dispatcher.py`. (Contrast a **skill**, which is data only: prompts,
 templates, workflows.)
@@ -335,3 +340,25 @@ Tokens go under `telegram` / `discord` in `config/messaging.json`, or in
 `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN`. A dry run never becomes a real
 send: `delivery_suppressed()` is checked before either path, and it is true for
 the whole test suite.
+
+## Compare supplied record snapshots
+
+`orion_dataset_compare` compares two supplied flat JSON record lists by a unique
+key field (`id` by default). It returns exact added, removed, changed and
+unchanged row counts, field changes, and up to 20 examples per category. Examples
+contain IDs and field names; other cell values are omitted. It reads no files,
+calls no services and requires no credentials or extra packages.
+
+For example, comparing `[{"id":"a","status":"open"}]` with
+`[{"id":"a","status":"done"},{"id":"b","status":"open"}]` reports one
+changed row and one added row. Direct record arrays, JSON-encoded arrays and
+Gemini Live's JSON row strings are accepted. Row order is ignored; numeric `1`
+and `1.0` compare equally, booleans differ from numbers, and missing fields
+differ from explicit null. String and integer IDs remain distinct.
+
+Inputs are limited to 512 rows per snapshot, 32 distinct fields and 256 KiB of
+combined supplied/normalised JSON. Nested cells, duplicate/missing keys,
+nonfinite numbers and oversized input fail explicitly. The plugin compares
+supplied data only; a matching snapshot does not prove the underlying service
+or file state is current. This reviewed tool ships through the existing plugin
+manifest and publication allowlist; no schedule is created for it.

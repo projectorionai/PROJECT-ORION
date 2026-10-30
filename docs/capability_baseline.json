@@ -5,6 +5,8 @@
     "antivirus",
     "audio_devices",
     "audio_studio",
+    "conversation_recording",
+    "sing",
     "autoplan",
     "avatar",
     "awareness",
@@ -138,7 +140,8 @@
     "window_control",
     "workflow",
     "workflow_patterns",
-    "workspace_control"
+    "workspace_control",
+    "smart_home"
   ],
   "handlers": [
     "agent_dispatch:agent_dispatch",
@@ -146,6 +149,8 @@
     "antivirus:antivirus_tool",
     "audio_devices:audio_devices_tool",
     "audio_studio:audio_studio_tool",
+    "conversation_recording:conversation_recording_tool",
+    "sing:sing_tool",
     "autoplan:autoplan_tool",
     "avatar:avatar_tool",
     "awareness:awareness_tool",
@@ -234,7 +239,7 @@
     "proactive_check:proactive_check",
     "proactive_report:proactive_report_tool",
     "process_file:process_file",
-    "process_governor:process_governor",
+    "process_governor:process_governor_tool",
     "product_research:product_research",
     "programming_knowledge:programming_knowledge_tool",
     "protocol:protocol_tool",
@@ -244,7 +249,7 @@
     "recall_conversation:recall_conversation",
     "reminder:reminder_tool",
     "research:research_tool",
-    "resource_status:resource_status_tool",
+    "resource_status:resource_status_async",
     "restart_orion:restart_orion",
     "rewind:rewind_tool",
     "save_memory:save_memory",
@@ -280,13 +285,15 @@
     "window_control:window_control",
     "workflow:workflow_tool",
     "workflow_patterns:workflow_patterns_tool",
-    "workspace_control:workspace_control"
+    "workspace_control:workspace_control",
+    "smart_home:smart_home_tool"
   ],
   "pages": [
     "AUTOMATION",
     "BRAIN",
     "CHESS",
     "COGNITION",
+    "GOALS",
     "COMMAND CENTRE",
     "DEVELOPMENT",
     "DIAGNOSTICS",
@@ -300,10 +307,9 @@
     "PLUGINS",
     "RESEARCH",
     "SECURITY",
-    "TELEMETRY",
-    "TOOLKIT",
     "WIDGETS",
-    "WORKBENCH"
+    "WORKBENCH",
+    "HOME"
   ],
   "plugins": [
     "dependency_manager:dependency_manager_tool.py",

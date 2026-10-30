@@ -1,13 +1,66 @@
 # O.R.I.O.N.
 
-Latest source audit and plugin availability: [23 September release review](docs/RELEASE_REVIEW_2026-09-23.md).
+Current desktop release: [Mark XXXXI Ascendant 41.1.1](docs/MARK_XXXXI_RELEASE_2026-10-29.md).
+Previous desktop release: [Mark XXXX Aegis 40.8.0](docs/MARK_XXXX_RELEASE_2026-10-27.md).
+Earlier desktop release: [Mark XXXIX Sentinel 39.0.0](docs/MARK_XXXIX_RELEASE_2026-10-27.md).
+Earlier desktop release: [Mark XXXVIII Clean Deck 38.0.0](docs/MARK_XXXVIII_RELEASE_2026-10-27.md).
+Earlier desktop release: [Mark XXXVII Screen Face 37.5.0](docs/MARK_XXXVII_RELEASE_2026-10-24.md).
+Earlier performance release: [Mark XXXV performance refinement 35.0.2](docs/MARK_XXXV_PERFORMANCE_2026-10-15.md).
+Earlier reliability release: [Mark XXXV 35.0.0](docs/MARK_XXXV_RELEASE_2026-10-15.md).
+Earlier source audit: [Mark XXXIII audit](docs/MARK_XXXIII_AUDIT_2026-09-30.md).
+Earlier release and plugin review: [23 September release review](docs/RELEASE_REVIEW_2026-09-23.md).
 
 **Open Resolution Intelligence Overt Network** is a Python desktop assistant
 with a PyQt6 interface, voice interaction, persistent memory, desktop tools and
 a camera-based Vision Lab. It combines local services with optional cloud or
 locally hosted language and vision models.
 
-**Package version: 32.0.0 · Mark XXXII**
+**Package version: 41.1.1 · Mark XXXXI**
+
+## What changed in Mark XXXV
+
+- Research has durable run IDs, explicit status/history/open selection, restart
+  interruption records, and cancellation that retains late-written partial files.
+- Research programme queues advance from settled outcomes. Failed or empty
+  synthesis remains incomplete even when useful notes were saved.
+- Text fallback and reconnect context retain structured outcomes and exact paths.
+- Native window operations run off the event loop and verify OS state before
+  reporting success. Empty video evidence cannot establish completed analysis.
+- OCR reports unknown confidence honestly, and optional local OCR setup does not
+  silently download models. Capability health distinguishes dependency checks
+  from timestamped operation evidence.
+- Messaging preserves failed/partial outcomes; synchronous delivery runs on a
+  worker. Scheduled plugin vault values use owner-scoped access instead of
+  process-wide environment injection, with a documented helper migration.
+- Optional metrics database startup and sampling run outside the interface loop.
+
+The release guide records validation, boundaries and remaining work. Cloud
+accounts, physical devices and provider quality require their own acceptance
+checks; local regressions do not establish those results.
+
+## What changed in Mark XXXIII
+
+- A persistent FACE/ORB selection and one materialisation timeline; listening
+  amplitude no longer makes the avatar report that ORION is speaking.
+- Telemetry and Security posture scans run outside the Qt/asyncio thread.
+- Continuous reply playback, sentence prefetch and turn-level microphone
+  gating keep speech sections together without enabling echo between them.
+- Supplied JARVIS capabilities use ORION's plugin contract and native services.
+  Credentials, device permissions and online chess access remain explicit.
+- Obsolete tasks have durable removal records and exact-title Notion archival.
+- A reproducible chess calibration and guarded intent-training candidates
+  replace unqualified claims of strength or intelligence. See the audit for
+  the measurement conditions, results and limitations.
+- Official satellite predictions, earthquakes, tsunami bulletins and UK
+  weather warnings share a cached World service and read-only MCP. The Globe
+  renders on demand and suspends hidden-page work.
+- The phone has selectable cloud voices with normal phone speech as fallback,
+  and optional paired PC controls with a cancellable shutdown countdown.
+
+The wider Command Deck layout revisions await design approval. See the
+[World feed guide](docs/WORLD_FEEDS_MARK_XXXIII_2026-09-30.md) and
+[remote PC controls](docs/REMOTE_PC_POWER_MARK_XXXIII.md) for current coverage
+and configuration.
 
 Read the [current capabilities summary](docs/CAPABILITIES_2026-09-18.md) for
 implemented features, dependencies and practical limits. Older architecture
@@ -35,9 +88,9 @@ notes and roadmaps describe development history; they are not release guarantees
 - **Ten MCP servers** — filesystem, Playwright, memory, SQLite, git, Context7,
   MarkItDown and more — with GitHub, Home Assistant, Postgres and Google Drive
   ready for credentials. Anything that writes, pushes or spends asks first.
-- **Stronger chess.** About 2490 Elo against Stockfish's calibrated levels (up
-  from about 1725), with plain-language move explanations and keyboard and
-  voice navigation.
+- **Chess analysis.** Plain-language move explanations and keyboard and voice
+  navigation. Historical strength claims require their original match evidence;
+  the Mark XXXIII audit supplies a reproducible current calibration instead.
 
 ## What changed in Mark XXXI
 
@@ -92,6 +145,9 @@ provider. Local language-model features need a running compatible local server
 and suitable installed models. Camera and microphone features need the
 corresponding devices and OS permissions.
 
+For Cloudflare Workers AI and other hosted text providers, see the
+[hosted provider setup guide](docs/HOSTED_AI_PROVIDERS.md).
+
 The full requirements file includes heavy optional packages. First-time package
 and model downloads are separate from normal application startup. Headless
 deployment has its own [dependency list](deploy/requirements-server.txt) and
@@ -144,6 +200,11 @@ desktop/taskbar shortcuts recreated after adopting the neutral public app identi
 | `docs/` | Guides, dated capability summary and historical design notes |
 
 See [security and private data](SECURITY.md) for storage and reporting guidance.
+
+For beginner cybersecurity code exercises, scoped penetration-testing labs and
+electronics defence lessons, see the [security learning guide](docs/SECURITY_LEARNING.md).
+Teaching defaults to one small step with pause/resume support; see
+[teaching at your pace](docs/SHORT_STEP_TEACHING.md).
 
 ## Licence
 

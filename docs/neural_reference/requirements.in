@@ -1,0 +1,16 @@
+# Compatibility starting points, NOT a resolved/tested environment lock.
+# Install CUDA PyTorch separately using the official Windows selector.
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+pydantic>=2.10,<3
+psutil>=5.9,<8
+pyautogui>=0.9.54,<1
+chromadb>=1.1,<2
+transformers>=4.57,<5
+accelerate>=1.0,<2
+bitsandbytes>=0.48,<0.50
+peft>=0.17,<0.19
+trl==0.24.0
+datasets>=3,<5
+# Reuse ORION's onnxruntime + tokenizers embedding encoder.
+# sentence-transformers is an alternative, not required by this reference.

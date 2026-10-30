@@ -385,3 +385,144 @@ def test_report_summary_is_a_single_readable_line():
     summary = report.summary()
     assert "\n" not in summary
     assert "ms)" in summary
+
+
+# ── interruption discards the old reply; it is never replayed ────────────────
+#
+# Real AudioPlaybackThread / SpeechQueueManager against a fake output stream.
+# The discard is explicit — an interruption generation that clear() bumps —
+# and nothing else ever drops audio.
+
+class _AnyBus:
+    def __getattr__(self, name):
+        signal = FakeSignal()
+        object.__setattr__(self, name, signal)
+        return signal
+
+
+class _QuietTts:
+    def attach_renderer(self, renderer):
+        self.renderer = renderer
+
+    def is_busy(self):
+        return False
+
+    def interrupt(self):
+        pass
+
+    def hold(self):
+        return False
+
+    def resume_speech(self):
+        return False
+
+    def held(self):
+        return False
+
+
+class _RecordingStream:
+    def __init__(self, on_write=None):
+        self.written = bytearray()
+        self.on_write = on_write
+
+    def write(self, piece):
+        self.written += bytes(piece)
+        if self.on_write is not None:
+            self.on_write()
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _renderer_and_manager():
+    from orion_core.audio import AudioPlaybackThread, SpeechQueueManager
+    bus = _AnyBus()
+    playback = AudioPlaybackThread(bus)
+    manager = SpeechQueueManager(bus, playback, _QuietTts(), AudioStateMachine(bus))
+    return playback, manager
+
+
+def test_stopping_a_paused_reply_discards_it_instead_of_parking_it():
+    """interrupt_all() cleared playback only when is_active(); a HOLD marks the
+    renderer inactive, so cancelling a paused reply left the old audio (and
+    the hold) in place, to replay after the next resume."""
+    playback, manager = _renderer_and_manager()
+    playback.enqueue(b"\x01\x00" * 64)
+    playback._held_tail = b"\x02\x00" * 64
+    playback.hold()
+    assert not playback.is_active()
+
+    assert manager.interrupt_all() is True, "a parked reply counts as cut"
+    assert playback.queue.empty() and playback._held_tail == b""
+    assert not playback.held(), "a hold left set would silence every later reply"
+    playback.enqueue(b"\x03\x00" * 8)
+    assert playback._take(timeout=None)[1] == b"\x03\x00" * 8
+
+
+def test_a_buffer_already_taken_stops_at_the_next_slice_after_an_interruption():
+    """clear() emptied the queue, but the buffer in the renderer's hand (up to
+    ~0.34 s) still played after the cut."""
+    playback, _ = _renderer_and_manager()
+    playback._stream = _RecordingStream(on_write=playback.clear)
+    buffer = b"\x04\x00" * (playback._WRITE_SLICE_BYTES * 2)      # four slices
+    playback._write(buffer, playback._generation)
+    assert len(playback._stream.written) == playback._WRITE_SLICE_BYTES
+    assert playback.stale_discarded == 1
+
+
+def test_a_chunk_racing_the_interruption_is_discarded_not_played():
+    playback, _ = _renderer_and_manager()
+    old = playback._generation
+    playback.clear()
+    playback.queue.put_nowait((old, b"stale"))     # enqueued an instant too late
+    playback.enqueue(b"fresh")
+    assert playback._take(timeout=None) == (playback._generation, b"fresh")
+    assert playback.stale_discarded == 1
+
+
+def test_coalescing_never_merges_across_an_interruption_or_loses_the_new_reply():
+    playback, _ = _renderer_and_manager()
+    playback._stream = _RecordingStream()
+    old = playback._generation
+    playback.enqueue(b"old-")
+    _, first = playback._take(timeout=None)
+    playback.clear()
+    playback.enqueue(b"new-")
+    assert playback._coalesce(first, old) == b"old-"
+    playback._write(b"old-", old)
+    assert bytes(playback._stream.written) == b"", "the stale buffer must not play"
+    assert playback._take(timeout=None)[1] == b"new-", "the new reply is kept, in order"
+
+
+def test_the_live_renderer_never_replays_a_cancelled_reply(monkeypatch):
+    """End to end on the real renderer thread: pause mid-reply, cancel, then
+    a new reply arrives — only the new reply reaches the device."""
+    import time as _t
+
+    from orion_core import audio as audio_mod
+    playback, manager = _renderer_and_manager()
+    stream = _RecordingStream()
+    monkeypatch.setattr(audio_mod, "_boost_thread_priority", lambda *_a: None)
+    monkeypatch.setattr(audio_devices, "resolve", lambda _kind: None)
+    monkeypatch.setattr(playback, "_open_output_stream",
+                        lambda _device: setattr(playback, "_stream", stream))
+    playback.start()
+    try:
+        manager.hold_all()
+        old = b"\x11\x11" * 3000
+        playback.enqueue(old)
+        _t.sleep(0.15)
+        assert bytes(stream.written) == b"", "held: nothing plays"
+        manager.interrupt_all()                    # the user cancels the turn
+        new = b"\x22\x22" * 3000
+        playback.enqueue(new)
+        deadline = _t.monotonic() + 5.0
+        while len(stream.written) < len(new) and _t.monotonic() < deadline:
+            _t.sleep(0.01)
+        assert bytes(stream.written) == new
+    finally:
+        playback.stop()
+        playback.join(3.0)

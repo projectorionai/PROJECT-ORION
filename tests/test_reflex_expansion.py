@@ -203,3 +203,43 @@ def test_a_miss_is_as_cheap_as_a_hit():
         match_reflex("tell me something interesting about the brain")
     per_call_us = (time.perf_counter() - start) * 1e6 / 2000
     assert per_call_us < 500.0, "a reflex miss costs %.0f us" % per_call_us
+
+
+# ── what time someone means (clock_sense) ────────────────────────────────────
+
+@pytest.mark.parametrize("now,hour,minute,text,expected", [
+    ("14:20", 3, 0, "remind me at 3 to call mum", "Wed 15:00"),        # was 03:00 tomorrow
+    ("14:20", 4, 15, "remind me at quarter past 4 to leave", "Wed 16:15"),
+    ("14:20", 11, 0, "remind me at 11 to go to bed", "Wed 23:00"),
+    ("14:20", 9, 0, "remind me at 9 to take my tablets", "Wed 21:00"),
+    ("14:20", 2, 0, "remind me at 2 to water the plants", "Thu 14:00"),
+    ("14:20", 7, 0, "set an alarm for 7", "Thu 07:00"),
+    ("14:20", 6, 30, "wake me up at half 6", "Thu 06:30"),
+    ("08:00", 9, 0, "remind me at 9", "Wed 09:00"),
+    ("23:30", 1, 0, "remind me at 1 to check the oven", "Thu 01:00"),
+    ("14:20", 3, 0, "remind me at 3am", "Thu 03:00"),
+    ("09:00", 5, 0, "remind me at 5pm", "Wed 17:00"),
+    ("14:20", 8, 0, "remind me about the amp at 8", "Wed 20:00"),
+    ("14:20", 6, 0, "remind me at 6 in the morning", "Thu 06:00"),
+    ("14:20", 17, 0, "remind me at 17:00", "Wed 17:00"),
+])
+def test_a_bare_hour_means_what_a_person_would_mean(now, hour, minute, text, expected):
+    from datetime import datetime
+    from orion_core.clock_sense import likely_moment
+    h, m = (int(x) for x in now.split(":"))
+    moment = likely_moment(hour, minute, datetime(2026, 10, 7, h, m), text)
+    assert moment.strftime("%a %H:%M") == expected
+
+
+def test_a_timer_with_no_unit_is_in_minutes_within_reason():
+    from orion_core.reflex import match_reflex
+    assert match_reflex("set a timer for 10").args == {"action": "timer", "minutes": 10}
+    assert match_reflex("timer 25").args == {"action": "timer", "minutes": 25}
+    assert match_reflex("set a timer for 400") is None      # not obviously anything: ask
+
+
+def test_an_impossible_level_is_asked_about_not_clamped_to_full():
+    from orion_core.reflex import match_reflex
+    assert match_reflex("volume to 300") is None             # was 100%: full blast
+    assert match_reflex("volume to 40").args == {"action": "volume", "level": 0.4}
+    assert match_reflex("set the volume to max").args["level"] == 1.0

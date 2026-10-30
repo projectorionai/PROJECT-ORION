@@ -66,6 +66,12 @@ def _source_file(handler: Any) -> str:
     being quietly mislabelled as the module it ought to be in.
     """
     function = getattr(handler, "__func__", handler)
+    # The compiled code already names its file. inspect.getsourcefile probes
+    # the filesystem for every candidate path, and this runs for each of ~140
+    # tools twice per boot, on the thread that paints the first window.
+    code = getattr(function, "__code__", None)
+    if code is not None and getattr(code, "co_filename", ""):
+        return os.path.basename(code.co_filename)
     try:
         path = inspect.getsourcefile(function) or inspect.getfile(function)
         if path:

@@ -256,24 +256,42 @@ class WorkspaceManager:
                 "attached to relaunch applications.",
                 ok=False,
             )
+        # Resolve before launching so a background restore can report its
+        # deferral without relabelling the active project or claiming success.
+        targets = list(dict.fromkeys(
+            target for w in snap.windows if (target := self._app_for_window(w))
+        ))
+        if targets:
+            from .execution_policy import require_foreground
+            blocked = require_foreground("workspace_restore")
+            if blocked is not None:
+                return blocked
         reopened: list[str] = []
-        # Re-open applications behind the recorded windows (deduped by executable).
-        launched: set[str] = set()
-        for w in snap.windows:
-            target = self._app_for_window(w)
-            if target and target not in launched:
-                launched.add(target)
-                try:
-                    self.desktop.open_app(target)
-                    reopened.append(target)
-                except Exception:
+        failures: list[dict[str, str]] = []
+        for target in targets:
+            try:
+                outcome = await asyncio.to_thread(self.desktop.open_app, target)
+                if not isinstance(outcome, ToolResult) or not outcome.ok:
+                    failures.append({"app": target, "reason": (
+                        str(outcome.text) if isinstance(outcome, ToolResult)
+                        else "Application launcher returned no verified result."
+                    )})
                     continue
-        if self.memory.active_project != snap.active_project and snap.active_project:
+                reopened.append(target)
+            except Exception as exc:
+                failures.append({"app": target, "reason": first_line(exc)})
+        if not failures and self.memory.active_project != snap.active_project and snap.active_project:
             self.memory.set_active_project(snap.active_project)
         self.bus.log.emit(f"WORKSPACE: restore '{key}' relaunched {len(reopened)} app(s).")
+        detail = (" Failed: " + "; ".join(
+            f"{item['app']}: {item['reason']}" for item in failures
+        ) + ".") if failures else ""
         return ToolResult(
             f"Restoring workspace '{key}' ({snap.summary()}). "
-            f"Relaunched: {', '.join(reopened) or 'nothing to relaunch'}."
+            f"Relaunched: {', '.join(reopened) or 'nothing to relaunch'}." + detail,
+            ok=not failures,
+            receipt={"status": ("partial" if reopened else "failed") if failures else "completed",
+                     "workspace": key, "reopened": reopened, "failures": failures},
         )
 
     def _app_for_window(self, w: WindowState) -> str:

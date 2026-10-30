@@ -93,3 +93,56 @@ def test_breach_summary_with_no_single_standout_phase():
     assert budget.over_budget()
     assert budget.slow_phases() == []
     assert "no single phase stands out" in budget.breach_summary()
+
+
+def test_readiness_milestones_are_separate_from_phases_and_first_wins():
+    """A painted window is not a listening microphone. Each readiness point is
+    recorded once — a Live reconnect an hour later is not a slower boot."""
+    from orion_core import startup_budget
+
+    seen = []
+    budget = StartupBudget(clock=_fixed_clock([0.0, 0.4, 0.6, 2.5, 9.0]))
+    budget.on_milestone(lambda name, at: seen.append((name, at)))
+    startup_budget.set_current(budget)
+    try:
+        budget.mark("core window visible")
+        startup_budget.milestone("first_paint")
+        startup_budget.milestone("microphone_ready")
+        assert budget.milestone("first_paint") is None   # already recorded
+    finally:
+        startup_budget.set_current(None)
+    startup_budget.milestone("provider_ready")           # no boot: ignored
+    assert [p.name for p in budget.phases] == ["core window visible"]
+    assert budget.milestones == {"first_paint": 0.6, "microphone_ready": 2.5}
+    assert seen == [("first_paint", 0.6), ("microphone_ready", 2.5)]
+    line = budget.report().splitlines()[-1]
+    assert "first_paint 0.60s" in line and "provider_ready -" in line
+
+
+def test_a_failing_milestone_callback_cannot_break_the_boot():
+    budget = StartupBudget(clock=_fixed_clock([0.0, 1.0]))
+    budget.on_milestone(lambda *_: 1 / 0)
+    assert budget.milestone("command_ready") == 1.0
+
+
+def test_a_cold_start_is_named_and_held_to_its_own_target():
+    """Mark XXXX.3: a first phase over COLD_LAUNCH_S is Windows reading ORION
+    from disk; a warm start is held to 4 s, a cold one to 9 s."""
+    from orion_core import startup_budget as sb
+
+    times = iter([0.0, 2.8, 4.4, 8.6])
+    budget = sb.StartupBudget(clock=lambda: next(times))
+    budget.mark("launcher + imports + Qt")
+    budget.mark("core window visible")
+    budget.mark("services")
+    assert budget.apply_start_kind() == "cold"
+    assert budget.target_seconds == sb.COLD_TARGET_S and not budget.over_budget()
+    assert "cold start - 2.8s before ORION's first line" in budget.report()
+
+    times = iter([0.0, 0.2, 0.8, 4.2])
+    warm = sb.StartupBudget(clock=lambda: next(times))
+    warm.mark("launcher + imports + Qt")
+    warm.mark("core window visible")
+    warm.mark("services")
+    assert warm.apply_start_kind() == "warm"
+    assert warm.over_budget() and "cold start" not in warm.report()

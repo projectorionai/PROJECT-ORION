@@ -135,7 +135,7 @@ class SnapshotPreviewWindow(_PreviewWindow):
     AUTO_HIDE_MS = 8000
 
     def __init__(self, bus: OrionBus, parent: Optional[QWidget] = None) -> None:
-        super().__init__("SNAPSHOT", parent)
+        super().__init__("Snapshot", parent)
         self.bus = bus
         self.resize(320, 260)
         self._auto_hide = QTimer(self)
@@ -164,7 +164,7 @@ class SnapshotPreviewWindow(_PreviewWindow):
             Qt.TransformationMode.SmoothTransformation,
         )
         self.image_label.setPixmap(scaled)
-        self.title_label.setText(f"SNAPSHOT — {note}" if note else "SNAPSHOT")
+        self.title_label.setText(f"Snapshot — {note}" if note else "Snapshot")
         self.show()
         self.raise_()
         self._auto_hide.start(self.AUTO_HIDE_MS)
@@ -194,7 +194,7 @@ class LiveCameraWindow(_PreviewWindow):
 
     def __init__(self, bus: OrionBus, tracker: Any | None = None,
                  parent: Optional[QWidget] = None) -> None:
-        super().__init__("LIVE CAMERA", parent)
+        super().__init__("Live Camera", parent)
         self.bus = bus
         self.tracker = tracker
         self.perception: Any = None
@@ -205,7 +205,7 @@ class LiveCameraWindow(_PreviewWindow):
         self.resize(self.VIEW_SIDE + 20, self.VIEW_SIDE + 46)
         self.image_label.setMinimumSize(self.VIEW_SIDE, self.VIEW_SIDE)
         # The views the camera can be seen through (vision_lab.OVERLAY_MODES).
-        self.mode_button = QPushButton("VIEW")
+        self.mode_button = QPushButton("View")
         self.mode_button.setFixedHeight(18)
         self.mode_button.setToolTip("Cycle the camera view: normal, edges, motion, "
                                     "colours, numbers, detect")
@@ -228,8 +228,8 @@ class LiveCameraWindow(_PreviewWindow):
         if mode not in OVERLAY_MODES:
             return
         self.overlay_mode = mode
-        self.title_label.setText("LIVE CAMERA" if mode == "normal"
-                                 else f"LIVE CAMERA · {mode.upper()}")
+        self.title_label.setText("Live Camera" if mode == "normal"
+                                 else f"Live Camera · {mode.title()}")
         self.mode_button.setAccessibleName(f"Camera view: {mode}")
         perception = self.perception
         if perception is not None:

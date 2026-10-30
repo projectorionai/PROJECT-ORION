@@ -31,6 +31,20 @@ def _normalise(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
 
+#: ORION's own name as speech recognition hears it. "Ryan" was the graph's
+#: most-linked concept from conversation (48 mentions against 9 for ORION),
+#: co-mentioned with everything the owner asked him.
+_HEARD_AS_ORION = frozenset({"ryan", "orien", "orian", "oreon"})
+_ADDRESS_WORDS = frozenset({"o", "oh", "a", "sir", "the", "hey", "orion"})
+
+
+def _canonical_name(name: str) -> str:
+    words = _normalise(name).split()
+    if words and set(words) & _HEARD_AS_ORION and set(words) <= _HEARD_AS_ORION | _ADDRESS_WORDS:
+        return "ORION"
+    return name
+
+
 def _entity_id(kind: str, name: str) -> str:
     digest = hashlib.sha1(f"{kind}:{_normalise(name)}".encode("utf-8")).hexdigest()[:16]
     return f"{kind}_{digest}"
@@ -181,9 +195,10 @@ class KnowledgeGraphEngine:
             updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(kind);
-        CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
-            name, kind, aliases, content=''
-        );
+        -- 8 Oct: this index had 1,339 rows for 845 entities and no reader.
+        -- Writes are retired; free its pages for reuse without vacuuming on
+        -- the GUI thread. Entity rows and the used event index stay intact.
+        DROP TABLE IF EXISTS entities_fts;
         CREATE TABLE IF NOT EXISTS relationships (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_id TEXT NOT NULL,
@@ -332,15 +347,11 @@ class KnowledgeGraphEngine:
                     entity.updated_at,
                 ),
             )
-            self.conn.execute(
-                "INSERT INTO entities_fts(rowid, name, kind, aliases) VALUES (?, ?, ?, ?)",
-                (
-                    abs(hash(entity.id)) % (2**31),
-                    entity.name,
-                    entity.kind,
-                    " ".join(entity.aliases),
-                ),
-            )
+            # No entities_fts row any more: nothing ever read that index, and
+            # its rowid was abs(hash(id)) - Python's per-process randomised str
+            # hash - so every mention added a row that could never be found or
+            # removed (1339 rows for 845 entities, 8 Oct). Entity search reads
+            # the entities table (search_entities).
             self.conn.commit()
         # C2: journal the entity write for desktop⇄cloud sync (knowledge tier →
         # additive merge). Guarded: journalling must never break a graph write.
@@ -516,7 +527,7 @@ class KnowledgeGraphEngine:
         ]
         for pattern, kind in patterns:
             for match in re.finditer(pattern, text):
-                name = match.group(1).strip(" .,:;")
+                name = _canonical_name(match.group(1).strip(" .,:;"))
                 if len(name) >= 3 and not name.lower().startswith(("the ", "and ")):
                     candidates.append((name, kind))
         seen: set[str] = set()
@@ -713,9 +724,11 @@ class KnowledgeGraphEngine:
                 todo.append((str(row["id"]), text))
         todo.sort(key=lambda item: len(item[1]))
         done = 0
+        # A boot top-up never builds the GPU session beside the face
+        # (semantic.py, GPU_BACKLOG_ROWS); a real backlog still may.
         for start in range(0, len(todo), batch):
             chunk = todo[start:start + batch]
-            vectors = semantic.ENCODER.encode([text for _id, text in chunk])
+            vectors = semantic.encode_for_index([text for _id, text in chunk], backlog=len(todo))
             if vectors is None:
                 break
             with self._lock:

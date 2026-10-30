@@ -414,17 +414,54 @@ class SystemResourceReader:
         ps = self._psutil
         if ps is None:
             return []
-        out: list[ProcessInfo] = []
-        for proc in ps.process_iter(attrs=["pid", "name", "cpu_percent", "memory_percent"]):
-            try:
-                info = proc.info
-                out.append(ProcessInfo(
-                    pid=int(info.get("pid") or 0),
-                    name=str(info.get("name") or "?"),
-                    cpu_percent=float(info.get("cpu_percent") or 0.0),
-                    mem_percent=float(info.get("memory_percent") or 0.0),
-                ))
-            except Exception:
-                continue
-        out.sort(key=lambda p: p.cpu_percent + p.mem_percent, reverse=True)
-        return out[:max(1, limit)]
+        sampled = sample_processes(interval=0.3, psutil_module=ps)
+        # The CPU hogs and the memory hogs, so identify_offenders can find
+        # either: sorting by cpu+mem let memory decide what was kept.
+        limit = max(1, limit)
+        by_cpu = sorted(sampled, key=lambda p: p.cpu_percent, reverse=True)[:limit]
+        by_mem = sorted(sampled, key=lambda p: p.mem_percent, reverse=True)[:limit]
+        seen: set[int] = set()
+        out = []
+        for proc in by_cpu + by_mem:
+            if proc.pid not in seen:
+                seen.add(proc.pid)
+                out.append(proc)
+        return out
+
+
+def sample_processes(interval: float = 0.5, psutil_module: Any = None) -> list[ProcessInfo]:
+    """Every visible process with its CPU share over *interval*, as Task
+    Manager shows it (percent of the whole machine), and its memory share.
+
+    psutil's per-process cpu_percent is measured against that same Process
+    object's previous call, and the first call returns 0.0. A single
+    process_iter pass therefore reported EVERY process at 0.0% CPU, and
+    "what's using my CPU" listed processes in PID order. Blocks for
+    *interval* - call it off the UI thread."""
+    ps = psutil_module
+    if ps is None:
+        try:
+            import psutil as ps  # type: ignore
+        except Exception:
+            return []
+    tracked = []
+    for proc in ps.process_iter(["pid", "name", "memory_percent"], ad_value=None):
+        if proc.pid == 0:                    # System Idle Process: idle time, not load
+            continue
+        try:
+            proc.cpu_percent(None)
+            tracked.append(proc)
+        except Exception:
+            continue
+    time.sleep(max(0.05, interval))
+    cores = ps.cpu_count() or 1
+    out: list[ProcessInfo] = []
+    for proc in tracked:
+        try:
+            cpu = proc.cpu_percent(None) / cores
+        except Exception:
+            continue
+        out.append(ProcessInfo(pid=int(proc.pid), name=str(proc.info.get("name") or "?"),
+                               cpu_percent=float(cpu),
+                               mem_percent=float(proc.info.get("memory_percent") or 0.0)))
+    return out

@@ -310,6 +310,7 @@ class AvatarEngine:
         self.animation = AvatarAnimationManager(rng)
         self.speaking = False
         self.dormant = True            # boots as the orb, like the rig itself
+        self.form = "auto"             # explicit face/orb choices survive state changes
         self._morph = 0.0
         self._emotion_override: dict[str, Any] | None = None
 
@@ -327,9 +328,18 @@ class AvatarEngine:
 
     def set_amplitude(self, value: float) -> None:
         self.animation.set_amplitude(value)
-        if float(value) > 0.02 and not self.speaking:
+        # The live microphone shares this signal with playback. A user's
+        # voice while listening must not turn ORION into a speaking avatar.
+        if (float(value) > 0.02 and not self.speaking
+                and self.machine.state != "listening"):
             self.speaking = True
             self.machine.request("speaking")
+
+    def set_form(self, form: str) -> None:
+        """Pin the selected appearance independently of listening or speech."""
+        value = str(form or "").strip().lower()
+        if value in {"auto", "face", "orb"}:
+            self.form = value
 
     def set_spectrum(self, low: float, mid: float, high: float) -> None:
         self.animation.set_spectrum(low, mid, high)
@@ -354,7 +364,8 @@ class AvatarEngine:
         emotion = self._emotion_override or render.get("emotion")
         # Morph: how "human" the rig is (1 = full head, 0 = dormant orb).
         # Eased so materialisation/collapse always scrubs smoothly.
-        target = 0.0 if self.dormant else 1.0
+        target = (0.0 if self.form == "orb" else 1.0 if self.form == "face"
+                  else 0.0 if self.dormant else 1.0)
         self._morph += (target - self._morph) * min(1.0, dt / 0.5)
         morph = self._morph if abs(self._morph - target) > 0.005 else target
         self._morph = morph
@@ -400,6 +411,13 @@ class AvatarController:
     def attach(self, face: Any) -> None:
         self.face = face
         self._pushed_state = ""    # force a full re-push on next tick
+        self._pushed_label = ""
+        self._pushed_morph = -1.0
+        self._last = time.monotonic()
+        self.engine.set_form(getattr(face, "form", "auto"))
+
+    def set_form(self, form: str) -> None:
+        self.engine.set_form(form)
 
     # Bus-facing slots (loose signatures so they connect to pyqtSignals).
     def on_state(self, state: str) -> None:
@@ -444,6 +462,12 @@ class AvatarController:
         if face is None:
             return
         try:
+            # The WebGL renderer owns its reversible materialisation
+            # timeline. One bridge frame avoids several independent IPC
+            # messages interleaving with an appearance change.
+            if hasattr(face, "set_avatar_frame"):
+                face.set_avatar_frame(frame)
+                return
             if frame["js_state"] != self._pushed_state:
                 self._pushed_state = frame["js_state"]
                 if hasattr(face, "set_state"):
@@ -456,7 +480,8 @@ class AvatarController:
             if hasattr(face, "set_pose"):
                 face.set_pose(frame["yaw"], frame["pitch"])
             if (abs(frame["morph"] - self._pushed_morph) > 0.004
-                    and hasattr(face, "set_morph")):
+                    and hasattr(face, "set_morph")
+                    and not getattr(face, "owns_materialisation", False)):
                 self._pushed_morph = frame["morph"]
                 face.set_morph(frame["morph"])
             if frame["label"] != self._pushed_label and hasattr(face, "set_label"):

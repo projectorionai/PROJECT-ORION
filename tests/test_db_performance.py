@@ -12,10 +12,12 @@ EVERY store, and a database that refuses them still opens.
 
 from __future__ import annotations
 
+import ast
 import sqlite3
 import sys
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -111,6 +113,7 @@ STORES = [
     ("finance", "FinanceStore"),
     ("wellbeing", "WellbeingStore"),
     ("decisions", "DecisionStore"),
+    ("goals", "GoalStore"),
 ]
 
 
@@ -126,6 +129,94 @@ def test_each_store_opens_in_wal(tmp_path, module_name, class_name):
     store.close()
 
 
+def _literal_readonly_uri(node):
+    if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+        return False
+    uri = urlsplit(node.value)
+    return (uri.scheme == "file" and not uri.fragment
+            and parse_qs(uri.query, keep_blank_values=True) == {"mode": ["ro"]})
+
+
+def _assigned_readonly_uri(tree, target, call):
+    if _literal_readonly_uri(target):
+        return True
+    if not isinstance(target, ast.Name):
+        return False
+    # A URI variable is exempt only when its single assignment proves this
+    # exact read-only shape. Unknown values, aliases and reassignment fail
+    # closed; uri=True by itself never proves a database is read-only.
+    writes = [node for node in ast.walk(tree) if isinstance(node, ast.Name)
+              and isinstance(node.ctx, ast.Store) and node.id == target.id]
+    assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                   and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                   and node.targets[0].id == target.id]
+    if len(writes) != 1 or len(assignments) != 1 or assignments[0].lineno >= call.lineno:
+        return False
+    value = assignments[0].value
+    if _literal_readonly_uri(value):
+        return True
+
+    def pieces(node):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return pieces(node.left) + pieces(node.right)
+        return [node]
+
+    parts = pieces(value)
+    return (len(parts) == 3 and isinstance(parts[0], ast.Constant) and parts[0].value == "file:"
+            and isinstance(parts[-1], ast.Constant) and parts[-1].value == "?mode=ro"
+            # The path comes from pathlib's resolved POSIX path, as used by
+            # goals._read_rows; an arbitrary interpolated URI remains suspect.
+            and isinstance(parts[1], ast.Call) and not parts[1].args and not parts[1].keywords
+            and isinstance(parts[1].func, ast.Attribute) and parts[1].func.attr == "as_posix"
+            and isinstance(parts[1].func.value, ast.Call) and not parts[1].func.value.args
+            and not parts[1].func.value.keywords and isinstance(parts[1].func.value.func, ast.Attribute)
+            and parts[1].func.value.func.attr == "resolve")
+
+
+def _opens_disk_database(source):
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "sqlite3" and node.func.attr == "connect"):
+            continue
+        target = node.args[0] if node.args else next(
+            (kw.value for kw in node.keywords if kw.arg == "database"), None)
+        if isinstance(target, ast.Constant) and target.value == ":memory:":
+            continue  # no disk I/O or WAL is possible for an in-memory database
+        uri_enabled = any(kw.arg == "uri" and isinstance(kw.value, ast.Constant)
+                          and kw.value.value is True for kw in node.keywords)
+        if uri_enabled and _assigned_readonly_uri(tree, target, node):
+            continue  # a read-only migration input cannot commit writes
+        return True
+    return False
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("sqlite3.connect(':memory:')", False),
+    ("sqlite3.connect(database=':memory:')", False),
+    ("sqlite3.connect(path)", True),
+    ("sqlite3.connect(':memory:'); sqlite3.connect(path)", True),
+    ("sqlite3.connect(database='jobs.db')", True),
+    ("sqlite3.connect('file:legacy.db?mode=ro', uri=True)", False),
+    ("sqlite3.connect('file:legacy.db?mode=rw', uri=True)", True),
+    ("sqlite3.connect('file:legacy.db?mode=rwc', uri=True)", True),
+    ("sqlite3.connect('file:legacy.db?mode=ro', uri=False)", True),
+    ("sqlite3.connect('file:legacy.db?mode=ro')", True),
+    ("sqlite3.connect(uri, uri=True)", True),
+    ("uri = external_value\nsqlite3.connect(uri, uri=True)", True),
+    ("uri = 'file:' + value + '?mode=ro'\nsqlite3.connect(uri, uri=True)", True),
+    ("uri = 'file:' + path.resolve().as_posix() + '?mode=ro'\nsqlite3.connect(uri, uri=True)", False),
+    ("uri = 'file:' + path.resolve().as_posix() + '?mode=rw'\nsqlite3.connect(uri, uri=True)", True),
+    ("uri = 'file:' + path.resolve().as_posix() + '?mode=rwc'\nsqlite3.connect(uri, uri=True)", True),
+    ("uri = 'file:legacy.db?mode=ro'\nuri = writable\nsqlite3.connect(uri, uri=True)", True),
+    ("uri = 'file:legacy.db?mode=ro'\nsqlite3.connect(uri, uri=True)\nsqlite3.connect(path)", True),
+    ("sqlite3.connect('file:legacy.db?mode=ro&mode=rw', uri=True)", True),
+])
+def test_store_policy_exempts_only_literal_in_memory_connections(source, expected):
+    assert _opens_disk_database(source) is expected
+
+
 def test_no_store_opens_sqlite_without_the_pragmas():
     """A new store that forgets the policy would silently reintroduce the lag."""
     root = Path(__file__).resolve().parents[1] / "orion_core"
@@ -134,7 +225,7 @@ def test_no_store_opens_sqlite_without_the_pragmas():
         if path.name in {"db.py", "maintenance.py", "diagnostics.py"}:
             continue                      # maintenance/diagnostics open read-only
         source = path.read_text(encoding="utf-8", errors="replace")
-        if "sqlite3.connect(" in source and "apply_pragmas" not in source:
+        if "apply_pragmas" not in source and _opens_disk_database(source):
             offenders.append(path.name)
     assert not offenders, (
         "these modules open SQLite without ORION's performance pragmas: "

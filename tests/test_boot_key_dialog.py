@@ -36,6 +36,11 @@ def _qt():
 
 def _run(coro_factory, answer):
     qt = _qt()
+    # The real boot already has its core window. This standalone fixture's
+    # dialog is its only window; accepting it must not quit Qt while the
+    # provider settings are still being persisted on the worker.
+    quit_on_last = qt.quitOnLastWindowClosed()
+    qt.setQuitOnLastWindowClosed(False)
 
     class _Dialog(QDialog):
         def open(self):
@@ -63,10 +68,13 @@ def _run(coro_factory, answer):
             beat.cancel()
 
     try:
-        with loop:
-            result = loop.run_until_complete(flow())
-    except SystemExit as exc:
-        result = exc
+        try:
+            with loop:
+                result = loop.run_until_complete(flow())
+        except SystemExit as exc:
+            result = exc
+    finally:
+        qt.setQuitOnLastWindowClosed(quit_on_last)
     return result, ticks, errors
 
 
@@ -114,3 +122,56 @@ def test_configured_settings_skip_the_dialog(monkeypatch):
         raise AssertionError("no dialog when a provider is configured")
     monkeypatch.setattr(app_module, "ApiKeyDialog", refuse)
     assert asyncio.run(app_module.ensure_provider_settings_async(None)) == "saved"
+
+
+def test_offline_environment_skips_key_setup_without_writing_credentials(monkeypatch):
+    from orion_core import providers
+    saved = object()
+    monkeypatch.setenv("ORION_MODE", "offline")
+    monkeypatch.setattr(providers, "read_provider_settings", lambda: saved)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("offline bootstrap must not prompt or rewrite credentials")
+
+    monkeypatch.setattr(app_module, "ApiKeyDialog", forbidden)
+    monkeypatch.setattr(app_module, "_configured_provider_settings", forbidden)
+    monkeypatch.setattr(providers, "write_api_key", forbidden)
+    monkeypatch.setattr(providers, "write_provider_settings", forbidden)
+    assert app_module.ensure_provider_settings() is saved
+    assert asyncio.run(app_module.ensure_provider_settings_async()) is saved
+
+
+def test_offline_dialog_choice_keeps_booting_without_reading_a_key(unconfigured):
+    from orion_core import providers
+    _qt()
+    saved = object()
+    unconfigured.setenv("ORION_MODE", "auto")
+    unconfigured.setattr(providers, "read_provider_settings", lambda: saved)
+
+    class Offline(QDialog):
+        OFFLINE_RESULT = 2
+
+        def open(self):
+            self.done(self.OFFLINE_RESULT)
+
+        def key(self):
+            raise AssertionError("offline selection must not read or persist a key")
+
+    unconfigured.setattr(app_module, "ApiKeyDialog", lambda _w: Offline())
+    assert asyncio.run(app_module.ensure_provider_settings_async()) is saved
+    assert os.environ["ORION_MODE"] == "offline"
+
+
+def test_key_dialog_exposes_a_distinct_offline_choice():
+    from orion_core.gui.widgets import ApiKeyDialog
+    from PyQt6.QtWidgets import QPushButton
+    _qt()
+    dialog = ApiKeyDialog()
+    try:
+        button = next(button for button in dialog.findChildren(QPushButton)
+                      if button.text() == "Continue Offline")
+        button.click()
+        assert dialog.result() == ApiKeyDialog.OFFLINE_RESULT
+        assert dialog.key() == ""
+    finally:
+        dialog.deleteLater()

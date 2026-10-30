@@ -11,7 +11,7 @@ import re
 from datetime import datetime, timezone
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 # aiohttp costs ~178 ms to import and is only used inside coroutines;
 # deferring it keeps it off ORION's startup path (see lazy_import).
@@ -22,6 +22,16 @@ from PIL import Image
 
 # PIL renamed its resampling enum; resolve once at import time.
 PIL_RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS  # type: ignore[attr-defined]
+
+
+def capture_disabled() -> bool:
+    """True when this run must not open a microphone or camera.
+
+    Set ``ORION_NO_CAPTURE=1`` for measurement and diagnostic runs
+    (``tools/perf_scenarios.py`` sets it): timing a boot must not mean
+    listening to, or watching, whoever is at the machine.
+    """
+    return os.getenv("ORION_NO_CAPTURE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def open_camera_capture(index: int = 0, hi_res: bool = False,
@@ -39,6 +49,8 @@ def open_camera_capture(index: int = 0, hi_res: bool = False,
     lazily so importing this module never pulls it in for callers that don't
     need a camera. Returns (capture_or_None, backend_name_used).
     """
+    if capture_disabled():
+        return None, "disabled"
     import cv2
     candidates: list[tuple[str, Any]] = []
     # MEASURED on this machine with a Logitech C920, three seconds of real
@@ -251,9 +263,33 @@ def correct_identity(text: str) -> str:
 def clean_transcript(text: str) -> str:
     """Strip model control tokens and non-printable bytes from transcripts,
     and repair any mangled self-name (ORIN/ORIO/…) the transcriber produced."""
+    return correct_identity(strip_control(text)).strip()
+
+
+def strip_control(text: str) -> str:
+    """Control tokens and non-printable bytes out, spacing KEPT: in a streamed
+    transcript a chunk's own leading space is the only word boundary."""
     text = re.sub(r"<ctrl\d+>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
-    return correct_identity(text).strip()
+    return re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
+
+
+def join_transcript(chunks: Iterable[str]) -> str:
+    """One utterance from Live transcription chunks.
+
+    The chunks are sub-word pieces that carry their own spacing ("Ye", "ah",
+    " I", "'m"). Each used to be stripped and the pieces re-joined with
+    spaces, so the user's words reached everything local - reflexes, the
+    capability-gap ledger, intent learning, stored memories - as "Ye ah , I
+    'm so ex cited", "che st", "sto ck fi sh". When no chunk carries spacing
+    at all, the old space-join is kept."""
+    pieces = [str(chunk) for chunk in chunks if chunk]
+    if not pieces:
+        return ""
+    spaced = any(any(ch.isspace() for ch in piece) for piece in pieces)
+    text = "".join(pieces) if spaced else " ".join(piece.strip() for piece in pieces)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r" ([,.?!;:])", r"\1", text)
+    return clean_transcript(text)
 
 
 # Invisible code points that appear inside real window titles — Edge embeds a
@@ -454,19 +490,28 @@ def weather_code_label(code: int) -> str:
         2: "partly cloudy",
         3: "overcast",
         45: "fog",
-        48: "depositing rime fog",
+        48: "freezing fog",
         51: "light drizzle",
         53: "moderate drizzle",
         55: "dense drizzle",
+        # The freezing, grains and snow-shower codes were missing, so a winter
+        # greeting said "a weather code 85 winter morning".
+        56: "freezing drizzle",
+        57: "heavy freezing drizzle",
         61: "slight rain",
         63: "moderate rain",
         65: "heavy rain",
+        66: "freezing rain",
+        67: "heavy freezing rain",
         71: "slight snow",
         73: "moderate snow",
         75: "heavy snow",
+        77: "snow grains",
         80: "slight rain showers",
         81: "moderate rain showers",
         82: "violent rain showers",
+        85: "snow showers",
+        86: "heavy snow showers",
         95: "thunderstorm",
         96: "thunderstorm with hail",
         99: "severe thunderstorm with hail",

@@ -165,6 +165,19 @@ def _model_ready():
     return _Yamnet.load()
 
 
+def test_the_real_model_runs_on_the_cpu_through_the_accelerator():
+    """DirectML rejects YAMNet when the session is built ("The parameter is
+    incorrect", 80070057), so accelerator.POLICY keeps it on the CPU, where
+    five seconds of sound take 6.5 ms."""
+    if not _model_ready():
+        pytest.skip("YAMNet model or onnxruntime unavailable")
+    from orion_core import accelerator
+    from orion_core.sound_sense import _Yamnet
+    assert isinstance(_Yamnet._session, accelerator.AcceleratedSession)
+    assert (_Yamnet._session.model, _Yamnet._session.device) == ("sound_sense", "CPU")
+    assert accelerator.policy("sound_sense") == accelerator.CPU
+
+
 def test_the_real_model_hears_a_smoke_alarm_beep():
     if not _model_ready():
         pytest.skip("YAMNet model or onnxruntime unavailable")

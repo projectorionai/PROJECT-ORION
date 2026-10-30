@@ -21,12 +21,18 @@ feeds into a repair proposal.  Everything heavy runs via ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
+import importlib.util
 import json
 import os
-import py_compile
 import sqlite3
+import sys
+import tempfile
+import threading
+import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -34,6 +40,7 @@ from typing import Any, Optional
 from .bus import OrionBus
 from .constants import CONFIG_DIR, CORE_DB_PATH, PACKAGE_DIR
 from .data import ToolResult
+from .module_presence import module_present
 from .utils import first_line, utc_stamp
 
 # (module, required?) — required failures are FAIL, optional are WARN.
@@ -46,6 +53,93 @@ DEPENDENCIES: tuple[tuple[str, bool], ...] = (
     ("matplotlib", False), ("pypdf", False), ("pyttsx3", False), ("vosk", False),
     ("win32com", False),
 )
+
+
+def _module_present(module: str) -> bool:
+    """Is ``module`` installed — WITHOUT executing it.
+
+    This runs on a worker thread while the Qt loop paints.  Importing a
+    package here ran its native initialisers off the main thread: on
+    30 Sep 2026 the periodic diagnostic's ``import pywinauto`` pulled in
+    ``win32ui`` (MFC) and the app died with a Windows access violation
+    (crash_reports/faulthandler.log).  A presence check only needs the
+    import system's lookup, never the module body.
+    """
+    return module_present(module)
+
+
+#: Packages that belong in a separate training/worker process, never in the
+#: running app.  The import check used to load every module, so 5 minutes
+#: after start the periodic diagnostic imported grandmaster/nnue.py and left
+#: PyTorch resident (+144 MB, measured 3 Oct 2026) for the rest of the session.
+WORKER_ONLY_PACKAGES = frozenset({
+    "torch", "tensorflow", "jax", "transformers", "sentence_transformers",
+})
+
+
+def _import_time_names(source: bytes, module: str, is_package: bool) -> set[str]:
+    """Absolute names a module imports while its body executes.
+
+    Function bodies are skipped (those imports are lazy); class bodies,
+    ``try`` and ``if`` blocks at module level all run at import time.
+    Relative imports are resolved against ``module``.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    package = module if is_package else module.rpartition(".")[0]
+    names: set[str] = set()
+    stack: list[ast.AST] = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                parts = package.split(".")
+                if node.level > 1:
+                    parts = parts[: -(node.level - 1)]
+                base = ".".join(parts)
+                base = f"{base}.{node.module}" if node.module else base
+            else:
+                base = node.module or ""
+            names.add(base)
+            # ``from .pkg import sub`` imports the submodule ``pkg.sub`` too.
+            names.update(f"{base}.{alias.name}" for alias in node.names
+                         if alias.name != "*")
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _worker_only_modules(modules: dict[str, Path]) -> dict[str, set[str]]:
+    """Map each package module that would load a worker-only package at
+    import time (directly or through another package module) to the
+    worker-only packages it needs."""
+    direct: dict[str, set[str]] = {}
+    internal: dict[str, set[str]] = {}
+    for mod, path in modules.items():
+        try:
+            source = path.read_bytes()
+        except OSError:
+            continue
+        names = _import_time_names(source, mod, path.name == "__init__.py")
+        roots = {name.split(".")[0] for name in names}
+        direct[mod] = roots & WORKER_ONLY_PACKAGES
+        internal[mod] = {name for name in names if name in modules and name != mod}
+    needs = {mod: set(found) for mod, found in direct.items()}
+    changed = True
+    while changed:  # propagate through package-internal imports
+        changed = False
+        for mod, deps in internal.items():
+            for dep in deps:
+                extra = needs.get(dep, set()) - needs[mod]
+                if extra:
+                    needs[mod] |= extra
+                    changed = True
+    return {mod: found for mod, found in needs.items() if found}
 
 
 @dataclass
@@ -97,7 +191,17 @@ class DiagnosticsEngine:
 
     async def run_full(self) -> ToolResult:
         self.bus.log.emit("DIAG: running full self-diagnostic…")
-        checks = await asyncio.to_thread(self._run_all)
+        from . import background, diagnostic_imports
+        stop = threading.Event()
+        with diagnostic_imports.cancellation_scope(stop):
+            work = background.spawn(asyncio.to_thread(self._run_all), name="orion-diagnostics")
+        if work is None:
+            return ToolResult("Diagnostic did not start: no active event loop.", ok=False)
+        try:
+            checks = await asyncio.shield(work)
+        except asyncio.CancelledError:
+            stop.set()  # the bounded verifier observes this and retires its child
+            raise
         fails = [c for c in checks if c.status == "FAIL"]
         warns = [c for c in checks if c.status == "WARN"]
         verdict = ("all systems healthy" if not fails and not warns else
@@ -116,20 +220,17 @@ class DiagnosticsEngine:
     # ── individual checks (sync; run in a worker thread) ──────────────────────
 
     def _run_all(self) -> list[Check]:
-        return [
-            self._check_compile(),
-            self._check_imports(),
-            self._check_dependencies(),
-            self._check_database(),
-            self._check_config(),
-            self._check_tools(),
-            self._check_health(),
-            self._check_resources(),
-            self._check_permissions(),
-            self._check_forge(),
-            self._check_incidents(),
-            self._check_capabilities(),
-        ]
+        from .diagnostic_imports import cancelled
+        checks = []
+        for check in (self._check_compile, self._check_imports, self._check_dependencies,
+                      self._check_database, self._check_config, self._check_tools,
+                      self._check_health, self._check_resources, self._check_permissions,
+                      self._check_forge, self._check_incidents, self._check_crashes,
+                      self._check_capabilities):
+            if cancelled():
+                break
+            checks.append(check())
+        return checks
 
     def _check_capabilities(self) -> Check:
         """Roll the capability-health matrix into one line, so 'run a diagnostic'
@@ -150,15 +251,21 @@ class DiagnosticsEngine:
                 parts.append(f"degraded: {', '.join(degraded)}")
             parts.append("ask 'capability health' for the full matrix")
             return Check("capabilities", "WARN", "; ".join(parts))
-        return Check("capabilities", "PASS", f"{len(rows)} capabilities usable")
+        return Check("capabilities", "PASS",
+                     f"{len(rows)} dependency/registration checks passed; runtime readiness not established")
 
     async def capability_report(self, deep: bool = True) -> ToolResult:
         """The full capability-health matrix — 'why can't ORION do X?'. deep=True
         runs functional probes (e.g. an actual OCR read)."""
         from .capability_health import capability_matrix, render_matrix
         rows = await asyncio.to_thread(capability_matrix, deep)
-        missing = any(r.status() == "MISSING" for r in rows)
-        return ToolResult(render_matrix(rows), ok=not missing)
+        ready = all(r.status() == "OK" for r in rows)
+        receipt = {"capability_health": [row.as_dict() for row in rows],
+                   "scope": "Probe evidence only; dependency checks do not establish runtime readiness"}
+        recent = getattr(getattr(self, "dispatcher", None), "recent_executions", None)
+        if callable(recent):
+            receipt["recent_tool_executions"] = recent(limit=10)
+        return ToolResult(render_matrix(rows), ok=ready, receipt=receipt)
 
     def _check_forge(self) -> Check:
         if self.forge is None:
@@ -218,45 +325,72 @@ class DiagnosticsEngine:
                 f"[{latest.id}] {latest.error_type}: {first_line(latest.message, 80)}")
         return Check("incidents", "PASS", "no captured incidents this session")
 
+    #: How far back a crash still counts as "recent" for the diagnostic.
+    CRASH_WINDOW_S = 7 * 24 * 3600
+
+    def _check_crashes(self) -> Check:
+        """Serious crash reports from the last week — including a native crash
+        that ended a previous session, which no in-process check can see."""
+        try:
+            from . import crash_reporter
+            reports = crash_reporter.recent(10)
+        except Exception as exc:
+            return Check("crashes", "WARN", first_line(exc, 60))
+        cutoff = time.time() - self.CRASH_WINDOW_S
+        serious = []
+        for row in reports:
+            try:
+                if Path(row["path"]).stat().st_mtime < cutoff:
+                    continue
+            except (OSError, KeyError):
+                continue
+            if crash_reporter.interpret(row.get("kind", ""), row.get("summary", ""))["severe"]:
+                serious.append(row)
+        if serious:
+            latest = serious[0]
+            return Check("crashes", "WARN",
+                         f"{len(serious)} serious crash report(s) this week — latest "
+                         f"{latest['file']}: {first_line(latest.get('summary') or latest.get('why'), 110)}")
+        return Check("crashes", "PASS", "no serious crash reports this week")
+
     def _check_compile(self) -> Check:
         failures: list[str] = []
+        count = 0
         for path in PACKAGE_DIR.rglob("*.py"):
+            count += 1
             try:
-                py_compile.compile(str(path), doraise=True)
-            except py_compile.PyCompileError as exc:
+                # A diagnostic must also work in a read-only installation.  A
+                # bytecode cache is not needed to establish that source parses.
+                compile(path.read_bytes(), str(path), "exec", dont_inherit=True)
+            except (OSError, SyntaxError, ValueError) as exc:
                 failures.append(f"{path.name}: {first_line(exc, 60)}")
         if failures:
             return Check("compile", "FAIL", f"{len(failures)} file(s) fail to compile: "
                          + "; ".join(failures[:4]))
-        return Check("compile", "PASS", "every module byte-compiles")
+        if getattr(sys, "frozen", False):
+            from .diagnostic_imports import inventory
+            known = inventory(PACKAGE_DIR)
+            coverage = (f"{len(known['modules'])} PYZ modules contain bundled bytecode"
+                        if "modules" in known else known["error"])
+            return Check("compile", "WARN", f"{count} loose source file(s) compile; "
+                         f"{coverage}; full source compilation is unavailable in this frozen build")
+        if not count:
+            return Check("compile", "WARN", "0 Python source files found; compilation coverage is unavailable")
+        return Check("compile", "PASS", f"{count} Python source file(s) compile without writing bytecode")
 
     def _check_imports(self) -> Check:
-        broken: list[str] = []
-        count = 0
-        for path in sorted(PACKAGE_DIR.rglob("*.py")):
-            rel = path.relative_to(PACKAGE_DIR.parent)
-            mod = ".".join(rel.with_suffix("").parts)
-            if mod.endswith("__init__"):
-                mod = mod[: -len(".__init__")]
-            if mod in {"orion_core.app"}:  # importing app is heavy but safe; skip run
-                continue
-            try:
-                importlib.import_module(mod)
-                count += 1
-            except Exception as exc:
-                broken.append(f"{mod}: {first_line(exc, 50)}")
-        if broken:
-            return Check("imports", "FAIL", f"{len(broken)} module(s) fail to import: "
-                         + "; ".join(broken[:3]))
-        return Check("imports", "PASS", f"{count} modules import cleanly")
+        from .diagnostic_imports import check
+        try:
+            result = check(PACKAGE_DIR)
+        except Exception as exc:
+            return Check("imports", "FAIL", "Isolated import diagnostic failed: " + first_line(exc, 160))
+        return Check("imports", result["status"], result["detail"])
 
     def _check_dependencies(self) -> Check:
         missing_req: list[str] = []
         missing_opt: list[str] = []
         for module, required in DEPENDENCIES:
-            try:
-                importlib.import_module(module)
-            except Exception:
+            if not _module_present(module):
                 (missing_req if required else missing_opt).append(module)
         if missing_req:
             return Check("dependencies", "FAIL", "missing required: " + ", ".join(missing_req))
@@ -303,11 +437,28 @@ class DiagnosticsEngine:
             from .dispatcher import TOOL_DECLARATIONS
         except Exception as exc:
             return Check("tools", "FAIL", f"declarations unimportable: {first_line(exc, 50)}")
-        names = [d.get("name") for d in TOOL_DECLARATIONS]
-        if len(names) != len(set(names)):
-            dupes = {n for n in names if names.count(n) > 1}
-            return Check("tools", "FAIL", f"duplicate tool names: {', '.join(dupes)}")
-        return Check("tools", "PASS", f"{len(names)} tool declarations, no duplicates")
+        declarations = (getattr(self.dispatcher, "TOOL_DECLARATIONS", TOOL_DECLARATIONS)
+                        if self.dispatcher is not None else TOOL_DECLARATIONS)
+        names = [d.get("name") for d in declarations]
+        if any(not isinstance(name, str) or not name for name in names):
+            return Check("tools", "FAIL", "tool declaration has an invalid name")
+        dupes = sorted(name for name, count in Counter(names).items() if count > 1)
+        if dupes:
+            return Check("tools", "FAIL", f"duplicate tool names: {', '.join(dupes[:5])}")
+        if self.dispatcher is not None:
+            try:
+                native = self.dispatcher.handler_table()
+                forged = getattr(self.dispatcher, "_tool_handlers", {}) or {}
+                mcp = (getattr(self.dispatcher, "_mcp_routes", {}) or {}
+                       if getattr(self.dispatcher, "mcp_host", None) is not None else {})
+                available = {name for routes in (native, forged) for name, handler in routes.items()
+                             if callable(handler)} | set(mcp)
+                missing = sorted(set(names) - available)
+            except Exception as exc:
+                return Check("tools", "FAIL", f"routing inspection failed: {first_line(exc, 60)}")
+            if missing:
+                return Check("tools", "FAIL", f"declared tools without a live route: {', '.join(missing[:5])}")
+        return Check("tools", "PASS", f"{len(names)} tool declarations route cleanly")
 
     def _check_health(self) -> Check:
         if self.telemetry is None:
@@ -334,11 +485,20 @@ class DiagnosticsEngine:
         return Check("resources", "PASS", f"CPU {cpu:.0f}% RAM {ram:.0f}% disk {disk:.0f}%")
 
     def _check_permissions(self) -> Check:
-        probe = CONFIG_DIR / ".diag_write_test"
+        probe: str | None = None
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            probe.write_text("ok", encoding="utf-8")
-            probe.unlink()
+            # A fixed filename can be overwritten or deleted by another
+            # diagnostic process, or collide with a file left after a crash.
+            handle, probe = tempfile.mkstemp(prefix=".diag_write_test.", dir=CONFIG_DIR)
+            with os.fdopen(handle, "wb") as stream:
+                stream.write(b"ok")
             return Check("permissions", "PASS", "config directory is writable")
         except Exception as exc:
             return Check("permissions", "FAIL", f"config not writable: {first_line(exc, 50)}")
+        finally:
+            if probe is not None:
+                try:
+                    os.unlink(probe)
+                except OSError:
+                    pass

@@ -32,19 +32,25 @@ from PyQt6.QtCore import Qt, QRectF, QTimer
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QProgressBar,
     QScrollArea,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from ..bus import OrionBus
 from ..constants import C
+from .labels import plural, title_case
+from .reflections import ReflectionsPanel
 
 # Custom-painted, so no stylesheet reached it and it grew its own cyan, amber
 # and blue-grey. Taken from C now: the ring is a status reading, so it uses
@@ -126,7 +132,7 @@ class FocusRing(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setMinimumSize(150, 150)
+        self.setFixedSize(200, 200)
         self._vm: dict[str, Any] = {"active": False}
 
     def set_state(self, vm: dict[str, Any]) -> None:
@@ -153,17 +159,12 @@ class FocusRing(QWidget):
             p.drawArc(rect, 90 * 16, sweep)
             centre = (f"{int(round(vm.get('remaining', 0)))}m"
                       if not vm.get("break_due") else "BREAK")
-            sub = str(vm.get("label", ""))[:22]
         else:
-            centre, sub = "IDLE", "no block running"
+            centre = "IDLE"
 
         p.setPen(_INK)
         p.setFont(QFont("Segoe UI", max(11, int(side * 0.16)), QFont.Weight.Bold))
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, centre)
-        p.setPen(QColor(C.MUTED))
-        p.setFont(QFont("Segoe UI", 8))
-        p.drawText(QRectF(0, rect.bottom() - side * 0.16, w, side * 0.16),
-                   Qt.AlignmentFlag.AlignHCenter, sub)
 
 
 def _panel(frame: QFrame, title: str) -> QVBoxLayout:
@@ -184,16 +185,32 @@ class FocusPanel(QFrame):
         super().__init__()
         self.bus = bus
         self.focus = focus
-        layout = _panel(self, "DEEP FOCUS")
+        layout = _panel(self, "Deep Focus")
 
         self.ring = FocusRing()
-        layout.addWidget(self.ring, 1)
+        overview = QHBoxLayout()
+        overview.setSpacing(24)
+        overview.addWidget(self.ring)
+        description = QVBoxLayout()
+        self.focus_title = QLabel("No focus session")
+        self.focus_title.setFont(QFont("Segoe UI", 17, QFont.Weight.DemiBold))
+        self.focus_title.setWordWrap(True)
+        self.focus_hint = QLabel("")
+        self.focus_hint.setObjectName("mutedLabel")
+        self.focus_hint.setWordWrap(True)
+        description.addStretch()
+        description.addWidget(self.focus_title)
+        description.addWidget(self.focus_hint)
+        description.addStretch()
+        overview.addLayout(description, 1)
+        layout.addLayout(overview)
 
         controls = QHBoxLayout()
         self.intention = QLineEdit()
-        self.intention.setPlaceholderText("what are we focusing on?")
+        self.intention.setPlaceholderText("What are we focusing on?")
         self.preset = QComboBox()
-        self.preset.addItems(["deep", "pomodoro", "long", "short"])
+        for preset in ("deep", "pomodoro", "long", "short"):
+            self.preset.addItem(title_case(preset), preset)     # shown as a name, used as the key
         controls.addWidget(self.intention, 1)
         controls.addWidget(self.preset, 0)
         layout.addLayout(controls)
@@ -208,20 +225,22 @@ class FocusPanel(QFrame):
         layout.addLayout(buttons)
 
         self.status = QLabel("")
+        self.status.setObjectName("mutedLabel")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
         self.start_btn.clicked.connect(self._start)
+        self.intention.returnPressed.connect(self._start)
         self.done_btn.clicked.connect(self._done)
         self.interrupt_btn.clicked.connect(self._interrupt)
         self.cancel_btn.clicked.connect(self._cancel)
         self.refresh()
 
     def _start(self) -> None:
-        if self.focus is None:
+        if self.focus is None or self.focus.active() is not None:
             return
         label = self.intention.text().strip() or "focus"
-        self.focus.start(label=label, preset=self.preset.currentText())
+        self.focus.start(label=label, preset=str(self.preset.currentData() or "deep"))
         self.intention.clear()
         self.refresh()
 
@@ -250,13 +269,18 @@ class FocusPanel(QFrame):
         if not vm.get("available"):
             self.status.setText("Focus engine unavailable.")
         elif active:
+            self.focus_title.setText(vm["label"])
+            self.focus_hint.setText("Time for a break." if vm["break_due"] else
+                                    f"{vm['planned']}-minute block · {plural(round(vm['remaining']), 'minute')} remaining")
             self.status.setText(
-                f"{vm['interruptions']} distraction(s) · streak {vm['streak']} day(s) · "
+                f"{plural(vm['interruptions'], 'distraction')} · streak {plural(vm['streak'], 'day')} · "
                 f"today {vm['today_minutes']}m")
         else:
+            self.focus_title.setText("No focus session")
+            self.focus_hint.setText("")
             self.status.setText(
-                f"Streak {vm['streak']} day(s) · today {vm['today_completed']} block(s), "
-                f"{vm['today_minutes']}m focused")
+                f"{plural(vm['streak'], 'day')} streak · {vm['today_completed']} completed today · "
+                f"{plural(vm['today_minutes'], 'minute')} focused")
 
 
 class StudyPanel(QFrame):
@@ -266,7 +290,7 @@ class StudyPanel(QFrame):
         self.study = study
         self._card: Any = None
         self._revealed = False
-        layout = _panel(self, "STUDY & RECALL")
+        layout = _panel(self, "Study & Recall")
 
         self.summary = QLabel("")
         self.summary.setWordWrap(True)
@@ -278,8 +302,10 @@ class StudyPanel(QFrame):
         layout.addWidget(self.prompt, 1)
 
         row = QHBoxLayout()
+        self.add_btn = QPushButton("Add Card")
         self.review_btn = QPushButton("Review")
         self.reveal_btn = QPushButton("Reveal")
+        row.addWidget(self.add_btn)
         row.addWidget(self.review_btn)
         row.addWidget(self.reveal_btn)
         layout.addLayout(row)
@@ -294,13 +320,50 @@ class StudyPanel(QFrame):
         layout.addLayout(grades)
 
         self.review_btn.clicked.connect(self._next)
+        self.add_btn.clicked.connect(self._add_card)
         self.reveal_btn.clicked.connect(self._reveal)
         self.refresh()
+
+    def _add_card(self) -> None:
+        if self.study is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add a Study Card")
+        dialog.resize(460, 320)
+        layout = QVBoxLayout(dialog)
+        front, back, deck = QLineEdit(), QTextEdit(), QLineEdit("General")
+        front.setPlaceholderText("Question or prompt")
+        back.setPlaceholderText("Answer")
+        for label, widget in (("Question", front), ("Answer", back), ("Deck", deck)):
+            layout.addWidget(QLabel(label))
+            layout.addWidget(widget)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
+                                   QDialogButtonBox.StandardButton.Cancel)
+        save = buttons.button(QDialogButtonBox.StandardButton.Save)
+        save.setEnabled(False)
+        def changed() -> None:
+            save.setEnabled(bool(front.text().strip() and back.toPlainText().strip()))
+        front.textChanged.connect(changed)
+        back.textChanged.connect(changed)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self.study.add(front.text().strip(), back.toPlainText().strip(),
+                               deck=deck.text().strip() or "General")
+                self.refresh()
+            except Exception as exc:
+                self.prompt.setText(f"Could not save the card: {str(exc)[:180]}")
 
     def _next(self) -> None:
         if self.study is None:
             return
-        self._card = self.study.next_due()
+        # next_due() changes the engine's voice-review cursor. The desktop
+        # keeps its own selection so opening this panel cannot redirect a
+        # spoken grade to a different card.
+        cards = self.study.due(limit=1)
+        self._card = cards[0] if cards else None
         self._revealed = False
         self.refresh()
 
@@ -311,8 +374,12 @@ class StudyPanel(QFrame):
     def _grade(self, quality: int) -> None:
         if self.study is None or self._card is None:
             return
-        self.study.grade(quality)
-        self._card = self.study.next_due()
+        # The engine is shared with voice review. Its implicit current card may
+        # have changed since this panel displayed its own card, so always grade
+        # the card the person can actually see here.
+        self.study.grade(quality, card_id=self._card.id)
+        cards = self.study.due(limit=1)
+        self._card = cards[0] if cards else None
         self._revealed = False
         self.refresh()
 
@@ -320,21 +387,26 @@ class StudyPanel(QFrame):
         vm = study_view(self.study)
         if not vm.get("available"):
             self.summary.setText("Study engine unavailable.")
+            for button in (self.add_btn, self.review_btn, self.reveal_btn, *self._grade_btns):
+                button.setEnabled(False)
             return
         decks = ", ".join(f"{d['deck']} ({d['due']}/{d['total']})" for d in vm["decks"][:4])
         self.summary.setText(
-            f"{vm['due']} due · {vm['total']} cards · {vm['mastered']} mastered"
+            f"{vm['due']} due · {plural(vm['total'], 'card')} · {vm['mastered']} mastered"
             + (f" · {vm['retention']}% recall" if vm["retention"] is not None else "")
             + (f"\nDecks: {decks}" if decks else ""))
         if self._card is None:
-            self.prompt.setText("Press Review to begin."
-                                if vm["due"] else "Nothing due — nicely ahead.")
+            self.prompt.setText("Your next review is ready. Select Review to begin."
+                                if vm["due"] else
+                                ("All caught up. Add a card or return when your next review is due."
+                                 if vm["total"] else "Build your first deck. Add a question and answer to start learning."))
         elif self._revealed:
             self.prompt.setText(f"Q: {self._card.front}\n\nA: {self._card.back}")
         else:
             self.prompt.setText(f"Q: {self._card.front}")
         reviewing = self._card is not None
-        self.review_btn.setEnabled(vm["due"] > 0 or not reviewing)
+        self.add_btn.setEnabled(True)
+        self.review_btn.setEnabled(vm["due"] > 0)
         self.reveal_btn.setEnabled(reviewing and not self._revealed)
         for b in self._grade_btns:
             b.setEnabled(reviewing and self._revealed)
@@ -345,7 +417,25 @@ class InsightPanel(QFrame):
         super().__init__()
         self.study = study
         self.focus = focus
-        layout = _panel(self, "INSIGHT")
+        layout = _panel(self, "Insight")
+        metrics = QHBoxLayout()
+        self.metrics: dict[str, QLabel] = {}
+        for key, label in (("minutes", "Focus · 7 Days"), ("blocks", "Completed Blocks"),
+                           ("recall", "Recall"), ("mastered", "Cards Mastered")):
+            card = QFrame()
+            column = QVBoxLayout(card)
+            heading, value = QLabel(label), QLabel("—")
+            heading.setObjectName("mutedLabel")
+            value.setFont(QFont("Segoe UI", 22, QFont.Weight.DemiBold))
+            column.addWidget(heading)
+            column.addWidget(value)
+            metrics.addWidget(card, 1)
+            self.metrics[key] = value
+        layout.addLayout(metrics)
+        self.mastery = QProgressBar()
+        self.mastery.setRange(0, 100)
+        self.mastery.setAccessibleName("Proportion of cards mastered")
+        layout.addWidget(self.mastery)
         self.body = QLabel("")
         self.body.setWordWrap(True)
         self.body.setTextFormat(Qt.TextFormat.RichText)
@@ -355,16 +445,20 @@ class InsightPanel(QFrame):
     def refresh(self) -> None:
         vm = insight_view(self.study, self.focus)
         s, fst = vm["study"], vm["focus_stats"]
-        bar = self._bar(s["new"], s["learning"], s["mastered"])
+        self.metrics["minutes"].setText(f"{fst.get('focus_minutes', 0)} min")
+        self.metrics["blocks"].setText(str(fst.get("completed", 0)))
+        self.metrics["recall"].setText(f"{s['retention']}%" if s["retention"] is not None else "—")
+        self.metrics["mastered"].setText(f"{s['mastered']} / {s['total']}")
+        self.mastery.setValue(round(100 * s["mastered"] / max(1, s["total"])))
+        self.mastery.setFormat("%p% mastered" if s["total"] else "Add study cards to begin")
         lines = [
-            f"<b>Mastery</b> {bar}",
-            f"new {s['new']} · learning {s['learning']} · mastered {s['mastered']}",
+            f"{s['new']} new · {s['learning']} learning · {s['mastered']} mastered",
         ]
         if s["retention"] is not None:
             lines.append(f"<b>Recall</b> {s['retention']}%")
         if fst:
             lines.append(
-                f"<b>Focus ({fst.get('days', 7)}d)</b> {fst.get('completed', 0)} blocks, "
+                f"<b>Focus ({fst.get('days', 7)}d)</b> {plural(fst.get('completed', 0), 'block')}, "
                 f"{fst.get('focus_minutes', 0)}m, {fst.get('completion_rate', 0)}% done, "
                 f"streak {fst.get('streak', 0)}")
         self.body.setText("<br>".join(lines))
@@ -381,7 +475,7 @@ class InsightPanel(QFrame):
 # ── the page ──────────────────────────────────────────────────────────────────
 
 class CognitionDeckView(QWidget):
-    """The COGNITION Command-Deck page: focus, study and insight in one surface."""
+    """The Cognition page: focus, study, insight and useful activity notes."""
 
     REFRESH_MS = 1000
 
@@ -402,14 +496,33 @@ class CognitionDeckView(QWidget):
         grid = QGridLayout(content)
         grid.setContentsMargins(4, 4, 4, 4)
         grid.setSpacing(10)
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
 
         self.focus_panel = FocusPanel(bus, focus)
         self.study_panel = StudyPanel(bus, study)
         self.insight_panel = InsightPanel(bus, study, focus)
+        self.reflections_panel = ReflectionsPanel(bus)
         grid.addWidget(self.focus_panel, 0, 0)
         grid.addWidget(self.study_panel, 0, 1)
-        grid.addWidget(self.insight_panel, 1, 0, 1, 2)
-        grid.setRowStretch(2, 1)
+        # Today round a 24-hour clock: conversations, focus, study (28 Oct 2026).
+        from .hud_instruments import DayRing
+        self.day_ring = DayRing()
+        self.day_ring.setFixedHeight(260)
+        day_panel = QFrame()
+        day_panel.setObjectName("panelFrame")
+        day_box = QVBoxLayout(day_panel)
+        day_box.setContentsMargins(14, 10, 14, 10)
+        day_heading = QLabel("Today")
+        day_heading.setObjectName("panelHeading")
+        day_box.addWidget(day_heading)
+        day_box.addWidget(self.day_ring)
+        grid.addWidget(day_panel, 1, 0, 1, 2)
+        grid.addWidget(self.insight_panel, 2, 0, 1, 2)
+        grid.addWidget(self.reflections_panel, 3, 0, 1, 2)
+        grid.setRowStretch(4, 1)
+        self._day_ticks = 0
+        self._day_busy = False
         scroll.setWidget(content)
 
         # Second-granularity refresh so the focus ring counts down — but never
@@ -419,10 +532,46 @@ class CognitionDeckView(QWidget):
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
+    #: How often (in refresh ticks) the day ring reads today again.
+    DAY_EVERY = 60
+
     def _tick(self) -> None:
         if not self.isVisible():
             return
         self.refresh_all()
+        self._day_ticks += 1
+        if self._day_ticks == 1 or self._day_ticks % self.DAY_EVERY == 0:
+            self.refresh_day()
+        self.day_ring.update()                  # the hour hand
+
+    def refresh_day(self) -> None:
+        """Read today's focus, study and conversations off the GUI thread."""
+        import asyncio
+
+        from ..constants import CONFIG_DIR
+        from .hud_instruments import day_activity
+        stores = {"focus_store": getattr(self.focus, "store", None),
+                  "study_store": getattr(self.study, "store", None),
+                  "log_path": CONFIG_DIR / "diagnostics" / "session.log"}
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self.day_ring.set_activity(day_activity(**stores))
+            return
+        if self._day_busy:
+            return
+        self._day_busy = True
+        from .. import background
+
+        async def read() -> None:
+            try:
+                activity = await asyncio.to_thread(lambda: day_activity(**stores))
+                self.day_ring.set_activity(activity)
+            except RuntimeError:
+                pass
+            finally:
+                self._day_busy = False
+        background.spawn(read(), name="orion-day-ring")
 
     def refresh_all(self) -> None:
         self.focus_panel.refresh()

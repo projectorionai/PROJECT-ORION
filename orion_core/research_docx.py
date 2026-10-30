@@ -18,14 +18,20 @@ run because a formatting library is absent would be an absurd way to fail.
 from __future__ import annotations
 
 import re
+import os
+import stat
+import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .constants import BASE_DIR
+from .constants import CONFIG_DIR
 
 #: Where research lands, unless a caller says otherwise.
-DEFAULT_DIR = BASE_DIR / "config" / "research"
+DEFAULT_DIR = CONFIG_DIR / "research"
+_WINDOWS = os.name == "nt"
+_RENAME_DELAYS = (0.025, 0.05, 0.1, 0.15)
 
 
 def available() -> bool:
@@ -87,6 +93,83 @@ def _plain(text: str) -> str:
     return text.strip()
 
 
+def _owned_regular(path: Path, identity: Any, *, empty: bool = False) -> bool:
+    """A changed, populated or linked reservation belongs to somebody else."""
+    if identity is None:
+        return False
+    try:
+        current = path.lstat()
+        return (stat.S_ISREG(current.st_mode)
+                and (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino)
+                and (not empty or current.st_size == 0))
+    except OSError:
+        return False
+
+
+def _publish_new(folder: Path, stem: str, suffix: str, writer: Any) -> Path:
+    """Publish a complete new result without replacing an older paper."""
+    temporary: Path | None = None
+    temporary_identity = None
+    from .research_publication import current
+    journal = current()
+    publication_id = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=folder, prefix=".paper-", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            temporary_identity = os.fstat(handle.fileno())
+        if journal is not None:
+            publication_id = journal.begin(folder.absolute(), temporary.absolute())
+        writer(temporary)
+        if journal is not None:
+            with temporary.open("r+b") as complete:
+                os.fsync(complete.fileno())
+            journal.stage(publication_id, "serialized", temporary=temporary.absolute())
+        for index in range(1000):
+            path = folder / f"{stem}{'_' + str(index + 1) if index else ''}{suffix}"
+            try:
+                with path.open("xb") as reserved:
+                    identity = os.fstat(reserved.fileno())
+            except FileExistsError:
+                continue
+            try:
+                if journal is not None:
+                    journal.stage(publication_id, "reserved", destination=path.absolute())
+                for attempt in range(len(_RENAME_DELAYS) + 1):
+                    if not _owned_regular(path, identity, empty=True):
+                        raise FileExistsError(f"Reserved paper destination changed: {path}")
+                    try:
+                        os.replace(temporary, path)
+                        break
+                    except OSError as exc:
+                        # AV/sync readers can briefly deny a Windows rename.
+                        # Retry only publication of the already complete temp;
+                        # never serialize twice or overwrite a changed target.
+                        if (not _WINDOWS or getattr(exc, "winerror", None) not in {5, 32, 33}
+                                or attempt == len(_RENAME_DELAYS)
+                                or not _owned_regular(path, identity, empty=True)):
+                            raise
+                        time.sleep(_RENAME_DELAYS[attempt])
+                if journal is not None:
+                    journal.observed(path)
+                    journal.stage(publication_id, "published")
+            except OSError:
+                if _owned_regular(path, identity, empty=True):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                raise
+            temporary = None
+            return path
+        raise FileExistsError("No unused paper filename was available")
+    finally:
+        if temporary is not None and _owned_regular(temporary, temporary_identity):
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
 def write_paper(paper: Any, folder: Path | None = None) -> tuple[Path | None, str]:
     """Write *paper* as .docx. Returns (path, note); path is None on failure."""
     folder = Path(folder) if folder else DEFAULT_DIR
@@ -97,9 +180,9 @@ def write_paper(paper: Any, folder: Path | None = None) -> tuple[Path | None, st
 
     stem = f"{datetime.now():%Y-%m-%d}-{_safe_name(paper.topic)}"
     if not available():
-        fallback = folder / f"{stem}.md"
         try:
-            fallback.write_text(_as_markdown(paper), encoding="utf-8")
+            fallback = _publish_new(folder, stem, ".md", lambda path: path.write_text(
+                _as_markdown(paper), encoding="utf-8"))
         except OSError as exc:
             return None, f"could not write the paper: {exc}"
         return fallback, ("python-docx is not installed, so this was saved as "
@@ -166,9 +249,8 @@ def write_paper(paper: Any, folder: Path | None = None) -> tuple[Path | None, st
             url = str(source.get("url") or "")
             document.add_paragraph(f"{index}. {title}" + (f" — {url}" if url else ""))
 
-    path = folder / f"{stem}.docx"
     try:
-        document.save(str(path))
+        path = _publish_new(folder, stem, ".docx", lambda target: document.save(str(target)))
     except Exception as exc:
         return None, f"could not save the Word document: {exc}"
     return path, ""
@@ -189,3 +271,9 @@ def _as_markdown(paper: Any) -> str:
 
 
 __all__ = ["DEFAULT_DIR", "available", "write_paper"]
+
+
+def write_text_artifact(path: Path, content: str) -> Path:
+    """New run-local text uses the same recoverable publication as papers."""
+    return _publish_new(path.parent, path.stem, path.suffix,
+                        lambda target: target.write_text(content, encoding="utf-8"))

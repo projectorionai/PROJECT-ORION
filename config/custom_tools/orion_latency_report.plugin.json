@@ -1,0 +1,33 @@
+{
+  "name": "orion_latency_report",
+  "description": "Analyse supplied timing samples, showing stage percentiles and the largest mean stage. Does not measure live hardware or request a model.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "samples": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 256,
+        "description": "Observed exclusive stage durations in milliseconds, for example [{capture: 100, model: 800, speech: 450}]. No cumulative timestamps.",
+        "items": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 16,
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 86400000
+          }
+        }
+      }
+    },
+    "required": [
+      "samples"
+    ]
+  },
+  "module": "orion_latency_report_tool.py",
+  "tier": "allow",
+  "requires": [],
+  "permissions": [],
+  "version": "1.0.0"
+}

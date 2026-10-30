@@ -185,7 +185,32 @@ SANCTIONED_EXECUTION = {
     # guard_forged_source approves them (forge.py), and the rehabilitation path
     # re-applies that guard before running a file that has sat in quarantine.
     "dynamic_loader.py",
+    # The verification helper compiles its own shipped literal once so the
+    # frozen parent and staged child use identical fixtures. It accepts no
+    # generated/user source; the next test locks that boundary down.
+    "forge_fixtures.py",
 }
+
+
+def test_fixture_execution_compiles_only_its_own_shipped_literal():
+    import ast
+    tree = ast.parse((ROOT / "orion_core/forge_fixtures.py").read_bytes())
+    sources = [node.value for node in tree.body if isinstance(node, ast.Assign)
+               and any(isinstance(target, ast.Name) and target.id == "_SOURCE"
+                       for target in node.targets)]
+    assert len(sources) == 1 and isinstance(sources[0], ast.Constant)
+    assert isinstance(sources[0].value, str)
+    executions = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name) and node.func.id in {"exec", "eval"}]
+    assert len(executions) == 1
+    call = executions[0]
+    assert call.func.id == "exec" and len(call.args) == 2 and not call.keywords
+    compiled, namespace = call.args
+    assert isinstance(compiled, ast.Call) and isinstance(compiled.func, ast.Name)
+    assert compiled.func.id == "compile" and len(compiled.args) == 3 and not compiled.keywords
+    assert isinstance(compiled.args[0], ast.Name) and compiled.args[0].id == "_SOURCE"
+    assert isinstance(compiled.args[2], ast.Constant) and compiled.args[2].value == "exec"
+    assert isinstance(namespace, ast.Name) and namespace.id == "_namespace"
 
 
 def test_no_unsanctioned_code_execution_path_exists():

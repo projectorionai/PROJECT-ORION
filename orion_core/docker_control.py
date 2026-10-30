@@ -29,7 +29,7 @@ def is_available() -> bool:
 
 def _run(args: list[str], timeout: int = _TIMEOUT) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["docker", *args], capture_output=True, text=True, timeout=timeout, shell=False,
+        ["docker", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, shell=False,
     )
 
 

@@ -63,7 +63,7 @@ def test_panel_shows_call_count_and_last_active(_app):
     ])
     panel = AgentMonitorPanel(_StubBus(), agents)
     text = panel.listing.item(0).text()
-    assert "3 call(s)" in text
+    assert "3 calls" in text
     assert "2026-08-01T09:00:00Z" in text
 
 

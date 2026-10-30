@@ -32,7 +32,9 @@ voice tone, pacing and word choice.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -254,8 +256,11 @@ class SentimentAnalyser:
             (r"\b(take care|are you (all right|ok|okay))\b", 2.5),
         ),
         "urgent": (
+            # "down" only as an outage ("the site is down"): "I'm going to shut
+            # you down" read as urgent and put the alert face on a goodbye.
             (r"\b(urgent(?:ly)?|immediately|critical|at once|right away|asap|"
-             r"emergency|overdue|deadline|breach|failure|down|offline)\b", 2.2),
+             r"emergency|overdue|deadline|breach|failure|offline|"
+             r"(?:is|are|was|were|went|gone|been)\s+down)\b", 2.2),
             (r"\b(must|now)\b", 0.6),
         ),
         "analytical": (
@@ -272,7 +277,71 @@ class SentimentAnalyser:
             (r"\b(proceeding|executing|working on|in progress|step \d|next step|"
              r"on it|running|building|scanning|checking)\b", 1.6),
         ),
+        # Mark XXXVII.4 (owner: "more emotional and read emotion better"):
+        # the feelings people actually voice, which the six above never named -
+        # so a sad "I've had a rough day" and a laughing "haha" both read as
+        # neutral, and his face stayed blank for them.
+        "sadness": (
+            (r"\b(sad|unhappy|lonely|miserable|heartbroken|gutted|depress\w*|"
+             r"crying|cried|in tears|upset|hurting|rough day|bad day|awful day|"
+             r"passed away|grieving|lost my)\b", 2.2),
+            (r"\bfeel(?:ing)? (?:low|down|blue|rubbish|terrible|awful|empty|sad)\b", 2.6),
+            (r"\b(?:not|never|no longer)\s+(?:\w+\s+){0,2}?(?:happy|good|great|fine|okay|"
+             r"ok|well|alright)\b", 2.0),
+        ),
+        "frustration": (
+            (r"\b(annoy\w*|frustrat\w*|angry|furious|fed up|sick of|ridiculous|useless|"
+             r"pissed off|winds? me up|doesn'?t work|not working|broken again|"
+             r"keeps? (?:failing|breaking|crashing)|for god'?s sake|ugh+|argh+)\b", 2.2),
+            (r"\bhate (?:this|it|that)\b", 2.2),
+        ),
+        "excitement": (
+            (r"\b(excit\w*|can'?t wait|yay+|woo+(?:hoo+)?|amazing|awesome|incredible|"
+             r"buzzing|thrilled|so happy|best day|let'?s go+)\b", 2.2),
+        ),
+        "amusement": (
+            (r"\b(ha(?:ha)+h?|he(?:he)+|lol|lmao|rofl|hilarious|so funny|that'?s funny|"
+             r"good one|cracking up|made me laugh)\b", 2.2),
+        ),
+        "gratitude": (
+            (r"\b(thank(?:s| you)|cheers|appreciate(?:d| it)?|grateful|you'?re a star|"
+             r"lifesaver)\b", 2.0),
+        ),
+        "affection": (
+            (r"\b(love you|i like you|you'?re (?:the best|amazing|awesome|cute|adorable|"
+             r"sweet|lovely)|good (?:boy|job|robot)|cutie|so cute|adorable)\b", 2.4),
+        ),
+        "tiredness": (
+            (r"\b(tired|exhausted|knackered|shattered|sleepy|worn out|drained|"
+             r"no energy|need (?:a )?(?:sleep|nap|rest))\b", 2.2),
+        ),
+        "surprise": (
+            (r"\b(wow|whoa|no way|oh my (?:god|gosh)|omg|i can'?t believe|unbelievable)\b", 2.0),
+            (r"\b(?:really|seriously)\?", 1.6),
+        ),
+        # Aimed at ORION himself ("you're bad at singing", "you're useless"):
+        # owner, 26 Oct 2026 - his face should show he minds, not stay content.
+        "insult": (
+            (r"\byou(?:'re| are)\s+(?:so\s+|really\s+|pretty\s+|such\s+an?\s+)?"
+             r"(?:bad|terrible|awful|rubbish|useless|stupid|dumb|annoying|crap|trash|"
+             r"hopeless|pathetic|idiot|the worst)\b", 2.6),
+            (r"\b(?:bad|terrible|awful|rubbish|crap|useless) at (?:singing|this|that|"
+             r"everything|your job|it)\b", 2.4),
+            (r"\byou (?:suck|can'?t sing|sound awful|sound terrible)\b|\bshut up\b|"
+             r"\bi hate you\b", 2.4),
+        ),
     }
+
+    #: Feelings a "not" in front turns round ("I'm not excited" is not joy,
+    #: "you're not bad at singing" is no insult).
+    _POSITIVE = frozenset({"celebratory", "excitement", "amusement", "affection",
+                           "gratitude", "confident", "insult"})
+    _NEGATOR = re.compile(r"\b(?:not|never|no|isn'?t|wasn'?t|aren'?t|don'?t|didn'?t|"
+                          r"doesn'?t|hardly|barely)\s+(?:\w+\s+){0,2}$", re.IGNORECASE)
+
+    @classmethod
+    def _negated(cls, text: str, start: int) -> bool:
+        return bool(cls._NEGATOR.search(text[max(0, start - 32):start]))
 
     _COMPILED = {
         name: tuple((re.compile(pat, re.IGNORECASE), weight) for pat, weight in rules)
@@ -292,11 +361,12 @@ class SentimentAnalyser:
             total = 0.0
             words: list[str] = []
             for pattern, weight in rules:
-                hits = pattern.findall(text)
+                hits = [m for m in pattern.finditer(text)
+                        if not (name in cls._POSITIVE and cls._negated(text, m.start()))]
                 if hits:
                     total += weight * min(len(hits), 4)   # saturate: 100
-                    words.extend(h if isinstance(h, str) else h[0]  # marks
-                                 for h in hits[:2])       # aren't 100× joy
+                    words.extend(m.group(0) for m in hits[:2])   # marks
+                                                          # aren't 100× joy
             if total > 0.0:
                 scores[name] = total
                 matched[name] = [w for w in words if w and w != "!"][:3]
@@ -343,16 +413,51 @@ _SENTIMENT_EMOTION: dict[str, str] = {
     "empathetic_concern": "concerned",
     "urgent": "alert",
     "analytical": "thinking",
-    "confident": "neutral",     # confidence reads as composed, not excitable
-    "focused": "thinking",
+    # Composed, but not blank: the most common thing he says ("Certainly")
+    # used to wear the neutral face, which is why he looked expressionless.
+    "confident": "content",
+    "focused": "determined",
+    "sadness": "sad",
+    # His own annoyance shows as annoyance (owner: "if angry about something
+    # then angry"), not as worry.
+    "frustration": "angry",
+    "insult": "sad",
+    "excitement": "excited",
+    "amusement": "amused",
+    "gratitude": "grateful",
+    "affection": "love",
+    "tiredness": "sleepy",
+    "surprise": "surprised",
     "neutral": "neutral",
+}
+
+#: How his face ANSWERS what the user feels - empathy, not a mirror: their
+#: sadness meets a sympathetic face (not a sad one), their frustration a
+#: calm one, their compliment a blush. Feelings with no entry (analytical,
+#: confident, focused) leave his face as it was.
+_USER_SENTIMENT_EMOTION: dict[str, str] = {
+    "celebratory": "happy",
+    "empathetic_concern": "empathetic",
+    "urgent": "alert",
+    "sadness": "empathetic",
+    "frustration": "reassuring",
+    "excitement": "excited",
+    "amusement": "amused",
+    "gratitude": "happy",
+    "affection": "shy",
+    "tiredness": "empathetic",
+    "surprise": "surprised",
+    # "You're bad at singing": he minds - a cross face, held for the reply.
+    "insult": "angry",
 }
 
 # Pipeline state → baseline emotion.
 _STATE_EMOTION: dict[str, str] = {
     "LISTENING": "listening",
     "SPEAKING": "speaking",
-    "PROCESSING": "thinking",
+    # Working on something - a tool, a plan, an answer - is focus, not idle
+    # musing: the concentrating face (owner: "if focused, focusing").
+    "PROCESSING": "determined",
     "CONNECTING": "thinking",
     "INITIALISING": "neutral",
     "STANDBY": "neutral",
@@ -369,12 +474,74 @@ _INTENSITY_SCALED = {
 }
 
 
+#: Spoken words for an expression that is not the face's own name for it.
+_SHOW_ALIASES: dict[str, str] = {
+    "smile": "happy", "smiling": "happy", "joy": "happy", "joyful": "happy",
+    "glad": "happy", "laugh": "amused", "laughing": "amused", "funny": "amused",
+    "cry": "sad", "crying": "sad", "upset": "sad", "unhappy": "sad",
+    "mad": "angry", "cross": "angry", "annoyed": "angry", "furious": "angry",
+    "scared": "alarmed", "afraid": "alarmed", "frightened": "alarmed", "fear": "alarmed",
+    "shock": "surprised", "shocked": "surprised", "surprise": "surprised",
+    "tired": "sleepy", "sleep": "sleepy", "worried": "concerned", "worry": "concerned",
+    "in_love": "love", "heart": "love", "loving": "love", "embarrassed": "shy",
+    "blush": "shy", "blushing": "shy", "puzzled": "confused", "thoughtful": "thinking",
+    "think": "thinking", "calm": "content", "relaxed": "content", "thankful": "grateful",
+    "interested": "curious", "focused": "determined", "brave": "determined",
+    "normal": "neutral", "resting": "neutral",
+}
+
+#: The order an expression tour shows them in: the feelings first, then the
+#: quieter faces, ending back at rest.
+TOUR_ORDER: tuple[str, ...] = (
+    "happy", "excited", "amused", "love", "shy", "surprised", "curious",
+    "thinking", "confused", "concerned", "sad", "angry", "determined",
+    "proud", "sleepy", "neutral",
+)
+
+
+#: Words around an expression's name that are not part of it.
+_SHOW_FILLER = frozenset({
+    "your", "my", "a", "an", "the", "face", "faces", "expression", "look",
+    "looking", "show", "me", "please", "of", "emotion", "very", "really", "bit",
+    "little", "so", "be", "do", "what", "when", "you", "re", "are", "like",
+})
+
+
+def face_expression(name: Any) -> str:
+    """The expression *name* asks for ("sad", "your smile", "in love"), as the
+    face names it - or "" when it names none. The Screen Face knows more
+    expressions than this engine's sentiment profiles; both count."""
+    words = [w for w in re.findall(r"[a-z]+", str(name or "").lower())
+             if w not in _SHOW_FILLER]
+    if not words:
+        return ""
+    try:
+        from .gui.screen_face import EMOTIONS as face_emotions, emotion_preset
+    except Exception:              # no Qt in this process: the engine's own
+        face_emotions, emotion_preset = {}, None
+    # The whole phrase first ("in love"), then each word from the last.
+    for candidate in ["_".join(words), *reversed(words)]:
+        key = _SHOW_ALIASES.get(candidate, candidate)
+        if key in face_emotions or key in EMOTIONS:
+            return key
+        if emotion_preset is not None:
+            preset = emotion_preset(key)
+            if preset != "neutral":
+                return preset
+    return ""
+
+
 class EmotionStateManager:
     """The single, bus-driven authority on ORION's emotional state."""
 
     SENTIMENT_HOLD_S = 10.0
     MIN_CONFIDENCE = 0.45
     EXCITED_AT = 0.8
+    #: How long an expression asked for by name stays on ("show me your sad
+    #: face") before the face goes back to following the conversation.
+    SHOW_HOLD_S = 6.0
+    #: Each expression of a tour ("cycle through your expressions").
+    TOUR_STEP_S = 2.0
 
     def __init__(self, bus: OrionBus, telemetry: Any | None = None) -> None:
         self.bus = bus
@@ -384,6 +551,11 @@ class EmotionStateManager:
         self._override_until = 0.0
         self._intensity = 1.0
         self._manual: str = ""
+        #: An expression shown on request, until _shown_until (show / tour).
+        self._shown: str = ""
+        self._shown_until = 0.0
+        self._show_timer: Any = None
+        self._tour: list[str] = []
         self._current = ""
         self._current_intensity = -1.0
         self._last_payload: dict[str, Any] = {"sentiment": "neutral",
@@ -409,8 +581,10 @@ class EmotionStateManager:
         confidence = float(payload.get("confidence") or 0.0)
         if confidence < self.MIN_CONFIDENCE:
             return
-        emotion = _SENTIMENT_EMOTION.get(sentiment, "")
-        if not emotion:
+        mapping = (_USER_SENTIMENT_EMOTION if payload.get("origin") == "user"
+                   else _SENTIMENT_EMOTION)
+        emotion = mapping.get(sentiment, "")
+        if not emotion or emotion == "neutral":
             return
         if sentiment == "celebratory" and confidence >= self.EXCITED_AT:
             emotion = "excited"
@@ -439,9 +613,92 @@ class EmotionStateManager:
         self._resolve()
         return f"Emotion pinned to {name}."
 
+    # ── showing an expression on request ──────────────────────────────────────
+
+    def show(self, name: Any, seconds: float | None = None) -> tuple[str, bool]:
+        """Wear *name* for a few seconds whatever else is happening - talking
+        about it included - then follow the conversation again. (reply, ok)."""
+        key = face_expression(name)
+        if not key:
+            return (f"{str(name or '').strip() or 'That'!r} is not one of my expressions. "
+                    "I can show: " + ", ".join(TOUR_ORDER[:-1]) + ".", False)
+        self._stop_show()
+        try:
+            hold = max(0.5, min(30.0, float(seconds))) if seconds not in (None, "") else self.SHOW_HOLD_S
+        except (TypeError, ValueError):
+            hold = self.SHOW_HOLD_S
+        self._wear(key, hold, self._end_show)
+        return (f"Showing my {key} face now.", True)
+
+    def tour(self, names: Any = None, step_s: float | None = None) -> tuple[str, bool]:
+        """Show each expression in turn ("cycle through your faces"), then go
+        back to following the conversation. (reply naming the order, ok)."""
+        if isinstance(names, str):
+            names = [part for part in re.split(r",|;|/|\band\b", names) if part.strip()]
+        wanted = [face_expression(n) for n in (names or ())] if names else list(TOUR_ORDER)
+        order = [n for n in dict.fromkeys(wanted) if n]
+        if not order:
+            return ("Name some expressions for me to show.", False)
+        self._stop_show()
+        try:
+            step = max(0.8, min(10.0, float(step_s))) if step_s is not None else self.TOUR_STEP_S
+        except (TypeError, ValueError):
+            step = self.TOUR_STEP_S
+        self._tour = order[1:]
+        self._tour_step = step
+        self._wear(order[0], step, self._advance_tour)
+        shown = [n for n in order if n != "neutral"]
+        return (f"Showing my expressions, about {step:g} seconds each, in this order: "
+                + ", ".join(shown) + ".", True)
+
+    def _wear(self, key: str, hold: float, then: Any) -> None:
+        self._shown = key
+        self._shown_until = time.monotonic() + hold
+        self._current = ""                  # always emitted, even if unchanged
+        self._resolve()
+        self._show_timer = self._later(hold, then)
+
+    def _advance_tour(self) -> None:
+        if not self._tour:
+            self._end_show()
+            return
+        key = self._tour.pop(0)
+        self._wear(key, getattr(self, "_tour_step", self.TOUR_STEP_S), self._advance_tour)
+
+    def _end_show(self) -> None:
+        self._shown, self._shown_until, self._show_timer = "", 0.0, None
+        self._resolve()
+
+    def _stop_show(self) -> None:
+        timer, self._show_timer = self._show_timer, None
+        self._tour = []
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        self._shown, self._shown_until = "", 0.0
+
+    @staticmethod
+    def _later(delay: float, callback: Any) -> Any:
+        """Run *callback* after *delay*: on the running loop (the GUI thread
+        under qasync), else on a timer thread. Either can be cancelled."""
+        try:
+            return asyncio.get_running_loop().call_later(delay, callback)
+        except RuntimeError:
+            timer = threading.Timer(delay, callback)
+            timer.daemon = True
+            timer.start()
+            return timer
+
     # ── resolution ────────────────────────────────────────────────────────────
 
     def _resolve(self) -> None:
+        if self._shown and time.monotonic() < self._shown_until:
+            # Asked for by name: it outranks the pin, the sentiment and the
+            # state - "here is my sad face" must not turn into "speaking".
+            self._emit(self._shown, 1.0)
+            return
         if self._manual:
             self._emit(self._manual, 1.0)
             return
@@ -459,6 +716,8 @@ class EmotionStateManager:
         self._current = name
         self._current_intensity = intensity
         profile = EMOTIONS.get(name, EMOTIONS["neutral"])
+        # One of the Screen Face's own expressions (love, shy, surprised,
+        # sleepy...) has no profile here: the face draws it from its name.
         params = self._scaled_params(profile, intensity)
         try:
             self.bus.emotion_changed.emit(name, params)
@@ -502,6 +761,7 @@ class EmotionStateManager:
             "baseline": self._baseline,
             "override": self._override or None,
             "manual": self._manual or None,
+            "shown": self._shown or None,
             "last_sentiment": dict(self._last_payload),
             "available": sorted(EMOTIONS),
         }

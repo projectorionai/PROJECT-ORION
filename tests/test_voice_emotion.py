@@ -288,3 +288,31 @@ def test_a_corrupt_state_file_is_survivable(tmp_path):
     path = tmp_path / "e.json"
     path.write_text("{ this is not json", encoding="utf-8")
     assert EmotionBaseline(path).observations("you") == 0
+
+
+# ── ORION's own delivery (audio.SpeechSynthesiser imports prosody_for) ───────
+
+def test_orions_local_voice_flexes_with_his_mood_within_a_tight_envelope():
+    """It was imported for months and never existed: the local voice spoke
+    every mood identically (found by the installed-app parity check)."""
+    from orion_core.voice_emotion import PROSODY_RATE_SPAN, PROSODY_VOLUME_SPAN, prosody_for
+    base_rate, base_volume = 180, 0.9
+    assert prosody_for("neutral", base_rate, base_volume) == (180, 0.9)
+    assert prosody_for("no-such-mood", base_rate, base_volume) == (180, 0.9)
+    excited = prosody_for("excited", base_rate, base_volume)
+    sad = prosody_for("sad", base_rate, base_volume)
+    assert excited[0] > base_rate > sad[0]
+    assert excited[1] > base_volume > sad[1]
+    from orion_core.emotion import EMOTIONS
+    for name in EMOTIONS:
+        rate, volume = prosody_for(name, base_rate, base_volume)
+        assert abs(rate - base_rate) <= base_rate * PROSODY_RATE_SPAN + 1, name
+        assert abs(volume - base_volume) <= base_volume * PROSODY_VOLUME_SPAN + 1e-9, name
+        assert 0.0 <= volume <= 1.0
+
+
+def test_the_local_voice_still_asks_for_its_prosody():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "orion_core" / "audio.py").read_text(
+        encoding="utf-8")
+    assert "from .voice_emotion import prosody_for" in source

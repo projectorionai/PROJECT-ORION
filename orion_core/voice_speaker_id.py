@@ -79,12 +79,14 @@ def record_enrollment_clip(seconds: float = 5.0, sample_rate: int = 16000) -> An
     in this pass — that would mean touching the real-time thread, and is
     intentionally left as a follow-up rather than done blind."""
     import sounddevice as sd
-    from .audio_devices import resolve
+    from .audio_devices import resolve, stream_guard
     device = resolve("input")
-    recording = sd.rec(
-        int(seconds * sample_rate), samplerate=sample_rate,
-        channels=1, dtype="float32", device=device)
-    sd.wait()
+    # Counted while open, so a PortAudio re-initialisation waits for it.
+    with stream_guard():
+        recording = sd.rec(
+            int(seconds * sample_rate), samplerate=sample_rate,
+            channels=1, dtype="float32", device=device)
+        sd.wait()
     return recording.flatten()
 
 
@@ -184,12 +186,13 @@ class SpeakerIdentificationService:
             pass
         return {}
 
-    def _save_profiles(self) -> None:
+    def _save_profiles(self) -> bool:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             atomic_write_text(PROFILES_PATH, json.dumps(self._profiles, indent=2), encoding="utf-8")
+            return True
         except OSError:
-            pass  # a read-only config directory must never break the call
+            return False
 
     def _log(self, message: str) -> None:
         if self.bus is not None:
@@ -198,6 +201,37 @@ class SpeakerIdentificationService:
             except Exception:
                 pass
 
+    def _prints(self) -> Any:
+        """Use the gate's live store, including isolated paths supplied by tests."""
+        from . import voiceprint
+
+        prints = voiceprint.store()
+        if prints.profiles_path == PROFILES_PATH:
+            return prints
+        return voiceprint.Voiceprints(path=CONFIG_DIR / "voiceprints.json",
+                                     profiles_path=PROFILES_PATH)
+
+    def start_learning(self, name: str, *, consent: bool = False,
+                       origin: str = "voice", user_name: str = "",
+                       on_event: Any = None) -> ToolResult:
+        """Learn from conversation's existing capture stream, without opening a mic."""
+        from . import voice_enrolment, voiceprint
+
+        if consent is not True:
+            return ToolResult("Voice learning needs your explicit consent=true.", ok=False)
+        if not str(name or "").strip():
+            return ToolResult("A name is required to learn a voice profile.", ok=False)
+        if not voiceprint.available():
+            return ToolResult("The voice encoder is unavailable, so I cannot learn a voice.",
+                              ok=False)
+        session = voice_enrolment.start(
+            name, store=self._prints(), user_name=user_name or name,
+            origin=origin, on_event=on_event)
+        return ToolResult("Voice learning has started. Read about twenty short lines, "
+                          "including a few quietly and a few louder. I keep only a "
+                          "voiceprint, never a recording. Say cancel to stop. "
+                          + session.describe())
+
     # ── enrolment ────────────────────────────────────────────────────────────
 
     def enroll(self, name: str, samples: list, sample_rate: int,
@@ -205,14 +239,14 @@ class SpeakerIdentificationService:
         name = str(name or "").strip()
         if not name:
             return ToolResult("A name is required to enrol a voice profile.", ok=False)
-        if not consent:
+        if consent is not True:
             return ToolResult(
                 "Voice enrolment requires explicit consent — call again with "
                 "consent=true once the person has agreed to have their voice "
                 "remembered permanently.", ok=False)
         if not available():
             return ToolResult(
-                "Voice recognition is not available (resemblyzer is not installed).", ok=False)
+                "Voice recognition is not available (no usable voice encoder).", ok=False)
         samples = list(samples or [])
         if not samples:
             return ToolResult("No audio samples supplied for enrolment.", ok=False)
@@ -221,17 +255,21 @@ class SpeakerIdentificationService:
             embeddings = [_embed(sample, sample_rate) for sample in samples]
             centroid = np.mean(embeddings, axis=0)
             norm = float(np.linalg.norm(centroid))
-            if norm > 0.0:
-                centroid = centroid / norm
+            if not np.isfinite(centroid).all() or norm <= 0.0:
+                raise ValueError("the samples did not produce a finite voiceprint")
+            centroid = centroid / norm
         except Exception as exc:
             return ToolResult(f"Could not process the audio samples: {exc}", ok=False)
+        self._profiles = self._load_profiles()
         self._profiles[name] = {
             "embedding": centroid.tolist(),
             "backend": backend(),
             "enrolled_at": time.time(),
             "sample_count": len(samples),
         }
-        self._save_profiles()
+        if not self._save_profiles():
+            self._profiles = self._load_profiles()
+            return ToolResult("The voice profile could not be saved.", ok=False)
         self._log(f"VOICE-ID: enrolled '{name}' ({len(samples)} sample(s)).")
         return ToolResult(f"Voice profile for '{name}' saved from {len(samples)} sample(s).")
 
@@ -241,12 +279,36 @@ class SpeakerIdentificationService:
         """Returns (name, score) for the closest enrolled profile once it
         clears MATCH_THRESHOLD, else ("", best_score_seen). Never raises —
         unprocessable audio (e.g. silence) yields ("", 0.0)."""
+        from . import voice_enrolment
+
+        # Enrolment must run before the empty-profile early return: the first
+        # owner has no existing profile yet, and uses this same capture seam.
+        if voice_enrolment.learning():
+            try:
+                voice_enrolment.observe_utterance(audio, sample_rate, store=self._prints())
+            except Exception as exc:
+                self._log(f"VOICE-ID: voice learning sample failed: {exc}")
+            return "", 0.0
+        self._profiles = self._load_profiles()
         if not available() or not self._profiles:
             return ("", 0.0)
         try:
             embedding = _embed(audio, sample_rate)
         except Exception:
             return ("", 0.0)
+        if backend() == BACKEND_ONNX:
+            try:
+                verdict = voice_enrolment.observe_utterance(
+                    audio, sample_rate, embedding=embedding, profiles=self._profiles,
+                    store=self._prints())
+                if verdict is not None:
+                    score = float(getattr(verdict, "match", 0.0)
+                                  or getattr(verdict, "score", 0.0))
+                    if verdict.category in {"owner", "known"} and verdict.confident:
+                        return str(verdict.speaker), score
+                    return "", score
+            except Exception as exc:
+                self._log(f"VOICE-ID: turn identification failed: {exc}")
         best_name, best_score = "", 0.0
         for name, record in self._profiles.items():
             stored = str(record.get("backend") or BACKEND_RESEMBLYZER)
@@ -266,20 +328,32 @@ class SpeakerIdentificationService:
     # ── management ───────────────────────────────────────────────────────────
 
     def list_profiles(self) -> list[str]:
+        self._profiles = self._load_profiles()
         return sorted(self._profiles)
 
     def remove_profile(self, name: str) -> ToolResult:
         name = str(name or "").strip()
+        self._profiles = self._load_profiles()
         if name not in self._profiles:
             return ToolResult(f"No voice profile for '{name}'.", ok=False)
+        prints = self._prints()
+        if name == prints.owner:
+            from . import voice_enrolment
+
+            ok, message = voice_enrolment.forget_my_voice(prints)
+            self._profiles = self._load_profiles()
+            return ToolResult(message, ok=ok)
         del self._profiles[name]
-        self._save_profiles()
+        if not self._save_profiles():
+            self._profiles = self._load_profiles()
+            return ToolResult("The voice profile could not be removed.", ok=False)
         self._log(f"VOICE-ID: removed profile '{name}'.")
         return ToolResult(f"Voice profile for '{name}' removed.")
 
     def describe(self) -> str:
+        self._profiles = self._load_profiles()
         if not available():
-            return "Voice recognition is not installed (resemblyzer/librosa missing)."
+            return "Voice recognition is unavailable (no usable voice encoder)."
         if not self._profiles:
             return "No voice profiles enrolled yet."
         names = ", ".join(sorted(self._profiles))

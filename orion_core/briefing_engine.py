@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from .bus import OrionBus
 from .data import ToolResult
-from .executive_core import _age_days, _parse_stamp
+from .executive_core import _age_days
 
 def _clock_now() -> datetime:
     """ORION's clock (TimeService), which also decides the briefing's part of
@@ -116,15 +116,15 @@ class PriorityMonitor:
 
     def due_soon(self, state: dict[str, Any],
                  hours: float = _DEADLINE_HOURS) -> list[str]:
-        now = datetime.now(timezone.utc)
+        # The one due rule (owner_tasks): a bare date is due at the END of it.
+        from .owner_tasks import hours_until
         pressing: list[tuple[float, str]] = []
         for task in (state.get("pending_tasks") or {}).values():
             if not isinstance(task, dict):
                 continue
-            due = _parse_stamp(str(task.get("due") or ""))
-            if due is None:
+            remaining = hours_until(task.get("due"), end=task.get("due_end"))
+            if remaining is None:
                 continue
-            remaining = (due - now).total_seconds() / 3600.0
             title = str(task.get("title") or "task")[:70]
             if remaining < 0:
                 pressing.append((remaining, f"{title} — OVERDUE"))

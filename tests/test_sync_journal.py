@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from orion_core.bus import OrionBus
 from orion_core.memory import OrionMemoryMatrix
+from orion_core.sync.journal import value_hash
 from orion_core.sync import (
     JournalEntry,
     SyncJournal,
@@ -47,7 +48,7 @@ def test_apply_remote_is_idempotent(tmp_path):
 
 def test_apply_remote_advances_lamport_clock(tmp_path):
     dst = SyncJournal(tmp_path / "dst.db", node_id="dst")
-    dst.apply_remote([JournalEntry("peer", 9, "notes", "notes", "k", "h", "v")])
+    dst.apply_remote([JournalEntry("peer", 9, "notes", "notes", "k", value_hash("v"), "v")])
     # A subsequent local write must be causally after the observed remote ts.
     assert dst.record("notes", "notes", "z", "w").lamport_ts == 10
 

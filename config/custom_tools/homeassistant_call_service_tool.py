@@ -30,6 +30,16 @@ from pathlib import Path
 from typing import Any
 
 TIMEOUT = 15
+
+
+MAX_RESPONSE_BYTES = 1_000_000
+
+
+def _bounded_http_body(response) -> bytes:
+    data = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise ValueError("Remote response exceeded its size limit; completion is unverified")
+    return data
 CONFIG_NAME = "homeassistant.json"
 
 #: Domains whose services change the physical world. Everything here is worth
@@ -71,7 +81,7 @@ def _request(config: dict, path: str, payload: dict | None = None) -> Any:
         url, data=body, headers=headers,
         method="POST" if payload is not None else "GET")
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        text = response.read().decode("utf-8")
+        text = _bounded_http_body(response).decode("utf-8")
     return json.loads(text) if text.strip() else []
 
 

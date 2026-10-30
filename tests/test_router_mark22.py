@@ -72,8 +72,11 @@ def test_local_ollama_is_the_last_resort():
 
 # ── Tier-2 hardware constraints (the 16GB-RAM box) ───────────────────────────
 
-def test_local_context_is_capped_at_2048():
-    assert ProviderRouter.LOCAL_NUM_CTX <= 2048
+def test_local_context_is_bounded_to_what_actually_ran():
+    # 2048 was the stated cap but never reached Ollama (/v1 drops num_ctx);
+    # measured, the server ran at 4096. The native transport now applies the
+    # value for real, and 4096 keeps the lean persona inside the context.
+    assert 2048 < ProviderRouter.LOCAL_NUM_CTX <= 4096
 
 
 def test_ollama_targets_qwen25_7b_by_default():

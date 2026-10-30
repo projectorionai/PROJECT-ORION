@@ -175,6 +175,9 @@ def open_url(url: str) -> bool:
     target = str(url or "").strip()
     if not target:
         return False
+    from .execution_policy import require_foreground
+    if require_foreground("browser_window") is not None:
+        return False
     path = browser_path()
     if path:
         try:

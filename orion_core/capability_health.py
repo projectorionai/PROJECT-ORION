@@ -10,8 +10,8 @@ actual state and renders a matrix:
 
   * present     — the implementing module/engine imports.
   * registered  — the tool that exposes it is in the schema (None if not a tool).
-  * available   — it is actually usable now (dependencies present, engine ready,
-                  and — with deep=True — a real functional probe succeeded).
+  * available   — the specific check passed; read evidence_level/readiness before
+                  treating dependency presence as a working runtime operation.
   * offline     — it works with no internet.
 
 Probes never raise; a probe that itself fails is reported as such rather than
@@ -21,9 +21,11 @@ cost a second or two.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import time
 from typing import Any, Callable
 
+from .module_presence import module_present
 from .utils import first_line
 
 
@@ -35,11 +37,30 @@ class CapabilityHealth:
     offline: bool
     detail: str = ""
     registered: bool | None = None      # None = not exposed as a single tool
+    evidence_level: str = "declaration"
+    checked_at: float = field(default_factory=time.time)
+    verified_at: float | None = None
+
+    def readiness(self, *, now: float | None = None, max_age: float = 300.0) -> str:
+        if self.status() != "OK":
+            return "unavailable"
+        if self.evidence_level != "operation" or self.verified_at is None:
+            return "not_verified"
+        age = max(0.0, (time.time() if now is None else now) - self.verified_at)
+        return "verified" if age <= max_age else "stale"
+
+    def as_dict(self, *, now: float | None = None) -> dict[str, Any]:
+        """Bounded evidence for models/UI; no device or network probe is run."""
+        return {"name": self.name, "status": self.status(), "present": self.present,
+                "available": self.available, "registered": self.registered, "offline": self.offline,
+                "detail": self.detail, "evidence_level": self.evidence_level,
+                "checked_at": self.checked_at, "verified_at": self.verified_at,
+                "readiness": self.readiness(now=now)}
 
     def status(self) -> str:
         if not self.present:
             return "MISSING"
-        if not self.available:
+        if not self.available or self.registered is False:
             return "DEGRADED"
         return "OK"
 
@@ -47,7 +68,8 @@ class CapabilityHealth:
         icon = {"OK": "✓", "DEGRADED": "▲", "MISSING": "✗"}[self.status()]
         reg = ("—" if self.registered is None else ("reg" if self.registered else "UNREG"))
         off = "offline" if self.offline else "cloud"
-        return f"  {icon} {self.name:<16} [{reg:<5} {off:<7}] {self.detail}"
+        evidence = self.readiness().replace("_", " ")
+        return f"  {icon} {self.name:<16} [{reg:<5} {off:<7}] {self.detail} [{self.evidence_level}; {evidence}]"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -76,11 +98,7 @@ def _importable(module: str) -> bool:
     cached = _IMPORTABLE.get(module)
     if cached is not None:
         return cached
-    import importlib.util
-    try:
-        found = importlib.util.find_spec(module) is not None
-    except Exception:
-        found = False
+    found = module_present(module)
     _IMPORTABLE[module] = found
     return found
 
@@ -124,6 +142,14 @@ def reset_probe_cache() -> None:
 def _probe_ocr(tools: set[str], deep: bool) -> CapabilityHealth:
     global _OCR_PROBE
     registered = "vision_analyse" in tools          # action='ocr'
+    if not deep:
+        dependencies = [name for name in ("rapidocr_onnxruntime", "winrt", "pytesseract",
+                                          "easyocr", "paddleocr") if _importable(name)]
+        return CapabilityHealth(
+            "OCR", bool(dependencies), bool(dependencies), True,
+            ("dependencies: " + ", ".join(dependencies) + "; models and read not checked")
+            if dependencies else "no OCR dependency found; install requirements/vision.txt",
+            registered, evidence_level="dependency")
     try:
         from .ocr_engine import OcrEngine
     except Exception as exc:
@@ -148,7 +174,9 @@ def _probe_ocr(tools: set[str], deep: bool) -> CapabilityHealth:
                 return CapabilityHealth("OCR", True, False, True,
                                         f"{name} present but read FAILED: {note}", registered)
             detail = f"engine: {name}; read OK"
-        return CapabilityHealth("OCR", True, True, True, detail, registered)
+        return CapabilityHealth("OCR", True, True, True, detail, registered,
+                                evidence_level="operation" if deep else "dependency",
+                                verified_at=time.time() if deep else None)
     except Exception as exc:
         return CapabilityHealth("OCR", True, False, True,
                                 f"probe error: {first_line(exc, 80)}", registered)
@@ -186,6 +214,7 @@ def _probe_plugins(tools: set[str], deep: bool) -> CapabilityHealth:
             and _time.monotonic() - _PLUGIN_PROBE_AT < _PLUGIN_TTL_S):
         return _PLUGIN_PROBE
     result = _probe_plugins_uncached(tools, deep)
+    result.evidence_level = "static"
     _PLUGIN_PROBE, _PLUGIN_PROBE_AT = result, _time.monotonic()
     return result
 
@@ -230,8 +259,10 @@ def _simple(name: str, module: str, *, tool: str | None, offline: bool,
             tools: set[str], extra: str = "") -> CapabilityHealth:
     present = _importable(module)
     registered = (tool in tools) if tool else None
-    detail = extra if present else f"missing module '{module}'"
-    return CapabilityHealth(name, present, present, offline, detail, registered)
+    detail = ((extra + "; " if extra else "")
+              + "dependency installed; runtime operation not checked") if present else f"missing module '{module}'"
+    return CapabilityHealth(name, present, present, offline, detail, registered,
+                            evidence_level="dependency")
 
 
 def _probe_engine(name: str, module: str, cls: str, *, tool: str | None,
@@ -246,17 +277,31 @@ def _probe_engine(name: str, module: str, cls: str, *, tool: str | None,
         if not _importable(full):
             return CapabilityHealth(name, False, False, offline,
                                     f"missing module '{module}'", registered)
-        return CapabilityHealth(name, True, True, offline, f"{module} present", registered)
+        return CapabilityHealth(name, True, True, offline,
+                                f"{module} present; setup and operation not checked", registered)
     try:
         mod = __import__(full, fromlist=[cls])
         getattr(mod, cls)
     except Exception as exc:
         return CapabilityHealth(name, False, False, offline,
                                 f"import failed: {first_line(exc, 70)}", registered)
-    return CapabilityHealth(name, True, True, offline, f"{cls} present", registered)
+    return CapabilityHealth(name, True, True, offline,
+                            f"{cls} imports; runtime operation not checked", registered,
+                            evidence_level="import")
 
 
 # ── the matrix ────────────────────────────────────────────────────────────────
+
+def _probe_stt() -> CapabilityHealth:
+    for module, label in (("faster_whisper", "Faster Whisper"),
+                          ("whisper", "Whisper"), ("vosk", "Vosk")):
+        if _importable(module):
+            return CapabilityHealth("Speech-to-text", True, True, True,
+                                    f"{label} installed; cached model and microphone not checked", None,
+                                    evidence_level="dependency")
+    return CapabilityHealth("Speech-to-text", False, False, True,
+                            "Install requirements/speech.txt for offline dictation", None)
+
 
 def capability_matrix(deep: bool = False) -> list[CapabilityHealth]:
     """Probe every major capability. deep=True adds functional probes (OCR read)."""
@@ -269,8 +314,7 @@ def capability_matrix(deep: bool = False) -> list[CapabilityHealth]:
                 tools=tools, extra="Gemini Live"),
         _simple("Voice (offline)", "pyttsx3", tool=None, offline=True,
                 tools=tools, extra="local TTS fallback"),
-        _simple("Speech-to-text", "vosk", tool=None, offline=True,
-                tools=tools, extra="Vosk offline STT"),
+        _probe_stt(),
         _simple("Desktop control", "pyautogui", tool="desktop_control",
                 offline=True, tools=tools),
         _simple("UI inspection", "pywinauto", tool="vision_verify",
@@ -302,7 +346,9 @@ def render_matrix(rows: list[CapabilityHealth]) -> str:
     ok = [r for r in rows if r.status() == "OK"]
     header = (f"Capability health — {len(ok)} OK, {len(degraded)} degraded, "
               f"{len(missing)} missing:")
-    return header + "\n" + "\n".join(r.line() for r in rows)
+    return header + "\nChecks establish only the evidence named in each row; " \
+        "installed dependencies do not establish end-to-end readiness.\n" \
+        + "\n".join(r.line() for r in rows)
 
 
 def unavailable(rows: list[CapabilityHealth] | None = None) -> list[CapabilityHealth]:

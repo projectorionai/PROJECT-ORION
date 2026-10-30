@@ -30,6 +30,8 @@ from __future__ import annotations
 import math
 import os
 import re
+import sys
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
@@ -48,11 +50,121 @@ ALWAYS_INCLUDE: tuple[str, ...] = ("catch_up", "reason", "capabilities")
 CLOUD_ONLY: frozenset[str] = frozenset({"web_search", "open_news"})
 
 # Context boost weights (added on top of the lexical score).
-BOOST_PAGE = 3.0        # a tool in the foreground deck page's domain
+BOOST_PAGE = 5.0        # a tool in the foreground deck page's domain
 BOOST_FOCUS = 4.0       # study/focus while a focus block is running
 BOOST_RECENT = 1.5      # a tool used earlier this turn-sequence
 #: Tie-breaker only — see the exactness bonus in lexical_scores.
 NAME_EXACTNESS_BONUS = 0.5
+
+# Text and voice discovery use slightly different menus. Retain a few exact
+# schemas without retaining an unbounded history of plugin/MCP descriptions.
+_SCHEMA_CACHE_ENTRIES = 4
+_LEXICAL_CACHE_BYTES = 4 * 1024 * 1024
+_VECTOR_CACHE_BYTES = 4 * 1024 * 1024
+_MATRIX_CACHE_BYTES = 4 * 1024 * 1024
+_CACHE_LOCK = threading.RLock()
+
+
+class _RoutingCache(dict):
+    """A mapping with precomputed entry costs; cache hits never size a tree."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.costs: dict[Any, int] = {}
+
+    def clear(self) -> None:
+        super().clear()
+        self.costs.clear()
+
+
+def _cache_size(value: Any, seen: set[int] | None = None) -> int:
+    """Conservative retained bytes, including keys, containers and array data."""
+    seen = set() if seen is None else seen
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        size += sum(_cache_size(k, seen) + _cache_size(v, seen) for k, v in value.items())
+    elif isinstance(value, (tuple, list, set, frozenset)):
+        size += sum(_cache_size(v, seen) for v in value)
+    else:
+        # Owning NumPy arrays may already include their buffer in getsizeof;
+        # counting nbytes again is conservative and also covers array views.
+        size += int(getattr(value, "nbytes", 0))
+        base = getattr(value, "base", None)
+        if base is not None:
+            size += _cache_size(base, seen)
+        for slot in getattr(type(value), "__slots__", ()):
+            if hasattr(value, slot):
+                size += _cache_size(getattr(value, slot), seen)
+    return size
+
+
+def _cached(cache: dict, key: Any) -> Any:
+    with _CACHE_LOCK:
+        value = cache.pop(key, None)
+        if value is not None:
+            cache[key] = value
+        return value
+
+
+def _cache_costs(cache: dict) -> dict:
+    # Plain mappings remain supported for lightweight existing test seams.
+    return (cache.costs if isinstance(cache, _RoutingCache)
+            else {key: _cache_size((key, value)) for key, value in cache.items()})
+
+
+def _evict(cache: dict, costs: dict, budget: int, entries: int) -> None:
+    global _INDEX
+    metadata = sys.getsizeof(costs) + len(costs) * sys.getsizeof(0)
+    total = sys.getsizeof(cache) + metadata + sum(costs.values())
+    while cache and (len(cache) > entries or total > budget):
+        oldest = next(iter(cache))
+        total -= costs.pop(oldest)
+        del cache[oldest]
+    if cache is _INDEX_CACHE and not any(value is _INDEX for value in cache.values()):
+        _INDEX = None  # the legacy latest-index view must not pin an evicted tree
+
+
+def _retain(cache: dict, key: Any, value: Any, *, budget: int, entries: int,
+            valid: Callable[[], bool] | None = None) -> bool:
+    """Bounded LRU admission; oversized work still returns to its own caller."""
+    size = _cache_size((key, value))
+    if size > budget:
+        return False
+    with _CACHE_LOCK:
+        if valid is not None and not valid():
+            return False
+        costs = _cache_costs(cache)
+        cache.pop(key, None)
+        cache[key] = value
+        costs[key] = size
+        _evict(cache, costs, budget, entries)
+        return key in cache
+
+
+def _retain_vectors(cache: dict, values: Iterable[tuple[str, Any]], *,
+                    valid: Callable[[], bool]) -> None:
+    """Admit an embedding batch without repeatedly traversing the whole cache."""
+    prepared = []
+    for key, value in values:
+        # Encoder rows are views of its entire batch. Retaining one such
+        # row would otherwise pin an unaccounted, potentially huge buffer.
+        owned = value.copy()
+        owned.flags.writeable = False
+        size = _cache_size((key, owned))
+        if size <= _VECTOR_CACHE_BYTES:
+            prepared.append((key, owned, size))
+    with _CACHE_LOCK:
+        if not valid():
+            return
+        costs = _cache_costs(cache)
+        for key, owned, size in prepared:
+            cache.pop(key, None)
+            cache[key] = owned
+            costs[key] = size
+        _evict(cache, costs, _VECTOR_CACHE_BYTES, 8192)
 
 def vocabulary_for(tool: str) -> str:
     """Curated invoking phrases for a tool, or "" — never raises.
@@ -69,14 +181,113 @@ def vocabulary_for(tool: str) -> str:
 
 
 _TOKEN = re.compile(r"[a-z0-9]+")
+#: Words that carry no tool's meaning. The second group are the question and
+#: helper words of everyday speech: while they counted, "how much cash have I
+#: got LEFT" ranked token_usage first, because "how much ... left" is how its
+#: vocabulary describes usage. Who/where/when/why/like stay: they mean
+#: something to voice ID, file search, reminders, diagnostics ("why can't you
+#: do that" has no other word to go on) and the voice tool.
 _STOP = frozenset(
     "the a an of to in on at for and or but is are was were be it its this that "
     "with from into about over under as by you your i me my we our so if then "
-    "run get set show tell make do use one".split())
+    "run get set show tell make do use one "
+    "how much many what whats which can could would will have has had got any "
+    "some there here please give just want need does did done been being very "
+    "really lets".split())
+
+
+def _fold(term: str) -> str:
+    """A plural and its singular are one term ("emails" is "email",
+    "helicopters" is "helicopter"). Applied to queries and tool documents
+    alike, so a fold that is not a real word ("focus" -> "focu") still
+    matches itself."""
+    if len(term) > 4 and term.endswith("s") and not term.endswith("ss"):
+        return term[:-1]
+    return term
 
 
 def _tokens(text: str) -> list[str]:
-    return [t for t in _TOKEN.findall((text or "").lower()) if t not in _STOP and len(t) > 1]
+    return [_fold(t) for t in _TOKEN.findall((text or "").lower()) if t not in _STOP and len(t) > 1]
+
+
+# ── requests that ask for more than one thing ────────────────────────────────
+#
+# "Find my CV and email it to Hannah" needs two tools, but ranked as one
+# sentence the second need competed with the first for the same few places:
+# on the planner's seven multi-part goals the six-result find_tool list held
+# every part's tool for 4 (encoder cold) or 6 (warm) of them. Each part is
+# now also ranked on its own and its best tools are placed just below the
+# whole request's best, so the first-ranked tool never changes.
+
+_PART_SPLIT = re.compile(
+    r"[;.?!]\s+|,?\s+\b(?:and then|then|after that|afterwards|and also|as well as|and|plus)\b\s+",
+    re.IGNORECASE)
+#: At most this many parts are ranked separately (each costs one ranking).
+MAX_PARTS = 4
+#: Part n's best tool scores (1 - n * PART_STEP) of the whole request's best.
+PART_STEP = 0.01
+
+
+#: Words that never make a piece of a request an ask of its own. Narrower
+#: than _STOP on purpose: "run diagnostics" and "what is on my screen" are
+#: asks, though _STOP leaves each of them one word.
+_FUNCTION_WORDS = frozenset(
+    "the a an my your our me us we i it its this that these those some any of to in on at "
+    "for with is are be".split())
+
+
+def request_parts(text: str) -> list[str]:
+    """The separate asks in *text* ("X and then Y", "X, and Y", "X. Y"), or []
+    for a single ask. A piece with fewer than two words that are not function
+    words is not an ask of its own ("pros and cons", "rock and roll" stay
+    whole)."""
+    pieces = (piece.strip(" ,") for piece in _PART_SPLIT.split(str(text or "")[:600]))
+    parts = [piece for piece in pieces
+             if sum(1 for word in _TOKEN.findall(piece.lower())
+                    if len(word) > 1 and word not in _FUNCTION_WORDS) >= 2]
+    return parts[:MAX_PARTS] if len(parts) >= 2 else []
+
+
+#: A part counts as answered when a plan uses one of its this-many best tools.
+COVERAGE_DEPTH = 5
+
+
+def uncovered_parts(request: str, tools: Iterable[str], declarations: Sequence[dict[str, Any]],
+                    scorer: "Scorer | None" = None, depth: int = COVERAGE_DEPTH) -> list[str]:
+    """The parts of a multi-part *request* that none of *tools* (a plan's
+    steps) answers: none of them is among that part's *depth* best tools.
+    A part nothing scores for is not reported - there is no evidence
+    either way. [] for a single ask."""
+    used = {str(tool) for tool in tools}
+    score = scorer or lexical_scores
+    missing = []
+    for part in request_parts(request):
+        scores = score(part, declarations)
+        best = [name for name in sorted(scores, key=lambda name: (-scores[name], name))[:depth]
+                if scores[name] > 0]
+        if best and not used.intersection(best):
+            missing.append(part)
+    return missing
+
+
+def merge_part_scores(whole: dict[str, float],
+                      parts: Sequence[dict[str, float]]) -> dict[str, float]:
+    """*whole* with each part's best tool lifted to (1 - n * PART_STEP) of
+    the whole's best (part n, from 1); every other score is left alone, so
+    the whole ranking moves down by at most one place per part. Scaling each
+    part's whole ranking up instead pushed right tools out of the top ten
+    (measured, encoder cold)."""
+    top = max(whole.values(), default=0.0)
+    if top <= 0 or not parts:
+        return whole
+    merged = dict(whole)
+    for index, scores in enumerate(parts, start=1):
+        if not scores:
+            continue
+        best = min(scores, key=lambda name: (-scores[name], name))
+        if scores[best] > 0:
+            merged[best] = max(merged.get(best, 0.0), top * (1.0 - index * PART_STEP))
+    return merged
 
 
 # ── runtime state ─────────────────────────────────────────────────────────────
@@ -111,25 +322,26 @@ _register("learning", "study", "focus", "language_tutor", "expand_mind",
           "cyber_curriculum", "knowledge_pack", "literature_vault")
 _register("memory", "save_memory", "query_intelligence", "recall_conversation",
           "conversation_recall", "rewind", "second_brain", "ingest", "learn",
-          "transcript", "awareness", "companion", "catch_up")
+          "transcript", "awareness", "companion", "catch_up", "context_capsule")
 _register("research", "research", "standing_questions", "proactive_check",
-          "proactive_report", "read_documents")
+          "proactive_report", "read_documents", "experiment_notebook")
 _register("vision", "vision_analyse", "vision_verify", "capture_screen",
           "screen_read", "perception")
 _register("desktop", "open_app", "close_app", "window_control", "media_control",
           "desktop_control", "peripherals", "gesture_control", "clipboard_operate",
           "process_governor", "process_file", "file_controller", "find_files",
           "display_info", "system_notify", "interface_control", "workspace_control",
-          "cursor_overlay", "organise_files")
+          "cursor_overlay", "organise_files", "display", "ui_theme", "ui_reactor",
+          "ui_orbit", "ui_chrome", "ui_effect", "ui_screen", "ui_reset", "undo")
 _register("web", "browser_control", "web_control", "web_automation",
           "social_media", "muscle_memory", "web_search", "fetch_url", "open_news",
-          "flight_search")
+          "flight_search", "navigation_trace")
 _register("engineering", "dev_workbench", "codebase_copilot", "debugger", "docker",
           "forge", "self_repair", "diagnostics", "code_changes", "self_changes",
           "cleanup_review")
 _register("automation", "execute_plan", "autoplan", "workflow", "workflow_patterns",
           "job", "mission", "skill", "protocol", "agent_dispatch", "reason",
-          "strategy", "perception")
+          "strategy", "decision", "perception", "project_rehearsal")
 _register("business", "product_research", "tiktok_intel", "instagram_intel",
           "commerce_hub", "competitor_intel", "brand_growth", "business_advisor",
           "founder_knowledge", "creator_intel", "campaign_pipeline",
@@ -138,17 +350,21 @@ _register("security", "security_recon", "security_watch", "breach_check",
           "antivirus", "privacy_guard", "sentinel", "pentest_lab")
 _register("creative", "audio_studio", "draft_report", "document_export",
           "entertainment", "gaming")
-_register("comms", "messaging", "outlook_mail", "notion_workspace", "phone_action")
+_register("comms", "messaging", "outlook_mail", "notion_workspace", "phone_action",
+          "telephony")
 _register("geo", "globe", "max_zoom_in_globe", "geo", "aviation")
 _register("system", "shutdown_orion", "restart_orion", "system_startup",
           "patch_notes", "capabilities", "token_usage", "resource_status",
           "ai_mode", "backup", "reminder", "morning_briefing", "briefing",
           "executive", "momentum", "mcp")
+_register("system", "plugin", "find_tool", "use_tool")
 _register("voice", "voice_tone", "speaker_id", "voice_speaker_id",
-          "elevenlabs_voice", "audio_devices", "emotion", "avatar")
+          "elevenlabs_voice", "audio_devices", "emotion", "avatar", "sound_sense")
+_register("voice", "sing", "conversation_recording")
 _register("games", "chess")
 _register("finance", "finance")
 _register("wellbeing", "wellbeing")
+_register("goals", "goals")
 
 #: deck page -> the domain whose tools it should boost while it is foreground.
 _PAGE_DOMAIN: dict[str, str] = {
@@ -158,7 +374,7 @@ _PAGE_DOMAIN: dict[str, str] = {
     "WORKBENCH": "vision", "GLOBE": "geo", "CHESS": "games",
     "AUTOMATION": "automation", "DIAGNOSTICS": "system", "LOG": "system",
     "TELEMETRY": "system", "OPS": "system", "WIDGETS": "comms",
-    "MISSION": "automation",
+    "MISSION": "automation", "GOALS": "goals",
 }
 
 
@@ -188,27 +404,27 @@ class _LexicalIndex:
 
     __slots__ = ("postings", "idf", "names", "pure_name", "fingerprint")
 
-    def __init__(self, declarations: Sequence[dict[str, Any]]) -> None:
+    def __init__(self, declarations: Sequence[dict[str, Any]], fingerprint: tuple | None = None) -> None:
+        fingerprint = _fingerprint(declarations) if fingerprint is None else fingerprint
         docs: dict[str, set[str]] = {}
         name_terms: dict[str, set[str]] = {}
         df: dict[str, int] = {}
-        for d in declarations:
-            name = d["name"]
+        for name, description, vocabulary in fingerprint:
             own = set(_tokens(name.replace("_", " ")))
             # Curated invoking vocabulary is weighted like the tool's own name,
             # because that is what it is: the words that mean "this tool". See
             # tool_vocabulary — without it, recall was 76.5%, because terms like
             # "weather" and "quiz" appear nowhere in the schema at all.
-            own |= set(_tokens(vocabulary_for(name)))
-            terms = own | set(_tokens(d.get("description", "")))
+            own |= set(_tokens(vocabulary))
+            terms = own | set(_tokens(description))
             docs[name] = terms
             name_terms[name] = own
         # df counted over the same per-declaration term sets as before
-        for d in declarations:
-            for t in docs[d["name"]]:
+        for name, _description, _vocabulary in fingerprint:
+            for t in docs[name]:
                 df[t] = df.get(t, 0) + 1
 
-        n = max(1, len(declarations))
+        n = max(1, len(fingerprint))
         postings: dict[str, list[tuple[str, float]]] = {}
         for name, terms in docs.items():
             own = name_terms[name]
@@ -217,39 +433,55 @@ class _LexicalIndex:
 
         self.postings = {t: tuple(v) for t, v in postings.items()}
         self.idf = {t: math.log((n + 1) / (c + 1)) + 1.0 for t, c in df.items()}
-        self.names = tuple(d["name"] for d in declarations)
+        self.names = tuple(name for name, *_ in fingerprint)
         # PURE name tokens, vocabulary excluded — used only for the exactness
         # bonus below, where the question is how much of the tool's own NAME the
         # query accounted for.
-        self.pure_name = {d["name"]: frozenset(_tokens(d["name"].replace("_", " ")))
-                          for d in declarations}
-        self.fingerprint = _fingerprint(declarations)
+        self.pure_name = {name: frozenset(_tokens(name.replace("_", " ")))
+                          for name, *_ in fingerprint}
+        self.fingerprint = fingerprint
 
 
-def _fingerprint(declarations: Sequence[dict[str, Any]]) -> int:
-    """Cheap identity for a declaration set — names plus count.
-
-    Descriptions are not hashed: they are static per tool, and hashing 136 of
-    them every turn would reintroduce a slice of the cost this index removes.
-    A plugin that adds, removes or renames a tool changes this.
-    """
-    return hash((len(declarations), tuple(d.get("name", "") for d in declarations)))
+def _fingerprint(declarations: Sequence[dict[str, Any]]) -> tuple:
+    """Exact routing inputs: a same-named MCP tool can change its purpose."""
+    return tuple((str(d.get("name", "")), str(d.get("description") or ""),
+                  vocabulary_for(str(d.get("name", "")))) for d in declarations)
 
 
 _INDEX: _LexicalIndex | None = None
+_INDEX_CACHE: dict[tuple, _LexicalIndex] = _RoutingCache()
 
 
 def _index_for(declarations: Sequence[dict[str, Any]]) -> _LexicalIndex:
     global _INDEX
-    if _INDEX is None or _INDEX.fingerprint != _fingerprint(declarations):
-        _INDEX = _LexicalIndex(declarations)
-    return _INDEX
+    key = _fingerprint(declarations)
+    with _CACHE_LOCK:
+        found = _cached(_INDEX_CACHE, key)
+        if found is not None:
+            _INDEX = found
+            return found
+    made = _LexicalIndex(declarations, fingerprint=key)
+    with _CACHE_LOCK:
+        # Another worker may have built the exact same immutable inputs.
+        found = _cached(_INDEX_CACHE, key)
+        if found is not None:
+            _INDEX = found
+            return found
+    kept = _retain(_INDEX_CACHE, key, made, budget=_LEXICAL_CACHE_BYTES,
+                   entries=_SCHEMA_CACHE_ENTRIES)
+    with _CACHE_LOCK:
+        _INDEX = _INDEX_CACHE.get(key) if kept else None
+    return made
 
 
 def reset_index() -> None:
     """Drop the cached index — call after the tool schema changes shape."""
     global _INDEX
-    _INDEX = None
+    with _CACHE_LOCK:
+        _INDEX = None
+        _INDEX_CACHE.clear()
+        _TOOL_MATRIX.clear()
+        _EXAMPLE_MATRIX.clear()
 
 
 def lexical_scores(query: str, declarations: Sequence[dict[str, Any]]) -> dict[str, float]:
@@ -300,15 +532,53 @@ def lexical_scores(query: str, declarations: Sequence[dict[str, Any]]) -> dict[s
 # back" (undo). Tool documents are embedded once per schema.
 
 #: Lexical units added per standard deviation a tool's meaning stands above
-#: the other tools for this request (only above-average tools gain).
-SEMANTIC_BOOST = 1.0
+#: the other tools for this request (only above-average tools gain). 1.5 was
+#: chosen on the development half of a 376-request everyday set once filler
+#: words stopped counting as evidence: with the intent network on, 1.0 -> 1.5
+#: took that half's top-3 from 87.2% to 88.8% (docs/ORION_TOOL_ROUTING.md).
+SEMANTIC_BOOST = 1.5
 
 #: tool document text -> its vector. Per document, not per schema: a newly
 #: connected MCP server or a forged tool embeds only itself (tens of ms), not
 #: all ~140 tools again (~2 s) on whatever thread happened to ask.
-_TOOL_VECTORS: dict[str, Any] = {}
+_TOOL_VECTORS: dict[str, Any] = _RoutingCache()
 #: schema fingerprint -> (names, stacked matrix), so a turn does not restack.
-_TOOL_MATRIX: dict[int, tuple[list[str], Any]] = {}
+_TOOL_MATRIX: dict[tuple, tuple[list[str], Any]] = _RoutingCache()
+_SEMANTIC_OWNER: tuple | None = None
+_SEMANTIC_EPOCH = 0
+
+
+def _encoder_identity(encoder: Any) -> tuple:
+    # Keep strong references: an allocator reusing an old id cannot revive an
+    # unrelated model's vectors. A replaced native session is a new generation.
+    return (encoder, getattr(encoder, "_session", None),
+            getattr(encoder, "_tokenizer", None), getattr(encoder, "spec", None))
+
+
+def _same_encoder(left: tuple | None, right: tuple) -> bool:
+    return left is not None and all(a is b for a, b in zip(left, right))
+
+
+def _semantic_context() -> tuple[Any, int]:
+    from . import semantic
+    global _SEMANTIC_OWNER, _SEMANTIC_EPOCH
+    encoder = semantic.ENCODER
+    identity = _encoder_identity(encoder)
+    with _CACHE_LOCK:
+        if not _same_encoder(_SEMANTIC_OWNER, identity):
+            _TOOL_VECTORS.clear()
+            _EXAMPLE_VECTORS.clear()
+            _TOOL_MATRIX.clear()
+            _EXAMPLE_MATRIX.clear()
+            _SEMANTIC_OWNER = identity
+            _SEMANTIC_EPOCH += 1
+        return encoder, _SEMANTIC_EPOCH
+
+
+def _semantic_current(context: tuple[Any, int]) -> bool:
+    from . import semantic
+    return (context[1] == _SEMANTIC_EPOCH
+            and _same_encoder(_SEMANTIC_OWNER, _encoder_identity(semantic.ENCODER)))
 
 
 def _tool_document(decl: dict[str, Any]) -> str:
@@ -322,53 +592,305 @@ def warm_semantic(declarations: Sequence[dict[str, Any]] | None = None) -> int:
     if declarations is None:
         from .dispatch_schema import TOOL_DECLARATIONS
         declarations = TOOL_DECLARATIONS
-    return len(_tool_matrix(list(declarations))[0]) if semantic_ready() else 0
+    try:                                  # the typing-slip speller (~90 ms), here off the loop
+        from .spelling import speller
+        speller()
+    except Exception:
+        pass
+    if not semantic_ready():
+        return 0
+    declarations = list(declarations)
+    _example_matrix(declarations)         # the example requests, also off the loop
+    return len(_tool_matrix(declarations)[0])
 
 
 def semantic_ready() -> bool:
-    from . import semantic
-    return semantic.ENCODER.ready()
+    # Synchronize even a cold replacement so the old native model is released.
+    return _semantic_context()[0].ready()
 
 
-def _tool_matrix(declarations: list[dict[str, Any]]) -> tuple[list[str], Any]:
-    from . import semantic
+# ── vectors kept between starts ──────────────────────────────────────────────
+#
+# Every launch re-embedded the same ~1,000 tool documents and example requests.
+# Measured 23 Oct on a settled install: 4.7 s on the orion-semantic-warm thread
+# plus ONNX's own worker threads - most of the ~13 CPU-seconds ORION burned in
+# the 30 s after reporting ready, competing with the owner's first request.
+# Those texts only change when the code or the model does, so their vectors
+# are kept on disk keyed by a digest of the model files and the exact text: an
+# edited description re-embeds itself and nothing else.
+
+#: Where they are kept. None = CONFIG_DIR/cache/routing_vectors.npz, except
+#: under pytest, where nothing is persisted unless a test sets a path here.
+VECTOR_CACHE_PATH: Any = None
+#: Rows kept at most (~1.5 KB each); the oldest go first.
+_VECTOR_CACHE_MAX = 6000
+_DISK: dict[str, Any] | None = None
+_DISK_LOCK = threading.Lock()
+
+
+def _vector_cache_path() -> Any:
+    if VECTOR_CACHE_PATH is not None:
+        return VECTOR_CACHE_PATH
+    if "pytest" in sys.modules:
+        return None
+    from .constants import CONFIG_DIR
+    return CONFIG_DIR / "cache" / "routing_vectors.npz"
+
+
+def _disk_key(encoder: Any, text: str) -> str:
+    import hashlib
+    spec = getattr(encoder, "spec", None)
+    files = getattr(spec, "files", None) or {}
+    pins = ",".join(sorted(str(getattr(f, "sha256", ""))[:16] for f in files.values()))
+    return hashlib.sha1(f"{getattr(spec, 'name', '?')}\0{pins}\0{text}".encode(
+        "utf-8", "replace")).hexdigest()
+
+
+def _disk_lookup(encoder: Any, texts: Sequence[str], load: bool = True) -> dict[str, Any]:
+    """Stored vectors for whichever of *texts* have one. Never raises. With
+    *load* False an unread file is not read now (a caller on the event loop)."""
+    global _DISK
+    path = _vector_cache_path()
+    dim = getattr(getattr(encoder, "spec", None), "dim", None)
+    if path is None or dim is None:
+        return {}      # only a real model (named, pinned, sized) may reuse vectors
+    with _DISK_LOCK:
+        if _DISK is None:
+            if not load:
+                return {}
+            _DISK = {}
+            try:
+                import numpy as np
+                with np.load(path) as data:
+                    _DISK = {str(k): row for k, row in zip(data["keys"], data["vectors"])}
+            except Exception:
+                _DISK = {}
+        found = {}
+        for text in texts:
+            row = _DISK.get(_disk_key(encoder, text))
+            if row is not None and row.shape[0] == dim:
+                found[text] = row
+        return found
+
+
+def _disk_store(encoder: Any, pairs: Iterable[tuple[str, Any]]) -> None:
+    """Add freshly encoded rows and rewrite the file atomically. Never raises."""
+    global _DISK
+    path = _vector_cache_path()
+    if path is None or getattr(getattr(encoder, "spec", None), "dim", None) is None:
+        return
+    try:
+        import numpy as np
+        with _DISK_LOCK:
+            if _DISK is None:
+                _DISK = {}
+            for text, vector in pairs:
+                key = _disk_key(encoder, text)
+                _DISK.pop(key, None)
+                _DISK[key] = np.array(vector, dtype=np.float32)
+            while len(_DISK) > _VECTOR_CACHE_MAX:
+                _DISK.pop(next(iter(_DISK)))
+            keys = np.array(list(_DISK), dtype="U40")
+            rows = np.vstack(list(_DISK.values())) if _DISK else None
+        if rows is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.stem + ".partial.npz")
+        np.savez(temporary, keys=keys, vectors=rows)
+        os.replace(temporary, path)
+    except Exception:
+        pass
+
+
+def _tool_matrix(declarations: list[dict[str, Any]], build: bool = True,
+                 _context: tuple[Any, int] | None = None) -> tuple[list[str], Any]:
+    """(names, stacked document vectors). With *build* False, tools whose
+    documents are not embedded yet are not embedded here: ([], None)."""
     import numpy as np
 
-    key = _fingerprint(declarations)
-    cached = _TOOL_MATRIX.get(key)
+    context = _semantic_context() if _context is None else _context
+    encoder, epoch = context
+    key = (epoch, _fingerprint(declarations))
+    cached = _cached(_TOOL_MATRIX, key)
     if cached is not None:
         return cached
     documents = [_tool_document(d) for d in declarations]
-    missing = [doc for doc in dict.fromkeys(documents) if doc not in _TOOL_VECTORS]
+    with _CACHE_LOCK:
+        available = {doc: _cached(_TOOL_VECTORS, doc) for doc in dict.fromkeys(documents)
+                     if _semantic_current(context)}
+    missing = [doc for doc in dict.fromkeys(documents) if available.get(doc) is None]
     if missing:
-        vectors = semantic.ENCODER.encode(missing)
+        stored = _disk_lookup(encoder, missing, load=build)
+        if stored:
+            available.update(stored)
+            _retain_vectors(_TOOL_VECTORS, stored.items(),
+                            valid=lambda: _semantic_current(context))
+            missing = [doc for doc in missing if doc not in stored]
+    if missing and not build:
+        return [], None
+    if missing:
+        vectors = encoder.encode(missing)
         if vectors is None:
             return [], None
-        _TOOL_VECTORS.update(zip(missing, vectors))
+        # Local rows remain usable even when their cache budget refuses them.
+        available.update(zip(missing, vectors))
+        _retain_vectors(_TOOL_VECTORS, zip(missing, vectors),
+                        valid=lambda: _semantic_current(context))
+        _disk_store(encoder, zip(missing, vectors))
     names = [d["name"] for d in declarations]
-    matrix = np.vstack([_TOOL_VECTORS[doc] for doc in documents]) if documents else None
-    _TOOL_MATRIX.clear()                 # one live schema at a time
-    _TOOL_MATRIX[key] = (names, matrix)
+    matrix = np.vstack([available[doc] for doc in documents]) if documents else None
+    _retain(_TOOL_MATRIX, key, (names, matrix), budget=_MATRIX_CACHE_BYTES,
+            entries=_SCHEMA_CACHE_ENTRIES, valid=lambda: _semantic_current(context))
     return names, matrix
 
 
-def semantic_scores(query: str, declarations: Sequence[dict[str, Any]]) -> dict[str, float]:
-    """Cosine of *query* against each tool's purpose; {} when the sentence
-    encoder is not warm, so callers fall back to words alone."""
-    from . import semantic
+# ── nearest example request ──────────────────────────────────────────────────
+#
+# A tool's document is one vector for everything it does; an indirect request
+# ("my laptop is crawling") is far from the whole of resource_status's
+# description but close to one of the everyday requests it is known by
+# (intent_situations.py). So a tool also scores the cosine of its NEAREST
+# example request, and keeps whichever is higher. Measured on the development
+# half of the routing set, encoder warm: top-1 79.4% -> 81.9% (3 seeds).
 
-    if not semantic.ENCODER.ready() or not str(query or "").strip():
+#: A request quoted in a tool's description ('play some jazz').
+_QUOTED_REQUEST = re.compile(r"'([^']{4,90})'")
+#: example text -> its vector (per text, like _TOOL_VECTORS).
+_EXAMPLE_VECTORS: dict[str, Any] = _RoutingCache()
+#: schema fingerprint -> (tool index per group, group starts, stacked matrix).
+_EXAMPLE_MATRIX: dict[tuple, tuple[Any, Any, Any]] = _RoutingCache()
+
+
+def _tool_examples(declarations: list[dict[str, Any]]) -> list[list[str]]:
+    """Per declaration: the everyday requests it is known by and the requests
+    its description quotes."""
+    try:
+        from .intent_situations import phrases
+        known = phrases()
+    except Exception:
+        known = {}
+    out = []
+    for decl in declarations:
+        name = str(decl.get("name", ""))
+        text = " ".join(str(decl.get("description", "")).split())
+        quoted = [q for q in _QUOTED_REQUEST.findall(text) if len(q.split()) >= 2]
+        out.append(list(dict.fromkeys([*known.get(name, ()), *quoted])))
+    return out
+
+
+def _example_matrix(declarations: list[dict[str, Any]], build: bool = True,
+                    _context: tuple[Any, int] | None = None
+                    ) -> tuple[Any, Any, Any] | None:
+    """(declaration index of each group, start row of each group, matrix) for
+    the tools that have examples; None when not built and *build* is False."""
+    import numpy as np
+
+    context = _semantic_context() if _context is None else _context
+    encoder, epoch = context
+    key = (epoch, _fingerprint(declarations))
+    cached = _cached(_EXAMPLE_MATRIX, key)
+    if cached is not None or not build:
+        return cached
+    per_tool = _tool_examples(declarations)
+    texts = list(dict.fromkeys(p for ps in per_tool for p in ps))
+    with _CACHE_LOCK:
+        available = {text: _cached(_EXAMPLE_VECTORS, text) for text in texts
+                     if _semantic_current(context)}
+    missing = [text for text in texts if available.get(text) is None]
+    if missing:
+        stored = _disk_lookup(encoder, missing)
+        if stored:
+            available.update(stored)
+            _retain_vectors(_EXAMPLE_VECTORS, stored.items(),
+                            valid=lambda: _semantic_current(context))
+            missing = [text for text in missing if text not in stored]
+    if missing:
+        vectors = encoder.encode(missing)
+        if vectors is None:
+            return None
+        available.update(zip(missing, vectors))
+        _retain_vectors(_EXAMPLE_VECTORS, zip(missing, vectors),
+                        valid=lambda: _semantic_current(context))
+        _disk_store(encoder, zip(missing, vectors))
+    owners, starts, rows = [], [], []
+    for index, examples in enumerate(per_tool):
+        if examples:
+            owners.append(index)
+            starts.append(len(rows))
+            rows.extend(available[p] for p in examples)
+    if not rows:
+        return None
+    made = (np.array(owners), np.array(starts), np.vstack(rows))
+    _retain(_EXAMPLE_MATRIX, key, made, budget=_MATRIX_CACHE_BYTES,
+            entries=_SCHEMA_CACHE_ENTRIES, valid=lambda: _semantic_current(context))
+    return made
+
+
+_WARMING = threading.Lock()
+
+
+def _warm_in_background(declarations: list[dict[str, Any]]) -> None:
+    """Embed a schema's tool documents and example requests on a worker,
+    once at a time."""
+    if not _WARMING.acquire(blocking=False):
+        return
+
+    def warm() -> None:
+        try:
+            _tool_matrix(declarations)
+            _example_matrix(declarations)
+        except Exception:
+            pass
+        finally:
+            _WARMING.release()
+    threading.Thread(target=warm, name="orion-tool-embed", daemon=True).start()
+
+
+def semantic_scores(query: str, declarations: Sequence[dict[str, Any]]) -> dict[str, float]:
+    """Cosine of *query* against each tool's purpose - or its nearest example
+    request, when that is closer; {} when the sentence encoder is not warm,
+    so callers fall back to words alone."""
+    import numpy as np
+
+    context = _semantic_context()
+    encoder = context[0]
+    if not encoder.ready() or not str(query or "").strip():
         return {}
-    names, matrix = _tool_matrix(list(declarations))
-    question = semantic.ENCODER.encode_one(query)
-    if matrix is None or question is None:
+    declarations = list(declarations)
+    # Embedding tool documents is a worker's job (warm_semantic). On the GUI
+    # thread - which under qasync is also the event loop - a schema that has
+    # just grown (an MCP server connecting adds a batch of tools) was embedded
+    # inline: an onnxruntime run() of a quarter of a second that froze the
+    # face. That turn is ranked on words while a worker catches up.
+    on_loop = threading.current_thread() is threading.main_thread()
+    names, matrix = _tool_matrix(declarations, build=not on_loop, _context=context)
+    if matrix is None:
+        if on_loop:
+            _warm_in_background(declarations)
+        return {}
+    question = encoder.encode_one(query)
+    if question is None:
         return {}
     sims = matrix @ question
+    # The examples are embedded by warm_semantic (a worker); a question on
+    # the main thread before that uses the documents alone, never waits.
+    examples = _example_matrix(declarations,
+                               build=threading.current_thread() is not threading.main_thread(),
+                               _context=context)
+    if examples is not None:
+        owners, starts, stacked = examples
+        nearest = np.maximum.reduceat(stacked @ question, starts)
+        sims = sims.copy()
+        sims[owners] = np.maximum(sims[owners], nearest)
     return {name: float(sims[i]) for i, name in enumerate(names)}
 
 
 def hybrid_scores(query: str, declarations: Sequence[dict[str, Any]]) -> dict[str, float]:
-    """Words plus meaning. Exactly lexical_scores when the encoder is cold."""
+    """Words plus meaning. Exactly lexical_scores when the encoder is cold.
+    Typing slips are put right first (spelling.py): "colse spotify" scores
+    as "close spotify"."""
+    from .spelling import correct
+    query = correct(query)
     scores = dict(lexical_scores(query, declarations))
     meaning = semantic_scores(query, declarations)
     if not meaning:

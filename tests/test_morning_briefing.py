@@ -252,6 +252,43 @@ def test_deliver_briefing_passes_period_to_compose_source_material(tmp_path):
     assert worker.dispatcher.briefing.calls == ["morning"]
 
 
+def test_a_briefing_composed_during_the_offer_is_used_on_yes():
+    # 27 Oct 2026: "Yes, go on" -> six seconds of silence while every feed
+    # was fetched. The offer now composes it in the background.
+    import types
+    from orion_core.live_worker import GenAILiveWorker
+
+    class _FakeBriefing:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def compose_source_material(self, period: str = "general") -> str:
+            self.calls.append(period)
+            return f"{period} briefing"
+
+    class _StopEvent:
+        def is_set(self) -> bool:
+            return True
+
+    async def run():
+        worker = types.SimpleNamespace(
+            dispatcher=types.SimpleNamespace(briefing=_FakeBriefing()), bus=_StubBus(),
+            connected=False, stop_event=_StopEvent())
+        GenAILiveWorker._prefetch_briefing(worker)
+        period = worker._briefing_prefetch[0]
+        await asyncio.sleep(0)
+        await GenAILiveWorker._deliver_briefing(worker, wait_for_connection=0.0, period=period)
+        # Composed once - by the prefetch - and the hold is spent.
+        assert worker.dispatcher.briefing.calls == [period]
+        assert worker._briefing_prefetch is None
+        # Another period does not take a stale composition.
+        GenAILiveWorker._prefetch_briefing(worker)
+        other = "general" if period == "morning" else "morning"
+        assert GenAILiveWorker._take_prefetched_briefing(worker, other) is None
+
+    asyncio.run(run())
+
+
 # ── "already briefed today" bookkeeping ─────────────────────────────────────
 # So a restart or a new same-day session doesn't re-offer a briefing already
 # delivered a few hours ago unless something has genuinely broken since.
@@ -445,7 +482,10 @@ def test_offer_startup_briefing_asks_normally_when_not_yet_briefed_today(tmp_pat
     worker._say = lambda text: sent.append(text)
 
     asyncio.run(GenAILiveWorker.offer_startup_briefing(worker))
-    assert sent == ["Good morning, sir. Would you like your briefing?"]
+    from orion_core.voice_variety import BANK
+    # The offer is phrased afresh each time (voice_variety), never a script.
+    assert len(sent) == 1 and sent[0].startswith("Good morning, sir. ")
+    assert sent[0][len("Good morning, sir. "):] in BANK["briefing_offer"]
     assert worker.awaiting_briefing is True
 
 
@@ -472,3 +512,47 @@ def test_a_morning_request_in_the_evening_is_the_evening_briefing(monkeypatch):
     asyncio.run(asyncio.sleep(0))
     assert seen == ["general"]
     assert "evening briefing" in result.text
+
+
+def test_a_second_briefing_request_joins_the_one_already_on_its_way(monkeypatch):
+    """3 of 10 sessions heard the briefing twice: every call spawned its own
+    delivery. While one is composing or being spoken, another joins it."""
+    import types
+    from orion_core.dispatch_productivity import ProductivityDispatchMixin
+
+    monkeypatch.setattr(MorningBriefingService, "greeting_period",
+                        staticmethod(lambda moment=None: "evening"))
+    deliveries: list[str] = []
+
+    async def scenario():
+        spoken = asyncio.Event()
+
+        async def deliver(period: str) -> None:
+            deliveries.append(period)
+            await spoken.wait()                 # composing, then speaking
+
+        d = types.SimpleNamespace(on_briefing_request=deliver)
+        first = await ProductivityDispatchMixin.morning_briefing(d, {})
+        await asyncio.sleep(0)
+        assert ProductivityDispatchMixin.briefing_in_flight(d)
+        second = await ProductivityDispatchMixin.morning_briefing(d, {})
+        third = await ProductivityDispatchMixin.morning_briefing(d, {"period": "morning"})
+        await asyncio.sleep(0)
+        assert deliveries == ["general"], "one delivery, however often it is asked for"
+        spoken.set()
+        await asyncio.sleep(0.01)
+        assert not ProductivityDispatchMixin.briefing_in_flight(d)
+        again = await ProductivityDispatchMixin.morning_briefing(d, {})
+        await asyncio.sleep(0)
+        spoken.set()
+        await asyncio.sleep(0.01)
+        return first, second, third, again
+
+    first, second, third, again = asyncio.run(scenario())
+    assert first.ok and first.receipt["status"] == "delivering"
+    assert "Do NOT compose, summarise or narrate a briefing yourself" in first.text
+    for joined in (second, third):
+        assert joined.ok and joined.receipt["status"] == "already_delivering"
+        assert "already on its way" in joined.text and "narrate" in joined.text
+    assert again.receipt["status"] == "delivering" and deliveries == ["general", "general"], \
+        "a later request after the first has finished is a new briefing"

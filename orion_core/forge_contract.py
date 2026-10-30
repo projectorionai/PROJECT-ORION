@@ -68,6 +68,9 @@ def schema_problems(schema: Any) -> tuple[list[str], dict]:
         problems.append("schema parameters 'required' must be a list")
     else:
         for key in required:
+            if not isinstance(key, str):
+                problems.append("schema parameters 'required' entries must be strings")
+                continue
             if key not in properties:
                 problems.append(
                     "'%s' is listed as required but is not in properties" % key)
@@ -75,15 +78,21 @@ def schema_problems(schema: Any) -> tuple[list[str], dict]:
     return problems, properties
 
 
-def signature_problems(run_fn: Any, properties: dict) -> list[str]:
+def signature_problems(run_fn: Any, properties: dict, *,
+                       required: list[str] | tuple[str, ...] | None = None) -> list[str]:
     """Check that ``run()`` can actually be called with the schema's parameters.
 
     The dispatcher always invokes a forged tool as ``run(**kwargs)``, so:
       * a positional-only parameter can never be supplied;
       * a parameter with no default that the schema does not declare will always
         be missing;
+      * when the schema's ``required`` list is supplied, every parameter without
+        a default must be listed there, since optional properties can be omitted;
       * a declared property that ``run()`` does not accept raises TypeError —
         unless ``run()`` takes ``**kwargs``, which absorbs anything.
+    The optional ``required`` argument preserves the properties-only API for
+    callers that do not have a full schema. Full-schema callers should use
+    :func:`contract_problems`, which also checks requiredness.
     """
     problems: list[str] = []
     if not callable(run_fn):
@@ -111,6 +120,11 @@ def signature_problems(run_fn: Any, properties: dict) -> list[str]:
                 problems.append(
                     "run() requires argument '%s', but the schema does not "
                     "declare it in properties" % name)
+            elif (parameter.default is inspect.Parameter.empty
+                  and required is not None and name not in required):
+                problems.append(
+                    "run() requires argument '%s', but the schema does not "
+                    "mark it as required" % name)
 
     if not accepts_kwargs:
         for key in properties:
@@ -128,7 +142,13 @@ def contract_problems(schema: Any, run_fn: Any) -> list[str]:
     An empty list means the tool is safe for the dispatcher to call.
     """
     problems, properties = schema_problems(schema)
-    problems.extend(signature_problems(run_fn, properties))
+    parameters = schema.get("parameters") if isinstance(schema, dict) else None
+    required = parameters.get("required", []) if isinstance(parameters, dict) else []
+    # The shape fault has already been reported. Continue signature checking
+    # with no guaranteed arguments instead of raising on malformed requiredness.
+    if not isinstance(required, (list, tuple)):
+        required = []
+    problems.extend(signature_problems(run_fn, properties, required=required))
     return problems
 
 

@@ -69,6 +69,96 @@ def describe_control(widget: Any, name: str, hint: str = "") -> Any:
     except Exception:
         pass          # a control that cannot be described must still work
     return widget
+
+
+# ── the deck's shared page grammar ────────────────────────────────────────────
+#
+# Every Command Deck page used to invent its own top: a 23 px title in
+# capitals on one, a 12 px heading on the next, a letter-spaced subtitle on a
+# third — and each one repeated the page name the deck's own header already
+# shows. The deck header names the page; these two pieces sum it up and keep
+# its secondary detail out of the way. (Mark XXXVIII removed the one-line
+# "what this page is for" lead: the page shows what it is for.)
+
+
+class SummaryStrip(QFrame):
+    """A few facts in one recessed row, instead of a card per fact.
+
+    ``add(key, value)`` returns the value label so the page keeps updating it
+    exactly as it updated its old card.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QHBoxLayout
+        from ..constants import SPACE
+
+        self.setObjectName("summaryStrip")
+        self._row = QHBoxLayout(self)
+        self._row.setContentsMargins(SPACE.MD, SPACE.SM, SPACE.MD, SPACE.SM)
+        self._row.setSpacing(SPACE.LG)
+        self._row.addStretch(1)
+
+    def add(self, key: str, value: str = "—", *, stretch: int = 0) -> QLabel:
+        cell = QWidget()
+        box = QVBoxLayout(cell)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(2)
+        name = QLabel(key)
+        name.setObjectName("summaryKey")
+        reading = QLabel(value)
+        reading.setObjectName("summaryValue")
+        reading.setAccessibleName(key)
+        reading.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.addWidget(name)
+        box.addWidget(reading)
+        self._row.insertWidget(self._row.count() - 1, cell, stretch)
+        return reading
+
+
+class DetailsSection(QWidget):
+    """Secondary information, folded away until somebody asks for it.
+
+    Debug counters, full tables and raw transcripts are real and stay one
+    click away; they simply stop competing with what the page is for.
+    """
+
+    def __init__(self, title: str = "Details", body: Optional[QWidget] = None, *,
+                 expanded: bool = False, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QToolButton
+
+        self._title = title
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.toggle = QToolButton()
+        self.toggle.setObjectName("detailsToggle")
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.toggled.connect(self.set_expanded)
+        layout.addWidget(self.toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        self.body = body if body is not None else QWidget()
+        layout.addWidget(self.body, 1)
+        self.set_expanded(expanded)
+
+    def set_expanded(self, expanded: bool) -> None:
+        expanded = bool(expanded)
+        if self.toggle.isChecked() != expanded:
+            self.toggle.blockSignals(True)
+            self.toggle.setChecked(expanded)
+            self.toggle.blockSignals(False)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.toggle.setAccessibleName(f"{'Hide' if expanded else 'Show'} {self._title.lower()}")
+        self.toggle.setToolTip(f"{'Hide' if expanded else 'Show'} {self._title.lower()}")
+        self.body.setVisible(expanded)
+
+    def is_expanded(self) -> bool:
+        return self.toggle.isChecked()
+
+
 from ..utils import clamp_channel
 
 
@@ -86,58 +176,63 @@ class _Particle:
 
 
 class MetricBar(QWidget):
+    """A name, a reading and a thin meter — one compact row.
+
+    It used to be a 58 px boxed card with a crimson-to-white gradient fill,
+    so four of them stacked made a CPU reading the loudest thing on the page.
+    A meter is not an alert: the track and fill are neutral (the same grammar
+    as the stylesheet's QProgressBar), and the one crimson mark is the 2 px
+    tip where the value currently is.
+    """
+
+    HEIGHT = 36
+
     def __init__(self, label: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.label         = label
         self.value         = 0.0
         self.display_value = 0.0
-        self.setMinimumHeight(58)
+        self.setMinimumHeight(self.HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setAccessibleName(label)
 
     def set_value(self, value: float) -> None:
         self.value = max(0.0, min(100.0, float(value)))
+        self.setAccessibleDescription(f"{self.value:.0f}%")
         self.update()
 
+    def sizeHint(self) -> Any:  # noqa: N802  (Qt naming)
+        from PyQt6.QtCore import QSize
+        return QSize(160, self.HEIGHT)
+
     def paintEvent(self, event: Any) -> None:
+        w, h = self.width(), self.height()
+        if w < 8 or h < 8:                   # degenerate size (flicker guard)
+            return
         self.display_value += (self.value - self.display_value) * 0.18
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
-        painter.setPen(QPen(QColor(C.BORDER), 1))
-        painter.setBrush(QColor(C.PANEL))
-        painter.drawRoundedRect(rect, 6, 6)
-        inner = rect.adjusted(10, 31, -10, -10)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#1a1116"))
-        painter.drawRoundedRect(inner, 4, 4)
-        fill_width = inner.width() * (self.display_value / 100.0)
-        fill       = QRectF(inner.left(), inner.top(), fill_width, inner.height())
-        gradient   = QLinearGradient(fill.topLeft(), fill.topRight())
-        gradient.setColorAt(0.0, QColor(C.PRI_DIM))
-        gradient.setColorAt(0.82, QColor(C.PRI))
-        gradient.setColorAt(1.0, QColor(C.ACCENT))       # cyan leading edge
-        painter.setBrush(gradient)
-        painter.drawRoundedRect(fill, 4, 4)
-        # Bright cyan tip cap for a high-tech "signal" feel.
-        if fill_width > 3:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(C.ACCENT))
-            tip = QRectF(fill.right() - 2.0, inner.top(), 2.0, inner.height())
-            painter.drawRoundedRect(tip, 1, 1)
+        text_box = QRectF(2, 0, w - 4, h - 10)
+        painter.setPen(QColor(C.SILVER))
+        painter.setFont(QFont("Segoe UI", 9))
+        painter.drawText(text_box, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         self.label)
         painter.setPen(QColor(C.WHITE))
-        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
-        painter.drawText(
-            QRectF(10, 6, rect.width() - 20, 20),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            self.label,
-        )
-        painter.setPen(QColor(C.ACCENT))
-        painter.setFont(QFont("Cascadia Mono", 9, QFont.Weight.DemiBold))
-        painter.drawText(
-            QRectF(10, 6, rect.width() - 20, 20),
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            f"{self.display_value:05.1f}%",
-        )
+        painter.setFont(QFont("Cascadia Mono", 9))
+        painter.drawText(text_box, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                         f"{self.display_value:.0f}%")
+        track = QRectF(2, h - 8, w - 4, 4)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 18))
+        painter.drawRoundedRect(track, 2, 2)
+        fill_width = track.width() * (self.display_value / 100.0)
+        if fill_width > 0.5:
+            painter.setBrush(QColor(255, 255, 255, 140))
+            painter.drawRoundedRect(QRectF(track.left(), track.top(), fill_width,
+                                           track.height()), 2, 2)
+            painter.setBrush(QColor(C.PRI))
+            painter.drawRect(QRectF(track.left() + max(0.0, fill_width - 2.0),
+                                    track.top(), 2.0, track.height()))
 
 
 class JobStatusPanel(QFrame):
@@ -215,7 +310,7 @@ class MetricGraph(QWidget):
 
         plot = rect.adjusted(10, 30, -10, -10)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#140c10"))
+        painter.setBrush(QColor(C.INK))
         painter.drawRoundedRect(plot, 4, 4)
 
         # Faint reference grid at 25/50/75%.
@@ -239,9 +334,11 @@ class MetricGraph(QWidget):
                 area.lineTo(pt)
             area.lineTo(plot.right(), plot.bottom())
             area.closeSubpath()
+            # A neutral trace over a faint neutral area: history is context,
+            # not news. The crimson is kept for the one point that is NOW.
             grad = QLinearGradient(plot.topLeft(), plot.bottomLeft())
-            grad.setColorAt(0.0, QColor(255, 26, 60, 120))
-            grad.setColorAt(1.0, QColor(255, 26, 60, 8))
+            grad.setColorAt(0.0, QColor(255, 255, 255, 34))
+            grad.setColorAt(1.0, QColor(255, 255, 255, 4))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(grad)
             painter.drawPath(area)
@@ -251,23 +348,22 @@ class MetricGraph(QWidget):
             for pt in pts[1:]:
                 line.lineTo(pt)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(C.PRI), 1.6))
+            painter.setPen(QPen(QColor(C.SILVER), 1.4))
             painter.drawPath(line)
-            # Bright cyan leading edge.
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(C.ACCENT))
+            painter.setBrush(QColor(C.PRI))
             painter.drawEllipse(pts[-1], 2.6, 2.6)
 
-        painter.setPen(QColor(C.WHITE))
-        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        painter.setPen(QColor(C.SILVER))
+        painter.setFont(QFont("Segoe UI", 9))
         painter.drawText(QRectF(10, 6, rect.width() - 20, 18),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                          self.label)
-        painter.setPen(QColor(C.ACCENT))
-        painter.setFont(QFont("Cascadia Mono", 9, QFont.Weight.DemiBold))
+        painter.setPen(QColor(C.WHITE))
+        painter.setFont(QFont("Cascadia Mono", 9))
         painter.drawText(QRectF(10, 6, rect.width() - 20, 18),
                          Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                         f"{self.display_value:05.1f}{self.unit}")
+                         f"{self.display_value:.0f}{self.unit}")
 
 
 class MiniOrb(QWidget):
@@ -408,6 +504,33 @@ class HolographicToggle(QPushButton):
         )
         self.clicked.connect(self.toggle_target)
 
+    def dock(self, area: Any = None) -> None:
+        """Sit in the bottom-left corner of the work area (or of *area*).
+
+        It used to be moved to (28, 28) - the top-left corner of the screen,
+        which is where the maximised core window draws its header, so the
+        pill sat on top of the O.R.I.O.N wordmark. The bottom-left corner is
+        the foot of the telemetry rail, the one place in that window nothing
+        else claims, and it is still a corner of the screen when the window
+        is hidden. It stays draggable from there.
+        """
+        from ..constants import SPACE
+
+        if area is None:
+            from PyQt6.QtGui import QGuiApplication
+
+            screen = None
+            try:
+                screen = self.target.screen()
+            except Exception:
+                pass
+            screen = screen or QGuiApplication.primaryScreen()
+            if screen is None:
+                return
+            area = screen.availableGeometry()
+        self.move(area.left() + SPACE.LG,
+                  area.top() + area.height() - SPACE.LG - self.height())
+
     def toggle_target(self) -> None:
         if self.target.isVisible():
             self.target.hide()
@@ -432,6 +555,8 @@ class HolographicToggle(QPushButton):
 
 
 class ApiKeyDialog(QDialog):
+    OFFLINE_RESULT = 2
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("O.R.I.O.N. Key Exchange")
@@ -444,18 +569,21 @@ class ApiKeyDialog(QDialog):
 
         self.setStyleSheet(APP_STYLESHEET)
         layout = QVBoxLayout(self)
-        title  = QLabel("Gemini Live authentication token required.")
+        title  = QLabel("Gemini Key")
         title.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
-        body   = QLabel("Enter the API key. It will be stored locally in config/api_keys.json.")
+        body   = QLabel("Optional - ORION also works offline.")
         body.setWordWrap(True)
         self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_edit.setPlaceholderText("AIza...")
+        self.key_edit.setPlaceholderText("AIza…")
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self._accept_if_valid)
         buttons.rejected.connect(self.reject)
+        offline = buttons.addButton("Continue Offline", QDialogButtonBox.ButtonRole.ActionRole)
+        offline.setAccessibleName("Continue offline without an API key")
+        offline.clicked.connect(lambda: self.done(self.OFFLINE_RESULT))
         layout.addWidget(title)
         layout.addWidget(body)
         layout.addWidget(self.key_edit)
@@ -466,6 +594,6 @@ class ApiKeyDialog(QDialog):
 
     def _accept_if_valid(self) -> None:
         if not self.key():
-            QMessageBox.warning(self, "Key Required", "Supply a Gemini API key to initialise O.R.I.O.N.")
+            QMessageBox.warning(self, "Key Required", "Enter a Gemini key, or choose Continue offline.")
             return
         self.accept()

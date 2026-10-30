@@ -52,6 +52,10 @@ def spawn(coro: Coroutine, *, name: str = "",
 
     task = loop.create_task(coro, name=name or label or None)
     _RUNNING.add(task)
+    # One owner for shutdown: background.cancel_all()/drain() now see this
+    # task too. Reporting stays here, so a failure is still reported once.
+    from . import background
+    background.adopt(task)
 
     def done(finished: asyncio.Task) -> None:
         _RUNNING.discard(finished)
@@ -69,8 +73,10 @@ def spawn(coro: Coroutine, *, name: str = "",
         if bus is not None:
             try:
                 what = label or name or "a background task"
+                lines = str(error).splitlines()
+                detail = lines[0][:120] if lines else type(error).__name__
                 bus.log.emit(f"TASK: {what} failed - "
-                             f"{str(error).splitlines()[0][:120]}")
+                             f"{detail}")
                 return
             except Exception:
                 pass

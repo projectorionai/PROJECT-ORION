@@ -18,8 +18,9 @@ from __future__ import annotations
 import math
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from threading import RLock
 
 from .constants import CONFIG_DIR
 from .db import apply_pragmas
@@ -33,7 +34,8 @@ MOOD_LABELS: dict[str, int] = {
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    from .time_service import TIME
+    return TIME.now()
 
 
 def _iso(dt: datetime) -> str:
@@ -48,7 +50,7 @@ def _parse(text: str) -> datetime:
 def _clamp(value, lo, hi, default=None):
     try:
         return max(lo, min(hi, int(value)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -56,9 +58,20 @@ def resolve_mood(value) -> int | None:
     """A mood label ('good') or a number → a valence in [-2, 2]."""
     if value is None or value == "":
         return None
-    if isinstance(value, str) and not value.lstrip("-").isdigit():
-        return MOOD_LABELS.get(value.strip().lower())
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.lstrip("+-").isdigit():
+            return MOOD_LABELS.get(value.lower())
     return _clamp(value, -2, 2)
+
+
+def _sleep_hours(value) -> float | None:
+    """Invalid or missing self-reports stay missing rather than biasing averages."""
+    try:
+        hours = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return hours if math.isfinite(hours) and 0 <= hours <= 24 else None
 
 
 def pearson(xs: list[float], ys: list[float]) -> float | None:
@@ -67,6 +80,11 @@ def pearson(xs: list[float], ys: list[float]) -> float | None:
     n = len(xs)
     if n < 2 or len(ys) != n:
         return None
+    if any(not math.isfinite(v) for v in (*xs, *ys)):
+        return None
+    # Scaling does not change correlation, and avoids overflow when squaring.
+    sx, sy = max(abs(x) for x in xs) or 1.0, max(abs(y) for y in ys) or 1.0
+    xs, ys = [x / sx for x in xs], [y / sy for y in ys]
     mx = sum(xs) / n
     my = sum(ys) / n
     cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
@@ -88,8 +106,9 @@ class Checkin:
     factors: list[str] = field(default_factory=list)
     id: int | None = None
 
-    def day(self) -> date:
-        return _parse(self.at).date()
+    def day(self, zone: tzinfo | None = None) -> date:
+        stamp = _parse(self.at)
+        return (stamp.astimezone(zone) if zone is not None else stamp).date()
 
 
 class WellbeingStore:
@@ -97,6 +116,7 @@ class WellbeingStore:
         self.path = Path(path) if path is not None else (CONFIG_DIR / "wellbeing.db")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._lock = RLock()
         # Mark XXVI: WAL + relaxed fsync - a committed write costs
         # 0.03 ms instead of 2.81 ms, and that time is paid on the
         # qasync/GUI thread. See orion_core/db.py.
@@ -112,41 +132,62 @@ class WellbeingStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 checkin_id INTEGER NOT NULL, tag TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_checkin_at ON checkins(at);
+            CREATE INDEX IF NOT EXISTS idx_factors_checkin ON factors(checkin_id);
             """)
         self._db.commit()
 
     def add(self, c: Checkin) -> Checkin:
-        cur = self._db.execute(
-            "INSERT INTO checkins (at, energy, mood_valence, stress, sleep_hours, note) "
-            "VALUES (?,?,?,?,?,?)",
-            (c.at or _iso(_now()), c.energy, c.mood_valence, c.stress, c.sleep_hours, c.note))
-        c.id = int(cur.lastrowid)
-        for tag in c.factors:
-            self._db.execute("INSERT INTO factors (checkin_id, tag) VALUES (?,?)",
-                             (c.id, str(tag)))
-        self._db.commit()
+        stamp = c.at or _iso(_now())
+        # Convert user values before opening a transaction.
+        tags = [str(tag) for tag in c.factors]
+        with self._lock, self._db:
+            cur = self._db.execute(
+                "INSERT INTO checkins (at, energy, mood_valence, stress, sleep_hours, note) "
+                "VALUES (?,?,?,?,?,?)",
+                (stamp, c.energy, c.mood_valence, c.stress, c.sleep_hours, c.note))
+            row_id = int(cur.lastrowid)
+            self._db.executemany("INSERT INTO factors (checkin_id, tag) VALUES (?,?)",
+                                 [(row_id, tag) for tag in tags])
+        c.id, c.at, c.factors = row_id, stamp, tags
         return c
 
-    def _row(self, r: sqlite3.Row) -> Checkin:
-        factors = [fr["tag"] for fr in self._db.execute(
-            "SELECT tag FROM factors WHERE checkin_id=?", (r["id"],)).fetchall()]
+    @staticmethod
+    def _row(r: sqlite3.Row) -> Checkin:
         return Checkin(id=r["id"], at=r["at"], energy=r["energy"],
                        mood_valence=r["mood_valence"], stress=r["stress"],
-                       sleep_hours=r["sleep_hours"], note=r["note"] or "", factors=factors)
+                       sleep_hours=_sleep_hours(r["sleep_hours"]), note=r["note"] or "")
 
-    def since(self, start: datetime) -> list[Checkin]:
-        return [self._row(r) for r in self._db.execute(
-            "SELECT * FROM checkins WHERE at>=? ORDER BY at", (_iso(start),)).fetchall()]
+    def _select(self, where: str = "", params: tuple = ()) -> list[Checkin]:
+        """Load check-ins and their factors in one indexed query, in stable order."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT c.*, f.tag AS factor_tag FROM checkins c "
+                "LEFT JOIN factors f ON f.checkin_id=c.id "
+                f"{where} ORDER BY c.at, c.id, f.id", params).fetchall()
+        checkins: dict[int, Checkin] = {}
+        for row in rows:
+            checkin = checkins.get(row["id"])
+            if checkin is None:
+                checkin = self._row(row)
+                checkins[row["id"]] = checkin
+            if row["factor_tag"] is not None:
+                checkin.factors.append(row["factor_tag"])
+        return list(checkins.values())
+
+    def since(self, start: datetime, end: datetime | None = None) -> list[Checkin]:
+        if end is None:
+            return self._select("WHERE c.at>=?", (_iso(start),))
+        return self._select("WHERE c.at>=? AND c.at<=?", (_iso(start), _iso(end)))
 
     def all(self) -> list[Checkin]:
-        return [self._row(r) for r in
-                self._db.execute("SELECT * FROM checkins ORDER BY at").fetchall()]
+        return self._select()
 
     def close(self) -> None:
-        try:
-            self._db.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self._db.close()
+            except Exception:
+                pass
 
 
 def _daily_mean(pairs: list[tuple[date, float]]) -> dict[date, float]:
@@ -162,20 +203,17 @@ class WellbeingEngine:
 
     def checkin(self, *, energy=None, mood=None, stress=None, sleep_hours=None,
                 note: str = "", factors=None, at: datetime | None = None) -> Checkin:
-        sleep = None
-        try:
-            sleep = float(sleep_hours) if sleep_hours is not None else None
-        except (TypeError, ValueError):
-            sleep = None
+        sleep = _sleep_hours(sleep_hours)
+        tags = [factors] if isinstance(factors, str) else list(factors or [])
         return self.store.add(Checkin(
             at=_iso(at or _now()), energy=_clamp(energy, 1, 5),
             mood_valence=resolve_mood(mood), stress=_clamp(stress, 1, 5),
-            sleep_hours=sleep, note=note, factors=list(factors or [])))
+            sleep_hours=sleep, note=note, factors=tags))
 
     def today(self, now: datetime | None = None) -> dict[str, object]:
         now = now or _now()
-        start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        todays = self.store.since(start)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
+        todays = self.store.since(start, end=now)
         energies = [c.energy for c in todays if c.energy is not None]
         return {
             "checkins": len(todays),
@@ -185,10 +223,10 @@ class WellbeingEngine:
 
     def trend(self, days: int = 14, now: datetime | None = None) -> dict[str, object]:
         now = now or _now()
-        window = self.store.since(now - timedelta(days=days))
+        window = self.store.since(now - timedelta(days=days), end=now)
 
         def _avg(vals):
-            vals = [v for v in vals if v is not None]
+            vals = [v for v in vals if v is not None and math.isfinite(v)]
             return round(sum(vals) / len(vals), 2) if vals else None
 
         def _direction(series):
@@ -223,11 +261,14 @@ class WellbeingEngine:
         "energy vs focus minutes" is honest about its sample size. Study
         correlation will follow once the study store exposes reviews-per-day."""
         now = now or _now()
-        window = self.store.since(now - timedelta(days=days))
-        energy_by_day = _daily_mean([(c.day(), float(c.energy)) for c in window
+        window = self.store.since(now - timedelta(days=days), end=now)
+        zone = now.tzinfo or timezone.utc
+        energy_by_day = _daily_mean([(c.day(zone), float(c.energy)) for c in window
                                      if c.energy is not None])
-        sleep_by_day = _daily_mean([(c.day(), float(c.sleep_hours)) for c in window
-                                    if c.sleep_hours is not None])
+        sleep_by_day = _daily_mean([(c.day(zone), float(c.sleep_hours)) for c in window
+                                    if c.sleep_hours is not None
+                                    and math.isfinite(c.sleep_hours)
+                                    and 0 <= c.sleep_hours <= 24])
 
         minutes_by_day: dict[date, float] = {}
         completed_by_day: dict[date, float] = {}
@@ -236,8 +277,8 @@ class WellbeingEngine:
                 for s in focus.store.all():
                     if not s.started_at or not s.ended_at:
                         continue
-                    d = _parse(s.started_at).date()
-                    if (now.date() - d).days > days:
+                    d = _parse(s.started_at).astimezone(zone).date()
+                    if not 0 <= (now.date() - d).days <= days:
                         continue
                     minutes_by_day[d] = minutes_by_day.get(d, 0.0) + s.elapsed_minutes()
                     completed_by_day[d] = completed_by_day.get(d, 0.0) + (1.0 if s.completed else 0.0)

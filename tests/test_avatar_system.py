@@ -186,6 +186,27 @@ def test_amplitude_implies_speaking():
     assert frame["amplitude"] > 0.3
 
 
+def test_microphone_amplitude_keeps_listening_state():
+    engine = AvatarEngine()
+    engine.request_state("LISTENING")
+    for _ in range(30):
+        engine.set_amplitude(0.7)
+        frame = engine.tick(0.05)
+    assert frame["state"] == "listening"
+    assert not engine.speaking
+
+
+def test_selected_form_survives_idle_listening_and_dormant_states():
+    engine = AvatarEngine()
+    for form, target in (("orb", 0.0), ("face", 1.0)):
+        engine.set_form(form)
+        for state in ("LISTENING", "IDLE", "SPEAKING", "STANDBY", "OFFLINE"):
+            engine.request_state(state)
+            for _ in range(100):
+                frame = engine.tick(0.05)
+            assert frame["morph"] == target
+
+
 # ── controller ────────────────────────────────────────────────────────────────
 
 class FakeFace:
@@ -253,6 +274,41 @@ def test_controller_face_sample_routes_to_engine():
     for _ in range(3):
         controller.on_face_sample({"present": True, "x": 0.5, "y": -0.2})
     assert controller.engine.animation.tracking
+
+
+def test_attaching_replacement_pushes_label_and_morph_again():
+    controller = AvatarController(face=FakeFace())
+    controller.on_state("LISTENING")
+    for _ in range(100):
+        controller.tick(0.05)
+    replacement = FakeFace()
+    controller.attach(replacement)
+    controller.tick(0.05)
+    assert replacement.labels == ["ORION · LISTENING"]
+    assert replacement.morphs == [1.0]
+
+
+def test_renderer_owns_materialisation_and_receives_one_frame():
+    class RendererFace(FakeFace):
+        form = "orb"
+        owns_materialisation = True
+
+        def __init__(self):
+            super().__init__()
+            self.frames = []
+
+        def set_avatar_frame(self, frame):
+            self.frames.append(frame)
+
+    face = RendererFace()
+    controller = AvatarController()
+    controller.attach(face)
+    controller.on_state("LISTENING")
+    controller.tick(0.05)
+    assert len(face.frames) == 1
+    assert face.morphs == []
+    assert face.states == []
+    assert controller.engine.form == "orb"
 
 
 # ── face tracker degradation ──────────────────────────────────────────────────

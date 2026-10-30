@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..bus import OrionBus
+from .labels import plural
 from .workflow_canvas import WorkflowChainCanvas
 
 _REFRESH_MS = 2000
@@ -83,7 +84,7 @@ class AutomationDeckView(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
-        title = QLabel("AUTOMATION — WORKFLOW ENGINE")
+        title = QLabel("Automation")
         title.setObjectName("titleLabel")
         outer.addWidget(title)
 
@@ -104,7 +105,7 @@ class AutomationDeckView(QWidget):
         outer.addWidget(self.status_label)
 
     def _build_library_panel(self) -> QFrame:
-        frame, layout = _panel("WORKFLOW LIBRARY")
+        frame, layout = _panel("Workflow Library")
         self.library_list = QListWidget()
         self.library_list.currentItemChanged.connect(self._on_library_selection)
         layout.addWidget(self.library_list, 1)
@@ -129,7 +130,7 @@ class AutomationDeckView(QWidget):
         return frame
 
     def _build_editor_panel(self) -> QFrame:
-        frame, layout = _panel("STEP EDITOR")
+        frame, layout = _panel("Step Editor")
 
         name_row = QHBoxLayout()
         name_row.addWidget(QLabel("Name"))
@@ -145,11 +146,12 @@ class AutomationDeckView(QWidget):
         self.canvas.step_clicked.connect(self._on_canvas_step_clicked)
         layout.addWidget(self.canvas)
 
-        self.steps_table = QTableWidget(0, 3)
-        self.steps_table.setHorizontalHeaderLabels(["Tool", "Args (JSON)", "Retries"])
+        self.steps_table = QTableWidget(0, 4)
+        self.steps_table.setHorizontalHeaderLabels(["Tool", "Args (JSON)", "Retries", "Optional"])
         self.steps_table.horizontalHeader().setStretchLastSection(False)
         self.steps_table.setColumnWidth(0, 150)
         self.steps_table.setColumnWidth(2, 60)
+        self.steps_table.setColumnWidth(3, 70)
         self.steps_table.itemChanged.connect(lambda *_a: self._refresh_canvas())
         self.steps_table.itemSelectionChanged.connect(self._on_step_table_selection)
         layout.addWidget(self.steps_table, 1)
@@ -178,12 +180,14 @@ class AutomationDeckView(QWidget):
         return frame
 
     def _build_runs_panel(self) -> QFrame:
-        frame, layout = _panel("RUNS")
+        frame, layout = _panel("Runs")
         self.runs_list = QListWidget()
+        self.runs_list.itemSelectionChanged.connect(self._update_cancel_button)
         layout.addWidget(self.runs_list, 1)
-        cancel_btn = QPushButton("Cancel Selected Run")
-        cancel_btn.clicked.connect(self._cancel_run)
-        layout.addWidget(cancel_btn)
+        self.cancel_button = QPushButton("Cancel Selected Run")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self._cancel_run)
+        layout.addWidget(self.cancel_button)
         return frame
 
     # ── library ───────────────────────────────────────────────────────────────
@@ -194,7 +198,7 @@ class AutomationDeckView(QWidget):
         for name, definition in sorted(self.engine.definitions.items()):
             steps = definition.get("steps") or []
             desc = definition.get("description") or ""
-            label = f"{name}  ({len(steps)} step(s))" + (f" — {desc}" if desc else "")
+            label = f"{name}  ({plural(len(steps), 'step')})" + (f" — {desc}" if desc else "")
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, name)
             self.library_list.addItem(item)
@@ -218,17 +222,24 @@ class AutomationDeckView(QWidget):
                 str(step.get("tool") or ""),
                 json.dumps(step.get("args") or {}),
                 int(step.get("retries", 1)),
+                optional=bool(step.get("optional", False)),
             )
         self._refresh_canvas()
 
     # ── step editor ───────────────────────────────────────────────────────────
 
-    def _add_step_row(self, tool: str, args_json: str, retries: int) -> None:
+    def _add_step_row(self, tool: str, args_json: str, retries: int,
+                      *, optional: bool = False) -> None:
         row = self.steps_table.rowCount()
         self.steps_table.insertRow(row)
         self.steps_table.setItem(row, 0, QTableWidgetItem(tool))
         self.steps_table.setItem(row, 1, QTableWidgetItem(args_json))
         self.steps_table.setItem(row, 2, QTableWidgetItem(str(retries)))
+        optional_item = QTableWidgetItem()
+        optional_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        optional_item.setCheckState(Qt.CheckState.Checked if optional else Qt.CheckState.Unchecked)
+        optional_item.setToolTip("Continue to the next step if this step fails.")
+        self.steps_table.setItem(row, 3, optional_item)
         self._refresh_canvas()
 
     def _remove_selected_step(self) -> None:
@@ -278,7 +289,8 @@ class AutomationDeckView(QWidget):
             tool_item = self.steps_table.item(row, 0)
             tool = tool_item.text().strip() if tool_item else ""
             if not tool:
-                continue
+                self.status_label.setText(f"Row {row + 1}: a tool is required. No steps were saved.")
+                return None
             args_item = self.steps_table.item(row, 1)
             args_text = args_item.text().strip() if args_item else "{}"
             try:
@@ -290,8 +302,13 @@ class AutomationDeckView(QWidget):
             try:
                 retries = int(retries_item.text().strip()) if retries_item else 1
             except ValueError:
-                retries = 1
-            steps.append({"tool": tool, "args": args, "retries": retries})
+                self.status_label.setText(f"Row {row + 1}: retries must be a whole number. No steps were saved.")
+                return None
+            step = {"tool": tool, "args": args, "retries": retries}
+            optional_item = self.steps_table.item(row, 3)
+            if optional_item and optional_item.checkState() == Qt.CheckState.Checked:
+                step["optional"] = True
+            steps.append(step)
         return steps
 
     def _save_workflow(self) -> None:
@@ -313,9 +330,10 @@ class AutomationDeckView(QWidget):
             self.status_label.setText("Select a workflow to delete.")
             return
         result = self.engine.remove(name)
+        if result.ok:
+            self._refresh_library()
+            self._new_workflow()
         self.status_label.setText(result.text)
-        self._refresh_library()
-        self._new_workflow()
 
     # ── runs ──────────────────────────────────────────────────────────────────
 
@@ -329,14 +347,24 @@ class AutomationDeckView(QWidget):
         self._refresh_runs()
 
     def _cancel_run(self) -> None:
-        item = self.runs_list.currentItem()
-        run_id = str(item.data(Qt.ItemDataRole.UserRole)) if item is not None else ""
+        run_id = self._selected_run_id()
+        if not run_id:
+            self.status_label.setText("No running workflow selected. Select a run to cancel.")
+            return
         result = self.engine.cancel(run_id)
         self.status_label.setText(result.text)
+
+    def _selected_run_id(self) -> str:
+        selected = self.runs_list.selectedItems()
+        return str(selected[0].data(Qt.ItemDataRole.UserRole) or "") if selected else ""
+
+    def _update_cancel_button(self) -> None:
+        self.cancel_button.setEnabled(bool(self._selected_run_id()))
 
     def _refresh_runs(self) -> None:
         if not self.isVisible():
             return
+        selected = self._selected_run_id()
         self.runs_list.clear()
         for run in list(self.engine.runs.values())[-12:]:
             text = f"{run.get('workflow', '?')} — {run.get('status', '?')}  " \
@@ -344,6 +372,9 @@ class AutomationDeckView(QWidget):
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, run.get("id", ""))
             self.runs_list.addItem(item)
+            if selected and str(run.get("id", "")) == selected:
+                self.runs_list.setCurrentItem(item)
+        self._update_cancel_button()
 
     def _on_event(self, channel: str, payload: Any) -> None:
         if channel == "workflow":

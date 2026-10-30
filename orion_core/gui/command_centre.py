@@ -20,13 +20,12 @@ runtime state.
 
 from __future__ import annotations
 
-import time
+import threading
 from collections import deque
-from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 import psutil
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -43,12 +42,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..constants import APP_NAME, C, HEALTH_COLOURS
+from ..constants import APP_NAME, C, HEALTH_COLOURS, SPACE
+from .line_icons import apply as apply_icon, pixmap as line_pixmap
 from .token_graph import TokenUsageGraph
-from .widgets import MetricBar
+from .widgets import DetailsSection, MetricBar
 
 
 class CommandCentreWindow(QMainWindow):
+    #: (devices, current input, current output) from the device-scan thread.
+    _devices_listed = pyqtSignal(object, object, object)
+
     def __init__(
         self,
         bus: Any,
@@ -84,68 +87,87 @@ class CommandCentreWindow(QMainWindow):
     # ── layout ────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
+        # Hierarchy (Mark XXXV refinement): one line saying what the page is
+        # for, with its one control; three compact status panels; the two
+        # live streams (activity and thoughts) taking the height; and the
+        # engineering tables — service heartbeats, the tool ledger, model
+        # usage, the feature registry — folded under Details. Eight equal
+        # panels, four of them empty tables, was what read as clutter.
         root = QWidget()
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(14, 14, 14, 14)
-        outer.setSpacing(10)
-        outer.addWidget(self._build_header())
+        outer.setContentsMargins(SPACE.MD, SPACE.SM, SPACE.MD, SPACE.MD)
+        outer.setSpacing(SPACE.SM + 4)
+        outer.addLayout(self._build_header())
 
         grid = QGridLayout()
-        grid.setSpacing(10)
+        grid.setSpacing(SPACE.SM + 4)
         grid.addWidget(self._build_system_panel(),   0, 0)
         grid.addWidget(self._build_audio_panel(),     0, 1)
         grid.addWidget(self._build_memory_panel(),    0, 2)
-        grid.addWidget(self._build_health_panel(),    1, 0)
-        grid.addWidget(self._build_tasks_panel(),     1, 1)
-        grid.addWidget(self._build_tokens_panel(),    1, 2)
-        grid.addWidget(self._build_logs_panel(),      2, 0, 1, 2)
-        grid.addWidget(self._build_thoughts_panel(),  2, 2)
-        grid.addWidget(self._build_capabilities_panel(), 3, 0, 1, 3)
-        grid.setRowStretch(2, 1)
+        grid.addWidget(self._build_logs_panel(),      1, 0, 1, 2)
+        grid.addWidget(self._build_thoughts_panel(),  1, 2)
+        grid.setRowStretch(1, 1)
+        for column in range(3):
+            grid.setColumnStretch(column, 1)
         outer.addLayout(grid, 1)
+
+        details_body = QWidget()
+        details_grid = QGridLayout(details_body)
+        details_grid.setContentsMargins(0, 0, 0, 0)
+        details_grid.setSpacing(SPACE.SM + 4)
+        details_grid.addWidget(self._build_health_panel(),  0, 0)
+        details_grid.addWidget(self._build_tasks_panel(),   0, 1)
+        details_grid.addWidget(self._build_tokens_panel(),  0, 2)
+        details_grid.addWidget(self._build_capabilities_panel(), 1, 0, 1, 3)
+        for column in range(3):
+            details_grid.setColumnStretch(column, 1)
+        self.details = DetailsSection(
+            "Details — Services, Actions, Model Usage and Features", details_body)
+        self.details.toggle.toggled.connect(self._on_details_toggled)
+        outer.addWidget(self.details)
         self.setCentralWidget(root)
 
-    def _build_header(self) -> QFrame:
-        frame = QFrame()
-        frame.setObjectName("headerFrame")
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(16, 10, 16, 10)
-        title = QLabel("COMMAND CENTRE")
-        title.setObjectName("titleLabel")
-        subtitle = QLabel("LIVE SYSTEM • AGENTS • TASKS • LOGS")
-        subtitle.setObjectName("subtitleLabel")
-        box = QVBoxLayout()
-        box.setSpacing(0)
-        box.addWidget(title)
-        box.addWidget(subtitle)
-        self.autonomy_btn = QPushButton("AUTONOMY: ?")
-        self.autonomy_btn.setToolTip("Toggle the autonomous control layer on/off.")
+    def _build_header(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(SPACE.SM)
+        row.addStretch(1)
+        self.autonomy_btn = QPushButton("Automatic Actions: checking")
+        self.autonomy_btn.setToolTip("Allow or pause ORION's automatic actions.")
         self.autonomy_btn.clicked.connect(self._toggle_autonomy)
-        self.clock = QLabel("")
-        self.clock.setObjectName("clockLabel")
-        layout.addLayout(box, 1)
-        layout.addWidget(self.autonomy_btn)
-        layout.addWidget(self.clock)
-        return frame
+        row.addWidget(self.autonomy_btn)
+        return row
 
     @staticmethod
     def _panel(title: str) -> tuple[QFrame, QVBoxLayout]:
         frame = QFrame()
         frame.setObjectName("panelFrame")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(SPACE.MD - 2, SPACE.SM + 4, SPACE.MD - 2, SPACE.SM + 4)
+        layout.setSpacing(SPACE.SM)
         heading = QLabel(title)
         heading.setObjectName("panelHeading")
         layout.addWidget(heading)
         return frame, layout
 
+    @staticmethod
+    def _fact(layout: QVBoxLayout, title: str) -> QLabel:
+        """A quiet name over its value — one row, not a sub-heading per fact."""
+        name = QLabel(title)
+        name.setObjectName("summaryKey")
+        value = QLabel("")
+        value.setObjectName("mutedLabel")
+        value.setWordWrap(True)
+        value.setAccessibleName(title)
+        layout.addWidget(name)
+        layout.addWidget(value)
+        return value
+
     def _build_system_panel(self) -> QFrame:
-        frame, layout = self._panel("SYSTEM")
-        self.cpu_bar = MetricBar("CPU")
-        self.ram_bar = MetricBar("RAM")
-        self.gpu_bar = MetricBar("GPU")
-        self.net_bar = MetricBar("NETWORK")
+        frame, layout = self._panel("Computer Performance")
+        self.cpu_bar = MetricBar("Processor")
+        self.ram_bar = MetricBar("Memory")
+        self.gpu_bar = MetricBar("Graphics")
+        self.net_bar = MetricBar("Network")
         for b in (self.cpu_bar, self.ram_bar, self.gpu_bar, self.net_bar):
             layout.addWidget(b)
         self.sys_note = QLabel("")
@@ -156,7 +178,7 @@ class CommandCentreWindow(QMainWindow):
         return frame
 
     def _build_audio_panel(self) -> QFrame:
-        frame, layout = self._panel("AUDIO STATE")
+        frame, layout = self._panel("Voice and Hearing")
         self.audio_state = QLabel("—")
         self.audio_state.setObjectName("stateLabel")
         self.audio_detail = QLabel("")
@@ -169,28 +191,32 @@ class CommandCentreWindow(QMainWindow):
         # ORION sometimes locks onto the wrong microphone/speaker; let the user
         # pick the right one directly.  Selecting a device applies live and
         # persists; "System default" follows the Windows default again.
-        picker = QLabel("DEVICE CONTROL")
-        picker.setObjectName("panelHeading")
-        layout.addWidget(picker)
-
         self.input_combo = QComboBox()
         self.input_combo.setToolTip("Choose which microphone ORION listens on.")
+        self.input_combo.setAccessibleName("Microphone")
         self.output_combo = QComboBox()
         self.output_combo.setToolTip("Choose which speaker/headphones ORION speaks through.")
-        for label, combo in (("🎙 Mic", self.input_combo), ("🔊 Voice", self.output_combo)):
+        self.output_combo.setAccessibleName("Speaker")
+        # Drawn icons, not 🎙/🔊: those are colour emoji on Windows — the only
+        # blue on the page — and a different size and baseline from the text.
+        for icon_name, label, combo in (("mic", "Microphone", self.input_combo),
+                                        ("volume-high", "Speaker", self.output_combo)):
             row = QHBoxLayout()
-            row.setSpacing(6)
-            tag = QLabel(label)
-            tag.setObjectName("mutedLabel")
-            tag.setMinimumWidth(56)
+            row.setSpacing(SPACE.SM)
+            tag = QLabel()
+            tag.setPixmap(line_pixmap(icon_name, 16, C.MUTED))
+            tag.setToolTip(label)
+            tag.setAccessibleName(label)
             row.addWidget(tag)
             row.addWidget(combo, 1)
             layout.addLayout(row)
 
-        refresh = QPushButton("⟳  Refresh devices")
+        refresh = QPushButton("Refresh Devices")
+        refresh.setObjectName("ghostButton")
+        apply_icon(refresh, "refresh")
         refresh.setToolTip("Re-scan available audio devices.")
         refresh.clicked.connect(self._populate_audio_devices)
-        layout.addWidget(refresh)
+        layout.addWidget(refresh, 0, Qt.AlignmentFlag.AlignLeft)
 
         self._populate_audio_devices()
         self.input_combo.activated.connect(self._on_input_device_picked)
@@ -200,29 +226,46 @@ class CommandCentreWindow(QMainWindow):
         return frame
 
     def _populate_audio_devices(self) -> None:
-        """Fill the mic/speaker dropdowns, marking the device currently in use."""
-        try:
-            from ..audio_devices import _devices, resolve_effective
-        except Exception:
-            return
-        try:
-            devices = _devices()
-        except Exception:
-            devices = []
+        """Fill the mic/speaker dropdowns, marking the device currently in use.
+
+        The scan runs on a worker thread and the result comes back as a
+        signal: query_devices() blocked the event loop 325 ms in the owner's
+        17 Oct session (PERF line, audio_devices.py:67)."""
+        if not getattr(self, "_devices_wired", False):
+            self._devices_listed.connect(self._fill_audio_devices)
+            self._devices_wired = True
+
+        def work() -> None:
+            devices: list = []
+            current: dict = {}
+            try:
+                from ..audio_devices import _devices, resolve_effective
+                devices = _devices()
+                for kind in ("input", "output"):
+                    try:
+                        current[kind] = resolve_effective(kind)
+                    except Exception:
+                        current[kind] = None
+            except Exception:
+                devices = []
+            try:
+                self._devices_listed.emit(devices, current.get("input"), current.get("output"))
+            except RuntimeError:
+                pass            # the window closed while the scan ran
+
+        threading.Thread(target=work, name="orion-devices-centre", daemon=True).start()
+
+    def _fill_audio_devices(self, devices: Any, current_in: Any, current_out: Any) -> None:
         specs = (
-            (self.input_combo, "input", "max_input_channels"),
-            (self.output_combo, "output", "max_output_channels"),
+            (self.input_combo, "max_input_channels", current_in),
+            (self.output_combo, "max_output_channels", current_out),
         )
-        for combo, kind, channel_key in specs:
+        for combo, channel_key, current in specs:
             combo.blockSignals(True)
             combo.clear()
-            combo.addItem("System default", "default")
-            try:
-                current = resolve_effective(kind)
-            except Exception:
-                current = None
+            combo.addItem("System Default", "default")
             selected = 0
-            for index, dev in enumerate(devices):
+            for index, dev in enumerate(devices or []):
                 if dev.get(channel_key, 0) > 0:
                     combo.addItem(f"[{index}] {dev.get('name', '?')}", str(index))
                     if index == current:
@@ -241,27 +284,15 @@ class CommandCentreWindow(QMainWindow):
             self.bus.audio_device_request.emit("output", spec)
 
     def _build_memory_panel(self) -> QFrame:
-        frame, layout = self._panel("MEMORY STATE")
-        self.mem_detail = QLabel("")
-        self.mem_detail.setObjectName("mutedLabel")
-        self.mem_detail.setWordWrap(True)
-        self.ws_detail = QLabel("")
-        self.ws_detail.setObjectName("mutedLabel")
-        self.ws_detail.setWordWrap(True)
-        self.display_detail = QLabel("")
-        self.display_detail.setObjectName("mutedLabel")
-        self.display_detail.setWordWrap(True)
-        layout.addWidget(QLabel("Tiers:"))
-        layout.addWidget(self.mem_detail)
-        layout.addWidget(QLabel("Workspace:"))
-        layout.addWidget(self.ws_detail)
-        layout.addWidget(QLabel("Displays:"))
-        layout.addWidget(self.display_detail)
+        frame, layout = self._panel("Saved Knowledge and Workspace")
+        self.mem_detail = self._fact(layout, "Saved Records")
+        self.ws_detail = self._fact(layout, "Workspace")
+        self.display_detail = self._fact(layout, "Displays")
         layout.addStretch(1)
         return frame
 
     def _build_health_panel(self) -> QFrame:
-        frame, layout = self._panel("AGENT / COMPONENT HEALTH")
+        frame, layout = self._panel("Service Status")
         self.health_table = QTableWidget()
         self.health_table.setColumnCount(3)
         self.health_table.setHorizontalHeaderLabels(["Component", "Status", "Detail"])
@@ -282,14 +313,14 @@ class CommandCentreWindow(QMainWindow):
         "is this thing beating", this one answers "what is this thing, what
         does it need, and what version is it".
         """
-        frame, layout = self._panel("SUBSYSTEM REGISTRY")
+        frame, layout = self._panel("Available Features")
         self.capabilities_note = QLabel("")
         self.capabilities_note.setObjectName("mutedLabel")
         layout.addWidget(self.capabilities_note)
         self.capabilities_table = QTableWidget()
         self.capabilities_table.setColumnCount(5)
         self.capabilities_table.setHorizontalHeaderLabels(
-            ["Module", "Role", "Health", "Depends on", "Version"])
+            ["Module", "Role", "Health", "Depends On", "Version"])
         self.capabilities_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.capabilities_table.verticalHeader().setVisible(False)
         self.capabilities_table.setMaximumHeight(190)
@@ -299,7 +330,7 @@ class CommandCentreWindow(QMainWindow):
     def _refresh_capabilities(self) -> None:
         registries = getattr(self.dispatcher, "registries", None)
         if registries is None:
-            self.capabilities_note.setText("Registries are not available.")
+            self.capabilities_note.setText("Feature information is unavailable.")
             return
         try:
             described = registries.modules.all_described(self.telemetry)
@@ -307,7 +338,7 @@ class CommandCentreWindow(QMainWindow):
             return
         unavailable = sum(1 for r in described.values() if not r.get("available"))
         self.capabilities_note.setText(
-            f"{len(described)} subsystem(s) registered  •  "
+            f"{len(described)} feature{'s' if len(described) != 1 else ''} listed  •  "
             f"{len(described) - unavailable} available")
         from PyQt6.QtGui import QColor
         self.capabilities_table.setRowCount(0)
@@ -328,7 +359,7 @@ class CommandCentreWindow(QMainWindow):
         self.capabilities_table.resizeColumnsToContents()
 
     def _build_tasks_panel(self) -> QFrame:
-        frame, layout = self._panel("TASK QUEUE & TOOL EXECUTION")
+        frame, layout = self._panel("Actions and Recent Results")
         self.task_note = QLabel("")
         self.task_note.setObjectName("mutedLabel")
         layout.addWidget(self.task_note)
@@ -341,14 +372,14 @@ class CommandCentreWindow(QMainWindow):
         return frame
 
     def _build_tokens_panel(self) -> QFrame:
-        frame, layout = self._panel("TOKEN USAGE · 24H · ALL PROVIDERS")
+        frame, layout = self._panel("Model Usage — Last 24 Hours")
         ledger = getattr(getattr(self.worker, "router", None), "token_ledger", None)
         self.token_graph = TokenUsageGraph(ledger)
         layout.addWidget(self.token_graph, 1)
         return frame
 
     def _build_logs_panel(self) -> QFrame:
-        frame, layout = self._panel("LIVE LOGS")
+        frame, layout = self._panel("Recent Activity")
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setObjectName("logBox")
@@ -357,15 +388,12 @@ class CommandCentreWindow(QMainWindow):
         return frame
 
     def _build_thoughts_panel(self) -> QFrame:
-        frame, layout = self._panel("THOUGHT STREAM · INNER VOICE")
+        frame, layout = self._panel("What ORION Is Thinking")
         self.thought_box = QPlainTextEdit()
         self.thought_box.setReadOnly(True)
         self.thought_box.setObjectName("logBox")
         self.thought_box.setMaximumBlockCount(200)
-        self.thought_box.setPlaceholderText(
-            "ORION's free thoughts appear here — reflections on what he is "
-            "noticing and why he acts, typed out live on his dedicated "
-            "thoughts model.")
+        self.thought_box.setPlaceholderText("No thoughts yet")
         layout.addWidget(self.thought_box, 1)
 
         # Live "typing" state: thoughts are revealed character-by-character so
@@ -410,7 +438,7 @@ class CommandCentreWindow(QMainWindow):
             self._clear_caret()
             self._stream_active = True
             self._stream_id = tid
-            marker = "⚙" if payload.get("kind") == "decision" else "◈"
+            marker = "▸" if payload.get("kind") == "decision" else "◈"
             self.thought_box.appendPlainText(f"{payload.get('at', '')} {marker} ")
             self._caret_on = False
         elif phase == "delta":
@@ -433,7 +461,7 @@ class CommandCentreWindow(QMainWindow):
         if tid in self._streamed_ids:
             self._streamed_ids.discard(tid)
             return
-        marker = "⚙" if payload.get("kind") == "decision" else "◈"
+        marker = "▸" if payload.get("kind") == "decision" else "◈"
         line = f"{payload.get('at', '')} {marker} {payload.get('text', '')}"
         self._thought_queue.append(line)
         if not self._type_timer.isActive() and not self._stream_active:
@@ -514,18 +542,32 @@ class CommandCentreWindow(QMainWindow):
         # convention as automation_deck/mission_deck's refreshes.
         if not self.isVisible():
             return
-        self.clock.setText(datetime.now().strftime("%H:%M:%S"))
         self._refresh_system()
         self._refresh_audio()
         self._refresh_memory()
-        self._refresh_health()
-        self._refresh_capabilities()
-        self._refresh_tasks()
+        self._refresh_details()
         self._refresh_logs()
         self._refresh_autonomy_button()
         # History sampling is NOT done here any more: this refresh is skipped
         # while the page is hidden (above), which silently stopped recording.
         # app._sample_metrics_history drives it regardless of what is showing.
+
+    def _on_details_toggled(self, _expanded: bool) -> None:
+        # A Qt slot: an exception escaping here would abort the process.
+        try:
+            self._refresh_details()
+        except Exception:
+            pass
+
+    def _refresh_details(self) -> None:
+        """The folded tables are rebuilt only while somebody can see them —
+        three table rebuilds a second for a section nobody had opened."""
+        details = getattr(self, "details", None)
+        if details is None or not details.is_expanded():
+            return
+        self._refresh_health()
+        self._refresh_capabilities()
+        self._refresh_tasks()
 
     def _refresh_system(self) -> None:
         # One reading for the whole application: the core window's telemetry
@@ -568,31 +610,32 @@ class CommandCentreWindow(QMainWindow):
         except Exception:
             snap = {}
         state = str(snap.get("state", "—"))
-        self.audio_state.setText(state)
+        self.audio_state.setText("Not speaking" if state.upper() == "IDLE" else state.replace("_", " ").capitalize())
         self.audio_detail.setText(
-            f"Active streams: {snap.get('active_streams', 0)}  "
-            f"(native={snap.get('native_active', False)}, tts={snap.get('tts_active', False)})\n"
-            f"Playback queue: {snap.get('playback_queue_depth', 0)} chunk(s)\n"
-            f"TTS queue: {snap.get('tts_queue_depth', 0)}\n"
+            f"Voice output: {'Live voice' if snap.get('native_active') else 'Local voice' if snap.get('tts_active') else 'quiet'}\n"
+            f"Waiting to speak: {snap.get('tts_queue_depth', 0)}\n"
             f"Local voice: {snap.get('local_voice', '?')}\n"
             f"{self._playback_latency()}"
         )
+        self.audio_detail.setToolTip(
+            f"Active streams: {snap.get('active_streams', 0)}; "
+            f"queued audio pieces: {snap.get('playback_queue_depth', 0)}")
 
     def _playback_latency(self) -> str:
         try:
             timers = self.telemetry.metrics.snapshot().get("timers", {})
             pl = timers.get("audio.playback.write_latency_ms")
             if pl:
-                return f"Playback write latency: p50 {pl['p50_ms']}ms, p95 {pl['p95_ms']}ms"
+                return f"Audio delay: usual {pl['p50_ms']} ms; 95% below {pl['p95_ms']} ms"
         except Exception:
             pass
-        return "Playback write latency: —"
+        return "Audio delay: not measured yet"
 
     def _refresh_memory(self) -> None:
         try:
             tiers = self.memory.tiers_snapshot()
             self.mem_detail.setText(
-                "  ".join(f"{k}:{v}" for k, v in tiers.items())
+                "  ".join(f"{k.replace('_', ' ').capitalize()}: {v} saved" for k, v in tiers.items())
                 + (f"\nActive project: {self.memory.active_project or 'none'}")
             )
         except Exception:
@@ -634,9 +677,9 @@ class CommandCentreWindow(QMainWindow):
         recent = list(getattr(self.dispatcher, "recent_tools", []))
         metrics = self.telemetry.metrics.snapshot().get("counters", {})
         self.task_note.setText(
-            f"Active tool executions: {active}  •  "
-            f"total calls: {int(metrics.get('tool.calls', 0))}  •  "
-            f"failures: {int(metrics.get('tool.failures', 0))}"
+            f"Actions running: {active}  •  "
+            f"attempted: {int(metrics.get('tool.calls', 0))}  •  "
+            f"could not finish: {int(metrics.get('tool.failures', 0))}"
         )
         self.tool_table.setRowCount(0)
         for entry in reversed(recent[-40:]):
@@ -666,10 +709,10 @@ class CommandCentreWindow(QMainWindow):
 
     def _refresh_autonomy_button(self) -> None:
         if self.control is None:
-            self.autonomy_btn.setText("AUTONOMY: n/a")
+            self.autonomy_btn.setText("Automatic Actions: unavailable")
             self.autonomy_btn.setEnabled(False)
             return
-        self.autonomy_btn.setText(f"AUTONOMY: {'ON' if self.control.enabled else 'OFF'}")
+        self.autonomy_btn.setText(f"Automatic Actions: {'allowed' if self.control.enabled else 'paused'}")
 
     def _toggle_autonomy(self) -> None:
         if self.control is not None:

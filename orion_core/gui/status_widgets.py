@@ -27,8 +27,15 @@ from ..bus import OrionBus
 
 
 def reduced_motion() -> bool:
-    """True when animations should be suppressed (env flag or OS hint)."""
-    return os.getenv("ORION_REDUCED_MOTION", "").strip().lower() in {"1", "true", "yes", "on"}
+    """True when animations should be suppressed: the ORION_REDUCED_MOTION
+    flag, or the Reduced motion preference."""
+    if os.getenv("ORION_REDUCED_MOTION", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        from ..appearance import motion_profile
+        return motion_profile().name == "reduced"
+    except Exception:
+        return False
 
 
 def _restyle(widget: QWidget, state: str) -> None:
@@ -39,19 +46,35 @@ def _restyle(widget: QWidget, state: str) -> None:
         style.polish(widget)
 
 
-# Connection-state → (chip state colour, short label).
+# Connection-state → (chip state colour, short label). Title Case, like
+# every other name on the deck: a chip in capitals reads as an alarm even
+# when it says everything is fine.
 _CONN_STATE_STYLE = {
-    "connected": ("good", "CONNECTED"),
-    "local_fallback": ("warn", "LOCAL MODEL"),
-    "connecting": ("neutral", "CONNECTING…"),
-    "reconnecting": ("warn", "RECONNECTING…"),
-    "cooling_down": ("warn", "COOLING DOWN"),
-    "rotating_credential": ("warn", "ROTATING KEY"),
-    "switching_provider": ("warn", "SWITCHING PROVIDER"),
-    "degraded_offline": ("bad", "NO PROVIDER"),
-    "shutting_down": ("neutral", "SHUTTING DOWN"),
-    "disconnected": ("neutral", "OFFLINE"),
+    "connected": ("good", "Connected"),
+    "local_fallback": ("warn", "Local Model"),
+    "connecting": ("neutral", "Connecting…"),
+    "reconnecting": ("warn", "Reconnecting…"),
+    "cooling_down": ("warn", "Cooling Down"),
+    "rotating_credential": ("warn", "Rotating Key"),
+    "switching_provider": ("warn", "Switching Provider"),
+    "degraded_offline": ("bad", "No Provider"),
+    "shutting_down": ("neutral", "Shutting Down"),
+    "disconnected": ("neutral", "Offline"),
 }
+
+
+def _replay(bus: Any, signal: str, slot: Any) -> None:
+    """Start a widget from the state its signal last reported. A page built on
+    first open would otherwise show its default until the next change."""
+    last_value = getattr(bus, "last_value", None)
+    if last_value is None:
+        return
+    try:
+        payload = last_value(signal)
+        if payload is not None:
+            slot(payload)
+    except Exception:
+        pass
 
 
 class ConnectionStatusChip(QLabel):
@@ -62,21 +85,23 @@ class ConnectionStatusChip(QLabel):
         self.setObjectName("statusChip")
         self.setAccessibleName("Connection status")
         self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self._set("disconnected", "OFFLINE", "The live channel is offline.")
+        self._set("disconnected", "Offline", "The live channel is offline.")
         bus.connection_state.connect(self.on_state)
+        _replay(bus, "connection_state", self.on_state)
 
     def _set(self, state: str, label: str, tooltip: str) -> None:
         self.setText(f"◉ {label}")
         self.setToolTip(tooltip)
         self.setAccessibleDescription(tooltip)
-        colour = _CONN_STATE_STYLE.get(state, ("neutral", state.upper()))[0]
+        colour = _CONN_STATE_STYLE.get(state, ("neutral", state))[0]
         _restyle(self, colour)
 
     def on_state(self, payload: Any) -> None:
         if not isinstance(payload, dict):
             return
         state = str(payload.get("state") or "disconnected")
-        colour, label = _CONN_STATE_STYLE.get(state, ("neutral", state.upper()))
+        colour, label = _CONN_STATE_STYLE.get(
+            state, ("neutral", state.replace("_", " ").capitalize()))
         message = str(payload.get("message") or label)
         self.setText(f"◉ {label}")
         self.setToolTip(message)
@@ -95,6 +120,7 @@ class DegradedBanner(QLabel):
         self.setAccessibleName("Degraded mode warning")
         self.hide()
         bus.provider_degraded.connect(self.on_degraded)
+        _replay(bus, "provider_degraded", self.on_degraded)
 
     def on_degraded(self, payload: Any) -> None:
         if not isinstance(payload, dict):
@@ -103,7 +129,7 @@ class DegradedBanner(QLabel):
             self.hide()
             return
         alts = payload.get("alternatives") or []
-        text = ("⚠ No AI text provider is currently available. Deterministic tools "
+        text = ("No AI text provider is currently available. Deterministic tools "
                 "still work. ")
         if alts:
             text += "Options: " + "; ".join(str(a) for a in alts[:3]) + "."
@@ -161,18 +187,22 @@ class ProviderStatusStrip(QFrame):
     """A composed status strip: connection chip + token mini + degraded banner.
     Drop-in for the command centre or diagnostics view."""
 
-    def __init__(self, bus: OrionBus, parent: QWidget | None = None) -> None:
+    def __init__(self, bus: OrionBus, parent: QWidget | None = None, *,
+                 show_tokens: bool = True) -> None:
+        """*show_tokens* False leaves ``token_mini`` for the caller to place
+        (the Diagnostics page keeps the request and token counters under
+        Details); it is refreshed the same way wherever it sits."""
         super().__init__(parent)
         self.setObjectName("statusStrip")
         self.setAccessibleName("Provider and connection status")
         self.bus = bus
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(6)
         top = QHBoxLayout()
-        top.setSpacing(12)
+        top.setSpacing(8)
         self.conn_chip = ConnectionStatusChip(bus)
-        self.diag_chip = QLabel("◉ NOMINAL")
+        self.diag_chip = QLabel("◉ Nominal")
         self.diag_chip.setObjectName("statusChip")
         self.diag_chip.setAccessibleName("Last provider diagnosis")
         _restyle(self.diag_chip, "neutral")
@@ -180,11 +210,13 @@ class ProviderStatusStrip(QFrame):
         top.addWidget(self.conn_chip, 0)
         top.addWidget(self.diag_chip, 0)
         top.addStretch(1)
-        top.addWidget(self.token_mini, 0)
+        if show_tokens:
+            top.addWidget(self.token_mini, 0)
         outer.addLayout(top)
         self.degraded = DegradedBanner(bus)
         outer.addWidget(self.degraded)
         bus.provider_diagnosed.connect(self.on_diagnosis)
+        _replay(bus, "provider_diagnosed", self.on_diagnosis)
 
     def on_diagnosis(self, payload: Any) -> None:
         if not isinstance(payload, dict):
@@ -198,7 +230,7 @@ class ProviderStatusStrip(QFrame):
         # actual remediation hidden behind a hover-only tooltip left the label
         # looking identical on every occurrence, with no visible way to tell
         # which provider or what to do about it.
-        label = f"◉ {category.replace('_', ' ').upper()}"
+        label = f"◉ {category.replace('_', ' ').capitalize()}"
         if provider:
             label += f" ({provider})"
         self.diag_chip.setText(label)

@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .constants import CONFIG_DIR
 from .db import apply_pragmas
 
 #: How many separate successful, unanimous observations before a phrase is a
@@ -65,7 +66,9 @@ MIN_OBSERVATIONS = 3
 #: reflex.py applies, kept in step deliberately.
 MAX_PHRASE_LEN = 90
 
-DEFAULT_PATH = Path("config") / "reflex_learning.db"
+# Learning belongs to the same writable store as memory. A relative path
+# depended on the shortcut's working directory and bypassed config_location.txt.
+DEFAULT_PATH = CONFIG_DIR / "reflex_learning.db"
 
 _PUNCT = re.compile(r"[^\w\s']+")
 _SPACE = re.compile(r"\s+")

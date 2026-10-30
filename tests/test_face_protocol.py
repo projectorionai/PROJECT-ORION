@@ -62,6 +62,51 @@ def test_the_default_face_implements_every_routed_method(method):
     assert callable(getattr(HoloHeadPanel, method))
 
 
+@pytest.mark.parametrize("method", _protocol())
+def test_the_screen_face_implements_every_routed_method(method):
+    """The screen face is the DEFAULT form, so it is what most people's
+    _to_face calls actually land on."""
+    from orion_core.gui.screen_face import ScreenFacePanel
+
+    assert callable(getattr(ScreenFacePanel, method, None)), (
+        f"core_window calls face.{method}() but the screen face has no such "
+        f"method — the call will be swallowed by _to_face's hasattr guard")
+
+
+#: What the AvatarController pushes besides the routed methods (avatar.py
+#: _push): each guarded with hasattr, so a gap is silent.
+_CONTROLLER_METHODS = ("set_state", "set_amplitude", "set_spectrum", "set_pose",
+                       "set_morph", "set_label", "set_palette_colours")
+
+
+@pytest.mark.parametrize("method", _CONTROLLER_METHODS)
+def test_the_screen_face_takes_what_the_avatar_controller_sends(method):
+    from orion_core.gui.screen_face import ScreenFacePanel
+
+    assert callable(getattr(ScreenFacePanel, method, None))
+
+
+def test_the_screen_face_panel_not_its_rig_answers():
+    """The glance trap again: anything the rig can do, the panel must say."""
+    from orion_core.gui.screen_face import ScreenFace, ScreenFacePanel
+
+    for method in (*_protocol(), *_CONTROLLER_METHODS):
+        if hasattr(ScreenFace, method):
+            assert hasattr(ScreenFacePanel, method), method
+    assert ScreenFacePanel.supports_orb_hands is False
+
+
+def test_the_screen_face_panel_queues_instead_of_touching_the_rig():
+    """The worker owns the rig; a direct call from the GUI thread races it."""
+    source = (ROOT / "orion_core" / "gui" / "screen_face.py").read_text(encoding="utf-8")
+    body = source[source.index("class ScreenFacePanel"):]
+    assert "_to_head(" in body
+    for forbidden in ("self._head.set_viseme(", "self._head.glance(",
+                      "self._head.apply_emotion(", "self._head.set_label(",
+                      "self._head.set_pose("):
+        assert forbidden not in body, f"{forbidden} bypasses the queue"
+
+
 def test_a_renderer_only_method_does_not_count():
     """The specific mistake: implementing it on HoloHead, which lives INSIDE
     the panel, and assuming the panel therefore has it."""

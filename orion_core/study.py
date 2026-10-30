@@ -33,11 +33,12 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
 from .constants import CONFIG_DIR
-from .language_tutor import sm2_step
 from .db import apply_pragmas
+from .language_tutor import sm2_step
 
 #: An interval at or beyond this many days means the card has moved from active
 #: learning into long-term retention. 21 days is the conventional Anki threshold
@@ -133,9 +134,8 @@ class StudyStore:
     def __init__(self, path: Path | str | None = None) -> None:
         self.path = Path(path) if path is not None else (CONFIG_DIR / "study.db")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # check_same_thread=False: the store is touched from the asyncio tool
-        # path and may later be read by a GUI deck page or the standby loop; the
-        # writes are small and serialised by SQLite's own locking.
+        # SQLite transactions must not interleave on this shared connection.
+        self._lock = RLock()
         self._db = sqlite3.connect(str(self.path), check_same_thread=False)
         # Mark XXVI: WAL + relaxed fsync - a committed write costs
         # 0.03 ms instead of 2.81 ms, and that time is paid on the
@@ -171,44 +171,75 @@ class StudyStore:
             );
             CREATE INDEX IF NOT EXISTS idx_cards_deck ON cards(deck);
             CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(due_at);
+            CREATE INDEX IF NOT EXISTS idx_reviews_at ON reviews(at);
+            CREATE INDEX IF NOT EXISTS idx_reviews_card_at ON reviews(card_id, at);
             """
         )
         self._db.commit()
 
     # -- writes --
     def add(self, card: StudyCard) -> StudyCard:
-        cur = self._db.execute(
-            "INSERT INTO cards (deck, front, back, source, tags, ease, "
-            "interval_days, repetitions, lapses, due_at, reviews, created_at, "
-            "last_review) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (card.deck, card.front, card.back, card.source, json.dumps(card.tags),
-             card.ease, card.interval_days, card.repetitions, card.lapses,
-             card.due_at, card.reviews, card.created_at, card.last_review))
-        self._db.commit()
-        card.id = int(cur.lastrowid)
-        return card
+        with self._lock:
+            with self._db:
+                cur = self._db.execute(
+                    "INSERT INTO cards (deck, front, back, source, tags, ease, "
+                    "interval_days, repetitions, lapses, due_at, reviews, created_at, "
+                    "last_review) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (card.deck, card.front, card.back, card.source, json.dumps(card.tags),
+                     card.ease, card.interval_days, card.repetitions, card.lapses,
+                     card.due_at, card.reviews, card.created_at, card.last_review))
+            card.id = int(cur.lastrowid)
+            return card
 
     def update(self, card: StudyCard) -> None:
-        if card.id is None:
-            return
-        self._db.execute(
-            "UPDATE cards SET deck=?, front=?, back=?, source=?, tags=?, ease=?, "
-            "interval_days=?, repetitions=?, lapses=?, due_at=?, reviews=?, "
-            "last_review=? WHERE id=?",
-            (card.deck, card.front, card.back, card.source, json.dumps(card.tags),
-             card.ease, card.interval_days, card.repetitions, card.lapses,
-             card.due_at, card.reviews, card.last_review, card.id))
-        self._db.commit()
+        with self._lock, self._db:
+            if card.id is None:
+                return
+            self._db.execute(
+                "UPDATE cards SET deck=?, front=?, back=?, source=?, tags=?, ease=?, "
+                "interval_days=?, repetitions=?, lapses=?, due_at=?, reviews=?, "
+                "last_review=? WHERE id=?",
+                (card.deck, card.front, card.back, card.source, json.dumps(card.tags),
+                 card.ease, card.interval_days, card.repetitions, card.lapses,
+                 card.due_at, card.reviews, card.last_review, card.id))
 
     def delete(self, card_id: int) -> bool:
-        cur = self._db.execute("DELETE FROM cards WHERE id=?", (card_id,))
-        self._db.commit()
-        return cur.rowcount > 0
+        with self._lock, self._db:
+            cur = self._db.execute("DELETE FROM cards WHERE id=?", (card_id,))
+            return cur.rowcount > 0
+
+    def reviews_since(self, start: datetime) -> list[datetime]:
+        """When each review since *start* happened, oldest first."""
+        with self._lock:
+            rows = self._db.execute("SELECT at FROM reviews WHERE at >= ? ORDER BY at",
+                                    (_iso(start),)).fetchall()
+        return [_parse_iso(str(row[0])) for row in rows]
 
     def log_review(self, card_id: int, quality: int, at: datetime | None = None) -> None:
-        self._db.execute("INSERT INTO reviews (card_id, at, quality) VALUES (?,?,?)",
-                         (card_id, _iso(at or _now()), int(quality)))
-        self._db.commit()
+        with self._lock, self._db:
+            self._db.execute("INSERT INTO reviews (card_id, at, quality) VALUES (?,?,?)",
+                             (card_id, _iso(at or _now()), max(0, min(5, int(quality)))))
+
+    def record_review(self, card_id: int, quality: int,
+                      at: datetime | None = None) -> StudyCard | None:
+        """Reload and advance the card together with its log, or roll both back."""
+        with self._lock:
+            quality = max(0, min(5, int(quality)))
+            at = at or _now()
+            with self._db:
+                self._db.execute("BEGIN IMMEDIATE")
+                card = self.get(card_id)
+                if card is None:
+                    return None
+                card.review(quality, now=at)
+                self._db.execute(
+                    "UPDATE cards SET ease=?, interval_days=?, repetitions=?, lapses=?, "
+                    "due_at=?, reviews=?, last_review=? WHERE id=?",
+                    (card.ease, card.interval_days, card.repetitions, card.lapses,
+                     card.due_at, card.reviews, card.last_review, card.id))
+                self._db.execute("INSERT INTO reviews (card_id, at, quality) VALUES (?,?,?)",
+                                 (card.id, _iso(at), quality))
+            return card
 
     # -- reads --
     def _row(self, row: sqlite3.Row) -> StudyCard:
@@ -224,16 +255,18 @@ class StudyStore:
             created_at=row["created_at"] or "", last_review=row["last_review"] or "")
 
     def get(self, card_id: int) -> StudyCard | None:
-        row = self._db.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
-        return self._row(row) if row else None
+        with self._lock:
+            row = self._db.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
+            return self._row(row) if row else None
 
     def all(self, deck: str | None = None) -> list[StudyCard]:
-        if deck:
-            rows = self._db.execute("SELECT * FROM cards WHERE deck=? ORDER BY id",
-                                    (deck,)).fetchall()
-        else:
-            rows = self._db.execute("SELECT * FROM cards ORDER BY id").fetchall()
-        return [self._row(r) for r in rows]
+        with self._lock:
+            if deck:
+                rows = self._db.execute("SELECT * FROM cards WHERE deck=? ORDER BY id",
+                                        (deck,)).fetchall()
+            else:
+                rows = self._db.execute("SELECT * FROM cards ORDER BY id").fetchall()
+            return [self._row(r) for r in rows]
 
     # -- indexed queries -------------------------------------------------
     #
@@ -245,62 +278,67 @@ class StudyStore:
     def due_cards(self, deck: str | None = None, limit: int = 20,
                   now: datetime | None = None) -> list[StudyCard]:
         """Cards ready for review, never-seen first then most overdue."""
-        stamp = _iso(now or _now())
-        clause = "(due_at = '' OR due_at <= ?)"
-        params: list[Any] = [stamp]
-        if deck:
-            clause += " AND deck = ?"
-            params.append(deck)
-        params.append(max(1, int(limit)))
-        rows = self._db.execute(
-            f"SELECT * FROM cards WHERE {clause} "
-            "ORDER BY (reviews > 0) ASC, due_at ASC, id ASC LIMIT ?",
-            params).fetchall()
-        return [self._row(r) for r in rows]
+        with self._lock:
+            stamp = _iso(now or _now())
+            clause = "(due_at = '' OR due_at <= ?)"
+            params: list[Any] = [stamp]
+            if deck:
+                clause += " AND deck = ?"
+                params.append(deck)
+            params.append(max(1, int(limit)))
+            rows = self._db.execute(
+                f"SELECT * FROM cards WHERE {clause} "
+                "ORDER BY (reviews > 0) ASC, due_at ASC, id ASC LIMIT ?",
+                params).fetchall()
+            return [self._row(r) for r in rows]
 
     def due_count(self, deck: str | None = None,
                   now: datetime | None = None) -> int:
-        stamp = _iso(now or _now())
-        clause = "(due_at = '' OR due_at <= ?)"
-        params: list[Any] = [stamp]
-        if deck:
-            clause += " AND deck = ?"
-            params.append(deck)
-        row = self._db.execute(
-            f"SELECT COUNT(*) AS n FROM cards WHERE {clause}", params).fetchone()
-        return int(row["n"] if row else 0)
+        with self._lock:
+            stamp = _iso(now or _now())
+            clause = "(due_at = '' OR due_at <= ?)"
+            params: list[Any] = [stamp]
+            if deck:
+                clause += " AND deck = ?"
+                params.append(deck)
+            row = self._db.execute(
+                f"SELECT COUNT(*) AS n FROM cards WHERE {clause}", params).fetchone()
+            return int(row["n"] if row else 0)
 
     def counts(self, deck: str | None = None,
                now: datetime | None = None) -> dict[str, int]:
         """total / new / mastered / lapses in ONE aggregate query."""
-        where, params = ("WHERE deck = ?", [deck]) if deck else ("", [])
-        row = self._db.execute(
-            "SELECT COUNT(*) AS total, "
-            "SUM(CASE WHEN reviews = 0 THEN 1 ELSE 0 END) AS new_cards, "
-            f"SUM(CASE WHEN interval_days >= {MASTERED_DAYS} THEN 1 ELSE 0 END) AS mastered, "
-            "SUM(lapses) AS lapses "
-            f"FROM cards {where}", params).fetchone()
-        if row is None:
-            return {"total": 0, "new": 0, "mastered": 0, "lapses": 0}
-        return {"total": int(row["total"] or 0), "new": int(row["new_cards"] or 0),
-                "mastered": int(row["mastered"] or 0), "lapses": int(row["lapses"] or 0)}
+        with self._lock:
+            where, params = ("WHERE deck = ?", [deck]) if deck else ("", [])
+            row = self._db.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN reviews = 0 THEN 1 ELSE 0 END) AS new_cards, "
+                f"SUM(CASE WHEN interval_days >= {MASTERED_DAYS} THEN 1 ELSE 0 END) AS mastered, "
+                "SUM(lapses) AS lapses "
+                f"FROM cards {where}", params).fetchone()
+            if row is None:
+                return {"total": 0, "new": 0, "mastered": 0, "lapses": 0}
+            return {"total": int(row["total"] or 0), "new": int(row["new_cards"] or 0),
+                    "mastered": int(row["mastered"] or 0), "lapses": int(row["lapses"] or 0)}
 
     def deck_summary(self, now: datetime | None = None) -> list[dict[str, Any]]:
         """Per-deck totals in one grouped query (was one full scan per deck)."""
-        stamp = _iso(now or _now())
-        rows = self._db.execute(
-            "SELECT deck, COUNT(*) AS total, "
-            "SUM(CASE WHEN due_at = '' OR due_at <= ? THEN 1 ELSE 0 END) AS due, "
-            f"SUM(CASE WHEN interval_days >= {MASTERED_DAYS} THEN 1 ELSE 0 END) AS mastered "
-            "FROM cards GROUP BY deck ORDER BY deck", (stamp,)).fetchall()
-        return [{"deck": r["deck"], "total": int(r["total"] or 0),
-                 "due": int(r["due"] or 0), "mastered": int(r["mastered"] or 0)}
-                for r in rows]
+        with self._lock:
+            stamp = _iso(now or _now())
+            rows = self._db.execute(
+                "SELECT deck, COUNT(*) AS total, "
+                "SUM(CASE WHEN due_at = '' OR due_at <= ? THEN 1 ELSE 0 END) AS due, "
+                f"SUM(CASE WHEN interval_days >= {MASTERED_DAYS} THEN 1 ELSE 0 END) AS mastered "
+                "FROM cards GROUP BY deck ORDER BY deck", (stamp,)).fetchall()
+            return [{"deck": r["deck"], "total": int(r["total"] or 0),
+                     "due": int(r["due"] or 0), "mastered": int(r["mastered"] or 0)}
+                    for r in rows]
 
     def decks(self) -> list[str]:
-        rows = self._db.execute(
-            "SELECT DISTINCT deck FROM cards ORDER BY deck").fetchall()
-        return [r["deck"] for r in rows]
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT DISTINCT deck FROM cards ORDER BY deck").fetchall()
+            return [r["deck"] for r in rows]
 
     def retention(self, deck: str | None = None, days: int = 30,
                   now: datetime | None = None) -> float | None:
@@ -312,24 +350,28 @@ class StudyStore:
         explicit ``now`` to each of its siblings, so a caller supplying a clock
         got counts from that date and retention from today.
         """
-        since = _iso((now or _now()) - timedelta(days=days))
-        if deck:
-            rows = self._db.execute(
-                "SELECT r.quality FROM reviews r JOIN cards c ON c.id=r.card_id "
-                "WHERE r.at>=? AND c.deck=?", (since, deck)).fetchall()
-        else:
-            rows = self._db.execute(
-                "SELECT quality FROM reviews WHERE at>=?", (since,)).fetchall()
-        if not rows:
-            return None
-        passed = sum(1 for r in rows if r["quality"] >= 3)
-        return round(100.0 * passed / len(rows), 1)
+        with self._lock:
+            now = now or _now()
+            since, until = _iso(now - timedelta(days=days)), _iso(now)
+            if deck:
+                row = self._db.execute(
+                    "SELECT COUNT(*) AS total, SUM(r.quality>=3) AS passed "
+                    "FROM reviews r JOIN cards c ON c.id=r.card_id "
+                    "WHERE r.at>=? AND r.at<=? AND c.deck=?", (since, until, deck)).fetchone()
+            else:
+                row = self._db.execute(
+                    "SELECT COUNT(*) AS total, SUM(quality>=3) AS passed "
+                    "FROM reviews WHERE at>=? AND at<=?", (since, until)).fetchone()
+            if not row["total"]:
+                return None
+            return round(100.0 * row["passed"] / row["total"], 1)
 
     def close(self) -> None:
-        try:
-            self._db.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self._db.close()
+            except Exception:
+                pass
 
 
 # ── card generation from source material ─────────────────────────────────────
@@ -494,13 +536,12 @@ class StudyEngine:
         no id is passed (the natural voice flow: ORION asks, the user answers,
         ORION grades). Returns the updated card, or None if it cannot be found."""
         now = now or _now()
-        card = self.store.get(card_id) if card_id is not None else self._current
-        if card is None or card.id is None:
+        target_id = card_id if card_id is not None else (
+            self._current.id if self._current is not None else None)
+        if target_id is None:
             return None
-        card.review(int(quality), now=now)
-        self.store.update(card)
-        self.store.log_review(card.id, int(quality), at=now)
-        if self._current is not None and self._current.id == card.id:
+        card = self.store.record_review(target_id, quality, at=now)
+        if self._current is not None and self._current.id == target_id:
             self._current = None
         return card
 

@@ -35,6 +35,7 @@ the bus so the user can see what he did on his own.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -172,7 +173,20 @@ class ThoughtActor:
         if self.bus is None:
             return
         if outcome.ok:
-            message = f"THOUGHT: {outcome.reason} — so I {outcome.detail}."
+            payload = {
+                "kind": "decision", "origin": "observation",
+                "text": f"{outcome.reason} — {outcome.detail}.",
+                "at": datetime.now().strftime("%H:%M:%S"),
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "evidence": [f"Maintenance action: {outcome.name}; completed"],
+            }
+            try:
+                signal = getattr(self.bus, "thought", None)
+                if signal is not None:
+                    signal.emit(payload)
+            except Exception:
+                pass
+            return
         else:
             message = (f"THOUGHT: {outcome.reason}, but I could not act on it "
                        f"({outcome.detail}).")

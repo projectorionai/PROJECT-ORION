@@ -1,7 +1,7 @@
 """
 Streaming silence compression — smoother speech without gabbling it.
 
-Adapted from MARK XL's `_compress_silence`, which works on a complete
+Adapted from MARK XXXX's `_compress_silence`, which works on a complete
 utterance. ORION streams, so the run length has to carry across chunk
 boundaries — a per-chunk implementation would leave a full-length pause
 every time one straddled a boundary, which is most of them.
@@ -69,7 +69,7 @@ def test_it_never_returns_more_than_it_was_given(comp):
 # ── the streaming part: state must carry across chunks ───────────────────────
 
 def test_a_pause_split_across_chunks_is_still_capped(comp):
-    """The whole reason this is not MARK XL's function copied over."""
+    """The whole reason this is not MARK XXXX's function copied over."""
     payload = silence(1600)
     out = b""
     step = FRAME_SAMPLES * 2 * 3          # three frames per chunk
@@ -141,7 +141,9 @@ def test_the_elevenlabs_stream_uses_it():
 
     from orion_core.audio import SpeechSynthesiser
 
-    source = inspect.getsource(SpeechSynthesiser._speak_elevenlabs)
+    # Shared by every cloud voice (ElevenLabs and Charon) since 10 Oct.
+    assert "_speak_cloud(" in inspect.getsource(SpeechSynthesiser._speak_elevenlabs)
+    source = inspect.getsource(SpeechSynthesiser._speak_cloud)
     assert "SilenceCompressor" in source
     assert "smoother.flush()" in source, (
         "the final partial frame must still reach the renderer")

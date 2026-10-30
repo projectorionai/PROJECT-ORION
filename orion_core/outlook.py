@@ -120,6 +120,10 @@ class OutlookService:
                             "for your mail directly and I shall start it for the task.",
                             ok=False,
                         )
+                    from .execution_policy import require_foreground
+                    blocked = require_foreground("outlook_application_launch")
+                    if blocked is not None:
+                        return blocked
                     outlook = win32com.client.Dispatch("Outlook.Application")
                     self._note_state("LAUNCHED", "started Outlook on explicit request")
                 namespace = outlook.GetNamespace("MAPI")

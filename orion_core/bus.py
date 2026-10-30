@@ -67,6 +67,7 @@ class OrionBus(QObject):
     # rather than by pixel-clicking his own window.  Payload is a dict
     # {"action": str, "target": str}.  Handled on the GUI thread by CoreWindow.
     gui_command      = pyqtSignal(object)
+    gui_result       = pyqtSignal(object)
 
     # Proactive voice: any subsystem (reminders, sentinel, protocols, presence)
     # can make ORION speak unprompted by emitting the text to announce.
@@ -176,6 +177,8 @@ class OrionBus(QObject):
     # [-1, 1].  Queued delivery moves it onto the GUI thread for the
     # AvatarController's head-follow.
     face_tracking    = pyqtSignal(object)
+    # Two-hand orb manipulation samples from GestureEngine's camera thread.
+    orb_gesture      = pyqtSignal(object)
 
     # ── lip-sync (Mark XXVI) ──────────────────────────────────────────────────
     # A mouth posture for the current speech sound, emitted by the viseme source
@@ -189,6 +192,11 @@ class OrionBus(QObject):
     # {"kind": "snapshot", "jpeg": bytes, "note": str} — emitted by the vision
     # layer at capture time and rendered by gui.camera_preview.
     camera_frame     = pyqtSignal(object)
+
+    # Accepted ContextEvent metadata from the volatile context broker. Never
+    # carries raw media; consumers should read context_service.snapshot() for
+    # current state because queued observations can expire or be revoked.
+    context_event    = pyqtSignal(object)
 
     # ── found material ────────────────────────────────────────────────────────
     # Rows that have a title and usually a link — news stories, research
@@ -220,3 +228,29 @@ class OrionBus(QObject):
     #: is a separate window, so a signal is how its visible Search bar reaches
     #: it without the two windows holding references to each other.
     open_palette     = pyqtSignal()
+
+    # ── the current state, for pages built late ───────────────────────────────
+    # A deck page constructed on first open (to keep boot and memory down)
+    # would otherwise show "OFFLINE" or "NOMINAL" until the NEXT state change,
+    # which may be an hour away. These signals describe a current state rather
+    # than an event, so the latest payload of each is kept and a late page
+    # starts from it. Only the latest; nothing accumulates.
+    STICKY_SIGNALS: tuple[str, ...] = (
+        "connection_state", "provider_degraded", "provider_diagnosed")
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._last_values: dict[str, object] = {}
+        for name in self.STICKY_SIGNALS:
+            getattr(self, name).connect(
+                lambda payload, _name=name: self._last_values.__setitem__(_name, payload))
+        # dashboard_event is a feed of many channels; the latest payload per
+        # channel ("diagnostics", "workflow"...) is what a late page needs.
+        self.dashboard_event.connect(
+            lambda channel, payload: self._last_values.__setitem__(
+                f"dashboard:{channel}", payload))
+
+    def last_value(self, name: str) -> object:
+        """The latest payload of a sticky signal (or ``dashboard:<channel>``),
+        or None if it has not been emitted yet."""
+        return self._last_values.get(name)

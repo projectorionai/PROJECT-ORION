@@ -19,6 +19,7 @@ planning, exactly as the existing typing paths do.
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 
@@ -35,14 +36,33 @@ _NEIGHBOURS: dict[str, str] = {
 MIN_WPM = 20.0
 MAX_WPM = 600.0          # 20 ms a key: still a key rate Notepad keeps up with
 
+#: Bounds on any one gap between keys. The floor keeps the key rate one that
+#: Win11 Notepad does not drop or repeat characters at (see control.edit_text);
+#: the ceiling caps a "thinking" pause.
+MIN_KEY_S = 0.015
+MAX_KEY_S = 1.2
+
+#: The commonest English letter pairs: typed as one rolling motion, so the
+#: second key follows the first faster than average.
+_COMMON_BIGRAMS = frozenset(
+    "th he in er an re on at en nd ti es or te of ed is it al ar st to nt ng "
+    "se ha as ou io le ve co me de hi ri ro ic ne ea ra ce li ch ll be ma si "
+    "om ur wh ow ly".split())
+_SENTENCE_END = frozenset(".!?")
+_CLAUSE_END = frozenset(",;:")
+#: Characters typed with Shift on a UK/US layout (besides capitals).
+_SHIFTED = frozenset('~!@#$%^&*()_+{}|:"<>?£')
+
 
 @dataclass(frozen=True)
 class TypingProfile:
     """How human the typing should feel."""
     wpm: float = 90.0            # words per minute (1 word ≈ 5 chars)
-    jitter: float = 0.35         # ± fraction of the base delay, per keystroke
+    jitter: float = 0.35         # spread of per-key timing (0 = metronome)
     typo_rate: float = 0.0       # probability a letter is mistyped then fixed
     seed: int | None = None      # set for reproducible plans (tests / demos)
+    pause_rate: float = 0.04     # chance of a brief pause at a word boundary
+    fast: bool = False           # machine speed: no delays, no typos
 
     def base_delay(self) -> float:
         """Seconds per character for the configured WPM (clamped to sane bounds)."""
@@ -58,11 +78,73 @@ class Keystroke:
     delay: float     # seconds to wait AFTER sending this key
 
 
-def _delay(rng: random.Random, base: float, jitter: float) -> float:
-    if jitter <= 0:
-        return base
-    lo, hi = base * (1.0 - jitter), base * (1.0 + jitter)
-    return max(0.0, rng.uniform(lo, hi))
+def key_rhythm(ch: str, following: str) -> float:
+    """How much longer (>1) or shorter (<1) than average the gap after
+    typing *ch* is, when *following* comes next.
+
+    A common bigram rolls off the fingers; a doubled letter is one finger
+    tapping twice; a space is followed by the start of a new word, a comma by
+    a breath and a full stop by the next thought; reaching for Shift or the
+    number row costs a little."""
+    factor = 1.0
+    pair = (ch + following).lower()
+    if pair in _COMMON_BIGRAMS:
+        factor *= 0.72
+    elif ch.isalpha() and ch.lower() == following.lower():
+        factor *= 0.85
+    if ch in _SENTENCE_END:
+        factor *= 2.2
+    elif ch in _CLAUSE_END:
+        factor *= 1.7
+    elif ch == "\n":
+        factor *= 2.5
+    elif ch == " ":
+        factor *= 1.15
+    if following.isupper() or following in _SHIFTED:
+        factor *= 1.2
+    elif following.isdigit() and not ch.isdigit():
+        factor *= 1.15
+    return factor
+
+
+def keystroke_delays(text: str, profile: TypingProfile,
+                     rng: random.Random | None = None) -> list[float]:
+    """Seconds to wait after each character of *text*.
+
+    Each gap is the WPM's average gap shaped by key_rhythm, with log-normal
+    spread (``jitter``; real inter-key times are right-skewed), plus a rare
+    0.25-0.7 s pause at a word boundary (``pause_rate``). The whole run is
+    then rescaled so it still takes what the WPM says — the rhythm moves time
+    between keys rather than adding it — and every gap is kept within
+    MIN_KEY_S..MAX_KEY_S. ``fast``: all zeros."""
+    if profile.fast:
+        return [0.0] * len(text)
+    rng = rng if rng is not None else random.Random(profile.seed)
+    base = profile.base_delay()
+    sigma = max(0.0, float(profile.jitter)) * 0.7
+    keys: list[float] = []
+    pauses: list[float] = []
+    for i, ch in enumerate(text):
+        following = text[i + 1] if i + 1 < len(text) else ""
+        gap = key_rhythm(ch, following)
+        if sigma > 0:
+            gap *= math.exp(rng.gauss(-sigma * sigma / 2.0, sigma))   # mean 1
+        keys.append(gap)
+        boundary = ch in " \n" or ch in _SENTENCE_END or ch in _CLAUSE_END
+        pause = 0.0
+        if following and boundary and profile.pause_rate > 0 and rng.random() < profile.pause_rate:
+            pause = rng.uniform(0.25, 0.7)
+        pauses.append(pause)
+    if not keys:
+        return []
+    budget = base * len(keys)
+    # Pauses may take at most a quarter of the time the WPM allows.
+    paused = sum(pauses)
+    if paused > budget * 0.25:
+        pauses = [p * budget * 0.25 / paused for p in pauses]
+        paused = budget * 0.25
+    scale = (budget - paused) / sum(keys)
+    return [min(MAX_KEY_S, max(MIN_KEY_S, k * scale + p)) for k, p in zip(keys, pauses)]
 
 
 def plan_keystrokes(text: str, profile: TypingProfile) -> list[Keystroke]:
@@ -70,24 +152,28 @@ def plan_keystrokes(text: str, profile: TypingProfile) -> list[Keystroke]:
     Turn ``text`` into a realistic keystroke sequence.  Deterministic when
     ``profile.seed`` is set.  Newlines/whitespace are typed verbatim; a mistyped
     letter is emitted as a wrong key, then a backspace, then the correct key —
-    so the control layer replays a believable self-correction.
+    so the control layer replays a believable self-correction.  Gaps between
+    keys come from keystroke_delays; ``profile.fast`` plans no delays and no
+    typos.
     """
     rng = random.Random(profile.seed)
+    delays = keystroke_delays(text, profile, rng)
     base = profile.base_delay()
     plan: list[Keystroke] = []
-    for ch in text:
+    for ch, delay in zip(text, delays):
         lower = ch.lower()
-        can_typo = (profile.typo_rate > 0
+        can_typo = (not profile.fast and profile.typo_rate > 0
                     and lower in _NEIGHBOURS
                     and rng.random() < profile.typo_rate)
         if can_typo:
             wrong = rng.choice(_NEIGHBOURS[lower])
             if ch.isupper():
                 wrong = wrong.upper()
-            plan.append(Keystroke("typo", wrong, _delay(rng, base, profile.jitter)))
-            # A brief "notice the mistake" pause before the backspace.
-            plan.append(Keystroke("backspace", "", _delay(rng, base * 1.5, profile.jitter)))
-        plan.append(Keystroke("char", ch, _delay(rng, base, profile.jitter)))
+            plan.append(Keystroke("typo", wrong, delay))
+            # Noticing the mistake takes longer than typing it.
+            plan.append(Keystroke("backspace", "",
+                                  min(MAX_KEY_S, max(MIN_KEY_S, base * rng.uniform(1.5, 3.0)))))
+        plan.append(Keystroke("char", ch, delay))
     return plan
 
 

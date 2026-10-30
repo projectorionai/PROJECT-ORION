@@ -18,6 +18,156 @@ import os
 import sys
 import time
 
+# Mark XXXX.4: OpenMP threads (faster-whisper's ctranslate2) sleep as soon as a
+# transcription ends instead of spinning: 40% less CPU, same 0.63 s latency.
+os.environ.setdefault("KMP_BLOCKTIME", "0")
+# OpenBLAS (numpy's, and scipy's own copy) commits a ~32 MB buffer per thread
+# the moment it loads, one thread per logical core. MEASURED 29 Oct 2026 on the
+# owner's 12-thread Ryzen: `import numpy` committed +363 MB private with +11 MB
+# resident; at 4 threads +106 MB. ORION's BLAS work (recall over 20k x 384
+# vectors, intent-network batches, 512x512 products) ran as fast at 4 threads
+# as at 12 (0.32 vs 0.49 ms, 1.67 vs 1.96 ms, 0.64 vs 0.48 ms). Must be set
+# before anything imports numpy.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+
+
+def _confine_link_launch(argv: list) -> list:
+    """A launch carrying an orion:// link carries the link and nothing else.
+
+    Windows runs `ORION.exe "%1"` for a link, and %1 is a URL a web page
+    chose. Should a browser ever pass quotes through unescaped, the rest of
+    that URL would arrive as extra arguments - `--forge-verify x.py`,
+    `--mcp-server` - and be obeyed by the mode dispatch below. So the extra
+    arguments are dropped before anything reads them; windows_shell then
+    parses the link against its allowlist.
+    """
+    links = [a for a in argv[1:]
+             if isinstance(a, str) and a.strip().lower().startswith("orion:")]
+    return [argv[0], *links] if links and argv else argv
+
+
+if __name__ == "__main__":
+    sys.argv[:] = _confine_link_launch(sys.argv)
+
+# Local operation is a launch choice, before provider or GUI bootstrap runs.
+# Headless children inherit the same routing policy without changing saved keys.
+if __name__ == "__main__" and "--offline" in sys.argv[1:]:
+    os.environ["ORION_MODE"] = "offline"
+
+# PyInstaller must dispatch multiprocessing children BEFORE claiming the UI
+# singleton or importing Qt/audio. spawn imports this file as __mp_main__.
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+def _headless(run: "object") -> int:
+    """Run a headless child mode; a failure becomes a traceback on fd 2 and
+    exit code 1.
+
+    The packaged app is a windowed executable, and PyInstaller shows a dialog
+    box for any unhandled exception in one - so a background child of ORION
+    (an MCP server, a page host, the Forge verifier) that failed to import
+    popped "Unhandled exception in script" onto the owner's screen (11 Oct
+    2026). Its parent reads the pipe and logs the failure instead. (Each mode
+    keeps a plain import inside its function so PyInstaller still finds it.)
+    """
+    try:
+        return run()  # type: ignore[operator]
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+        text = traceback.format_exc()
+        try:
+            os.write(2, text.encode("utf-8", "replace"))
+        except OSError:
+            pass
+        return 1
+
+
+def _report_desktop_boot_failure(exc: BaseException) -> None:
+    """Persist a traceback when the GUI fails before its crash reporter starts.
+
+    The normal app installs CrashReporter only after most of startup. An error
+    while QApplication or the first window is being created therefore used to
+    leave a session header, but no traceback in the diagnostic files.
+    """
+    import traceback
+
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    summary = f"Desktop startup failed: {type(exc).__name__}: {exc}"
+    try:
+        from orion_core import session_log
+        summary = session_log.redact(summary)
+        detail = session_log.redact(detail)
+        session_log.write(f"CRASH: {summary}\n{detail}")
+        session_log.flush(timeout=2.0)
+    except BaseException:
+        pass
+    try:
+        from orion_core.crash_reporter import CrashReporter
+        CrashReporter(None).report("python", summary, detail)
+    except BaseException:
+        pass
+    try:
+        os.write(2, f"ORION could not start: {summary}\n".encode("utf-8", "replace"))
+    except OSError:
+        pass
+
+
+def _argv_after(flag: str) -> list[str]:
+    return sys.argv[sys.argv.index(flag) + 1:]
+
+
+def _mcp_server() -> int:
+    from orion_core.mcp_bundled import run
+    return run(_argv_after("--mcp-server"))
+
+
+def _face_host() -> int:
+    from orion_core.gui.face_host import run_host
+    return run_host()
+
+
+def _page_host() -> int:
+    from orion_core.gui.page_host import run_host
+    rest = _argv_after("--page-host")
+    return run_host(rest[0] if rest else "")
+
+
+def _forge_verify() -> int:
+    from orion_core.forge_runtime import run_script
+    return run_script(_argv_after("--forge-verify"))
+
+
+# The packaged app runs its own bundled MCP servers (`ORION.exe --mcp-server
+# orion_world`): no window, no singleton, no Qt - see orion_core/mcp_bundled.
+if __name__ == "__main__" and "--mcp-server" in sys.argv[1:]:
+    raise SystemExit(_headless(_mcp_server))
+
+# ORION's face in its own process (`ORION.exe --face-host`), embedded in the
+# Core Window so Python stalls cannot stutter it - see orion_core/gui/face_host.
+if __name__ == "__main__" and "--face-host" in sys.argv[1:]:
+    raise SystemExit(_headless(_face_host))
+
+# The globe and the Brain instruments the same way (`ORION.exe --page-host
+# web|brain|face`) - see orion_core/gui/page_host.
+if __name__ == "__main__" and "--page-host" in sys.argv[1:]:
+    raise SystemExit(_headless(_page_host))
+
+# The Forge verifies new tools with the installed app's own interpreter
+# (`ORION.exe --forge-verify script.py`) - see orion_core/forge_runtime.
+if __name__ == "__main__" and "--forge-verify" in sys.argv[1:]:
+    raise SystemExit(_headless(_forge_verify))
+
+# Forged tools may import packages the Forge installed for them.
+if __name__ == "__main__":
+    try:
+        from orion_core.forge_runtime import add_packages_to_path as _forge_packages
+        _forge_packages()
+    except Exception:
+        pass
+
 
 _LAUNCH_STARTED_AT = time.perf_counter()
 
@@ -88,7 +238,13 @@ def _relaunch_in_background() -> None:
     raise SystemExit(0)
 
 
-_relaunch_in_background()
+if __name__ == "__main__":
+    if "--game-updater-scheduled" in sys.argv[1:]:
+        # A scheduled launcher operation needs neither an ORION window nor
+        # the UI singleton; it may run while the assistant is already open.
+        from orion_core.jv_plugins.scheduled import main as scheduled_game_update
+        raise SystemExit(scheduled_game_update())
+    _relaunch_in_background()
 
 
 def _claim_single_instance() -> object:
@@ -107,6 +263,10 @@ def _claim_single_instance() -> object:
 
     The claim is returned and held for the life of the process. Letting it be
     garbage-collected would release the lock while ORION is still running.
+
+    A refused launch that carries a shell command (Explorer's "Ask ORION",
+    a jump-list task, an orion:// link) hands it to the running ORION before
+    exiting - enforce() does that through windows_shell.forward_launch.
     """
     try:
         from orion_core.single_instance import enforce
@@ -161,7 +321,9 @@ def _require_modules(*names: str) -> None:
         raise ModuleNotFoundError("Missing packages: " + ", ".join(missing))
 
 
-if _headless_requested():
+if __name__ == "__mp_main__":
+    pass
+elif _headless_requested():
     # Lighter gate: the cloud node needs no GUI, audio or screen-grab stack.
     try:
         _require_modules("aiohttp", "qasync", "PyQt6.QtCore")
@@ -194,4 +356,29 @@ if __name__ == "__main__":
     if _headless_requested():
         main()
     else:
-        main(started_at=_LAUNCH_STARTED_AT)
+        # The log lines also go to config/diagnostics/session.log (a real run
+        # only: tests build windows without passing through here).
+        try:
+            from orion_core import session_log
+            session_log.enable()
+        except Exception:
+            pass
+        # ORION speaks in Charon even when the Live channel is down (voice_charon).
+        try:
+            from orion_core import voice_charon
+            voice_charon.enable()
+        except Exception:
+            pass
+        # Shell opens run off the event-loop thread (see pump_guard).
+        try:
+            from orion_core import pump_guard
+            pump_guard.install()
+        except Exception:
+            pass
+        try:
+            main(started_at=_LAUNCH_STARTED_AT)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            _report_desktop_boot_failure(exc)
+            raise SystemExit(1) from None

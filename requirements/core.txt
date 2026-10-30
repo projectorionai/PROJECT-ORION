@@ -1,0 +1,48 @@
+# ── O.R.I.O.N. requirements: desktop core ──────────────────────────────────
+# With only this group ORION starts, talks over Gemini Live, routes every tool,
+# drives the desktop and remembers. Every other group adds capabilities that
+# report a clear "not installed" message when absent — verified by the
+# minimal-install check in tests/test_requirements_honesty.py.
+#     python -m pip install -r requirements/core.txt
+
+# Core runtime (required — ORION will not start without these)
+PyQt6>=6.6,<7
+PyQt6-WebEngine>=6.6,<7                  # the in-GUI Three.js globe
+qasync>=0.27,<1                          # asyncio ↔ Qt event-loop unification
+aiohttp>=3.9,<4                          # async HTTP for news/markets/geocoding/providers
+sounddevice>=0.4,<1                      # microphone + speaker I/O
+google-genai>=2.8,<3                     # Gemini Live native-audio channel
+pillow>=10,<13                           # image handling (screen frames, OCR input)
+mss>=9,<11                               # fast screen capture
+psutil>=5.9,<8                           # telemetry, process/security monitoring
+audioop-lts>=0.2,<1; python_version >= "3.13"  # mu-law/resampling for the phone bridge; audioop left the stdlib in 3.13
+nvidia-ml-py>=12,<14                     # GPU meters in-process (NVML); no nvidia-smi process per sample
+numpy>=1.24,<3                           # arrays for vision + charts
+onnxruntime>=1.16,<2                     # runs the semantic encoder, the speaker-voiceprint encoder and OCR, without torch
+tokenizers>=0.15,<1                      # semantic.py: the sentence encoder's tokenizer (meaning-based recall)
+
+# Autonomous desktop control (required for voice-driven PC navigation)
+pyautogui>=0.9.54,<1                     # cursor + keyboard + screenshots
+pywinauto>=0.6.8,<1                      # UIA accessibility tree (buttons/menus/dialogs)
+pygetwindow>=0.0.9,<1                    # window management
+screeninfo>=0.8,<1                       # multi-monitor topology
+keyboard>=0.13,<1                        # Unicode typing + hotkeys
+
+# Windows integration
+pywin32                  # Outlook COM, window/DPI helpers (Windows only)
+tzdata>=2024.1                           # calculator.py world time + time_service Europe/London (Windows ships no tz database)
+winrt-Windows.Media.Control>=3,<4       # media_session.py: real play/pause/skip + "what's playing" through Windows media sessions (falls back to media keys)
+pycaw>=20240316                          # peripherals.py: master volume + mute (both the old .Activate and the 20251023 .EndpointVolume APIs)
+
+# Plugins and installer checks
+jsonschema>=4,<5                         # reviewed JSON-validation plugin
+packaging>=23,<27                        # installed requirement/version checks
+
+# Chess (built into the Command Deck — play, adjustable ELO, analysis)
+python-chess>=1.9,<2                     # board/rules/PGN/UCI client — orion_core/chess_engine.py. The actual
+                          # Stockfish engine binary is a separate download (not pip-installable);
+                          # auto-fetched into config/engines/stockfish.exe on first use, degrading
+                          # to an actionable message if that fails — same pattern as nmap/Npcap.
+
+# Local LLM (optional — enables MODE B fully-offline intelligence)
+# Install the Ollama app from https://ollama.com then:  ollama pull qwen2.5

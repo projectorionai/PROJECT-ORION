@@ -194,6 +194,19 @@ class ShadowEvaluator:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def recall_trend(self, window: int = 50) -> dict[str, Any]:
+        """Recall (the tool really used was in the shortlist) on the last
+        *window* real turns and on the *window* before them (None if none)."""
+        kept = [r["kept"] for r in self._db.execute(
+            "SELECT kept FROM observations ORDER BY id DESC LIMIT ?", (2 * window,))]
+
+        def recall(rows: list[Any]) -> float | None:
+            return 100.0 * sum(1 for r in rows if r) / len(rows) if rows else None
+
+        recent, earlier = kept[:window], kept[window:]
+        return {"turns": len(kept), "recent_turns": len(recent),
+                "recent": recall(recent), "earlier": recall(earlier)}
+
     def missed_tools(self) -> list[tuple[str, int]]:
         """Which tools get filtered out, worst first — a repeated offender is a
         scoring bug in one tool's description, not a reason to abandon the idea."""

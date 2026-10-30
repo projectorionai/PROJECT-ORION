@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import html
+import logging
+import math
 import re
-from datetime import datetime
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -40,6 +43,7 @@ class ReportDrafter:
         self.bus = bus
         self.router = router
         self.telemetry = telemetry
+        self._metrics_warning = False
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
     async def draft(self, topic: str, brief: str = "",
@@ -53,15 +57,33 @@ class ReportDrafter:
             return ToolResult("What should the report be about?", ok=False)
         sections = sections or ["Executive Summary", "Analysis", "Findings", "Recommendations"]
         narrative = await self._write(topic, brief, sections)
-        chart_svgs = [self._bar_chart(c) for c in (charts or []) if isinstance(c, dict)]
-        folder = REPORTS_DIR / f"{datetime.now():%Y-%m-%d}_{self._slug(topic)}"
-        folder.mkdir(parents=True, exist_ok=True)
-        written = await asyncio.to_thread(self._write_files, folder, topic, narrative, chart_svgs)
+        folder = None
+        try:
+            # mkdtemp reserves a unique directory atomically, even for parallel drafts.
+            folder = Path(await asyncio.to_thread(
+                tempfile.mkdtemp,
+                prefix=f"{datetime.now(timezone.utc).astimezone():%Y-%m-%d}_{self._slug(topic)}_",
+                dir=REPORTS_DIR))
+            written = await asyncio.to_thread(
+                self._render_files, folder, topic, narrative, charts or [])
+        except OSError as exc:
+            partial = f" Partial files may remain in {folder}." if folder is not None else ""
+            return ToolResult(f"Report could not be saved: {first_line(exc, 160)}.{partial}",
+                              ok=False)
         if self.telemetry is not None:
-            self.telemetry.metrics.incr("report.drafted")
+            try:
+                self.telemetry.metrics.incr("report.drafted")
+            except Exception as exc:
+                if not self._metrics_warning:
+                    self._metrics_warning = True
+                    logging.getLogger(__name__).warning(
+                        "Optional report metrics failed (%s)", type(exc).__name__)
+        try:
+            where = folder.relative_to(BASE_DIR)
+        except ValueError:          # a reports folder outside ORION's own: say it in full
+            where = folder
         return ToolResult(
-            f"Report drafted: '{topic}'. Wrote {', '.join(written)} to "
-            f"{folder.relative_to(BASE_DIR)}."
+            f"Report drafted: '{topic}'. Wrote {', '.join(written)} to {where}."
         )
 
     # ── narrative ─────────────────────────────────────────────────────────────
@@ -96,13 +118,27 @@ class ReportDrafter:
     def _bar_chart(self, chart: dict[str, Any]) -> str:
         title = str(chart.get("title") or "Chart")
         data = chart.get("data") or {}
-        pairs = [(str(k), float(v)) for k, v in data.items()
-                 if isinstance(v, (int, float))] if isinstance(data, dict) else []
+        pairs: list[tuple[str, float]] = []
+        for key, value in data.items() if isinstance(data, dict) else []:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            try:
+                value = float(value)
+            except (OverflowError, ValueError):
+                continue
+            if math.isfinite(value):
+                pairs.append((str(key), value))
         if not pairs:
             return ""
         width, bar_h, gap, left = 520, 26, 12, 130
         height = 40 + len(pairs) * (bar_h + gap)
-        peak = max(v for _, v in pairs) or 1.0
+        # Normalise before subtracting, so +/-1e308 cannot overflow the span.
+        scale = max(abs(v) for _, v in pairs) or 1.0
+        low = min(0.0, min(v / scale for _, v in pairs))
+        high = max(0.0, max(v / scale for _, v in pairs))
+        span = high - low or 1.0
+        plot_width = width - left - 85
+        zero_x = left + (-low / span) * plot_width
         parts = [
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
             f'viewBox="0 0 {width} {height}" role="img">',
@@ -110,11 +146,14 @@ class ReportDrafter:
             f'<text x="12" y="24" fill="{C.PRI}" font-family="Segoe UI,Arial" '
             f'font-size="14" font-weight="700">{html.escape(title)}</text>',
         ]
+        parts.append(f'<line x1="{zero_x:.1f}" x2="{zero_x:.1f}" y1="36" '
+                     f'y2="{height}" stroke="{C.MUTED}"/>')
         y = 40
         for label, value in pairs:
-            bar_w = (value / peak) * (width - left - 60)
+            value_x = left + ((value / scale - low) / span) * plot_width
+            bar_x, bar_w = min(zero_x, value_x), abs(value_x - zero_x)
             parts.append(
-                f'<rect x="{left}" y="{y}" width="{max(1, bar_w):.1f}" height="{bar_h}" '
+                f'<rect x="{bar_x:.1f}" y="{y}" width="{bar_w:.1f}" height="{bar_h}" '
                 f'rx="4" fill="{C.PRI}"/>'
             )
             parts.append(
@@ -123,14 +162,20 @@ class ReportDrafter:
                 f'{html.escape(label[:20])}</text>'
             )
             parts.append(
-                f'<text x="{left + bar_w + 6:.1f}" y="{y + bar_h - 8}" fill="{C.MUTED}" '
-                f'font-family="Segoe UI,Arial" font-size="11">{value:,.0f}</text>'
+                f'<text x="{width - 12}" y="{y + bar_h - 8}" text-anchor="end" fill="{C.MUTED}" '
+                f'font-family="Segoe UI,Arial" font-size="11">{value:,.4g}</text>'
             )
             y += bar_h + gap
         parts.append("</svg>")
         return "".join(parts)
 
     # ── file writing ──────────────────────────────────────────────────────────
+
+    def _render_files(self, folder: Path, topic: str, narrative: str,
+                      charts: list[dict[str, Any]]) -> list[str]:
+        svgs = [svg for chart in charts if isinstance(chart, dict)
+                if (svg := self._bar_chart(chart))]
+        return self._write_files(folder, topic, narrative, svgs)
 
     def _write_files(self, folder: Path, topic: str, narrative: str,
                      charts: list[str]) -> list[str]:

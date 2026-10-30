@@ -86,7 +86,7 @@ class SecurityReconService:
         if not targets:
             return ToolResult(
                 "No targets are authorized for security testing "
-                "(loopback is always allowed)."
+                "(loopback is always allowed).", ok=False
             )
         return ToolResult("Authorized targets: " + ", ".join(targets))
 

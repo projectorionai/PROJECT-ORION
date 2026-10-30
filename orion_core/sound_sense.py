@@ -107,11 +107,9 @@ class _Yamnet:
             if not model.is_file():
                 return False
             try:
-                import onnxruntime as ort
-                options = ort.SessionOptions()
-                options.intra_op_num_threads = 2
-                cls._session = ort.InferenceSession(str(model), options,
-                                                    providers=["CPUExecutionProvider"])
+                from . import accelerator
+                # On the CPU by policy: DirectML rejects this model at build.
+                cls._session = accelerator.create_session("sound_sense", model, threads=2)
                 cls._labels = (folder / "labels.txt").read_text(
                     encoding="utf-8").splitlines()
             except Exception:

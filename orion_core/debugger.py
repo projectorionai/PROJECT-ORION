@@ -50,6 +50,10 @@ class DebugSession:
         return self._proc is not None and self._proc.poll() is None
 
     def start(self) -> ToolResult:
+        from .execution_policy import require_foreground
+        blocked = require_foreground("unrestricted_debug_process")
+        if blocked is not None:
+            return blocked
         if self.is_running():
             return ToolResult("A debug session is already running. Stop it first.", ok=False)
         path = Path(self.script_path)
@@ -59,7 +63,7 @@ class DebugSession:
             self._proc = subprocess.Popen(
                 [sys.executable, "-u", "-m", "pdb", str(path), *self.args],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, cwd=str(path.parent),
+                text=True, errors="replace", bufsize=1, cwd=str(path.parent),
             )
         except OSError as exc:
             return ToolResult(f"Could not launch debugger: {exc}", ok=False)
@@ -98,6 +102,10 @@ class DebugSession:
         )
 
     def send(self, command: str) -> ToolResult:
+        from .execution_policy import require_foreground
+        blocked = require_foreground("unrestricted_debug_command")
+        if blocked is not None:
+            return blocked
         if not self.is_running():
             return ToolResult("No debug session is running.", ok=False)
         proc = self._proc

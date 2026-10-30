@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import os
 from typing import Any
+from urllib.parse import quote
 
 # aiohttp costs ~178 ms to import and is only used inside coroutines;
 # deferring it keeps it off ORION's startup path (see lazy_import).
@@ -133,7 +134,7 @@ class BreachMonitor:
             return ToolResult("Good news: that password does not appear in any "
                               "known breach corpus. Still, never reuse it across sites.")
         sev = severity_for(count)
-        self.bus.banner.emit(f"🛡 Password found in breaches ({count:,}×, {sev})", 5)
+        self.bus.banner.emit(f"Security: password found in breaches ({count:,}×, {sev})", 5)
         return ToolResult(
             f"That password has appeared in known breaches {count:,} time(s) — "
             f"severity {sev}. Treat it as compromised: change it anywhere you use it "
@@ -154,7 +155,7 @@ class BreachMonitor:
                 "integrations.hibp.api_key in config/api_keys.json (or set "
                 "ORION_HIBP_API_KEY), then ask again. The password check needs no key.",
                 ok=False)
-        url = _HIBP_ACCOUNT_URL.format(account=account)
+        url = _HIBP_ACCOUNT_URL.format(account=quote(account, safe=""))
         status, data = await self._get_json_with_status(
             url + "?truncateResponse=false",
             headers={"hibp-api-key": key})
@@ -176,7 +177,7 @@ class BreachMonitor:
             return ToolResult("I couldn't complete the account breach lookup just now.",
                               ok=False)
         names = [str(b.get("Name") or b.get("Title") or "?") for b in data]
-        self.bus.banner.emit(f"🛡 {account} in {len(names)} breach(es)", 5)
+        self.bus.banner.emit(f"Security: {account} in {len(names)} breach(es)", 5)
         head = ", ".join(names[:8]) + ("…" if len(names) > 8 else "")
         return ToolResult(
             f"{account} appears in {len(names)} known breach(es): {head}. "
@@ -191,12 +192,13 @@ class BreachMonitor:
             hdrs.update(headers or {})
             client_timeout = ClientTimeout(total=timeout, connect=5.0)
             async with ClientSession(timeout=client_timeout) as session:
-                async with session.get(url, headers=hdrs) as response:
+                async with session.get(url, headers=hdrs,
+                                       allow_redirects=False) as response:
                     if response.status != 200:
                         return None
                     return await response.text()
-        except Exception as exc:
-            self.bus.log.emit(f"BREACH: request failed - {str(exc).splitlines()[0][:100]}")
+        except Exception:
+            self.bus.log.emit("BREACH: request failed")
             return None
 
     async def _get_json_with_status(self, url: str, *, headers: dict[str, str] | None = None,
@@ -206,10 +208,11 @@ class BreachMonitor:
             hdrs.update(headers or {})
             client_timeout = ClientTimeout(total=timeout, connect=5.0)
             async with ClientSession(timeout=client_timeout) as session:
-                async with session.get(url, headers=hdrs) as response:
+                async with session.get(url, headers=hdrs,
+                                       allow_redirects=False) as response:
                     if response.status != 200:
                         return response.status, None
                     return 200, await response.json()
-        except Exception as exc:
-            self.bus.log.emit(f"BREACH: request failed - {str(exc).splitlines()[0][:100]}")
+        except Exception:
+            self.bus.log.emit("BREACH: request failed")
             return 0, None

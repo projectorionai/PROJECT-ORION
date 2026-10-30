@@ -102,6 +102,17 @@ OUTBOUND = frozenset({Channel.SMS, Channel.VOICE_CALL})
 _E164 = re.compile(r"\A\+[1-9]\d{6,14}\Z")
 
 
+#: Words that say nothing about WHO ("call my mum", "ring the plumber").
+_NAME_FILLER = frozenset({"my", "the", "our", "a", "an", "please", "to", "call", "ring",
+                          "phone", "text", "message", "dial"})
+
+
+def _name_words(name: str) -> tuple[str, ...]:
+    """A contact name as plain words: no emoji, punctuation or possessive 's."""
+    words = re.findall(r"[a-z0-9]+", str(name or "").casefold().replace("'s", " "))
+    return tuple(w for w in words if w not in _NAME_FILLER)
+
+
 def normalise_number(raw: str, default_country: str = "44") -> str:
     """A phone number in E.164, or "" if it is not one.
 
@@ -182,7 +193,36 @@ class ContactBook:
         for contact in self._contacts.values():
             if contact.name.casefold() == wanted:
                 return contact.number
+        # "my mum" for "Mum ❤️", "dave" for "Dave Smith" — but only when
+        # exactly ONE contact fits. A call cannot be un-made, so anything
+        # ambiguous resolves to nothing and the caller asks who was meant.
+        spoken = _name_words(who)
+        if not spoken:
+            return ""
+        same = [c for c in self._contacts.values() if _name_words(c.name) == spoken]
+        if len(same) == 1:
+            return same[0].number
+        starts = [c for c in self._contacts.values()
+                  if _name_words(c.name)[:len(spoken)] == spoken]
+        if len(starts) == 1:
+            return starts[0].number
         return ""
+
+    def candidates(self, who: str) -> list[str]:
+        """Contacts a name could mean when it fits more than one ("dave")."""
+        spoken = _name_words(who)
+        if not spoken:
+            return []
+        return sorted(c.name for c in self._contacts.values()
+                      if _name_words(c.name)[:len(spoken)] == spoken)
+
+    def unresolved(self, who: str, verb: str) -> str:
+        """What to say when *who* resolves to no single contact."""
+        options = self.candidates(who)
+        if len(options) > 1:
+            return f"More than one contact fits {who!r}: {', '.join(options)} - which one?"
+        return (f"I don't have {who!r} in the numbers I'm allowed to {verb}. "
+                f"Add it to config/{CONTACTS_PATH} first.")
 
     def names(self) -> list[str]:
         return sorted(contact.name for contact in self._contacts.values())
@@ -429,10 +469,7 @@ class TelephonyGateway:
         """
         number = self.contacts.resolve(to)
         if not number:
-            return Dispatch(
-                False, Channel.VOICE_CALL,
-                f"I don't have {to!r} in the numbers I'm allowed to dial. "
-                f"Add it to config/{CONTACTS_PATH} first.")
+            return Dispatch(False, Channel.VOICE_CALL, self.contacts.unresolved(to, "dial"))
 
         screened = screen(message, self.guard)
         if not screened.safe:
@@ -463,9 +500,7 @@ class TelephonyGateway:
         """Send an SMS. Cheaper, quieter, and it leaves a record they can read."""
         number = self.contacts.resolve(to)
         if not number:
-            return Dispatch(
-                False, Channel.SMS,
-                f"I don't have {to!r} in the numbers I'm allowed to message.")
+            return Dispatch(False, Channel.SMS, self.contacts.unresolved(to, "message"))
         screened = screen(message, self.guard)
         if not screened.safe:
             return Dispatch(False, Channel.SMS,

@@ -51,17 +51,31 @@ def _health_colour(status: OpStatus) -> QColor:
 
 
 class StatusStrip(QWidget):
-    """A one-line operational-status surface. Feed it OpStatus via set_status()."""
+    """A one-line operational-status surface. Feed it OpStatus via set_status().
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    *embedded* draws it without a ground of its own, for a strip that sits
+    inside the deck's header row instead of taking a row to itself — the
+    separate rail spent 36 px of every page on two words.
+    """
+
+    def __init__(self, parent: QWidget | None = None, *, embedded: bool = False) -> None:
         super().__init__(parent)
         self._status = OpStatus()
+        self._embedded = bool(embedded)
         self.setMinimumHeight(28)
         self.setMaximumHeight(40)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setAccessibleName("ORION's status")
 
     def set_status(self, status: OpStatus) -> None:
         self._status = status or OpStatus()
+        try:
+            st = self._status
+            self.setAccessibleDescription(
+                " · ".join(x for x in ("Online" if st.online and st.mode != "offline"
+                                       else "Offline", st.voice, st.activity) if x))
+        except Exception:
+            pass
         self.update()
 
     def _font(self, size: int, bold: bool = False) -> QFont:
@@ -75,7 +89,8 @@ class StatusStrip(QWidget):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), _BG)
+        if not self._embedded:
+            p.fillRect(self.rect(), _BG)
         st = self._status
         cy = h / 2
 
@@ -88,19 +103,21 @@ class StatusStrip(QWidget):
         # mode chip
         x = 26.0
         p.setFont(self._font(8, bold=True))
-        mode = "CLOUD" if (st.online and st.mode != "offline") else "OFFLINE"
+        connected = st.online and st.mode != "offline"
+        mode = "Online" if connected else "Offline"
         # Connected is the normal case and recedes; not connected steps
         # forward. It was the other way round — cyan for CLOUD, grey for
         # OFFLINE — which spent the loudest colour on the state that needs no
         # attention and hid the one that does.
-        p.setPen(_ACCENT if mode == "CLOUD" else _WARN)
+        p.setPen(_ACCENT if connected else _WARN)
         p.drawText(QRectF(x, 0, 60, h), Qt.AlignmentFlag.AlignVCenter, mode)
         x += 58
 
         # voice state
         p.setFont(self._font(9, bold=True))
         p.setPen(_INK)
-        voice = st.voice.upper()
+        voice = {"processing": "Thinking", "standby": "Ready", "idle": "Ready"}.get(
+            st.voice.lower(), st.voice.capitalize())
         p.drawText(QRectF(x, 0, 110, h), Qt.AlignmentFlag.AlignVCenter, voice)
         x += 108
 
@@ -114,13 +131,17 @@ class StatusStrip(QWidget):
         if st.activity:
             tail.append(st.activity)
         if st.focus:
-            tail.append(f"focus: {st.focus}")
+            tail.append(f"Focus: {st.focus}")
         if tail:
-            p.setFont(self._font(9))
+            from PyQt6.QtGui import QFontMetrics
+
+            font = self._font(9)
+            p.setFont(font)
             p.setPen(_DIM)
-            p.drawText(QRectF(x, 0, max(10.0, w - x - 12), h),
-                       Qt.AlignmentFlag.AlignVCenter,
-                       "·  " + "   ·   ".join(tail))
+            room = max(10.0, w - x - 12)
+            text = QFontMetrics(font).elidedText(
+                "·  " + "   ·   ".join(tail), Qt.TextElideMode.ElideRight, int(room))
+            p.drawText(QRectF(x, 0, room, h), Qt.AlignmentFlag.AlignVCenter, text)
 
     def __probe_state__(self) -> dict[str, Any]:
         """Headless inspection hook for the render test."""

@@ -33,6 +33,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .labels import page_display_name, title_case
+
 # Palette entry kinds — what happens when you choose one (see CommandPalette
 # .command_chosen below).
 #
@@ -49,6 +51,24 @@ from PyQt6.QtWidgets import (
 KIND_TOOL = "tool"
 KIND_PAGE = "page"
 KIND_ACTION = "action"
+
+_TOOL_TITLES = {
+    "project_rehearsal": "Rehearse a Project Deadline",
+    "context_capsule": "Save or Recall a Work Handoff",
+    "experiment_notebook": "Track a Personal Experiment",
+    "web_search": "Search the Web", "resource_status": "Check Computer Performance",
+    "breach_check": "Check for Exposed Credentials", "web_automation": "Use the Browser",
+    "workspace_control": "Arrange Your Workspace", "geo": "Find a Place",
+    "reminder": "Set or Review a Reminder", "recall_conversation": "Find an Earlier Conversation",
+    "memory": "Remember Something", "process_file": "Read a File", "desktop_control": "Use the Desktop",
+    "token_usage": "Check Model Usage", "morning_briefing": "Get Your Daily Briefing",
+    "document_intelligence": "Ask About Your Documents", "execute_plan": "Carry Out a Plan",
+}
+
+
+def command_title(name: str) -> str:
+    """A readable action label; the callable identity remains unchanged."""
+    return _TOOL_TITLES.get(name) or title_case(name.replace("_", " "))
 
 
 @dataclass(frozen=True)
@@ -77,7 +97,7 @@ def build_commands(tool_declarations: Iterable[dict]) -> list[PaletteCommand]:
             continue
         commands.append(PaletteCommand(
             name=name,
-            title=name.replace("_", " "),
+            title=command_title(name),
             subtitle=_first_sentence(tool.get("description") or ""),
             kind=KIND_TOOL,
         ))
@@ -98,8 +118,8 @@ def build_page_commands(page_names: Iterable[str]) -> list[PaletteCommand]:
             continue
         commands.append(PaletteCommand(
             name=label,
-            title=label.title(),
-            subtitle="Command Deck page",
+            title=page_display_name(label),
+            subtitle="Open this page",
             kind=KIND_PAGE,
         ))
     return sorted(commands, key=lambda c: c.name)
@@ -184,15 +204,14 @@ class CommandPalette(QDialog):
 
     def __init__(self, commands: Sequence[PaletteCommand], parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Command palette")
+        self.setWindowTitle("Find a Page or Action")
         self.setModal(True)
         self.resize(560, 420)
         self._commands = list(commands)
 
         layout = QVBoxLayout(self)
         self.search = QLineEdit()
-        self.search.setPlaceholderText(
-            "Search ORION's commands and pages…  (Esc to close)")
+        self.search.setPlaceholderText("Search pages and actions…")
         self.results = QListWidget()
         layout.addWidget(self.search)
         layout.addWidget(self.results)

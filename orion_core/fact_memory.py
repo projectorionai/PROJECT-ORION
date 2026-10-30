@@ -113,17 +113,31 @@ _EXTRACT_INSTRUCTION = (
     "identity, relationships and names, health and dietary needs, preferences, "
     "routines, work and study, possessions, important dates, places. Ignore "
     "requests, questions, passing states (tired, busy), opinions about the task "
-    "at hand, and anything hypothetical. Never output passwords, card numbers, "
+    "at hand, and anything hypothetical. Record only what the message states in "
+    "so many words: never infer a fact from a vague, garbled or half-finished "
+    "sentence ('one thing you should know about me is I don't know' states "
+    "nothing). Never output passwords, card numbers, "
     "codes or other secrets. Write each fact as ONE short sentence in the third "
     "person beginning 'The user' (e.g. 'The user's sister, Emma, lives in "
     "Leeds.'). Turn relative dates ('next Friday', 'in two weeks') into "
     "calendar dates using today's date, given with the message. If a fact "
     "UPDATES or CONTRADICTS one of the existing memories listed with the "
     "message (the user moved, changed job, a date changed), set \"replaces\" "
-    "to that memory's key; otherwise null. Reply with JSON only: {\"facts\": "
-    "[{\"key\": \"short_snake_case\", \"fact\": \"...\", \"replaces\": null}]} "
+    "to that memory's key; otherwise null. For every fact, include evidence: "
+    "an exact quote of the durable statement from THIS message, never from "
+    "existing memories. The fact must say no more than that quote supports. "
+    "Reply with JSON only: {\"facts\": "
+    "[{\"key\": \"short_snake_case\", \"fact\": \"...\", \"evidence\": \"exact user words\", \"replaces\": null}]} "
     "— or {\"facts\": []} when nothing lasting was said."
 )
+
+
+#: A sentence that opens as the speaker's own statement ("My sister...",
+#: "I'm allergic...", "So, I work at..."), after any spoken filler.
+_OWN_STATEMENT = re.compile(
+    r"^\s*(?:(?:so|well|oh|okay|ok|um|uh|erm|and|also|actually|yeah|right|"
+    r"by the way|just so you know|orion|ryan)[\s,.]+)*"
+    r"(?:my|i|i'm|im|i've|ive|i'd|i'll|we|we're|our)\b", re.IGNORECASE)
 
 
 def enabled() -> bool:
@@ -173,7 +187,7 @@ def parse_facts(raw: str) -> list[tuple[str, str]]:
     return [(key, fact) for key, fact, _replaces in parse_fact_updates(raw)]
 
 
-def parse_fact_updates(raw: str) -> list[tuple[str, str, str]]:
+def parse_fact_updates(raw: str, *, source_text: str | None = None) -> list[tuple[str, str, str]]:
     """(key, fact, replaces) triples; *replaces* is "" when the fact is new."""
     text = str(raw or "")
     match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -187,6 +201,11 @@ def parse_fact_updates(raw: str) -> list[tuple[str, str, str]]:
     for item in (data.get("facts") or []) if isinstance(data, dict) else []:
         if not isinstance(item, dict):
             continue
+        if source_text is not None:
+            quote = " ".join(str(item.get("evidence") or "").split())
+            source = " ".join(source_text.split())
+            if not quote or quote not in source or not looks_like_a_fact(quote):
+                continue
         fact = " ".join(str(item.get("fact") or "").split())
         if not (8 <= len(fact) <= 300):
             continue
@@ -313,6 +332,10 @@ class FactHarvester:
 
     async def _extract(self, text: str, related: list[tuple[str, str, str]] | None = None
                        ) -> list[tuple[str, str, str]]:
+        # 8 Oct: a model stub rewrote a vague "I don't know" into an unrelated
+        # personal fact. Enforce intake here too, including direct learn().
+        if not looks_like_a_fact(text):
+            return []
         router = self.router
         if router is not None:
             self._last_call = time.monotonic()
@@ -326,12 +349,17 @@ class FactHarvester:
                 _profile, raw = await router.generate_text(
                     f"{context}Message: {text}", instruction=_EXTRACT_INSTRUCTION,
                     task="memory", max_tokens=500)
-                return parse_fact_updates(raw)
+                return parse_fact_updates(raw, source_text=text)
             except Exception:
                 pass            # no provider: keep the sentence itself (below)
         # Offline, or the model failed: the user's own sentence is the fact.
         # Meaning-based recall reads "My sister Emma just moved to Leeds" as
-        # well as any rewrite of it.
+        # well as any rewrite of it. With no model to judge it, the sentence
+        # must at least BE a statement about themselves: on 3 Oct an overheard
+        # fragment, "los ang said i have a i'm just chilling so", passed the
+        # gate on its inner "i have" and was filed as a personal fact.
+        if not _OWN_STATEMENT.match(text):
+            return []
         return [(_slug(" ".join(text.split()[:8])), text, "")]
 
     def _home_for(self, key: str, fact: str) -> tuple[str, str, bool]:
@@ -345,7 +373,13 @@ class FactHarvester:
         finder = getattr(matrix, "relevant", None)
         if finder is not None:
             try:
-                for row in finder(fact, limit=3, floor=DUPLICATE_COSINE):
+                # Stored facts are embedded as "label: fact" (memory._embed_text),
+                # so the new one is asked about in the same shape, with the label
+                # the model proposed. Measured with the real encoder: repeats
+                # stay >= 0.97, paraphrases >= 0.92, different facts <= 0.82;
+                # the bare sentence let two paraphrases fall under 0.90.
+                probe = f"{str(key).replace('_', ' ')}: {fact}"
+                for row in finder(probe, limit=3, floor=DUPLICATE_COSINE):
                     if row.get("category") in _DEDUP_CATEGORIES:
                         same = (float(row.get("similarity", 0.0)) >= SAME_COSINE
                                 or str(row.get("value", "")).strip() == fact.strip())

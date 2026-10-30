@@ -26,10 +26,13 @@ than a crash or a lie) when no backend is installed.
 
 from __future__ import annotations
 
+import asyncio
+import io
+import sys
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
-# (image_bytes) -> PNG/JPEG bytes of the current screen
+# () -> PNG/JPEG bytes of the current screen
 CaptureFn = Callable[[], bytes]
 # (image_bytes, prompt) -> (description, how) e.g. ("A code editor…", "model")
 DescribeFn = Callable[[bytes, str], Awaitable[tuple[str, str]]]
@@ -55,31 +58,43 @@ class ScreenReading:
 
 
 def default_capture() -> bytes:
-    """Grab the current screen as PNG bytes. Tries mss, then Pillow's ImageGrab.
+    """Grab the whole desktop as a bounded JPEG, suitable for model vision.
 
     Raises RuntimeError with a plain message when neither backend is available,
     so the caller can degrade rather than crash."""
-    # mss is fast and cross-monitor.
-    try:
-        import mss
-        import mss.tools
-        factory = getattr(mss, "MSS", None) or mss.mss   # MSS is the newer name
-        with factory() as sct:
-            shot = sct.grab(sct.monitors[0])          # the full virtual screen
-            return mss.tools.to_png(shot.rgb, shot.size)
-    except Exception:
-        pass
-    try:
-        import io
-        from PIL import ImageGrab
-        image = ImageGrab.grab()
+    from PIL import Image
+    from .display import physical_pixels
+    from .utils import PIL_RESAMPLE
+
+    def encode(image: Any) -> bytes:
+        image = image.convert("RGB")
+        image.thumbnail((2560, 2560), PIL_RESAMPLE)
         buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
+        image.save(buffer, format="JPEG", quality=90)
         return buffer.getvalue()
-    except Exception as exc:
-        raise RuntimeError(
-            "no screen-capture backend available (install 'mss' or 'pillow')"
-        ) from exc
+
+    @physical_pixels
+    def capture() -> bytes:
+        # mss is fast and cross-monitor. The same bytes used to be PNG but
+        # were labelled image/jpeg by the vision transport.
+        try:
+            import mss
+            factory = getattr(mss, "MSS", None) or mss.mss
+            with factory() as sct:
+                shot = sct.grab(sct.monitors[0])
+                return encode(Image.frombytes("RGB", shot.size, shot.rgb))
+        except Exception:
+            pass
+        try:
+            from PIL import ImageGrab
+            image = ImageGrab.grab(all_screens=True) if sys.platform == "win32" else ImageGrab.grab()
+            return encode(image)
+        except Exception as exc:
+            raise RuntimeError(
+                "no screen-capture backend available (install 'mss' or 'pillow')"
+            ) from exc
+
+    return capture()
 
 
 def capture_available() -> bool:
@@ -107,7 +122,7 @@ class ScreenReader:
     async def read(self, prompt: str = "") -> ScreenReading:
         # 1. capture — the only place a screenshot is ever taken
         try:
-            image = self._capture()
+            image = await asyncio.to_thread(self._capture)
         except Exception as exc:
             return ScreenReading(False, "", "", "none",
                                  note=f"Couldn't capture the screen: {exc}")

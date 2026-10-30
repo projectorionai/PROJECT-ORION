@@ -24,6 +24,16 @@ GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 POSTCODES = "https://api.postcodes.io/postcodes/"
 TIMEOUT = 15
 
+
+MAX_RESPONSE_BYTES = 1_000_000
+
+
+def _bounded_http_body(response) -> bytes:
+    data = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise ValueError("Remote response exceeded its size limit; completion is unverified")
+    return data
+
 #: WMO weather codes, in the words a person would use. The API returns a
 #: number; "code 61" is not an answer to "what's the weather".
 CONDITIONS = {
@@ -46,7 +56,7 @@ def _get(url: str, params: dict) -> dict:
     request = urllib.request.Request(
         f"{url}?{query}", headers={"User-Agent": "ORION/1.0"})
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        return json.loads(response.read().decode("utf-8"))
+        return json.loads(_bounded_http_body(response).decode("utf-8"))
 
 
 def _looks_like_uk_postcode(text: str) -> bool:

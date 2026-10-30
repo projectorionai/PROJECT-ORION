@@ -72,8 +72,10 @@ class MomentumEngine:
 
     @staticmethod
     def _is_overdue(due: str) -> bool:
-        due = str(due or "").strip()
-        return len(due) >= 10 and due[4] == "-" and due < date.today().isoformat()
+        # The one rule (owner_tasks): "2026-10-25 09:00" is overdue at 10:00,
+        # which this string comparison against today's date never noticed.
+        from .owner_tasks import is_overdue
+        return is_overdue(due)
 
     # ── modes ──────────────────────────────────────────────────────────────────
 

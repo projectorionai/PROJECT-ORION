@@ -118,6 +118,13 @@ class SocialAutomationService:
     async def _run_pw(self, coro: Any) -> ToolResult:
         """Submit an already-built coroutine to the Playwright thread's own
         event loop and await its result from the caller's (qasync) loop."""
+        from .execution_policy import require_foreground
+        blocked = require_foreground("social_visible_browser")
+        if blocked is not None:
+            # Public actions construct this coroutine before entering the
+            # bridge; close the unstarted coroutine when refusing the launch.
+            coro.close()
+            return blocked
         self._ensure_loop_thread()
         if self._pw_loop is None:
             return ToolResult("The social automation thread failed to start.", ok=False)
@@ -128,6 +135,10 @@ class SocialAutomationService:
         """Launch (or reuse) a persistent browser context on the DEDICATED
         social profile. Must be called with self._lock held. Returns None
         on success, or an actionable ToolResult on failure."""
+        from .execution_policy import require_foreground
+        blocked = require_foreground("social_visible_browser")
+        if blocked is not None:
+            return blocked
         if self._context is not None:
             return None
         try:

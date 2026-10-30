@@ -63,6 +63,7 @@ from PyQt6.QtWidgets import (
 
 from ..bus import OrionBus
 from .. import background
+from .labels import plural
 
 _MAX_HISTORY = 40
 
@@ -150,7 +151,7 @@ class AgentWorkspaceView(QWidget):
         outer.addWidget(self.status_label)
 
     def _build_brief_panel(self) -> QFrame:
-        frame, layout = _panel("BRIEF")
+        frame, layout = _panel("Brief")
         self.request_input = QPlainTextEdit()
         self.request_input.setPlaceholderText("What do you need from this specialist?")
         self.request_input.setMaximumHeight(90)
@@ -162,7 +163,7 @@ class AgentWorkspaceView(QWidget):
 
         attach_row = QHBoxLayout()
         attach_row.setSpacing(4)
-        add_files_btn = QPushButton("Add File(s)")
+        add_files_btn = QPushButton("Add Files")
         add_files_btn.setToolTip(
             "Attach files so this specialist can see what's in them")
         add_files_btn.clicked.connect(self._pick_files)
@@ -184,7 +185,7 @@ class AgentWorkspaceView(QWidget):
         layout.addWidget(self.attachments_label)
 
         if self.quick_prompts:
-            prompts_label = QLabel("Quick start")
+            prompts_label = QLabel("Quick Start")
             prompts_label.setObjectName("mutedLabel")
             layout.addWidget(prompts_label)
             prompt_row = QHBoxLayout()
@@ -202,7 +203,7 @@ class AgentWorkspaceView(QWidget):
         return frame
 
     def _build_tools_panel(self) -> QFrame:
-        frame, layout = _panel("INSTRUMENTS")
+        frame, layout = _panel("Instruments")
         self.tools_label = QLabel("")
         self.tools_label.setObjectName("mutedLabel")
         self.tools_label.setWordWrap(True)
@@ -211,16 +212,15 @@ class AgentWorkspaceView(QWidget):
         return frame
 
     def _build_findings_panel(self) -> QFrame:
-        frame, layout = _panel("FINDINGS")
+        frame, layout = _panel("Findings")
         self.findings_output = QPlainTextEdit()
         self.findings_output.setReadOnly(True)
         self.findings_output.setObjectName("logBox")
-        self.findings_output.setPlaceholderText("The specialist's answer appears here.")
         layout.addWidget(self.findings_output, 1)
         return frame
 
     def _build_context_panel(self) -> QFrame:
-        frame, layout = _panel("CONTEXT — THIS SESSION")
+        frame, layout = _panel("Context — This Session")
         self.history_list = QListWidget()
         self.history_list.itemActivated.connect(self._on_history_selection)
         layout.addWidget(self.history_list, 1)
@@ -241,7 +241,7 @@ class AgentWorkspaceView(QWidget):
         info = self._agent_info()
         calls = info.get("calls", 0)
         last_active = info.get("last_active") or "never"
-        self.activity_label.setText(f"{calls} call(s) · last active {last_active}")
+        self.activity_label.setText(f"{plural(calls, 'call')} · last active {last_active}")
 
     def _refresh_tools(self) -> None:
         try:
@@ -251,8 +251,7 @@ class AgentWorkspaceView(QWidget):
         if names:
             self.tools_label.setText("Can consult:\n" + "\n".join(f"• {n}" for n in sorted(names)))
         else:
-            self.tools_label.setText("No read-only instruments attached yet — "
-                                     "answers come from persona + reasoning alone.")
+            self.tools_label.setText("No tools attached")
 
     # ── actions ───────────────────────────────────────────────────────────────
 
@@ -339,7 +338,7 @@ class AgentWorkspaceView(QWidget):
             self.status_label.setText("File import is not available on this workspace.")
             return
         paths, _ = QFileDialog.getOpenFileNames(
-            self, f"Attach file(s) for the {self.page_title}")
+            self, f"Attach Files for the {self.page_title}")
         if paths:
             self._run(lambda: self._attach_async(paths, is_folder=False))
 
@@ -348,7 +347,7 @@ class AgentWorkspaceView(QWidget):
             self.status_label.setText("File import is not available on this workspace.")
             return
         path = QFileDialog.getExistingDirectory(
-            self, f"Attach a folder for the {self.page_title}")
+            self, f"Attach a Folder for the {self.page_title}")
         if path:
             self._run(lambda: self._attach_async([path], is_folder=True))
 
@@ -360,7 +359,7 @@ class AgentWorkspaceView(QWidget):
         IngestionEngine's own fingerprint cache, so a file attached before
         (here or on the LIBRARY deck) attaches again instantly.
         """
-        label = Path(paths[0]).name if len(paths) == 1 else f"{len(paths)} item(s)"
+        label = Path(paths[0]).name if len(paths) == 1 else plural(len(paths), 'item')
         self.status_label.setText(f"Reading {label} for the {self.page_title}…")
         try:
             if is_folder:
@@ -387,7 +386,7 @@ class AgentWorkspaceView(QWidget):
         skipped = len(results) - added
         if added:
             detail = f" ({skipped} unreadable)" if skipped else ""
-            self.status_label.setText(f"Attached {added} file(s){detail}.")
+            self.status_label.setText(f"Attached {plural(added, 'file')}{detail}.")
         else:
             self.status_label.setText("No readable files found in that selection.")
 

@@ -71,9 +71,10 @@ def test_the_core_window_does_not_build_a_second_avatar(monkeypatch, _app):
     # unchanged: when the native renderer owns the face, the window must host
     # its adapter rather than build a second avatar of its own.
     monkeypatch.setenv("ORION_HOLO_HEAD", "0")
-    # The face, not whatever form the developer last chose: the saved
-    # choice lives in the real config and "orb" builds a different widget.
-    monkeypatch.setenv("ORION_FACE_FORM", "face")
+    # The classic face, not whatever form the developer last chose: the saved
+    # choice lives in the real config, and "orb" and "screen" (the default)
+    # each build a different widget.
+    monkeypatch.setenv("ORION_FACE_FORM", "classic")
     face = core_window_mod.OrionCoreWindow._build_face(object())
     assert isinstance(face, NativeFacePanel)
     # The panel draws nothing itself: it is an adapter over a renderer handed

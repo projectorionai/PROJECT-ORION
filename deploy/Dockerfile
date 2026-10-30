@@ -2,9 +2,13 @@
 # Build (from the repo root):
 #   docker build -t orion-node -f deploy/Dockerfile .
 # Run:
-#   docker run -d --name orion -p 8765:8765 \
+#   docker run -d --name orion -p 127.0.0.1:8765:8765 \
 #     -v orion-config:/app/config \
-#     -e ORION_HEADLESS=1 orion-node
+#     -e ORION_REMOTE_EXPOSURE=platform-proxy \
+#     -e ORION_REMOTE_PUBLIC_URL=https://orion.example.com orion-node
+# The container's internal listener binds 0.0.0.0; Docker publishes it only
+# on the HOST's loopback address. Put Caddy on the host in front of this port. Publishing 8765 on
+# every host interface would expose the HTTP pairing and chat API without TLS.
 #
 # Works on Oracle Cloud Ampere A1 (arm64) and x86; python:slim is multi-arch.
 

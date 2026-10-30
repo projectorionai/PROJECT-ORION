@@ -407,7 +407,7 @@ def _run_ps(script: str, timeout: float) -> subprocess.CompletedProcess:
         raise FileNotFoundError("no powershell.exe/pwsh found on PATH")
     return subprocess.run(
         [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-        capture_output=True, text=True, timeout=timeout, shell=False,
+        capture_output=True, text=True, errors="replace", timeout=timeout, shell=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
@@ -561,7 +561,7 @@ class AntivirusMonitor:
         if st is None:
             return ToolResult(_UNAVAILABLE_MESSAGE, ok=False)
         if not st.is_healthy():
-            self.bus.banner.emit("🛡 Windows Defender protection is degraded", 5)
+            self.bus.banner.emit("Security: Windows Defender protection is degraded", 5)
         return ToolResult(format_status(st))
 
     async def recent_threats(self, limit: int = 10) -> ToolResult:
@@ -576,7 +576,7 @@ class AntivirusMonitor:
         self._incr("security.antivirus.quick_scan")
         if outcome.threats_found:
             self.bus.banner.emit(
-                f"🛡 Defender quick scan found {outcome.threats_found} threat(s)", 6)
+                f"Security: Defender quick scan found {outcome.threats_found} threat(s)", 6)
             self.bus.speak_request.emit(
                 f"Security alert: Windows Defender's quick scan found "
                 f"{outcome.threats_found} threat(s) in its detection history. "

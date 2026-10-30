@@ -88,8 +88,9 @@ stages and fps snapshot).
 from __future__ import annotations
 
 import json
+import os
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from PyQt6.QtCore import Qt, QTimer
@@ -126,8 +127,11 @@ FACE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 // message and the Python-side signal are wired here.
 (function(){
   var settled=false;
+  window.__orionRender={frames:0,lastAt:0,lost:false,lostAt:0,error:''};
   window.__orionFaceBooted=function(){ settled=true; };
   function fail(reason){
+    window.__orionFailed=String(reason||'unknown');
+    window.__orionRender.error=window.__orionFailed;
     if(settled) return;
     settled=true;
     // Recorded so the Qt side can tell a page that FAILED from one that is
@@ -151,10 +155,13 @@ FACE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   window.addEventListener('error', function(e){
     var t=e&&e.target;
     if(t&&(t.tagName==='SCRIPT'||t.tagName==='LINK')) fail('asset load failed');
+    else if(e&&e.message) fail('renderer error: '+e.message);
   }, true);
+  window.__orionRenderFailed=fail;
+  window.addEventListener('unhandledrejection',function(e){fail(String(e.reason||'renderer promise failed'));});
   // Belt and braces: a module that never runs fires no error event in some
   // engines, so a watchdog covers the silent case too.
-  setTimeout(function(){ fail('timeout'); }, 12000);
+  setTimeout(function(){ if(!settled) fail('timeout'); }, 12000);
 })();
 </script>
 <script type="importmap">{"imports":{
@@ -223,7 +230,7 @@ function fitCamera(){
 }
 fitCamera();
 const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true,preserveDrawingBuffer:true});
-renderer.setSize(innerWidth,innerHeight); renderer.setPixelRatio(Math.min(devicePixelRatio,1.75));
+renderer.setSize(innerWidth,innerHeight); renderer.setPixelRatio(Math.min(devicePixelRatio,__PIXEL_CAP__));
 renderer.outputColorSpace=THREE.SRGBColorSpace; renderer.toneMapping=THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure=0.95; document.body.appendChild(renderer.domElement);
 const composer=new EffectComposer(renderer);
@@ -257,8 +264,65 @@ window.orionAmplitude=a=>{tg.amp=Math.max(0,Math.min(1,a));};
 // from ever producing a NaN mouth shape.
 const clamp01=v=>Math.max(0,Math.min(1,Number(v)||0));
 window.orionSpectrum=(l,m,h)=>{tg.specLow=clamp01(l);tg.specMid=clamp01(m);tg.specHigh=clamp01(h);};
-window.orionMorph=v=>{morphTarget=Math.max(0,Math.min(1,v));};
+window.orionMorph=v=>{const n=Number(v);if(Number.isFinite(n))morphTarget=Math.max(0,Math.min(1,n));};
 window.orionState=s=>{mode=String(s||'').toUpperCase();};
+// Orb-only interaction. The face's pose and animation remain untouched.
+const orbCtl={x:0,y:0,spread:0,yaw:0,pitch:0,roll:0,
+  tx:0,ty:0,ts:0,tyaw:0,tpitch:0,troll:0,drag:null,camera:false,
+  mouseX:0,mouseY:0,mouseSpread:0,handX:0,handY:0,handSpread:0,
+  handRoll:0,handSeenAt:0};
+const orbReady=()=>morphTarget<0.5&&morphT<0.5;
+const orbClamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+window.orionOrbCameraEnabled=enabled=>{orbCtl.camera=!!enabled;
+  if(!enabled){orbCtl.handX=orbCtl.handY=orbCtl.handSpread=orbCtl.handRoll=0;
+    orbCtl.handSeenAt=0;}};
+window.orionOrbHands=sample=>{
+  if(!orbCtl.camera||!orbReady()||!sample)return;
+  const n=Number(sample.hands)||0;
+  if(n<1){if(performance.now()-orbCtl.handSeenAt>250)
+    orbCtl.handX=orbCtl.handY=orbCtl.handSpread=orbCtl.handRoll=0;
+    return;}
+  orbCtl.handSeenAt=performance.now();
+  orbCtl.handX=orbClamp((Number(sample.x)||0)*62,-72,72);
+  orbCtl.handY=orbClamp((Number(sample.y)||0)*48,-55,55);
+  orbCtl.handSpread=n>=2?clamp01(sample.spread):0;
+  orbCtl.handRoll=n>=2?orbClamp(Number(sample.twist)||0,-0.65,0.65):0;
+};
+const orbCanvas=renderer.domElement;
+orbCanvas.style.touchAction='none';
+orbCanvas.addEventListener('pointerdown',e=>{
+  if(!orbReady())return;
+  orbCtl.drag={id:e.pointerId,x:e.clientX,y:e.clientY,
+    mode:e.button===2?'rotate':(e.shiftKey?'spread':'move')};
+  orbCanvas.setPointerCapture(e.pointerId); e.preventDefault();
+});
+orbCanvas.addEventListener('pointermove',e=>{
+  const d=orbCtl.drag; if(!d||d.id!==e.pointerId||!orbReady())return;
+  const dx=e.clientX-d.x,dy=e.clientY-d.y,r=orbCanvas.getBoundingClientRect();
+  d.x=e.clientX; d.y=e.clientY;
+  if(d.mode==='move'){
+    orbCtl.mouseX=orbClamp(orbCtl.mouseX+dx/Math.max(1,r.width)*165,-72,72);
+    orbCtl.mouseY=orbClamp(orbCtl.mouseY-dy/Math.max(1,r.height)*155,-55,55);
+  }else if(d.mode==='rotate'){
+    orbCtl.tyaw=orbClamp(orbCtl.tyaw+dx*0.012,-2.5,2.5);
+    orbCtl.tpitch=orbClamp(orbCtl.tpitch+dy*0.012,-1.2,1.2);
+  }else orbCtl.mouseSpread=clamp01(orbCtl.mouseSpread-dy/Math.max(1,r.height)*2.4);
+  e.preventDefault();
+});
+const endOrbDrag=e=>{if(orbCtl.drag&&orbCtl.drag.id===e.pointerId)orbCtl.drag=null;};
+orbCanvas.addEventListener('pointerup',endOrbDrag);
+orbCanvas.addEventListener('pointercancel',endOrbDrag);
+orbCanvas.addEventListener('lostpointercapture',endOrbDrag);
+orbCanvas.addEventListener('contextmenu',e=>{if(orbReady())e.preventDefault();});
+orbCanvas.addEventListener('wheel',e=>{
+  if(!orbReady())return;
+  orbCtl.mouseSpread=clamp01(orbCtl.mouseSpread-e.deltaY*0.0012);e.preventDefault();
+},{passive:false});
+orbCanvas.addEventListener('dblclick',e=>{
+  if(!orbReady())return;
+  orbCtl.mouseX=orbCtl.mouseY=orbCtl.mouseSpread=orbCtl.tyaw=orbCtl.tpitch=0;
+  e.preventDefault();
+});
 window.orionEmotion=p=>{ if(!p)return;
   const m={voxel_density:'density',glow:'glow',glow_pulse:'pulse',speed:'speed',particle_velocity:'pvel',
     turbulence:'turb',brow:'brow',eye_height:'eyeH',eye_width:'eyeW',mouth_curve:'mouthCurve',mouth_tension:'tension'};
@@ -311,15 +375,21 @@ addEventListener('message',e=>{const d=e.data||{};try{
   if(d.spectrum!==undefined)window.orionSpectrum(d.spectrum.low,d.spectrum.mid,d.spectrum.high);
   if(d.morph!==undefined)window.orionMorph(d.morph);
   if(d.emotion)window.orionEmotion(d.emotion);
+  if(d.presentation&&window.orionPresentation)window.orionPresentation(d.presentation);
   if(d.label)window.orionLabel(d.label);
   if(d.state)window.orionState(d.state);
 }catch(_){}});
-window.orionPose=(y,x)=>{rig.rotation.y=y||0; rig.rotation.x=x||0; poseHold=1.0;};
+window.orionPose=(y,x)=>{poseTarget.y=y||0; poseTarget.x=x||0; poseHold=1.0;};
+// Scale on idle drift and breathing only (the Reduced motion preference);
+// speech, lips and expressions are untouched. 1 = exactly as designed.
+let motionScale=__MOTION_SCALE__;
+window.orionMotion=m=>{const v=+m; motionScale=isFinite(v)?Math.max(0,Math.min(1,v)):1;};
 window.orionSnap=(w=420,q=0.6)=>{composer.render();
   const c=document.createElement('canvas'); c.width=w; c.height=Math.round(w*innerHeight/innerWidth);
   c.getContext('2d').drawImage(renderer.domElement,0,0,c.width,c.height);
   return c.toDataURL('image/jpeg',q);};
 let poseHold=0;
+const poseTarget={x:0,y:0};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // FIELD — the anatomy.  One radial function shapes every layer of the being.
@@ -978,6 +1048,80 @@ const latt=new THREE.Mesh(new THREE.IcosahedronGeometry(57,1),
     blending:THREE.AdditiveBlending,depthWrite:false}));
 rig.add(ring1); rig.add(ring2); rig.add(latt);
 
+let uiScale=1,uiIntensity=1,uiColour=null,uiRings=true,orbitGeneration=0;
+const imageOrbit=new THREE.Group();scene.add(imageOrbit);
+function clearImageOrbit(){orbitGeneration++;for(const child of [...imageOrbit.children]){
+ imageOrbit.remove(child);child.geometry.dispose();if(child.material.map)child.material.map.dispose();child.material.dispose();}}
+window.orionPresentation=p=>{
+ if(!p)return;
+ if(p.operation==='ui_reset'){uiScale=1;uiIntensity=1;uiColour=null;uiRings=true;clearImageOrbit();
+  core.geometry.dispose();core.geometry=new THREE.SphereGeometry(30,48,36);return;}
+ if(p.operation==='ui_reactor'){
+  const shapes={sphere:()=>new THREE.SphereGeometry(30,48,36),torus:()=>new THREE.TorusGeometry(26,9,16,48),
+   cube:()=>new THREE.BoxGeometry(45,45,45),octahedron:()=>new THREE.OctahedronGeometry(34),
+   icosahedron:()=>new THREE.IcosahedronGeometry(34,1)};
+  if(!shapes[p.shape])return;core.geometry.dispose();core.geometry=shapes[p.shape]();
+  uiScale=Math.max(.2,Math.min(3,Number(p.scale)||1));uiIntensity=Math.max(0,Math.min(3,Number(p.intensity)));
+  uiColour=/^#[0-9a-f]{6}$/i.test(p.colour)?new THREE.Color(p.colour):null;uiRings=p.rings!==false;
+ }else if(p.operation==='ui_orbit'){
+  clearImageOrbit();const generation=orbitGeneration;
+  (p.images||[]).slice(0,4).forEach((source,index)=>{
+   if(!/^data:image\/(png|jpeg|gif|webp);base64,/.test(source))return;
+   new THREE.TextureLoader().load(source,texture=>{
+    if(generation!==orbitGeneration){texture.dispose();return;}
+    texture.colorSpace=THREE.SRGBColorSpace;
+    const aspect=Math.max(.3,Math.min(3,texture.image.width/texture.image.height));
+    const picture=new THREE.Mesh(new THREE.PlaneGeometry(32*aspect,32),
+     new THREE.MeshBasicMaterial({map:texture,transparent:true,side:THREE.DoubleSide}));
+    picture.userData.angle=index*Math.PI/2;imageOrbit.add(picture);
+   });
+  });
+ }else if(p.operation==='ui_effect'){
+  const effects={pulse:[{opacity:1},{opacity:.7},{opacity:1}],flash:[{filter:'brightness(1)'},{filter:'brightness(1.25)'},{filter:'brightness(1)'}],
+   scan:[{filter:'contrast(1)'},{filter:'contrast(1.3)'},{filter:'contrast(1)'}],
+   shake:[{transform:'translateX(0)'},{transform:'translateX(3px)'},{transform:'translateX(-3px)'},{transform:'translateX(0)'}],
+   glitch:[{filter:'saturate(1)'},{filter:'saturate(0)'},{filter:'saturate(1)'}]};
+  if(effects[p.kind])renderer.domElement.animate(effects[p.kind],{duration:450,iterations:1});
+ }
+};
+
+// Fine dust appears as the orb is pulled apart. Its displacement stays on the
+// GPU; the existing cube shell supplies the larger fragments underneath.
+const orbDustUni={uSpread:{value:0},uTime:{value:0},uPx:{value:renderer.getPixelRatio()},
+  uBright:{value:st.bright.clone()},uAccent:{value:st.accent.clone()}};
+let orbDust=null;
+{
+  const count=12000,pos=new Float32Array(count*3),seed=new Float32Array(count);
+  for(let i=0;i<count;i++){
+    const y=Math.random()*2-1,a=Math.random()*Math.PI*2,r=27+Math.random()*28;
+    const side=Math.sqrt(1-y*y);
+    pos[i*3]=Math.cos(a)*side*r;pos[i*3+1]=y*r;pos[i*3+2]=Math.sin(a)*side*r;
+    seed[i]=Math.random();
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  geo.setAttribute('aSeed',new THREE.BufferAttribute(seed,1));
+  orbDust=new THREE.Points(geo,new THREE.ShaderMaterial({
+    uniforms:orbDustUni,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,
+    vertexShader:`uniform float uSpread,uTime,uPx; attribute float aSeed;
+      varying float vAlpha,vSeed;
+      void main(){vec3 dir=normalize(position+vec3(0.001));
+        vec3 p=position+dir*uSpread*(24.0+48.0*aSeed);
+        p.x+=sign(position.x)*uSpread*(35.0+35.0*aSeed);
+        p.y+=sin(uTime*1.7+aSeed*73.0)*uSpread*3.0;
+        vec4 mv=modelViewMatrix*vec4(p,1.0);
+        gl_Position=projectionMatrix*mv;
+        gl_PointSize=(1.3+1.9*aSeed)*uPx*(340.0/max(40.0,-mv.z));
+        vAlpha=uSpread*(0.35+0.65*aSeed);vSeed=aSeed;}`,
+    fragmentShader:`uniform vec3 uBright,uAccent;varying float vAlpha,vSeed;
+      void main(){float d=length(gl_PointCoord-0.5);
+        float a=(1.0-smoothstep(0.08,0.5,d))*vAlpha;
+        if(a<0.005)discard;
+        gl_FragColor=vec4(mix(uAccent,uBright,vSeed),a);}`
+  }));
+  orbDust.frustumCulled=false;orbDust.visible=false;rig.add(orbDust);
+}
+
 // Scan ring — a data sweep across the head during detailing + processing.
 const scanRing=new THREE.Mesh(new THREE.TorusGeometry(1,0.16,6,72),
   new THREE.MeshBasicMaterial({color:0xff2a44,transparent:true,opacity:0,
@@ -1125,10 +1269,8 @@ let parts=[], pgeo=null, ppos=null, pmat=null;
     blending:THREE.AdditiveBlending,depthWrite:false});
   scene.add(new THREE.Points(pgeo,pmat));
 }
-// Reaching here means Three.js loaded and the scene is built — disarm the
-// offline watchdog before it can fire a false "no internet" message.
-{try{window.__orionFaceBooted&&window.__orionFaceBooted();}catch(_){}
- const l=document.getElementById('loading'); if(l)l.remove();}
+// Scene construction alone does not prove the compositor can draw. Keep the
+// startup guard armed until the first completed, non-lost render below.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ANIMATION — 7-stage materialisation timeline, speech, gaze, behaviour.
@@ -1166,7 +1308,19 @@ function step(dt){
   const sFrame=stage(0.45,0.70), sDetail=stage(0.62,0.88), sSkin=stage(0.66,0.92);
   const sEyes=stage(0.86,0.97), sTorso=stage(0.93,1.0);
   const face=morphT;
+  const orbFactor=1-sstep(0.08,0.45,morphT);
+  const orbEase=1-Math.exp(-dt*10);
+  orbCtl.tx=orbClamp(orbCtl.mouseX+orbCtl.handX,-72,72);
+  orbCtl.ty=orbClamp(orbCtl.mouseY+orbCtl.handY,-55,55);
+  orbCtl.ts=Math.max(orbCtl.mouseSpread,orbCtl.handSpread);
+  orbCtl.troll=orbCtl.handRoll;
+  for(const [now,target] of [['x','tx'],['y','ty'],['spread','ts'],
+                             ['yaw','tyaw'],['pitch','tpitch'],['roll','troll']])
+    orbCtl[now]=lerp(orbCtl[now],orbCtl[target],orbEase);
+  const orbSpread=orbCtl.spread*orbFactor;
+  cam.position.z=lerp(cam.position.z,268+orbSpread*145,orbEase);
   window.__dbg={morphT,fps:Math.round(1000/Math.max(1,frameEMA)),
+    orbSpread,orbPosition:{x:rig.position.x,y:rig.position.y},
     stages:{destab:sDestab,burst:sBurst,struct:sStruct,frame:sFrame,detail:sDetail,skin:sSkin,eyes:sEyes,torso:sTorso}};
 
   // ── speech envelope → jaw, spectral visemes, energy ───────────────────────
@@ -1233,22 +1387,31 @@ function step(dt){
   const breathe=1+0.035*Math.sin(clock*1.05)+0.012*Math.sin(clock*2.7);
   core.visible=orbLife>0.02;
   if(core.visible){
-    core.scale.setScalar(orbLife*breathe*(1+sDestab*0.22));
+    core.scale.setScalar(uiScale*orbLife*breathe*(1+sDestab*0.22)*(1-orbSpread*0.94));
     coreUni.uTime.value=clock*(1+sDestab*2.5);
-    coreUni.uHeat.value=0.45+st.glow*0.5+sDestab*1.4+st.amp*0.4;
-    coreUni.uAccent.value.copy(st.accent); coreUni.uBright.value.copy(st.bright);
+    coreUni.uHeat.value=uiIntensity*(0.45+st.glow*0.5+sDestab*1.4+st.amp*0.4);
+    coreUni.uAccent.value.copy(uiColour||st.accent); coreUni.uBright.value.copy(uiColour||st.bright);
   }
-  ring1.visible=ring2.visible=latt.visible=core.visible;
+  ring1.visible=ring2.visible=latt.visible=core.visible&&uiRings;
+  imageOrbit.visible=core.visible;
+  for(const picture of imageOrbit.children){const angle=picture.userData.angle+clock*.12;
+   picture.position.set(Math.cos(angle)*86,Math.sin(angle)*64,0);picture.quaternion.copy(camera.quaternion);}
   if(latt.visible){
     const spin=1+sDestab*5;
     ring1.rotation.x=1.1+clock*0.5*spin; ring1.rotation.y=clock*0.33*spin;
     ring2.rotation.x=-0.6-clock*0.41*spin; ring2.rotation.z=clock*0.27*spin;
     latt.rotation.y=clock*0.21*spin; latt.rotation.x=Math.sin(clock*0.3)*0.4;
-    const ro=orbLife*(0.35+sDestab*0.5+st.amp*0.2);
-    ring1.material.opacity=ro; ring2.material.opacity=ro*0.8; latt.material.opacity=orbLife*0.26;
+    const ro=orbLife*(0.35+sDestab*0.5+st.amp*0.2)*(1-orbSpread*0.88);
+    ring1.material.opacity=ro; ring2.material.opacity=ro*0.8;
+    latt.material.opacity=orbLife*0.26*(1-orbSpread*0.88);
     ring1.scale.setScalar(orbLife*breathe); ring2.scale.setScalar(orbLife*breathe);
     latt.scale.setScalar(orbLife*breathe);
     ring1.material.color.copy(st.accent); ring2.material.color.copy(st.accent);
+  }
+  orbDust.visible=orbSpread>0.015;
+  if(orbDust.visible){
+    orbDustUni.uSpread.value=orbSpread;orbDustUni.uTime.value=clock;
+    orbDustUni.uBright.value.copy(st.bright);orbDustUni.uAccent.value.copy(st.accent);
   }
 
   // ── skin membranes: knit-in, speech-reactive under-skin data flow ─────────
@@ -1375,6 +1538,10 @@ function step(dt){
       const rx=x*cx-z*sx, rz=x*sx+z*cx; x=rx; z=rz;}
     x+=nn*jitter*0.30; y+=Math.cos(clock*1.5+h.phase)*jitter*0.30; z+=nn*jitter*0.26;
     x+=h.nx*disS*5; y+=h.ny*disS*5; z+=h.nz*disS*5;
+    // Orb only: pulling two hands apart splits the shell into fine fragments.
+    x+=orbSpread*(ox/ORB_R*37+(ox<0?-1:1)*47);
+    y+=orbSpread*oy/ORB_R*35;
+    z+=orbSpread*oz/ORB_R*37;
     // jaw-follow for the lower-face cubes
     // Scalar maths in place, NOT jawApply({x,y,z}): that built two objects
     // per cube per frame — 8,500 cubes at 60 fps, ~33 MB/s of garbage while
@@ -1392,7 +1559,7 @@ function step(dt){
     const sockClear=(1-0.75*h.sock*sEyes)*(1-0.60*h.mouth*sEyes);
     const qs=(1+0.10*Math.sin(clock*3.2+h.phase*2.0))*settle*sockClear*(1-disS*0.9);
     let show=1; if(hide>0 && ((i*2654435761)%1000)/1000<hide*0.5) show=0;
-    dummy.scale.setScalar(show*qs*(1+st.amp*0.08));
+    dummy.scale.setScalar(show*qs*(1+st.amp*0.08)*(1-orbSpread*0.78));
     qA.copy(h.oquat).slerp(h.quat,am); dummy.quaternion.copy(qA);
     dummy.rotateZ(disS*3*h.swirl);
     dummy.updateMatrix(); mesh.setMatrixAt(i,dummy.matrix);
@@ -1446,7 +1613,12 @@ function step(dt){
   bgCubes.position.y=Math.sin(clock*0.11)*4;
 
   // ── presence: living head motion (speech nods, idle drift, listening) ─────
-  if(poseHold>0){poseHold-=dt;}
+  // The head EASES toward where it should be. Tracked poses arrive about 20
+  // times a second and idle drift resumes a second after they stop; both used
+  // to be written straight into the rig, so the head moved in 20 Hz steps and
+  // snapped between the tracked and idle pose whenever tracking paused.
+  let wantY=rig.rotation.y, wantX=rig.rotation.x, wantZ=rig.rotation.z;
+  if(poseHold>0){poseHold-=dt; wantY=poseTarget.y; wantX=poseTarget.x;}
   else{
     nodP=lerp(nodP,speakEnv,0.2);
     // Idle drift uses two slow incommensurate frequencies so it reads as LIVING
@@ -1454,17 +1626,26 @@ function step(dt){
     // running"), at a deliberately small amplitude (was a ±0.22rad sine swing).
     // It SETTLES while LISTENING so attention reads as stillness, not drift.
     const calm=1-listen*0.6;
-    rig.rotation.y=(Math.sin(clock*0.19)*0.6+Math.sin(clock*0.37)*0.4)*0.09*calm
+    wantY=(Math.sin(clock*0.19)*0.6+Math.sin(clock*0.37)*0.4)*0.09*calm*motionScale
       +Math.sin(clock*1.9)*0.015*nodP;
     // emotional posture: sadness droops the head, alertness leans in,
     // curiosity tilts — the body language half of the expression.  A faint
     // attentive lean-in while listening.
-    rig.rotation.x=-0.02+(Math.sin(clock*0.16)*0.6+Math.sin(clock*0.29)*0.4)*0.02*calm
+    wantX=-0.02+(Math.sin(clock*0.16)*0.6+Math.sin(clock*0.29)*0.4)*0.02*calm*motionScale
       -nodP*0.02+Math.sin(clock*2.3)*0.012*nodP-listen*0.02+exState.headX*face;
-    rig.rotation.z=Math.sin(clock*0.13)*0.010*calm+listen*0.04*Math.sin(clock*0.5)
+    wantZ=Math.sin(clock*0.13)*0.010*calm*motionScale+listen*0.04*Math.sin(clock*0.5)
       +exState.headZ*face;
   }
-  rig.position.y=Math.sin(clock*0.9)*0.6*face;                 // breathing
+  const poseEase=1-Math.exp(-dt*9);   // ~0.11 s to settle; slow drift passes through
+  if(orbFactor>0.5){
+    wantY=orbCtl.yaw;wantX=orbCtl.pitch;wantZ=orbCtl.roll;
+  }
+  rig.rotation.y+=(wantY-rig.rotation.y)*poseEase;
+  rig.rotation.x+=(wantX-rig.rotation.x)*poseEase;
+  rig.rotation.z+=(wantZ-rig.rotation.z)*poseEase;
+  rig.position.x=lerp(rig.position.x,orbCtl.x*orbFactor,poseEase);
+  rig.position.y=lerp(rig.position.y,orbCtl.y*orbFactor+
+    Math.sin(clock*0.9)*0.6*face*motionScale,poseEase);
   torsoRig.rotation.y=rig.rotation.y*0.35;                     // torso lags the head
   torsoRig.rotation.z=rig.rotation.z*0.5;
 }
@@ -1482,7 +1663,8 @@ let stepFault='';
 // only motion is a slow breath, which 30 fps carries as well as 60. Anything
 // that moves restores full rate on the very next frame, since this is checked
 // per frame rather than on a timer.
-const ACTIVE_FPS=60, IDLE_FPS=__IDLE_FPS__;
+const ACTIVE_FPS=60; let IDLE_FPS=__IDLE_FPS__;
+window.orionIdleFps=n=>{const v=n|0; IDLE_FPS=Math.max(10,Math.min(60,v||30));};
 // Hysteresis, and a dwell before dropping. The first version compared each
 // signal to one threshold every frame, and every signal here is an
 // exponential lerp that approaches its threshold asymptotically and sits on
@@ -1493,47 +1675,116 @@ const ACTIVE_FPS=60, IDLE_FPS=__IDLE_FPS__;
 // turned out to be: not a stall (the Qt thread showed zero pauses over 50 ms
 // in 60 s at 100 Hz) and not the GPU (3d engine ~11% mean), but the governor
 // meant to make him cheaper.
-// Leaving idle is instant and any one signal can do it; entering it needs
-// every signal calm for IDLE_AFTER consecutive frames.
+// Leaving idle is instant; entering it needs a full second of calm time.
+// Counting requestAnimationFrame callbacks made that dwell depend on display
+// refresh rate, including callbacks on which no frame was rendered.
 const QUIET_IN=0.010, QUIET_OUT=0.030;
 const SETTLE_IN=0.002, SETTLE_OUT=0.008;
-const IDLE_AFTER=60;
-let idleRate=false, calmFor=0;
-// The frame target is published as well as returned, because the quality
-// governor in step() needs it too and targetFrameMs() is NOT idempotent -
-// it advances the dwell counter. Calling it a second time per frame would
-// count the same calm frame twice.
+const IDLE_AFTER_MS=1000;
+let idleRate=false, quietSince=null;
+// Publish the frame target for the quality governor as well.
 let frameTargetMs=1000/ACTIVE_FPS;
 function targetFrameMs(){
+  const now=performance.now();
+  const activeState=['LISTENING','SPEAKING','THINKING','PROCESSING'].includes(mode);
+  const orbMoving=orbReady()&&(!!orbCtl.drag||
+    Math.abs(orbCtl.spread-orbCtl.ts)>0.005||
+    Math.abs(orbCtl.x-orbCtl.tx)>0.15||Math.abs(orbCtl.y-orbCtl.ty)>0.15);
   if(idleRate){
-    if(Math.abs(morphTarget-morphT)>SETTLE_OUT||st.amp>QUIET_OUT||speakEnv>QUIET_OUT){
-      idleRate=false; calmFor=0;
+    if(activeState||orbMoving||Math.abs(morphTarget-morphT)>SETTLE_OUT||
+       tg.amp>QUIET_OUT||st.amp>QUIET_OUT||speakEnv>QUIET_OUT){
+      idleRate=false; quietSince=null;
     }
   }else{
-    const calm=Math.abs(morphTarget-morphT)<SETTLE_IN&&st.amp<QUIET_IN&&speakEnv<QUIET_IN;
-    calmFor=calm?calmFor+1:0;
-    if(calmFor>=IDLE_AFTER){ idleRate=true; }
+    const calm=!activeState&&!orbMoving&&Math.abs(morphTarget-morphT)<SETTLE_IN&&
+      tg.amp<QUIET_IN&&st.amp<QUIET_IN&&speakEnv<QUIET_IN;
+    if(!calm)quietSince=null;
+    else if(quietSince===null)quietSince=now;
+    else if(now-quietSince>=IDLE_AFTER_MS)idleRate=true;
   }
   frameTargetMs=1000/(idleRate?IDLE_FPS:ACTIVE_FPS);
   return frameTargetMs;
 }
 
+let nextFrameAt=lastT;
+function takeRenderFrame(now){
+  const previousTarget=frameTargetMs;
+  const interval=targetFrameMs();
+  if(interval<previousTarget)nextFrameAt=Math.min(nextFrameAt,now);
+  if(now+Math.min(2,interval*0.12)<nextFrameAt)return false;
+  // Preserve the deadline's remainder. Resetting it to the last paint time
+  // dropped slightly early callbacks and produced alternating 16/33 ms
+  // frames on an otherwise healthy 60 Hz display.
+  const overdue=Math.max(0,now-nextFrameAt);
+  nextFrameAt+=Math.max(1,Math.floor(overdue/interval)+1)*interval;
+  return true;
+}
+
 function animate(){
   requestAnimationFrame(animate);
-  if(document.hidden)return;                 // never burn GPU unwatched
+  if(document.hidden){
+    lastT=performance.now(); nextFrameAt=lastT;
+    return;                                 // never burn GPU unwatched
+  }
   const now=performance.now();
-  // Half a millisecond of slack: without it a frame that arrives a hair early
-  // is dropped and the effective rate halves.
-  if(now-lastT<targetFrameMs()-0.5)return;
+  if(!takeRenderFrame(now))return;
   const dt=Math.min(0.05,(now-lastT)/1000); lastT=now;
   frameEMA=frameEMA*0.95+dt*1000*0.05;
-  try{step(dt);}catch(e){if(stepFault!==String(e)){stepFault=String(e);console.error('ORION avatar step fault:',e);}}
-  composer.render();
+  try{
+    step(dt);
+    if(renderer.getContext().isContextLost())return;
+    composer.render();
+    const renderState=window.__orionRender;
+    renderState.frames++;renderState.lastAt=performance.now();
+    if(renderState.frames===1){
+      window.__orionFaceBooted&&window.__orionFaceBooted();
+      const loading=document.getElementById('loading');if(loading)loading.remove();
+    }
+  }catch(e){
+    if(stepFault!==String(e)){stepFault=String(e);console.error('ORION avatar render fault:',e);}
+    window.__orionRenderFailed&&window.__orionRenderFailed(String(e));
+  }
 }
 lastT=performance.now();
 animate();
-addEventListener('resize',()=>{fitCamera();
-  renderer.setSize(innerWidth,innerHeight);composer.setSize(innerWidth,innerHeight);});
+// Counters QuantumFace3D reads every few seconds (_poll_health). A black flash
+// used to leave no trace at all: was the WebGL context lost, the page resized,
+// or the renderer stalled? preventDefault lets Chromium restore a lost context,
+// and the restored one is drawn at once rather than a whole idle frame later.
+// A hitch (>= 50 ms, three frames at 60 Hz) is visible stutter; a gap
+// (> 400 ms) is a stalled renderer. maxHitch/maxGap are the page's lifetime
+// worst; winHitch/winGap the worst since ORION last read them (he resets them).
+window.orionHealth={lost:0,restored:0,resizes:0,gaps:0,maxGap:0,hitches:0,maxHitch:0,winHitch:0,winGap:0};
+let healthAt=performance.now();
+(function watchFrames(t){
+  const gap=t-healthAt;
+  if(!document.hidden){
+    if(gap>=50){const g=Math.round(gap);orionHealth.hitches++;orionHealth.maxHitch=Math.max(orionHealth.maxHitch,g);orionHealth.winHitch=Math.max(orionHealth.winHitch,g);}
+    if(gap>400){const g=Math.round(gap);orionHealth.gaps++;orionHealth.maxGap=Math.max(orionHealth.maxGap,g);orionHealth.winGap=Math.max(orionHealth.winGap,g);}
+  }
+  healthAt=t;requestAnimationFrame(watchFrames);
+})(performance.now());
+document.addEventListener('visibilitychange',()=>{healthAt=performance.now();});
+renderer.domElement.addEventListener('webglcontextlost',e=>{
+  e.preventDefault();orionHealth.lost++;
+  window.__orionRender.lost=true;window.__orionRender.lostAt=performance.now();
+},false);
+renderer.domElement.addEventListener('webglcontextrestored',()=>{
+  orionHealth.restored++;window.__orionRender.lost=false;
+},false);
+// setSize clears the canvas, and the next frame may be a whole idle interval
+// away (100 ms at 10 fps): until then the compositor showed an empty, black
+// canvas - one flash per resize. Redraw in the same task, so a cleared canvas
+// is never presented, and only when the size really changed.
+let sizedW=innerWidth,sizedH=innerHeight;
+addEventListener('resize',()=>{
+  if(innerWidth===sizedW&&innerHeight===sizedH)return;
+  sizedW=innerWidth;sizedH=innerHeight;
+  orionHealth.resizes++;
+  fitCamera();
+  renderer.setSize(innerWidth,innerHeight);composer.setSize(innerWidth,innerHeight);
+  try{composer.render();}catch(e){}
+});
 </script></body></html>"""
 
 
@@ -1545,6 +1796,50 @@ THREE_DIR = "assets/three"
 THREE_VERSION = "0.160.0"
 
 CDN_BASE = f"https://cdn.jsdelivr.net/npm/three@{THREE_VERSION}/"
+
+
+#: Reads the page's health counters and starts a new reading window (the
+#: per-reading worst stutter), in one evaluation so no frame falls between.
+HEALTH_READ_JS = ("(()=>{const h=window.orionHealth;if(!h)return 'null';"
+                  "const s=JSON.stringify(h);h.winHitch=0;h.winGap=0;return s;})()")
+
+
+def health_change(seen: dict[str, int], raw: Any) -> str:
+    """One readable line for what changed in the page's health counters since
+    *seen* (updated in place), or '' when nothing did."""
+    try:
+        now = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return ""
+    if not isinstance(now, dict):
+        return ""
+    parts = []
+    labels = (("lost", "WebGL context lost"), ("restored", "WebGL context restored"),
+              ("resizes", "resized"), ("hitches", "stuttered"), ("gaps", "renderer stalled"))
+    # "longest" is the worst of THESE stutters: the page's per-reading worst
+    # (winHitch/winGap, reset by HEALTH_READ_JS) where it reports one. 16 Oct
+    # 2026: the lifetime maximum was quoted instead, so every FACE line of the
+    # session said "(longest 1017 ms)" - one boot-time gap repeated 20 times
+    # and read as twenty one-second freezes.
+    longest = {"gaps": ("winGap", "maxGap"), "hitches": ("winHitch", "maxHitch")}
+    for key, label in labels:
+        try:
+            value = int(now.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        delta = value - seen.get(key, 0)
+        if delta > 0:
+            extra = ""
+            if key in longest:
+                window, lifetime = longest[key]
+                worst = now.get(window) if window in now else now.get(lifetime)
+                try:
+                    extra = f" (longest {int(worst or 0)} ms)"
+                except (TypeError, ValueError):
+                    extra = ""
+            parts.append(f"{label} x{delta}{extra}")
+        seen[key] = value
+    return "; ".join(parts)
 
 
 def local_three() -> "Path | None":
@@ -1662,8 +1957,9 @@ def idle_fps() -> int:
     import os
 
     try:
-        wanted = int(str(os.getenv("ORION_FACE_IDLE_FPS", "")).strip() or 30)
-    except ValueError:
+        wanted = int(str(os.getenv("ORION_FACE_IDLE_FPS", "")).strip()
+                     or getattr(_motion(), "idle_fps", 30))
+    except (TypeError, ValueError):
         return 30
     return max(10, min(60, wanted))
 
@@ -1692,8 +1988,22 @@ def three_sourced(html: str) -> str:
         base = "./"
     else:
         base = CDN_BASE
+    profile = _motion()
     return (html.replace("__THREE_BASE__", base)
-                .replace("__IDLE_FPS__", str(idle_fps())))
+                .replace("__IDLE_FPS__", str(idle_fps()))
+                .replace("__PIXEL_CAP__", f"{profile.pixel_cap:.2f}")
+                .replace("__MOTION_SCALE__", f"{profile.ambient:.2f}"))
+
+
+def _motion() -> Any:
+    """The motion/performance preference (appearance.motion_profile), or the
+    designed defaults if it cannot be read."""
+    try:
+        from ..appearance import motion_profile
+        return motion_profile()
+    except Exception:
+        from types import SimpleNamespace
+        return SimpleNamespace(pixel_cap=1.75, ambient=1.0, idle_fps=30)
 
 
 
@@ -1875,26 +2185,45 @@ class QuantumFace3D(QWidget):
     """Real-time GPU quantum human — holographic data head with orb morph."""
 
     available = WEBENGINE_OK
-    # States where ORION collapses back to the glowing orb (dormant/idle).
-    _ORB_STATES = {"STANDBY", "INITIALISING", "OFFLINE", "SHUTTING DOWN"}
-
+    owns_materialisation = True
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.state_name = "STANDBY"
-        # "face": the state decides (orb when dormant, him when active).
-        # "orb": held in the orb whatever he is doing — the form somebody asks
-        # for when a human face is not what the room wants. Pinned HERE rather
-        # than by swapping widgets, so switching is the page's own morph (a
-        # second and a half, no reload) instead of a new Chromium page.
+        # Both choices are pinned. Listening, speech and idle change the
+        # expression, never the appearance selected in the menu. JavaScript
+        # owns one reversible morph timeline; Python supplies its endpoint.
         self._form = "face"
+        self._orb_camera_enabled = False
         self._built = False
+        self._render_failure = ""
+        self._software_fallback: Any = None
         self._pending_emotion: tuple[str, dict] | None = None
+        # The Motion preference applies live. Held weakly: a face torn down
+        # and rebuilt (orb/face swaps, overlay mode) must not be kept alive,
+        # or called, by the preference it once listened to.
+        try:
+            import weakref
+            from .. import appearance
+            ref = weakref.ref(self)
+
+            def _on_motion(profile: Any, _ref=ref) -> None:
+                face = _ref()
+                if face is None:
+                    appearance.remove_motion_listener(_on_motion)
+                else:
+                    face._apply_motion(profile)
+            appearance.on_motion_change(_on_motion)
+        except Exception:
+            pass
         # AvatarController updates these values at 20 Hz.  Keep the visual
         # stream smooth while avoiding a QtWebEngine IPC call for every tiny
         # tracking jitter; the values are reset whenever the page is rebuilt.
         self._last_js_amplitude: float | None = None
         self._last_js_spectrum: tuple[float, float, float] | None = None
         self._last_js_pose: tuple[float, float] | None = None
+        self._last_js_morph: float | None = None
+        self._last_js_state: str | None = None
+        self._last_js_label: str | None = None
         # The last emotion sent, so a reloaded page gets it back; and when the
         # renderer died recently, so a crash loop is not reloaded forever.
         self._last_emotion: dict | None = None
@@ -1905,7 +2234,7 @@ class QuantumFace3D(QWidget):
         self.view: Any = None
         self.timer = QTimer(self)      # interface parity
         if WEBENGINE_OK:
-            self._placeholder = QLabel("◉  ORION materialises when you open this view.")
+            self._placeholder = QLabel("")
             self._placeholder.setObjectName("mutedLabel")
             self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(self._placeholder)
@@ -1922,6 +2251,14 @@ class QuantumFace3D(QWidget):
             self._placeholder.deleteLater()
             self._placeholder = None
         self.view = QWebEngineView()
+        try:
+            # The page's own backdrop (#020207), so a frame Chromium has not
+            # drawn yet - a load, a surface swap - matches him instead of
+            # flashing the default white.
+            from PyQt6.QtGui import QColor
+            self.view.page().setBackgroundColor(QColor("#020207"))
+        except Exception:
+            pass
         self._reset_js_stream_cache()
         try:
             # A call made while Chromium is still loading can be accepted by
@@ -1945,8 +2282,24 @@ class QuantumFace3D(QWidget):
             self.view.setUrl(
                 QUrl(f"{ORION_SCHEME}://three/{_AssetHandler.PAGE}"))
         else:
-            self.view.setHtml(three_sourced(FACE_HTML), _three_base_url())
+            # Missing/broken local serving is an offline failure, not consent
+            # to fetch a CDN. Draw an orb now while the owner replaces this rig.
+            self._render_failure = "the local avatar assets cannot be served"
+            self.view.deleteLater()
+            self.view = None
+            from .hud import CentralHud
+            self._software_fallback = CentralHud(self)
+            self._software_fallback.set_state(self.state_name)
+            self._layout.addWidget(self._software_fallback)
+            return
         self._layout.addWidget(self.view)
+        # Read the page's own health counters (window.orionHealth) so a black
+        # flash or a stalled renderer leaves a line in the session log.
+        self._health_seen: dict[str, int] = {}
+        self._health_timer = QTimer(self)
+        self._health_timer.setInterval(self.HEALTH_POLL_MS)
+        self._health_timer.timeout.connect(self._poll_health)
+        self._health_timer.start()
         if self._pending_emotion is not None:
             name, params = self._pending_emotion
             self.apply_emotion(name, params)
@@ -1960,6 +2313,9 @@ class QuantumFace3D(QWidget):
 
     def set_amplitude(self, value: float) -> None:
         amplitude = max(0.0, min(1.0, float(value)))
+        fallback = getattr(self, "_software_fallback", None)
+        if fallback is not None:
+            fallback.set_amplitude(amplitude)
         if self.view is None:
             return
         if (self._last_js_amplitude is not None
@@ -1987,11 +2343,11 @@ class QuantumFace3D(QWidget):
 
     def set_state(self, state: str) -> None:
         self.state_name = str(state or "STANDBY").upper()
+        fallback = getattr(self, "_software_fallback", None)
+        if fallback is not None:
+            fallback.set_state(self.state_name)
         self._js(f"window.orionLabel&&orionLabel({json.dumps('ORION · ' + self.state_name)})")
-        # Materialise the quantum human when present; collapse to the orb when
-        # dormant — or always, while the orb form is pinned.
-        morph = 0.0 if (self._form == "orb" or self.state_name in self._ORB_STATES) else 1.0
-        self._js(f"window.orionMorph&&orionMorph({morph})")
+        self._apply_form()
         # The page reacts to the state itself too (PROCESSING data surge,
         # LISTENING eye tracking, pupil contraction).
         self._js(f"window.orionState&&orionState({json.dumps(self.state_name)})")
@@ -2054,18 +2410,84 @@ class QuantumFace3D(QWidget):
 
     def set_pose(self, yaw: float, pitch: float) -> None:
         """Rotate the head rig — the AvatarController's face-tracking follow."""
+        import time
         pose = (float(yaw), float(pitch))
         if self.view is None:
             return
+        now = time.monotonic()
+        # Unchanged poses are skipped, but not for long: the page holds a
+        # tracked pose for one second, and when the person sat still the
+        # updates stopped, the hold lapsed and the head swung back to its idle
+        # drift until the next small movement swung it back again.
         if (self._last_js_pose is not None
-                and max(abs(a - b) for a, b in zip(pose, self._last_js_pose)) < 0.003):
+                and max(abs(a - b) for a, b in zip(pose, self._last_js_pose)) < 0.003
+                and now - getattr(self, "_last_js_pose_at", 0.0) < 0.5):
             return
         if self._js(f"window.orionPose&&orionPose({pose[0]:.4f},{pose[1]:.4f})"):
             self._last_js_pose = pose
+            self._last_js_pose_at = now
 
     def set_morph(self, value: float) -> None:
-        """Scrub the orb↔human materialisation directly (0 orb … 1 human)."""
-        self._js(f"window.orionMorph&&orionMorph({max(0.0, min(1.0, float(value))):.3f})")
+        """Retain the legacy bridge without overriding a selected form.
+
+        Old behaviour controllers still send their own interpolated values.
+        Accepting those created a second materialisation timeline competing
+        with the menu selection. The renderer always follows the chosen form.
+        """
+        self._apply_form()
+
+    def _apply_form(self) -> None:
+        morph = 0.0 if self._form == "orb" else 1.0
+        if self._last_js_morph == morph:
+            return
+        if self._js(f"window.orionMorph&&orionMorph({morph:.3f})"):
+            self._last_js_morph = morph
+
+    def set_avatar_frame(self, frame: dict[str, Any]) -> None:
+        """Send one ordered behaviour frame, leaving the form timeline alone."""
+        import time
+
+        self.state_name = str(frame.get("js_state") or "IDLE").upper()
+        fallback = getattr(self, "_software_fallback", None)
+        if fallback is not None:
+            fallback.set_state(self.state_name)
+            fallback.set_amplitude(frame.get("amplitude", 0.0))
+            return
+        if self.view is None:
+            return
+        now = time.monotonic()
+        calls = []
+        updates = {}
+        if self.state_name != self._last_js_state:
+            calls.append(f"window.orionState&&orionState({json.dumps(self.state_name)})")
+            updates["_last_js_state"] = self.state_name
+        label = str(frame.get("label") or "ORION")[:60]
+        if label != self._last_js_label:
+            calls.append(f"window.orionLabel&&orionLabel({json.dumps(label)})")
+            updates["_last_js_label"] = label
+        amp = max(0.0, min(1.0, float(frame.get("amplitude", 0.0))))
+        if self._last_js_amplitude is None or abs(amp - self._last_js_amplitude) >= 0.008:
+            calls.append(f"window.orionAmplitude&&orionAmplitude({amp:.3f})")
+            updates["_last_js_amplitude"] = amp
+        bands = tuple(max(0.0, min(1.0, float(frame.get(key, 0.0))))
+                      for key in ("spectrum_low", "spectrum_mid", "spectrum_high"))
+        if (self._last_js_spectrum is None or
+                max(abs(a - b) for a, b in zip(bands, self._last_js_spectrum)) >= 0.012):
+            calls.append(f"window.orionSpectrum&&orionSpectrum({bands[0]:.3f},{bands[1]:.3f},{bands[2]:.3f})")
+            updates["_last_js_spectrum"] = bands
+        pose = (float(frame.get("yaw", 0.0)), float(frame.get("pitch", 0.0)))
+        if (self._last_js_pose is None or
+                max(abs(a - b) for a, b in zip(pose, self._last_js_pose)) >= 0.003 or
+                now - getattr(self, "_last_js_pose_at", 0.0) >= 0.5):
+            calls.append(f"window.orionPose&&orionPose({pose[0]:.4f},{pose[1]:.4f})")
+            updates.update(_last_js_pose=pose, _last_js_pose_at=now)
+        if calls and self._js(";".join(calls)):
+            for key, value in updates.items():
+                setattr(self, key, value)
+
+    def set_presentation(self, payload: dict) -> None:
+        """Apply already validated orb controls without fetching remote assets."""
+        self._js(f"window.orionPresentation&&orionPresentation({json.dumps(payload)})")
 
     def set_label(self, text: str) -> None:
         self._js(f"window.orionLabel&&orionLabel({json.dumps(str(text)[:60])})")
@@ -2075,14 +2497,25 @@ class QuantumFace3D(QWidget):
         return self._form
 
     def set_form(self, form: str) -> str:
-        """Hold ORION in his orb ("orb") or let his state decide ("face").
+        """Hold the chosen face or orb through every behaviour state.
 
         Applied at once through the page's own morph; the orb still breathes,
         pulses with his voice and reacts to his state.
         """
         self._form = "orb" if str(form or "").strip().lower() == "orb" else "face"
-        self.set_state(self.state_name)
+        self._apply_form()
         return self._form
+
+    def set_orb_camera_enabled(self, enabled: bool) -> None:
+        self._orb_camera_enabled = bool(enabled)
+        self._js("window.orionOrbCameraEnabled&&window.orionOrbCameraEnabled("
+                 + ("true" if enabled else "false") + ")")
+
+    def set_orb_hands(self, sample: Any) -> None:
+        if self._form != "orb" or not self._orb_camera_enabled or not isinstance(sample, dict):
+            return
+        self._js("window.orionOrbHands&&window.orionOrbHands("
+                 + json.dumps(sample) + ")")
 
     def check_state(self, callback) -> None:
         """Report "alive", "failed" or "loading" to *callback*.
@@ -2092,15 +2525,18 @@ class QuantumFace3D(QWidget):
         treating them alike meant a slow start looked exactly like a machine
         without WebGL — which then latched a permanent fallback.
         """
-        if self.view is None:
+        if getattr(self, "_render_failure", "") or self.view is None:
             callback("failed")
             return
         try:
             self.view.page().runJavaScript(
                 "(function(){try{"
-                " if(window.__dbg && typeof window.__dbg.fps==='number')"
-                "  return 'alive';"
-                " return window.__orionFailed ? 'failed' : 'loading';"
+                " const r=window.__orionRender;"
+                " if(window.__orionFailed||(r&&r.error))return 'failed';"
+                " if(!r||r.frames<1)return 'loading';"
+                " if(document.hidden)return 'alive';"
+                " if(r.lost)return performance.now()-r.lostAt>5000?'failed':'loading';"
+                " return performance.now()-r.lastAt>10000?'failed':'alive';"
                 "}catch(e){return 'loading';}})()",
                 lambda result: callback(str(result or "loading")))
         except Exception:
@@ -2109,11 +2545,9 @@ class QuantumFace3D(QWidget):
     def check_alive(self, callback) -> None:
         """Ask the page whether its render loop is actually running.
 
-        ``window.__dbg`` is assigned inside the animation frame, so it exists
-        only once Three.js has loaded, compiled its shaders and drawn at least
-        once. Absent, something failed — WebGL unavailable, a GPU driver that
-        refuses, a corrupt vendored file — and the page is showing a message
-        where ORION should be.
+        Completed renders, their timestamps and explicit renderer failures
+        share the same check as the window's ongoing health watcher. Merely
+        constructing a scene or stepping its animation is insufficient.
 
         The page has always called ``window.orionFaceFailed`` in that case and
         nothing on this side ever listened, so the failure was invisible: no
@@ -2122,17 +2556,7 @@ class QuantumFace3D(QWidget):
         Asynchronous because runJavaScript is: *callback* receives True or
         False, on the GUI thread, whenever the page answers.
         """
-        if self.view is None:
-            callback(False)
-            return
-        try:
-            self.view.page().runJavaScript(
-                "(function(){try{return !!(window.__dbg &&"
-                " typeof window.__dbg.fps === 'number');}"
-                "catch(e){return false;}})()",
-                lambda result: callback(bool(result)))
-        except Exception:
-            callback(False)
+        self.check_state(lambda state: callback(state == "alive"))
 
     def _install_asset_handler(self) -> None:
         """Let the page fetch the vendored library, and nothing else."""
@@ -2149,12 +2573,10 @@ class QuantumFace3D(QWidget):
             else:
                 self._asset_handler = None
         except Exception as exc:
-            # Reported, not swallowed: falling back to the CDN is survivable,
-            # doing it silently is how the vendored copy went unused.
             self._asset_handler = None
             try:
                 print(f"[ORION] FACE: serving three.js locally failed ({exc}); "
-                      f"falling back to the CDN.", flush=True)
+                      f"using the software orb.", flush=True)
             except Exception:
                 pass
 
@@ -2162,6 +2584,9 @@ class QuantumFace3D(QWidget):
         self._last_js_amplitude = None
         self._last_js_spectrum = None
         self._last_js_pose = None
+        self._last_js_morph = None
+        self._last_js_state = None
+        self._last_js_label = None
 
     def _on_page_loaded(self, _ok: bool) -> None:
         """The document is ready: resend what a still-loading page dropped.
@@ -2170,10 +2595,30 @@ class QuantumFace3D(QWidget):
         navigating, before the page can run them, so the face used to start in
         its default state until the next change arrived.
         """
+        if not _ok:
+            self._render_failure = "the local avatar page did not load"
+            return
+        self._render_failure = ""
         self._reset_js_stream_cache()
         self.set_state(self.state_name)
         if self._last_emotion is not None:
             self._js(f"window.orionEmotion&&orionEmotion({json.dumps(self._last_emotion)})")
+        # The served page may predate a change of preference (it is cached for
+        # crash reloads), so the live values are always re-applied here.
+        self._apply_motion(_motion())
+        self.set_orb_camera_enabled(self._orb_camera_enabled)
+
+    def _apply_motion(self, profile: Any) -> None:
+        """Idle drift/breath scale and idle frame rate, without a reload.
+        The render-resolution cap applies from the next page load."""
+        try:
+            ambient = float(getattr(profile, "ambient", 1.0))
+            fps = int(os.getenv("ORION_FACE_IDLE_FPS", "").strip()
+                      or getattr(profile, "idle_fps", 30))
+        except (TypeError, ValueError):
+            ambient, fps = 1.0, 30
+        self._js(f"window.orionMotion&&window.orionMotion({ambient:.2f});"
+                 f"window.orionIdleFps&&window.orionIdleFps({max(10, min(60, fps))});")
 
     #: Reloads allowed inside RENDER_CRASH_WINDOW_S before the face is left
     #: alone, so a renderer that dies on every load cannot spin forever.
@@ -2198,10 +2643,32 @@ class QuantumFace3D(QWidget):
         except Exception:
             pass
         if len(self._render_crashes) > self.RENDER_CRASH_LIMIT:
+            self._render_failure = "the avatar renderer repeatedly crashed"
             print(f"[FACE3D] {detail} - repeated crashes, not reloading again.", flush=True)
             return
         print(f"[FACE3D] {detail} - reloading the face.", flush=True)
         QTimer.singleShot(500, self._reload_after_crash)
+
+    #: How often the page's health counters are read (only while visible).
+    HEALTH_POLL_MS = 5000
+
+    def _poll_health(self) -> None:
+        if self.view is None or not self.isVisible():
+            return
+        try:
+            self.view.page().runJavaScript(HEALTH_READ_JS, self._on_health)
+        except Exception:
+            pass
+
+    def _on_health(self, raw: Any) -> None:
+        """Log what changed since the last reading: lost/restored WebGL
+        contexts, resizes, and frame gaps over 400 ms (a stalled renderer)."""
+        line = health_change(self._health_seen, raw)
+        if not line:
+            return
+        from .. import session_log
+        session_log.write(f"FACE: {line}")
+        print(f"[FACE3D] {line}", flush=True)
 
     def _reload_after_crash(self) -> None:
         if self.view is None:

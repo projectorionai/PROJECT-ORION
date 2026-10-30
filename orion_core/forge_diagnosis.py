@@ -45,6 +45,9 @@ class FailureClass(str, Enum):
     NETWORK = "network"
     FILESYSTEM = "filesystem"
     RUNTIME_ERROR = "runtime_error"
+    #: The harness itself could not run (no interpreter, could not spawn):
+    #: nothing in the generated code is at fault, so no repair can help.
+    VERIFIER_UNAVAILABLE = "verifier_unavailable"
     UNKNOWN = "unknown"
 
 
@@ -94,6 +97,8 @@ _MISSING_MODULE_PATTERNS = (
 _SYNTAX_RE = re.compile(r"(?m)^\s*(SyntaxError|IndentationError|TabError)\b")
 _ASSERTION_RE = re.compile(r"(?m)^\s*AssertionError\b|^\s*assert\s")
 _TIMEOUT_RE = re.compile(r"(?i)subprocess timeout|timed out after|TimeoutExpired")
+#: sandbox._run_script's report that the harness itself failed to run.
+_VERIFIER_RE = re.compile(r"Verifier failed: ([^\n]*)")
 
 # A test calling run() wrongly, or a module not honouring the contract.
 _SIGNATURE_RE = re.compile(
@@ -245,6 +250,10 @@ _DIRECTIVES: dict[FailureClass, str] = {
         "exactly, or load it by path with importlib. This is a TEST defect: do "
         "not change the module."
     ),
+    FailureClass.VERIFIER_UNAVAILABLE: (
+        "Verification could not run on this machine. This is not a defect in "
+        "the code; do not change it."
+    ),
     FailureClass.UNKNOWN: (
         "The failure is not self-explanatory. Re-read the error output, state "
         "the most likely root cause in one comment line, and make the smallest "
@@ -288,6 +297,15 @@ def diagnose(
             missing_module=missing,
             consumes_attempt=consumes,
         )
+
+    # 0. The harness never ran the code at all (sandbox._run_script reports it
+    #    as "Verifier failed: ..."). It was "unknown -> repair both": 15
+    #    sessions in the installed app each paid four model "repairs" of code
+    #    that had never been executed (8-10 Oct).
+    harness = _VERIFIER_RE.search(text)
+    if harness:
+        return _built(FailureClass.VERIFIER_UNAVAILABLE, RepairTarget.NONE,
+                      harness.group(1).strip() or "the verifier could not run")
 
     # 1. Timeout — the process never got to report anything useful.
     if timed_out or _TIMEOUT_RE.search(text):

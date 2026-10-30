@@ -18,10 +18,12 @@ Grounded, not gimmicky:
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from threading import RLock
 
 from .constants import CONFIG_DIR
 from .db import apply_pragmas
@@ -39,7 +41,8 @@ DEFAULT_BREAK = 10
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    from .time_service import TIME
+    return TIME.now()
 
 
 def _iso(dt: datetime) -> str:
@@ -56,11 +59,11 @@ def resolve_cadence(preset: str | None, minutes: int | None = None,
     """Turn a spoken cadence ('a pomodoro', 'a deep block', '45 minutes') into a
     concrete (work, break) pair. Explicit minutes always win."""
     work, brk = PRESETS.get((preset or "").strip().lower(), (DEFAULT_WORK, DEFAULT_BREAK))
-    if minutes:
+    if minutes is not None:
         work = int(minutes)
         # A sensible break scales with the block if one wasn't asked for.
-        brk = int(break_minutes) if break_minutes else max(3, round(work / 5))
-    elif break_minutes:
+        brk = int(break_minutes) if break_minutes is not None else max(3, round(work / 5))
+    elif break_minutes is not None:
         brk = int(break_minutes)
     return max(1, work), max(0, brk)
 
@@ -101,6 +104,7 @@ class FocusStore:
         self.path = Path(path) if path is not None else (CONFIG_DIR / "focus.db")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._lock = RLock()
         # Mark XXVI: WAL + relaxed fsync - a committed write costs
         # 0.03 ms instead of 2.81 ms, and that time is paid on the
         # qasync/GUI thread. See orion_core/db.py.
@@ -121,6 +125,14 @@ class FocusStore:
                 energy_after INTEGER,
                 notes TEXT DEFAULT ''
             )""")
+        # The task being worked on, in small steps (the Focus page's list).
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS plan_steps (
+                position INTEGER PRIMARY KEY,
+                task TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0
+            )""")
         self._db.commit()
 
     def _row(self, row: sqlite3.Row) -> FocusSession:
@@ -133,6 +145,14 @@ class FocusStore:
             notes=row["notes"] or "")
 
     def add(self, s: FocusSession) -> FocusSession:
+        with self._lock:
+            with self._db:
+                row_id = self._insert(s)
+            s.id = row_id
+            return s
+
+    def _insert(self, s: FocusSession) -> int:
+        """Insert within the caller's transaction; publish the id after commit."""
         cur = self._db.execute(
             "INSERT INTO sessions (label, planned_minutes, break_minutes, kind, "
             "started_at, ended_at, completed, interruptions, energy_before, "
@@ -140,59 +160,115 @@ class FocusStore:
             (s.label, s.planned_minutes, s.break_minutes, s.kind, s.started_at,
              s.ended_at, int(s.completed), s.interruptions, s.energy_before,
              s.energy_after, s.notes))
-        self._db.commit()
-        s.id = int(cur.lastrowid)
-        return s
+        return int(cur.lastrowid)
+
+    def start_session(self, s: FocusSession) -> FocusSession:
+        """Finish the old block and save its replacement in one transaction."""
+        with self._lock:
+            now = _parse(s.started_at)
+            with self._db:
+                # Also serialises separate connections to the same SQLite file.
+                self._db.execute("BEGIN IMMEDIATE")
+                rows = self._db.execute(
+                    "SELECT * FROM sessions WHERE started_at<>'' AND ended_at=''").fetchall()
+                for row in rows:
+                    previous = self._row(row)
+                    self._db.execute(
+                        "UPDATE sessions SET ended_at=?, completed=? WHERE id=?",
+                        (s.started_at, int(previous.is_break_due(now)), previous.id))
+                row_id = self._insert(s)
+            s.id = row_id
+            return s
 
     def update(self, s: FocusSession) -> None:
-        if s.id is None:
-            return
-        self._db.execute(
-            "UPDATE sessions SET label=?, planned_minutes=?, break_minutes=?, "
-            "kind=?, started_at=?, ended_at=?, completed=?, interruptions=?, "
-            "energy_before=?, energy_after=?, notes=? WHERE id=?",
-            (s.label, s.planned_minutes, s.break_minutes, s.kind, s.started_at,
-             s.ended_at, int(s.completed), s.interruptions, s.energy_before,
-             s.energy_after, s.notes, s.id))
-        self._db.commit()
+        with self._lock:
+            if s.id is None:
+                return
+            with self._db:
+                self._db.execute(
+                    "UPDATE sessions SET label=?, planned_minutes=?, break_minutes=?, "
+                    "kind=?, started_at=?, ended_at=?, completed=?, interruptions=?, "
+                    "energy_before=?, energy_after=?, notes=? WHERE id=?",
+                    (s.label, s.planned_minutes, s.break_minutes, s.kind, s.started_at,
+                     s.ended_at, int(s.completed), s.interruptions, s.energy_before,
+                     s.energy_after, s.notes, s.id))
 
     def active(self) -> FocusSession | None:
-        row = self._db.execute(
-            "SELECT * FROM sessions WHERE started_at<>'' AND ended_at='' "
-            "ORDER BY id DESC LIMIT 1").fetchone()
-        return self._row(row) if row else None
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM sessions WHERE started_at<>'' AND ended_at='' "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+            return self._row(row) if row else None
 
-    def since(self, start: datetime) -> list[FocusSession]:
-        rows = self._db.execute(
-            "SELECT * FROM sessions WHERE started_at>=? ORDER BY started_at",
-            (_iso(start),)).fetchall()
-        return [self._row(r) for r in rows]
+    def since(self, start: datetime, *, before: datetime | None = None) -> list[FocusSession]:
+        with self._lock:
+            if before is None:
+                rows = self._db.execute(
+                    "SELECT * FROM sessions WHERE started_at>=? ORDER BY started_at",
+                    (_iso(start),)).fetchall()
+            else:
+                rows = self._db.execute(
+                    "SELECT * FROM sessions WHERE started_at>=? AND started_at<? ORDER BY started_at",
+                    (_iso(start), _iso(before))).fetchall()
+            return [self._row(r) for r in rows]
 
-    # -- indexed queries (streak/stats were loading every session) --------
+    # -- narrow reporting queries (avoid materialising full sessions) --------
 
-    def completed_days(self) -> set:
-        """The DATES with at least one completed block — one indexed query
-        instead of materialising every session the user has ever run."""
-        rows = self._db.execute(
-            "SELECT DISTINCT substr(started_at, 1, 10) AS day FROM sessions "
-            "WHERE completed = 1 AND started_at <> ''").fetchall()
-        days = set()
-        for row in rows:
-            try:
-                days.add(date.fromisoformat(str(row["day"])))
-            except (TypeError, ValueError):
-                continue
-        return days
+    def completed_days(self, zone: tzinfo | None = None) -> set:
+        """Days with a completed block, interpreted in the reporting timezone.
+
+        Keep the compact UTC query for callers requesting UTC; local dates
+        require converting real timestamps, including their historical offsets.
+        """
+        with self._lock:
+            utc_days = zone is None or zone == timezone.utc
+            expression = "substr(started_at, 1, 10)" if utc_days else "started_at"
+            rows = self._db.execute(
+                f"SELECT DISTINCT {expression} AS day FROM sessions "
+                "WHERE completed = 1 AND started_at <> ''").fetchall()
+            days = set()
+            for row in rows:
+                try:
+                    stamp = str(row["day"])
+                    days.add(date.fromisoformat(stamp) if utc_days else _parse(stamp).astimezone(zone).date())
+                except (TypeError, ValueError):
+                    continue
+            return days
 
     def all(self) -> list[FocusSession]:
-        return [self._row(r) for r in
-                self._db.execute("SELECT * FROM sessions ORDER BY started_at").fetchall()]
+        with self._lock:
+            return [self._row(r) for r in
+                    self._db.execute("SELECT * FROM sessions ORDER BY started_at").fetchall()]
+
+    # -- the task in steps ----------------------------------------------------
+
+    def save_plan(self, task: str, steps: list[tuple[str, bool]]) -> None:
+        """Replace the saved steps. Kept across restarts so a half-done list
+        is still there tomorrow."""
+        rows = [(i, str(task or "").strip()[:200], str(text).strip()[:200], int(bool(done)))
+                for i, (text, done) in enumerate(steps) if str(text).strip()]
+        with self._lock:
+            with self._db:
+                self._db.execute("DELETE FROM plan_steps")
+                self._db.executemany(
+                    "INSERT INTO plan_steps (position, task, text, done) VALUES (?,?,?,?)", rows)
+                if not rows and str(task or "").strip():
+                    self._db.execute("INSERT INTO plan_steps (position, task, text, done) "
+                                     "VALUES (-1, ?, '', 0)", (str(task).strip()[:200],))
+
+    def load_plan(self) -> tuple[str, list[tuple[str, bool]]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT task, text, done FROM plan_steps ORDER BY position").fetchall()
+        task = next((r["task"] for r in rows if r["task"]), "")
+        return task, [(r["text"], bool(r["done"])) for r in rows if r["text"]]
 
     def close(self) -> None:
-        try:
-            self._db.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self._db.close()
+            except Exception:
+                pass
 
 
 class FocusEngine:
@@ -208,15 +284,13 @@ class FocusEngine:
         only if it had already reached its planned length), so 'start' is always
         safe to call."""
         now = now or _now()
-        current = self.store.active()
-        if current is not None:
-            self._finish(current, completed=current.is_break_due(now), now=now)
+        # Validate the replacement before touching the currently running block.
         work, brk = resolve_cadence(preset, minutes, break_minutes)
         s = FocusSession(
             label=(label or "focus").strip() or "focus", planned_minutes=work,
             break_minutes=brk, kind=(kind or "deep"), started_at=_iso(now),
             energy_before=_clamp_energy(energy))
-        return self.store.add(s)
+        return self.store.start_session(s)
 
     def active(self, now: datetime | None = None) -> FocusSession | None:
         return self.store.active()
@@ -224,27 +298,30 @@ class FocusEngine:
     def interrupt(self, now: datetime | None = None) -> FocusSession | None:
         """Log a distraction against the running block — the honest cost of a
         context switch, so the streak isn't the only thing measured."""
-        s = self.store.active()
-        if s is None:
-            return None
-        s.interruptions += 1
-        self.store.update(s)
-        return s
+        with self.store._lock:
+            s = self.store.active()
+            if s is None:
+                return None
+            s.interruptions += 1
+            self.store.update(s)
+            return s
 
     def complete(self, energy: int | None = None, notes: str = "",
                  now: datetime | None = None) -> FocusSession | None:
         """End the running block as a success and start its break."""
-        s = self.store.active()
-        if s is None:
-            return None
-        return self._finish(s, completed=True, energy_after=energy, notes=notes, now=now)
+        with self.store._lock:
+            s = self.store.active()
+            if s is None:
+                return None
+            return self._finish(s, completed=True, energy_after=energy, notes=notes, now=now)
 
     def cancel(self, now: datetime | None = None) -> FocusSession | None:
         """Abandon the running block; it does not count toward the streak."""
-        s = self.store.active()
-        if s is None:
-            return None
-        return self._finish(s, completed=False, now=now)
+        with self.store._lock:
+            s = self.store.active()
+            if s is None:
+                return None
+            return self._finish(s, completed=False, now=now)
 
     def _finish(self, s: FocusSession, *, completed: bool, energy_after: int | None = None,
                 notes: str = "", now: datetime | None = None) -> FocusSession:
@@ -261,7 +338,7 @@ class FocusEngine:
     def streak(self, now: datetime | None = None) -> int:
         """Consecutive days up to today with at least one COMPLETED block."""
         now = now or _now()
-        done_days = self.store.completed_days()
+        done_days = self.store.completed_days(now.tzinfo)
         if not done_days:
             return 0
         day = now.date()
@@ -295,8 +372,8 @@ class FocusEngine:
 
     def today(self, now: datetime | None = None) -> dict[str, object]:
         now = now or _now()
-        start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        todays = self.store.since(start)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        todays = self.store.since(start, before=start + timedelta(days=1))
         completed = [s for s in todays if s.completed]
         return {
             "sessions": len(todays),
@@ -310,8 +387,37 @@ def _clamp_energy(value: int | None) -> int | None:
         return None
     try:
         return max(1, min(5, int(value)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
+
+
+_STEP_BREAKS = re.compile(r"\n|;|•|,|\band then\b|\bthen\b|\bafter that\b", re.IGNORECASE)
+_STEP_LEAD = re.compile(r"^\s*(?:[-*]\s*|\d+[.)]\s*|and\s+|then\s+)+", re.IGNORECASE)
+
+
+def chunk_task(text: str, limit: int = 8) -> list[str]:
+    """Break a task written as one line into its steps: "outline the essay,
+    write the intro then add two sources" becomes three. Only the person's own
+    words are used - a task that names one thing stays one step, and the page
+    lets them add the rest."""
+    steps: list[str] = []
+    seen: set[str] = set()
+    for part in _STEP_BREAKS.split(str(text or "")):
+        pieces = [part]
+        # "and" joins two steps only when both sides are a phrase of their
+        # own: "write the intro and add sources", not "salt and pepper".
+        halves = re.split(r"\s+and\s+", part.strip(), maxsplit=1, flags=re.IGNORECASE)
+        if len(halves) == 2 and all(len(h.split()) >= 2 for h in halves):
+            pieces = halves
+        for piece in pieces:
+            step = _STEP_LEAD.sub("", piece).strip(" .")
+            if not step or step.casefold() in seen:
+                continue
+            seen.add(step.casefold())
+            steps.append(step[0].upper() + step[1:])
+            if len(steps) >= limit:
+                return steps
+    return steps
 
 
 def human_minutes(minutes: float) -> str:
@@ -325,5 +431,5 @@ def human_minutes(minutes: float) -> str:
 
 __all__ = [
     "PRESETS", "DEFAULT_WORK", "DEFAULT_BREAK", "FocusSession", "FocusStore",
-    "FocusEngine", "resolve_cadence", "human_minutes",
+    "FocusEngine", "resolve_cadence", "human_minutes", "chunk_task",
 ]

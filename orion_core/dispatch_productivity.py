@@ -48,6 +48,62 @@ def _busiest_provider(runway: Any) -> str:
     return best
 
 
+def _storage_text() -> str:
+    """Free space on each fixed drive: 'C: 120 GB free of 476 GB (75% used)'.
+    Removable and optical drives are left out (an empty card reader is not
+    'full'); '' when nothing can be read."""
+    try:
+        import psutil
+        lines = []
+        for part in psutil.disk_partitions(all=False):
+            opts = str(part.opts or "").lower()
+            if "cdrom" in opts or "removable" in opts or not part.fstype:
+                continue
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+            except OSError:
+                continue
+            gb = 1024 ** 3
+            lines.append(f"{part.mountpoint.rstrip(chr(92))} {usage.free / gb:,.0f} GB free of "
+                         f"{usage.total / gb:,.0f} GB ({usage.percent:.0f}% used)")
+        return ("Storage: " + "; ".join(lines) + ".") if lines else ""
+    except Exception:
+        return ""
+
+
+def _battery_text() -> str:
+    try:
+        import psutil
+        battery = psutil.sensors_battery()
+    except Exception:
+        battery = None
+    if battery is None:
+        return "This PC has no battery — it runs from the mains."
+    plugged = "charging" if battery.power_plugged else "on battery"
+    left = ""
+    secs = battery.secsleft
+    if not battery.power_plugged and isinstance(secs, (int, float)) and secs > 0:
+        hours, rest = divmod(int(secs) // 60, 60)
+        left = f", about {hours} h {rest} min left" if hours else f", about {rest} min left"
+    return f"Battery at {battery.percent:.0f}%, {plugged}{left}."
+
+
+def _timer_words(seconds: float) -> str:
+    """'ten-minute', '30-second', '1 hour 30 minute' - the timer's own name."""
+    whole = int(round(seconds))
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours and not minutes and not secs:
+        return f"{hours}-hour"
+    if not hours and minutes and not secs:
+        return f"{minutes}-minute"
+    if not hours and not minutes:
+        return f"{secs}-second"
+    parts = ([f"{hours} hour"] if hours else []) + ([f"{minutes} minute"] if minutes else []) \
+        + ([f"{secs} second"] if secs else [])
+    return " ".join(parts)
+
+
 class ProductivityDispatchMixin:
     """Agents, briefings, globe, telemetry, protocols, planning and executive tools."""
 
@@ -153,7 +209,7 @@ class ProductivityDispatchMixin:
                 decision = engine.record(
                     str(args.get("question") or args.get("decision") or ""),
                     str(args.get("choice") or args.get("option") or ""),
-                    confidence=int(args.get("confidence") or 70),
+                    confidence=int(args["confidence"] if args.get("confidence") is not None else 70),
                     prediction=str(args.get("prediction") or ""),
                     rationale=str(args.get("rationale") or args.get("why") or ""),
                     review_days=int(args.get("review_days") or 30),
@@ -255,6 +311,12 @@ class ProductivityDispatchMixin:
 
     def finance_tool(self, args: dict[str, Any]) -> ToolResult:
         """Offline personal/business finance (Mark XXVI): ledger + runway."""
+        try:
+            return ProductivityDispatchMixin._finance_tool(self, args)
+        except (ValueError, TypeError, OverflowError) as exc:
+            return ToolResult(f"Finance request couldn't be completed: {first_line(exc, 160)}", ok=False)
+
+    def _finance_tool(self, args: dict[str, Any]) -> ToolResult:
         engine = getattr(self, "finance", None)
         if engine is None:
             from .finance import FinanceEngine
@@ -280,7 +342,7 @@ class ProductivityDispatchMixin:
                 merchant=str(args.get("merchant") or args.get("note") or ""))
             verb = "Income" if direction == "in" else "Spent"
             on = f" on {t.merchant}" if t.merchant else ""
-            return ToolResult(f"{verb} {abs(float(args['amount'])):.2f}{on}. "
+            return ToolResult(f"{verb} {t.amount:.2f}{on}. "
                               f"Cash now {engine.liquid_cash():.2f}.")
 
         if action in {"balance", "cash"}:
@@ -303,7 +365,7 @@ class ProductivityDispatchMixin:
             if not str(args.get("name") or "") or args.get("amount") is None:
                 return ToolResult("A subscription needs a name and an amount.", ok=False)
             s = engine.add_subscription(str(args["name"]), float(args["amount"]),
-                                        cadence_days=int(args.get("cadence_days") or 30))
+                                        cadence_days=int(args["cadence_days"] if args.get("cadence_days") is not None else 30))
             return ToolResult(f"Tracking '{s.name}' at {s.amount:.2f} every {s.cadence_days} days.")
 
         if action in {"upcoming", "renewals"}:
@@ -324,6 +386,8 @@ class ProductivityDispatchMixin:
             n = engine.import_csv(text, account=str(args.get("account") or ""))
             return ToolResult(f"Imported {n} transactions. Cash now {engine.liquid_cash():.2f}.")
 
+        if action not in {"report", "status", "summary", "overview"}:
+            return ToolResult(f"Unsupported finance action: {action}.", ok=False)
         r = engine.report()
         runway = f"{r['runway_months']} months" if r["runway_months"] is not None else "unlimited (not burning)"
         return ToolResult(f"Cash {r['cash']:.2f} · burn {r['monthly_burn']:.2f}/mo · runway "
@@ -345,7 +409,7 @@ class ProductivityDispatchMixin:
                 factors = [f.strip() for f in factors.split(",") if f.strip()]
             c = engine.checkin(
                 energy=args.get("energy"), mood=args.get("mood"), stress=args.get("stress"),
-                sleep_hours=args.get("sleep_hours") or args.get("sleep"),
+                sleep_hours=(args["sleep_hours"] if args.get("sleep_hours") is not None else args.get("sleep")),
                 note=str(args.get("note") or ""), factors=factors)
             bits = []
             if c.energy is not None:
@@ -392,11 +456,56 @@ class ProductivityDispatchMixin:
 
         return ToolResult(f"Unsupported wellbeing action: {action}.", ok=False)
 
+    async def goals_tool(self, args: dict[str, Any]) -> ToolResult:
+        """Personal goals (goals.py): outcomes, measures, pace, plans. Every
+        database touch runs on a worker thread — this is reached from voice."""
+        from . import goals as goals_module
+        engine = getattr(self, "goal_tracker", None)
+        if engine is None:
+            # A bare dispatcher (tests, a partial boot): the same store, with
+            # whatever reminder service and model router already exist.
+            momentum = getattr(self, "momentum", None)
+            engine = await asyncio.to_thread(
+                goals_module.GoalsEngine, reminders=getattr(self, "reminders", None),
+                router=getattr(momentum, "router", None),
+                companion=getattr(self, "companion", None),
+                cognition=getattr(self, "cognition", None))
+            self.goal_tracker = engine
+        args = dict(args or {})
+        if goals_module.resolve_action(args.get("action")) == "plan":
+            return await goals_module.plan_goal(engine, args)
+        return await asyncio.to_thread(goals_module.tool_action, engine, args)
+
+    async def conversation_recording_tool(self, args: dict[str, Any]) -> ToolResult:
+        from . import conversation_recorder
+        return await conversation_recorder.handle(
+            action=args.get("action", "status"), consent=args.get("consent", False),
+            session_id=args.get("session_id", ""), query=args.get("query", ""),
+            record_only=args.get("record_only", True))
+
     async def agent_dispatch(self, args: dict[str, Any]) -> ToolResult:
+        # background=true detaches a read-only specialist run as a job that is
+        # announced when it lands. A call already running inside a job (the
+        # detached run itself, a plan, a workflow) stays in that job.
+        from . import jobs as _jobs
+        background = (str(args.get("background") or "").strip().lower()
+                      in {"1", "true", "yes", "on"}
+                      and _jobs.current_control() is None)
+        # The model names the request several ways; "No request supplied"
+        # failed two owner requests on 26-27 Oct (capability-gap ledger).
+        request = next((str(args[key]) for key in ("request", "query", "task", "prompt",
+                                                   "question", "message", "instruction",
+                                                   "goal", "topic", "text")
+                        if str(args.get(key) or "").strip()), "")
+        if not request.strip():
+            return ToolResult("No request supplied: call agent_dispatch again with the owner's "
+                              "words in 'request'.", ok=False)
         return await self.agent_manager.dispatch(
-            request=str(args.get("request") or args.get("query") or ""),
+            request=request,
             agent_name=str(args.get("agent") or "auto"),
             context=str(args.get("context") or ""),
+            background=background,
+            jobs=getattr(self, "jobs", None),
         )
 
     async def reason_tool(self, args: dict[str, Any]) -> ToolResult:
@@ -490,23 +599,117 @@ class ProductivityDispatchMixin:
         """
         from .briefing import MorningBriefingService
 
+        section = str(args.get("section") or "").strip().lower().replace(" ", "_")
+        if section in {"markets", "market", "stocks", "stock_market", "shares", "indices",
+                       "crypto", "cryptocurrency", "bitcoin"}:
+            return await self._markets_now(section)
         now_period = MorningBriefingService.greeting_period()
         period = str(args.get("period") or "general").strip().lower()
         if period == "morning" and now_period != "morning":
             period = "general"
         label = f"{now_period} briefing"
         if self.on_briefing_request is not None:
-            background.spawn(self.on_briefing_request(period))
+            # SINGLE FLIGHT. Each call used to spawn its own delivery, and 3 of
+            # 10 sessions heard the briefing twice: the model called this again
+            # while the first was being composed (often in reply to the
+            # delivery's own prompt), or narrated one itself from "underway".
+            # A request while one is composing or speaking joins it.
+            running = getattr(self, "_briefing_delivery", None)
+            if running is not None and not running.done():
+                return ToolResult(
+                    f"Your {label} is already on its way - it is being composed and "
+                    "delivered right now. Do NOT start, summarise or narrate a briefing "
+                    "yourself and do not call this tool again; at most say it is coming.",
+                    receipt={"status": "already_delivering", "period": period})
+            task = background.spawn(self.on_briefing_request(period), name="briefing delivery")
+            try:
+                self._briefing_delivery = task
+            except AttributeError:
+                pass
             return ToolResult(
-                f"Your {label} is underway — composing the intelligence picture "
-                f"now. (It is the {now_period}: call it your {label}, never a "
-                f"morning briefing unless it is the morning.)")
+                f"Your {label} is being composed now and the briefing system will deliver "
+                "it to the user as its own message in a moment. Do NOT compose, summarise "
+                "or narrate a briefing yourself, and do not call this tool again; just "
+                "acknowledge briefly (for example 'coming right up'). (It is the "
+                f"{now_period}: call it your {label}, never a morning briefing unless it "
+                "is the morning.)", receipt={"status": "delivering", "period": period})
         briefing = await self.briefing.compose_source_material(period=period)
         return ToolResult(briefing)
+
+    def briefing_in_flight(self) -> bool:
+        """True while a requested briefing is being composed or delivered, so
+        another way in (a typed "yes" to the startup offer) can join it instead
+        of starting a second one."""
+        running = getattr(self, "_briefing_delivery", None)
+        return running is not None and not running.done()
+
+    async def _markets_now(self, section: str) -> ToolResult:
+        """'How's the stock market doing?' is one question, not a briefing:
+        the four indices in the right tense (markets.py) and, unless only
+        shares were asked about, the main cryptocurrencies - in a second."""
+        from aiohttp import ClientSession, ClientTimeout
+        from . import markets
+        crypto_only = section in {"crypto", "cryptocurrency", "bitcoin"}
+        shares_only = section in {"stocks", "stock_market", "shares", "indices"}
+        parts: list[str] = []
+        async with ClientSession(timeout=ClientTimeout(total=8.0, connect=4.0)) as session:
+            if not crypto_only:
+                quotes = await markets.fetch(session)
+                parts.append(markets.summary(quotes) if quotes
+                             else "The share prices aren't available right now.")
+            crypto = getattr(getattr(self, "briefing", None), "_crypto_section", None)
+            if not shares_only and crypto is not None:
+                parts.append(await crypto(session))
+        text = " ".join(p for p in parts if p).strip()
+        ok = bool(text) and "unavailable" not in text.lower()
+        return ToolResult(text or "Market prices aren't available right now.", ok=ok or len(parts) > 1)
+
+    #: What the user may call each globe overlay or layer.
+    _GLOBE_SHOWS = {
+        "radar": "radar", "rain_radar": "radar", "weather_radar": "radar", "rain": "radar",
+        "day_night": "daynight", "daynight": "daynight", "night": "daynight",
+        "day_and_night": "daynight", "daylight": "daynight", "night_and_day": "daynight",
+        "where_it_is_night": "daynight", "sun": "daynight",
+        "terminator": "daynight", "city_lights": "daynight", "sunlight": "daynight",
+        "measure": "measure", "distance": "measure", "ruler": "measure",
+        "events": "events", "natural_events": "events", "disasters": "events",
+        "wildfires": "events", "fires": "events", "storms": "events", "hurricanes": "events",
+        "typhoons": "events", "volcanoes": "events", "floods": "events",
+        "earthquakes": "earthquakes", "quakes": "earthquakes",
+        "satellites": "satellites", "iss": "satellites", "space_station": "satellites",
+        "tsunami": "tsunami", "tsunamis": "tsunami",
+        "weather_warnings": "weather", "warnings": "weather",
+    }
+    _GLOBE_SPOKEN = {"radar": "the rain radar", "daynight": "day and night with city lights",
+                     "measure": "distance measuring", "events": "natural events",
+                     "earthquakes": "earthquakes", "satellites": "space stations",
+                     "tsunami": "tsunami bulletins", "weather": "UK weather warnings"}
 
     def globe_tool(self, args: dict[str, Any]) -> ToolResult:
         action = str(args.get("action") or "").strip().lower()
         place = str(args.get("place") or args.get("location") or args.get("query") or "").strip()
+        # Overlays and world layers: "show the rain radar", "hide the storms".
+        show = str(args.get("show") or args.get("layer") or args.get("overlay") or "").strip().lower()
+        hide = str(args.get("hide") or "").strip().lower()
+        if action in {"show", "hide", "on", "off"} and not (show or hide) and place:
+            show, place = place.lower(), ""
+        target = (hide or show).replace(" ", "_").replace("-", "_")
+        for article in ("the_", "a_", "an_", "live_"):
+            target = target.removeprefix(article)
+        if target:
+            name = self._GLOBE_SHOWS.get(target) or self._GLOBE_SHOWS.get(target.removesuffix("s"))
+            if name is None:
+                return ToolResult(
+                    "The globe can show: the rain radar, day and night, natural events "
+                    "(fires, storms, volcanoes), earthquakes, space stations, tsunami "
+                    "bulletins, UK weather warnings, and measure distances.", ok=False)
+            on = not hide and action not in {"hide", "off"}
+            self.bus.dashboard_event.emit("globe_overlay", {"name": name, "on": on})
+            spoken = self._GLOBE_SPOKEN[name]
+            if name == "measure" and on:
+                return ToolResult("Measuring on the globe: click two or more points and I'll "
+                                  "show the distance along the Earth's surface.")
+            return ToolResult(f"{'Showing' if on else 'Hiding'} {spoken} on the globe.")
         # Zoom / reset the camera without changing location.
         zoom_words = {"zoom_in": "in", "zoom in": "in", "in": "in", "closer": "in",
                       "zoom_out": "out", "zoom out": "out", "out": "out", "back": "out",
@@ -546,6 +749,10 @@ class ProductivityDispatchMixin:
             "Maximising zoom on the globe now — flying the camera to the "
             "closest level the view supports.")
 
+    async def resource_status_async(self, args: dict[str, Any]) -> ToolResult:
+        """resource_status off the UI loop (it samples process CPU)."""
+        return await asyncio.to_thread(self.resource_status_tool, args)
+
     def resource_status_tool(self, args: dict[str, Any]) -> ToolResult:
         """Report current system resource pressure without interrupting work.
 
@@ -555,8 +762,13 @@ class ProductivityDispatchMixin:
 
         With ``action='trends'`` it instead reports the rolling history —
         metric trends over time and the tool-usage audit (Priority 3.1/3.4)."""
-        if str(args.get("action") or "").lower().strip() in {"trends", "history", "usage", "audit"}:
+        action = str(args.get("action") or "").lower().strip()
+        if action in {"trends", "history", "usage", "audit"}:
             return self._resource_trends(args)
+        if action in {"storage", "disk", "disks", "space", "drives"}:
+            return ToolResult(_storage_text() or "I couldn't read the drives.")
+        if action in {"battery", "power"}:
+            return ToolResult(_battery_text())
         from .resource_monitor import ResourceMonitor, SystemResourceReader
         reader = getattr(self, "_resource_reader", None)
         monitor = getattr(self, "_resource_monitor", None)
@@ -587,6 +799,9 @@ class ProductivityDispatchMixin:
             parts.append(f"ORION's web renderers {renderers:.0f} MB")
         detail = "; ".join(parts)
         text = f"{assessment.message} [{detail}]"
+        storage = _storage_text()
+        if storage:
+            text += f"\n{storage}"
         from . import resource_governor
         governor = resource_governor.GOVERNOR
         if governor is not None:
@@ -712,13 +927,38 @@ class ProductivityDispatchMixin:
         if self.reminders is None:
             return ToolResult("Reminders are not available.", ok=False)
         action = str(args.get("action") or "add").lower().strip()
+        if action in {"timer", "set_timer", "countdown", "start_timer"}:
+            # A kitchen timer is a reminder with a length and no task:
+            # "set a timer for ten minutes" has nothing to remember but the time.
+            try:
+                seconds = (float(args.get("seconds") or 0) + 60 * float(args.get("minutes") or 0)
+                           + 3600 * float(args.get("hours") or 0))
+            except (TypeError, ValueError):
+                seconds = 0.0
+            if seconds <= 0:
+                return ToolResult("How long should the timer be?", ok=False)
+            if seconds > 24 * 3600:
+                return ToolResult("A timer can run for up to a day — for longer, set a reminder.",
+                                  ok=False)
+            label = str(args.get("text") or args.get("label") or "").strip()
+            length = _timer_words(seconds)
+            result = self.reminders.add(text=label or f"your {length} timer is up",
+                                        minutes=seconds / 60.0)
+            due = re.search(r"\(at (\d{1,2}:\d{2})\)", result.text or "")
+            if result.ok and due:
+                named = f" for the {label}" if label else ""
+                return ToolResult(f"{length[0].upper()}{length[1:]} timer{named} started — "
+                                  f"it goes off at {due.group(1)}.")
+            return result
         if action in {"add", "set", "create", "remind"}:
             minutes = args.get("minutes")
             return self.reminders.add(
                 text=str(args.get("text") or args.get("task") or ""),
-                minutes=float(minutes) if minutes is not None else None,
+                minutes=minutes,
                 at=str(args.get("at") or ""),
                 phrase=str(args.get("phrase") or args.get("query") or ""),
+                channel=args.get("channel") or "",
+                recipient=str(args.get("recipient") or ""),
             )
         if action in {"list", "show"}:
             return self.reminders.list_text()
@@ -759,6 +999,13 @@ class ProductivityDispatchMixin:
             "Unsupported audio_studio action. Use index_assets, process_vocal_take, "
             "or export_stem_package.", ok=False,
         )
+
+    async def sing_tool(self, args: dict[str, Any]) -> ToolResult:
+        """ORION sings (singing.handle): a short song in his own voice, tuned
+        to a melody over a soft backing, played through his voice output.
+        The rendering runs off the event loop inside singing.handle."""
+        from . import singing
+        return await singing.handle(self, args)
 
     def campaign_pipeline_tool(self, args: dict[str, Any]) -> ToolResult:
         if self.pipeline is None:
@@ -880,8 +1127,30 @@ class ProductivityDispatchMixin:
                 failed += 1
             line = result.text.splitlines()[0][:220] if result.text else ""
             report.append(f"{number}. {tool}: {'OK' if result.ok else 'FAILED'} - {line}")
+            if not result.ok and str(step.get("on_fail") or "").lower() not in {
+                    "continue", "skip", "ignore", "retry"}:
+                # The same default as PlanExecutor: a failed step that changes
+                # something stops the plan; what follows assumed it worked.
+                from .job_store import READ_ONLY, side_effect_class
+                if side_effect_class(tool, raw_args if isinstance(raw_args, dict) else {}) \
+                        != READ_ONLY:
+                    report.append(f"STOPPED: step {number} ({tool}) failed, so the steps "
+                                  "after it were not run.")
+                    break
         report.append(f"VERIFICATION: {succeeded} step(s) succeeded, {failed} failed.")
         return ToolResult("\n".join(report), ok=failed == 0)
+
+    def _running_research(self) -> str:
+        """'Researching X - N of M minutes elapsed.' while a research run is
+        going, else ''."""
+        research = getattr(self, "research", None)
+        task = (getattr(research, "_active", None) or {}).get("task")
+        if task is None or task.done():
+            return ""
+        try:
+            return research.status().text
+        except Exception:
+            return ""
 
     async def job_tool(self, args: dict[str, Any]) -> ToolResult:
         """Run read-only work detached from the conversation, and collect it later."""
@@ -913,7 +1182,16 @@ class ProductivityDispatchMixin:
         if action in {"list", "status", "jobs"}:
             job_id = str(args.get("job_id") or "").strip()
             if not job_id:
-                return self.jobs.report()
+                report = self.jobs.report()
+                # Research runs on its own task, not as a job: "what are you
+                # working on?" left out the research he said was running
+                # (owner, 30 Oct 2026: "how do I know if he's actually still
+                # doing something?").
+                researching = self._running_research()
+                if researching:
+                    return ToolResult(f"{researching}\n{report.text}", ok=report.ok,
+                                      receipt=report.receipt)
+                return report
             job = self.jobs.get(job_id)
             return (ToolResult(job.summary()) if job is not None
                     else ToolResult(f"No job matches '{job_id}'.", ok=False))
@@ -924,9 +1202,24 @@ class ProductivityDispatchMixin:
         if action in {"cancel", "stop", "abort"}:
             return self.jobs.cancel(str(args.get("job_id") or ""))
 
+        # Pause, resume and priority change WHEN work runs, never WHETHER a
+        # side-effecting step is allowed: resuming an interrupted job still
+        # stops at the job store's bound approval for any step that changes
+        # something. Approving is deliberately not an action here — a tool
+        # call can come from the model or from text it read, and an approval
+        # must come from the user (the Tasks page or the phone's card).
+        if action in {"pause", "hold"} and hasattr(self.jobs, "pause"):
+            return self.jobs.pause(str(args.get("job_id") or ""))
+        if action in {"resume", "continue", "unpause"} and hasattr(self.jobs, "resume"):
+            return await self.jobs.resume(str(args.get("job_id") or ""))
+        if (action in {"priority", "prioritise", "prioritize", "sooner"}
+                and hasattr(self.jobs, "reprioritise")):
+            return self.jobs.reprioritise(str(args.get("job_id") or ""),
+                                          str(args.get("priority") or "user"))
+
         return ToolResult(
-            f"Unsupported job action: {action}. Use run, list, result, or cancel.",
-            ok=False)
+            f"Unsupported job action: {action}. Use run, list, result, cancel, "
+            "pause, resume or priority.", ok=False)
 
     async def proactive_check(self, args: dict[str, Any]) -> ToolResult:
         if self.proactive is None:
@@ -951,9 +1244,43 @@ class ProductivityDispatchMixin:
         if action in {"governor", "runway", "budget", "should_i_switch",
                       "cost", "spend"}:
             return self._cost_governor_report(args)
+        if action in {"set_brain", "switch_brain", "set_brain_mode", "use_brain",
+                      "change_brain", "switch", "set_mode"}:
+            return self._set_brain_mode(args)
+        if action in {"brain", "brain_mode", "which_brain", "brain_status"}:
+            return self._brain_mode_report()
         if self.ai is None:
             return ToolResult("Mode information is unavailable.", ok=False)
         return self.ai.report()
+
+    def _brain_mode_report(self) -> ToolResult:
+        """Which brain answers (brain_mode.py), and the local model it uses."""
+        lines_of = getattr(self.ai, "brain_lines", None)
+        if callable(lines_of):
+            try:
+                return ToolResult("\n".join(lines_of()))
+            except Exception:
+                pass
+        from . import brain_mode
+        return ToolResult(f"Brain mode: {brain_mode.describe()}")
+
+    def _set_brain_mode(self, args: dict[str, Any]) -> ToolResult:
+        """Switch between the cloud, hybrid and local brains — saved, and
+        applied now when the live worker is attached (apply_brain_mode)."""
+        from . import brain_mode
+        wanted = brain_mode.normalise(args.get("mode") or args.get("brain")
+                                      or args.get("target") or args.get("task"))
+        if wanted is None:
+            return ToolResult("Which brain should I use: cloud, hybrid or local?", ok=False)
+        apply = getattr(self, "apply_brain_mode", None)
+        if callable(apply):
+            ok, message = apply(wanted)
+            return ToolResult(message, ok=bool(ok))
+        if brain_mode.set_mode(wanted) is None:
+            return ToolResult("I couldn't save the brain setting.", ok=False)
+        return ToolResult(f"Brain set to {brain_mode.LABELS[wanted]} — "
+                          f"{brain_mode.EXPLANATIONS[wanted]} It takes full effect when "
+                          "I next start.")
 
     def _cost_governor_report(self, args: dict[str, Any]) -> ToolResult:
         """CAP-02: given live usage and machine load, say whether to switch to a
@@ -986,9 +1313,13 @@ class ProductivityDispatchMixin:
 
     def emotion_tool(self, args: dict[str, Any]) -> ToolResult:
         """Mark X.7: inspect or pin ORION's emotional rendering."""
+        action = str(args.get("action") or "status").lower().strip()
+        if action in {"insights", "insight", "trend", "mood_trend", "history", "week"}:
+            # Mark XXXIX: the emotional_insight_generator plugin, rebuilt -
+            # how the user has been over days, from their own words.
+            return self._mood_insights(args)
         if self.emotion is None:
             return ToolResult("The emotion engine is not available.", ok=False)
-        action = str(args.get("action") or "status").lower().strip()
         if action in {"status", "current", "describe"}:
             desc = self.emotion.describe()
             return ToolResult(
@@ -1001,10 +1332,38 @@ class ProductivityDispatchMixin:
             return ToolResult(self.emotion.set_emotion(str(args.get("name") or "")))
         if action in {"auto", "clear", "release"}:
             return ToolResult(self.emotion.set_emotion("auto"))
+        if action in {"show", "display", "flash", "tour", "cycle", "show_all"}:
+            # Held on his face for a moment, or one after another - his own
+            # window, so only for the owner's turn (require_own_window).
+            from .execution_policy import require_own_window
+            blocked = require_own_window("gui_expression")
+            if blocked is not None:
+                return blocked
+            if action in {"tour", "cycle", "show_all"}:
+                message, ok = self.emotion.tour(args.get("names") or None)
+            else:
+                message, ok = self.emotion.show(str(args.get("name") or ""), args.get("seconds"))
+            return ToolResult(message, ok=ok)
         return ToolResult(
-            f"Unsupported emotion action: {action}. Use status, set (with name), or auto.",
+            f"Unsupported emotion action: {action}. Use status, set (with name), show "
+            "(with name), tour, insights, or auto.",
             ok=False,
         )
+
+    async def _mood_insights(self, args: dict[str, Any]) -> ToolResult:
+        """How the user has been over the last few days (mood_insights.py),
+        read from memory off the event loop."""
+        from . import mood_insights
+        try:
+            days = int(float(args.get("days") or 7))
+        except (TypeError, ValueError):
+            days = 7
+        memory = getattr(self, "memory", None)
+        try:
+            text = await asyncio.to_thread(mood_insights.insights, memory, days)
+        except Exception as exc:
+            return ToolResult(f"I couldn't look back over your week - {first_line(exc)}.", ok=False)
+        return ToolResult(text)
 
     async def momentum_tool(self, args: dict[str, Any]) -> ToolResult:
         if self.momentum is None:
@@ -1103,28 +1462,32 @@ class ProductivityDispatchMixin:
         name = str(args.get("name") or args.get("plugin") or "").strip()
 
         if action in {"list", "installed", "plugins"}:
-            return self.plugins.list_plugins()
+            return await asyncio.to_thread(self.plugins.list_plugins)
         if action in {"describe", "info", "show", "about"}:
-            return self.plugins.describe(name)
+            return await asyncio.to_thread(self.plugins.describe, name)
         if action in {"enable", "activate", "on"}:
-            return self.plugins.set_enabled(name, True)
+            return await asyncio.to_thread(self.plugins.set_enabled, name, True)
         if action in {"disable", "deactivate", "off"}:
-            # Disabling must take effect NOW, not at the next restart: a plugin
-            # with event hooks would otherwise keep reacting while the user
-            # believes it is off. Its tool stays registered until the next
-            # reload, but it stops receiving events immediately.
+            result = await asyncio.to_thread(self.plugins.set_enabled, name, False)
+            if not result.ok:
+                return result
             bridge = getattr(self, "plugin_events", None)
-            if bridge is not None:
+            # Bound services use the saved preference gate and can resume
+            # after re-enable. Legacy services must be detached explicitly.
+            if bridge is not None and getattr(bridge, "registry", None) is not self.plugins:
                 try:
                     bridge.forget(name)
                 except Exception:
                     pass
-            return self.plugins.set_enabled(name, False)
+            scheduler = getattr(self, "plugin_scheduler", None)
+            if scheduler is not None and getattr(scheduler, "registry", None) is not self.plugins:
+                scheduler.remove(name)
+            return result
         if action in {"create", "new", "scaffold", "make"}:
             raw_events = args.get("events")
             if isinstance(raw_events, str):
                 raw_events = [e.strip() for e in raw_events.split(",") if e.strip()]
-            return self.plugins.create(
+            return await asyncio.to_thread(self.plugins.create,
                 name,
                 str(args.get("description") or args.get("purpose") or ""),
                 str(args.get("tier") or "confirm"),
@@ -1133,21 +1496,31 @@ class ProductivityDispatchMixin:
                 events=raw_events,
             )
         if action in {"install", "add"}:
-            return self.plugins.install(
+            return await asyncio.to_thread(self.plugins.install,
                 str(args.get("source") or args.get("path") or ""))
+        if action in {"restore", "unquarantine", "restore_quarantined"} and callable(
+                getattr(self.plugins, "restore_quarantined", None)):
+            return await asyncio.to_thread(self.plugins.restore_quarantined, name)
         if action in {"remove", "uninstall", "delete"}:
+            result = await asyncio.to_thread(self.plugins.remove, name)
+            if not result.ok:
+                return result
+            removed_name = next((item["name"] for item in (result.evidence or [])
+                                 if item.get("kind") == "plugin_removed" and isinstance(item.get("name"), str)), name)
             bridge = getattr(self, "plugin_events", None)
             if bridge is not None:
                 try:
-                    bridge.forget(name)      # a removed plugin must stop reacting
+                    bridge.forget(removed_name)      # retire the actual registered callable identity
                 except Exception:
                     pass
-            return self.plugins.remove(name)
+            from .plugin_registry import detach_runtime
+            detach_runtime(self, removed_name)
+            return result
         if action in {"doctor", "health", "check", "diagnose"}:
-            return self.plugins.doctor(events=getattr(self, "plugin_events", None))
+            return await asyncio.to_thread(self.plugins.doctor, events=getattr(self, "plugin_events", None))
         if action in {"backfill", "manifests"}:
-            written = self.plugins.backfill_manifests()
-            remaining = self.plugins.manifestless()
+            written, remaining = await asyncio.to_thread(
+                lambda: (self.plugins.backfill_manifests(), self.plugins.manifestless()))
             if written:
                 text = (f"Wrote {len(written)} manifest(s) at the safe "
                         f"'confirm' tier: " + ", ".join(written))
@@ -1158,7 +1531,7 @@ class ProductivityDispatchMixin:
                          "so run 'plugin doctor': " + ", ".join(remaining))
             return ToolResult(text)
         if action in {"export", "bundle", "share", "package"}:
-            return self.plugins.export_bundle(
+            return await asyncio.to_thread(self.plugins.export_bundle,
                 name, str(args.get("source") or args.get("path") or ""))
         if action in {"unmute", "revive", "unsilence"}:
             bridge = getattr(self, "plugin_events", None)
@@ -1183,10 +1556,10 @@ class ProductivityDispatchMixin:
                                   ok=False)
             return ToolResult(bridge.report())
         if action in {"audit", "permissions", "capabilities", "trust"}:
-            return self.plugins.audit(name)
+            return await asyncio.to_thread(lambda: self.plugins.audit(name))
         if action in {"update", "check_update", "upgrade"}:
-            return self.plugins.check_update(
-                name, str(args.get("version") or args.get("source") or ""))
+            return await asyncio.to_thread(lambda: self.plugins.check_update(
+                name, str(args.get("version") or args.get("source") or "")))
         if action in {"deps", "dependencies", "install_deps"}:
             return await self.plugins.install_dependencies(name)
         if action in {"reload", "refresh"}:
@@ -1217,7 +1590,8 @@ class ProductivityDispatchMixin:
                 registry=self.plugins,
                 # Without this a hot-reloaded plugin keeps working as a tool but
                 # silently stops REACTING — its event hooks would be lost.
-                events=getattr(self, "plugin_events", None))
+                events=getattr(self, "plugin_events", None),
+                scheduler=getattr(self, "plugin_scheduler", None))
         except Exception as exc:
             return ToolResult(f"Plugin reload failed: {exc}", ok=False)
         loaded = len(plan.loadable)
@@ -1334,7 +1708,10 @@ class ProductivityDispatchMixin:
         lines = ["RIGHT NOW:"]
         worker = getattr(self, "live_worker", None)
         if worker is not None:
-            if getattr(worker, "session", None) is not None:
+            ready = getattr(worker, "_transport_ready", None)
+            connected = (bool(ready()) if callable(ready) else
+                         bool(getattr(worker, "connected", False) and getattr(worker, "session", None)))
+            if connected:
                 model = str(getattr(worker, "active_live_model", "") or "").rsplit("/", 1)[-1]
                 lines.append(f"- Voice: Gemini Live connected{f' ({model})' if model else ''}.")
             else:
@@ -1344,20 +1721,20 @@ class ProductivityDispatchMixin:
         if router is not None:
             try:
                 text = [p.name for p in router.text_profiles()]
-                lines.append(f"- Thinking: {len(text)} text model provider(s) available"
+                lines.append(f"- Thinking: {len(text)} text model provider(s) eligible for routing"
                              + (f" ({', '.join(text[:5])})." if text else
-                                " — none reachable at the moment."))
+                                " — none eligible at the moment."))
             except Exception:
                 pass
             try:
                 from .provider_capabilities import Capability, supports
                 seeing = [p.name for p in router.text_profiles()
                           if supports(p, Capability.VISION) or "vision" in p.strengths]
-                keyed = [p.name for p in router.settings.ordered_profiles()
-                         if p.supports_live_audio and str(router.active_key(p) or "").strip()]
-                lines.append("- Seeing: " + ("available (" + ", ".join((seeing + keyed)[:4]) + ")."
+                keyed = [p.name for p in router.live_profiles()]
+                lines.append("- Seeing: " + ("model routes eligible (" + ", ".join((seeing + keyed)[:4])
+                                             + "); camera permission and capture not checked."
                                              if seeing or keyed else
-                                             "the camera works, but no vision-capable model is configured."))
+                                             "no eligible vision model route; camera readiness not checked."))
             except Exception:
                 pass
         declarations = getattr(self, "TOOL_DECLARATIONS", None) or []
@@ -1366,11 +1743,11 @@ class ProductivityDispatchMixin:
         by_server: dict[str, int] = {}
         for server, _tool in mcp_routes.values():
             by_server[server] = by_server.get(server, 0) + 1
-        lines.append(f"- Tools: {len(declarations)} callable"
+        lines.append(f"- Tools: {len(declarations)} registered"
                      + (f", including {sum(by_server.values())} from MCP servers ("
                         + ", ".join(f"{k} {v}" for k, v in sorted(by_server.items())) + ")"
                         if by_server else "")
-                     + (f" and {len(forged)} I forged myself" if forged else "") + ".")
+                     + (f" and {len(forged)} dynamic handler(s)" if forged else "") + ".")
         host = getattr(self, "mcp_host", None)
         if host is not None:
             try:
@@ -1449,7 +1826,8 @@ class ProductivityDispatchMixin:
             # state change.  The board owns the experience, so route there
             # deterministically instead of relying on the model to issue a
             # second, often-generic Command Deck navigation call.
-            if result.ok:
+            from .execution_policy import require_own_window
+            if result.ok and require_own_window("gui_chess_navigation") is None:
                 try:
                     self.bus.gui_command.emit({"action": "chess", "target": ""})
                 except Exception:
@@ -1503,6 +1881,40 @@ class ProductivityDispatchMixin:
             return self.chess.flip()
         if action in {"history", "moves", "move_list"}:
             return self.chess.history_text()
+        # Lichess: friends play him remotely through his BOT account
+        # (chess_lichess.py — outbound only, nothing listens on this PC).
+        if action in {"lichess_start", "take_challenges", "go_online", "lichess_online"}:
+            return await self.chess.lichess_start()
+        if action in {"lichess_stop", "stop_challenges", "go_offline", "lichess_offline"}:
+            return await self.chess.lichess_stop()
+        if action in {"lichess_status", "lichess"}:
+            return self.chess.lichess_status()
+        if action in {"challenge", "lichess_challenge", "challenge_friend"}:
+            username = str(args.get("username") or args.get("friend") or "")
+            if not username:
+                return ToolResult("Who should I challenge? I need their Lichess username.",
+                                  ok=False)
+            try:
+                minutes = float(args.get("minutes") or 5)
+                increment = int(args.get("increment") if args.get("increment") is not None else 3)
+            except (TypeError, ValueError):
+                minutes, increment = 5.0, 3
+            return await self.chess.lichess_challenge(
+                username, minutes, increment,
+                str(args.get("rated") or "").strip().lower() in {"true", "1", "yes", "rated"},
+                str(args.get("colour") or args.get("color") or "random").lower())
+        if action in {"lichess_allow", "allow_friend", "lichess_disallow", "remove_friend"}:
+            username = str(args.get("username") or args.get("friend") or "")
+            if not username:
+                return ToolResult("Which Lichess username?", ok=False)
+            return self.chess.lichess_allow(
+                username, allowed=action in {"lichess_allow", "allow_friend"})
+        if action in {"lichess_anyone", "accept_anyone"}:
+            enabled = str(args.get("enabled") if args.get("enabled") is not None
+                          else "true").strip().lower() in {"true", "1", "yes", "on"}
+            return self.chess.lichess_accept_anyone(enabled)
+        if action in {"lichess_resign"}:
+            return await self.chess.lichess_resign()
         if action in {"analyse_move", "analyze_move", "explain_move"}:
             move_number = args.get("move_number")
             kwargs: dict[str, Any] = {

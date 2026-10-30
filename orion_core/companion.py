@@ -313,8 +313,9 @@ class CompanionEngine:
 
     def achievements(self, limit: int = 12) -> list[dict[str, Any]]:
         with self._lock:
+            # The id lets one item be forgotten exactly (forget.py).
             rows = self.conn.execute(
-                "SELECT title, detail, at FROM achievements ORDER BY at DESC LIMIT ?",
+                "SELECT id, title, detail, at FROM achievements ORDER BY at DESC LIMIT ?",
                 (limit,)).fetchall()
         return [dict(r) for r in rows]
 

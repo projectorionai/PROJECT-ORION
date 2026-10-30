@@ -1,6 +1,7 @@
 """
-Tests for mobile-data lite mode (#12): the heavy CDN-backed voxel face is
-dropped for a self-contained CSS orb on metered connections, and text/HTML is
+Tests for mobile data (#12): the phone page is light on every connection (a
+2-D canvas signal, no WebGL face and nothing from a CDN), so the app's
+?lite=1 and the browser's Save-Data hint get the same page; text/HTML is
 gzip-compressed when the client accepts it.
 """
 
@@ -41,25 +42,25 @@ async def _client(gateway, **kw):
     return client
 
 
-def test_full_page_has_the_heavy_face(tmp_path):
+def test_the_page_draws_a_light_signal_not_a_webgl_face(tmp_path):
     async def flow():
         client = await _client(_gateway(tmp_path))
         try:
             body = await (await client.get("/")).text()
-            assert 'src="/face"' in body
+            assert '<canvas id="vector"' in body
+            assert 'src="/face"' not in body
         finally:
             await client.close()
     asyncio.run(flow())
 
 
-def test_lite_query_drops_face_for_css_orb(tmp_path):
+def test_lite_query_gets_the_same_light_page(tmp_path):
     async def flow():
         client = await _client(_gateway(tmp_path))
         try:
-            body = await (await client.get("/?lite=1")).text()
-            assert 'src="/face"' not in body      # no CDN-backed WebGL face
-            assert "orionlite" in body            # ...replaced by the CSS orb
-            assert 'id="face"' in body            # keeps the id so faceMsg no-ops
+            full = await (await client.get("/")).text()
+            lite = await (await client.get("/?lite=1")).text()
+            assert lite == full
         finally:
             await client.close()
     asyncio.run(flow())

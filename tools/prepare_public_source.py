@@ -15,12 +15,17 @@ import subprocess
 import sys
 import zipfile
 
-# Reviewed model weights: only these exact bytes may bypass text-only auditing.
+# Reviewed binary assets: only these exact bytes may bypass text-only auditing.
 BINARY_ASSETS = {
+    # Official MediaPipe recogniser, version 1; GestureEngine pins these bytes.
+    'assets/hand/gesture_recognizer.task': '97952348cf6a6a4915c2ea1496b4b37ebabc50cbbf80571435643c455f2b0482',
     'assets/face/face_detection_yunet_2023mar.onnx': '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4',
     'assets/voiceprint/encoder.onnx': '5374e37c9a7bee1edaf4e4a63f77106a323474b104dac9a06b37ee4132264d14',
     'assets/yamnet/yamnet.onnx': 'd4459cb7fb460e44252ac0408b3718c02ec1286c467a14abaf2ef412fbc0194c',
     'assets/yamnet/yamnet.data': '0b4de0b14bf2b528d51e3cd84e2d3e2ae826b942fbec6001c654605f1f2ceb60',
+    # Procedural artwork from tools/make_brand_icons.py, reviewed 2026-09-27.
+    'assets/brand/orion-emblem-1024.png': '8874e10cd06ef03d0324b9d400d338c58d13243ed3e541b420cf8d9733486943',
+    'android/app/src/main/ic_launcher-playstore.png': '4b67f10ecf0fc32dc1babb2f37263dd1887544bb580f3f42252d3f2722e56369',
 }
 
 PUBLIC_CONFIG_FILES = frozenset({
@@ -63,19 +68,48 @@ PUBLIC_CONFIG_FILES = frozenset({
     "config/custom_tools/json_validator.plugin.json",
     "config/custom_tools/live_camera_analysis_tool.py",
     "config/custom_tools/live_camera_analysis.plugin.json",
+    # Mark XXXIII reviewed adapters, not their private runtime settings.
+    *(f"config/custom_tools/{name}{suffix}" for name in (
+        "jv_document_review", "jv_quiz", "jv_pomodoro", "jv_water_reminder",
+        "jv_excel_writer", "jv_calorie_counter", "jv_game_updater",
+        "jv_chat_takeover", "jv_telegram_remote", "jv_cloud_agent",
+        "jv_reminder", "jv_forge_trial",
+    ) for suffix in ("_tool.py", ".plugin.json")),
+    *(f"config/custom_tools/{name}{suffix}" for name in (
+        "orion_latency_report", "orion_batch_planner", "orion_dataset_compare",
+    ) for suffix in ("_tool.py", ".plugin.json")),
     *(f"config/knowledge_packs/{name}.json" for name in (
         "ai", "business", "coding", "copywriting", "dropshipping",
         "entrepreneurship", "marketing", "personal_development",
         "sales_psychology", "tiktok_shop",
     )),
 })
+#: Reviewed plugins that stay in the source (their tests still run) but are
+#: no longer SHIPPED inside the app (build_standalone): built-in tools replace
+#: them in Mark XXXVII.5 - messaging channels, smart_home, weather, reminders,
+#: the emotion engine - and jv_telegram_remote never loaded. An install that
+#: already has one keeps it until the owner archives it (plugin_registry).
+RETIRED_PLUGINS = frozenset({
+    "homeassistant_call_service", "philips_hue", "telegram_message", "discord_message",
+    "push_notify", "ifttt_webhook", "open_meteo_weather", "emotional_monitor",
+    "emotional_insight_generator", "json_validator", "jv_reminder", "jv_telegram_remote",
+})
+# Launcher icons rendered by tools/make_brand_icons.py (procedural, no
+# third-party artwork). The adaptive-icon XML references them, so the
+# published Android project cannot build without them.
+GENERATED_ICONS = frozenset(
+    f"android/app/src/main/res/mipmap-{density}/{stem}.webp"
+    for density in ("mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi")
+    for stem in ("ic_launcher", "ic_launcher_round",
+                 "ic_launcher_foreground", "ic_launcher_background")
+)
 SOURCE_DIRECTORIES = frozenset({
     ".github", "android", "assets", "deploy", "docs", "launcher",
-    "orion_core", "skills", "tests", "tools",
+    "orion_core", "requirements", "robot", "skills", "tests", "tools",
 })
 ROOT_FILES = frozenset({
     ".env.example", ".gitignore", ".dockerignore", "README.md", "SECURITY.md",
-    "LICENSE", "LICENSE.md", "ARCHITECTURE.md", "EXECUTION_PLAN.md", "JARVIS_SUBSYSTEMS.md",
+    "LICENSE", "LICENSE.md", "ARCHITECTURE.md", "EXECUTION_PLAN.md", "PLANS.md", "JARVIS_SUBSYSTEMS.md",
     "ORION_CAPABILITIES.md", "orion.py", "requirements.txt", "conftest.py",
     "test_jarvis_subsystems.py", "build_exe.py", "build_setup.py",
     "build_standalone.py",
@@ -85,7 +119,9 @@ ROOT_FILES = frozenset({
 TEXT_SUFFIXES = frozenset({
     ".py", ".md", ".txt", ".json", ".yml", ".yaml", ".toml", ".ini",
     ".gradle", ".properties", ".pro", ".xml", ".kt", ".service",
-    ".html", ".css", ".js", ".sh", ".ps1", ".bat",
+    ".html", ".css", ".js", ".sh", ".ps1", ".bat", ".aidl",
+    # The robot library and sketches (robot/): C, C++ and Arduino sources.
+    ".c", ".h", ".hpp", ".cpp", ".ino",
 })
 FORBIDDEN_PARTS = frozenset({
     ".git", ".venv", "venv", "__pycache__", ".pytest_cache",
@@ -130,7 +166,12 @@ def eligible_path(name: str) -> bool:
         "assets/canonical_face_model.obj",
     }:
         return True
-    if name in {"deploy/Caddyfile", "deploy/Caddyfile.hostinger", "deploy/Dockerfile"}:
+    if name in GENERATED_ICONS:
+        return True
+    if name in {
+        "deploy/Caddyfile", "deploy/Caddyfile.hostinger", "deploy/Dockerfile", "deploy/Dockerfile.render",
+        "deploy/forge-verifier.Dockerfile", "docs/neural_reference/requirements.in",
+    }:
         return True
     if path.name == ".gitignore":
         return True
@@ -173,6 +214,68 @@ def local_secrets(paths: list[Path]) -> list[str]:
     return sorted(values)
 
 
+#: Marks an AI assistant leaves in commits and files; the public copy has none.
+#: Assembled, so this file does not trip its own check.
+AUTHORSHIP_TRACES = ("Co-" + "Authored-By", "noreply" + "@anthropic.com",
+                     "Generated with " + "[" + "Cla" + "ude Code]")
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b")
+_TAILNET_HOST = re.compile(r"[a-z0-9-]+\.[a-z0-9-]+\.ts\.net", re.I)
+_EXAMPLE_DOMAINS = ("example.com", "example.org", "example.net", "users.noreply.github.com")
+
+
+def local_private_terms(config_dirs=(), *, home: Path | None = None, env=None) -> list[str]:
+    """Personal details this PC knows about its owner, found without asking.
+
+    28 Oct 2026, before ORION goes open source: a private-terms file had to
+    be remembered for every export, and the release's own export passed
+    none. These always apply: the names in identity.json (creator, user
+    name, and any long part of them), the Windows profile folder, the
+    OneDrive organisation, the PC's name, and every e-mail address and
+    tailnet host in the local config - plus AUTHORSHIP_TRACES."""
+    import os
+    env = os.environ if env is None else env
+    terms: set[str] = set(AUTHORSHIP_TRACES)
+
+    def add_name(value: object) -> None:
+        name = " ".join(str(value or "").split())
+        if len(name) >= 4:
+            terms.add(name)
+            terms.update(part for part in name.split() if len(part) >= 6)
+
+    home = Path.home() if home is None else home
+    if len(home.name) >= 4:
+        terms.add(home.name)
+    folders = [Path(str(env.get(key) or "")).name for key in ("OneDriveCommercial", "OneDrive")]
+    try:
+        folders += [child.name for child in home.glob("OneDrive - *")]
+    except OSError:
+        pass
+    for folder in folders:
+        if folder.startswith("OneDrive - ") and len(folder) > 14:
+            terms.add(folder[len("OneDrive - "):])     # the organisation's name
+    computer = str(env.get("COMPUTERNAME") or "")
+    if len(computer) >= 5 and computer.upper() not in {"LOCALHOST", "DESKTOP"}:
+        terms.add(computer)
+    for config in config_dirs:
+        config = Path(config)
+        try:
+            identity = json.loads((config / "identity.json").read_text(encoding="utf-8-sig"))
+            if isinstance(identity, dict):
+                add_name(identity.get("creator"))
+                add_name(identity.get("user_name"))
+        except (OSError, ValueError):
+            pass
+        for path in sorted(config.glob("*.json")) if config.is_dir() else []:
+            try:
+                text = path.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeDecodeError):
+                continue
+            terms.update(m for m in _EMAIL.findall(text)
+                         if not m.lower().endswith(_EXAMPLE_DOMAINS))
+            terms.update(m.lower() for m in _TAILNET_HOST.findall(text))
+    return sorted(terms)
+
+
 def audit(root: Path, names: list[str], *, secrets=(), private_terms=()):
     """Return exactly the scanned bytes and value-free findings (fail closed)."""
     root = root.resolve()
@@ -196,14 +299,15 @@ def audit(root: Path, names: list[str], *, secrets=(), private_terms=()):
         data = path.read_bytes()
         if name in BINARY_ASSETS:
             if hashlib.sha256(data).hexdigest() != BINARY_ASSETS[name]:
-                findings.append({"file": name, "kind": "reviewed model digest changed"})
+                kind = "reviewed artwork digest changed" if name.endswith(".png") else "reviewed model digest changed"
+                findings.append({"file": name, "kind": kind})
                 continue
             for label, values in (("known local credential", secrets), ("private term", private_terms)):
                 if any(value and value.encode("utf-8").lower() in data.lower() for value in values):
                     findings.append({"file": name, "kind": label})
             payload[name] = data
             continue
-        if name == "assets/orion.ico":
+        if name == "assets/orion.ico" or name in GENERATED_ICONS:
             payload[name] = data
             continue
         try:
@@ -269,6 +373,10 @@ def main(argv=None) -> int:
         terms = json.loads(args.private_terms_file.read_text(encoding="utf-8-sig")) if args.private_terms_file else []
         if not isinstance(terms, list) or not all(isinstance(t, str) and t.strip() for t in terms):
             raise ValueError("Private terms must be a JSON list of non-empty strings.")
+        # Always: what this PC knows about its owner (the checkout's config
+        # and the installed app's, %USERPROFILE%\ORION\config).
+        terms = sorted(set(terms) | set(local_private_terms(
+            [root / "config", Path.home() / "ORION" / "config"])))
         payload, findings = audit(root, candidate_paths(root),
                                   secrets=local_secrets(args.secrets_file), private_terms=terms)
         if findings:

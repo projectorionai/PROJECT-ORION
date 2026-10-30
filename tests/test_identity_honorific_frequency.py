@@ -119,3 +119,27 @@ def test_style_capsule_uses_the_occasional_instruction_by_default(tmp_path, monk
 def test_describe_reports_the_frequency(tmp_path, monkeypatch):
     manager = _manager(tmp_path, monkeypatch)
     assert manager.describe()["honorific_frequency"] == "occasional"
+
+
+# ── the owner's name from Preferences ───────────────────────────────────────
+
+def test_the_name_given_in_preferences_is_kept_and_used(tmp_path, monkeypatch):
+    """Preferences asked "You are called" and nothing ever read the answer."""
+    manager = _manager(tmp_path, monkeypatch)
+    assert "asked, in your Preferences" not in manager.persona_text()
+    assert manager.set_user_name("  Alex   Morgan ") is True
+    assert manager.set_user_name("Alex Morgan") is False      # unchanged
+    reopened = _manager(tmp_path, monkeypatch)
+    assert reopened.user_name() == "Alex Morgan"
+    persona = reopened.persona_text()
+    assert "'Alex Morgan'" in persona and "never in every reply" in persona
+    assert "listener line says someone else" in persona
+    assert reopened.set_user_name("") is True
+    assert "user_name" not in _manager(tmp_path, monkeypatch).preferences
+
+
+def test_the_header_greets_the_owner_by_first_name():
+    from datetime import datetime
+    from orion_core.gui.core_window import _greeting_words
+    assert _greeting_words(datetime(2026, 10, 8, 9)) == "Good morning"
+    assert _greeting_words(datetime(2026, 10, 8, 20), "Alex Morgan") == "Good evening, Alex"

@@ -362,6 +362,7 @@ class DeepResearchEngine:
         # uses the agent's own gathering instead of touching the network.
         self.live_reading = (self.router is not None) if live_reading is None else live_reading
         self.last: Paper | None = None
+        self._activity: Any = None
 
     # ── logging ──────────────────────────────────────────────────────────────
 
@@ -376,6 +377,8 @@ class DeepResearchEngine:
         """Announce a stage on the research console as well as the log."""
         self._log(f"RESEARCH: {message}")
         payload = {"kind": kind, "message": message, "at": time.time(), **extra}
+        if kind == "writing" and self._activity is not None:
+            self._activity.progress(message)
         if self.bus is not None:
             try:
                 self.bus.dashboard_event.emit("research_step", payload)
@@ -564,6 +567,25 @@ class DeepResearchEngine:
         """Plan, then write every section concurrently, then assemble."""
         style = resolve_style(style)
         depth = resolve_depth(depth)
+        # The paper's real start and single finish, for the BRAIN and NEURAL
+        # pages (research_runs.ActivitySignal); its reading reports progress
+        # under this run rather than as a second one.
+        from .research_runs import ActivitySignal
+        self._activity = ActivitySignal(self.bus, topic, "paper")
+        self._activity.start()
+        status = "failed"
+        try:
+            paper = await self._write_paper(topic, style, depth, on_progress)
+            status = "done" if paper.sources and not paper.failed else "draft"
+            return paper
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        finally:
+            self._activity.finish(status)
+
+    async def _write_paper(self, topic: str, style: Style, depth: Depth,
+                           on_progress: Callable[[int, int], None] | None) -> Paper:
         pages, count, words = DEPTHS[depth]
         started = time.monotonic()
         self._step("paper_start", f"starting a {STYLES[style].label.lower()} on "
@@ -698,7 +720,7 @@ class DeepResearchEngine:
             researcher = LiveResearcher(
                 ask=lambda prompt, persona="research reader":
                     self._ask(prompt, persona, max_tokens=900),
-                bus=self.bus, on_event=self.on_event)
+                bus=self.bus, on_event=self.on_event, activity=self._activity)
             run = await researcher.investigate(
                 topic, questions=questions, per_question=per_question,
                 rounds=rounds, deadline_s=minutes * 60.0)

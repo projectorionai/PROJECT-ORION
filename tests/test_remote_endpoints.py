@@ -65,6 +65,34 @@ def test_detect_empty_when_nothing_reachable():
     assert detect_endpoints(8765, tailscale={"dns": "", "ips": []}, lan=[]) == []
 
 
+def test_serve_advertises_only_https_magicdns_on_443():
+    endpoints = detect_endpoints(
+        8000, https=False, serve=True,
+        tailscale={"dns": "orion-host.tail1234.ts.net",
+                   "ips": ["100.101.102.103"]},
+        lan=["192.168.1.20"],
+    )
+    assert endpoints == [{
+        "kind": "tailscale-serve", "host": "orion-host.tail1234.ts.net",
+        "port": 443, "https": True,
+        "url": "https://orion-host.tail1234.ts.net:443/", "priority": 10,
+    }]
+
+
+def test_direct_tailnet_https_advertises_only_named_origin():
+    endpoints = detect_endpoints(
+        443, https=True, tailnet_only=True,
+        tailscale={"dns": "orion-host.tail1234.ts.net",
+                   "ips": ["100.101.102.103"]},
+        lan=["192.168.1.20"],
+    )
+    assert endpoints == [{
+        "kind": "tailscale", "host": "orion-host.tail1234.ts.net",
+        "port": 443, "https": True,
+        "url": "https://orion-host.tail1234.ts.net:443/", "priority": 10,
+    }]
+
+
 def test_tailscale_status_json_absent_cli_is_empty(monkeypatch):
     import orion_core.remote_endpoints as mod
     monkeypatch.setattr(mod, "tailscale_exe", lambda: None)

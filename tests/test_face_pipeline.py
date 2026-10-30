@@ -317,3 +317,133 @@ def test_a_pipeline_failure_falls_back_rather_than_blanking():
     start = source.index("def _ensure_pipeline")
     body = source[start:start + 1400]
     assert "self._threaded = False" in body
+
+
+# ── frame and worker ownership (audit 6 Oct 2026, A08 + A09) ─────────────────
+
+def _qt():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def test_a_frame_the_gui_holds_is_never_painted_over():
+    _qt()
+    from PyQt6.QtGui import QColor
+    from orion_core.gui.face_pipeline import FrameBuffer
+    buffer = FrameBuffer()
+    buffer.back_image(8, 8, QColor("red"))
+    buffer.publish()
+    held, generation = buffer.take()
+    red = held.pixel(0, 0)
+    buffer.back_image(8, 8, QColor("green"))
+    buffer.publish()
+    buffer.back_image(8, 8, QColor("blue"))          # the next, unpublished frame
+    assert generation == 1 and held.pixel(0, 0) == red
+    newest, _ = buffer.take()
+    assert newest.pixel(0, 0) == QColor("green").rgb()
+
+
+def test_a_slow_stop_keeps_its_one_worker_and_a_restart_resumes_it():
+    import threading
+    from types import SimpleNamespace
+
+    _qt()
+    from PyQt6.QtGui import QColor
+    from orion_core.gui.face_pipeline import FaceRenderPipeline
+    release = threading.Event()
+    head = SimpleNamespace(step=lambda dt, **kw: None,
+                           paint=lambda *args: release.wait(5))     # wedged mid-frame
+    pipeline = FaceRenderPipeline(head, fps=60)
+    pipeline.set_geometry(16, 16, 8, 8, 6)
+    pipeline.set_palette(QColor("white"), QColor("cyan"), QColor("black"))
+    pipeline.start()
+    owner = pipeline._thread
+    try:
+        for _ in range(100):                              # let it reach the paint
+            if pipeline.paint_ms or not owner.is_alive():
+                break
+            threading.Event().wait(0.01)
+        assert pipeline.stop(timeout=0.05) is False
+        assert pipeline.running and pipeline.stopping and pipeline._thread is owner
+        pipeline.start()                                  # a show during the stop
+        assert pipeline._thread is owner and not pipeline.stopping
+        rendered = pipeline.rendered
+        release.set()
+        for _ in range(200):
+            if pipeline.rendered > rendered + 2:
+                break
+            threading.Event().wait(0.01)
+        assert pipeline.rendered > rendered, "the resumed worker should carry on"
+    finally:
+        release.set()
+        assert pipeline.stop(timeout=2) is True
+    assert not owner.is_alive() and not pipeline.running
+
+
+def test_the_panel_keeps_a_pipeline_whose_worker_is_still_finishing():
+    from types import SimpleNamespace
+
+    _qt()
+    from orion_core.gui.holo_head import HoloHeadPanel
+    started = []
+    still_running = SimpleNamespace(stop=lambda: False, stopping=True, running=True,
+                                    start=lambda: started.append(1))
+    panel = SimpleNamespace(_pipeline=still_running, _threaded=True)
+    HoloHeadPanel.stop_pipeline(panel)
+    assert panel._pipeline is still_running, "dropping it would let a second worker in"
+    assert HoloHeadPanel._ensure_pipeline(panel) is still_running and started == [1]
+    finished = SimpleNamespace(stop=lambda: True, stopping=False, running=False)
+    panel._pipeline = finished
+    HoloHeadPanel.stop_pipeline(panel)
+    assert panel._pipeline is None
+
+
+def test_held_frames_survive_many_publications_and_a_resize():
+    _qt()
+    from PyQt6.QtGui import QColor
+    from orion_core.gui.face_pipeline import FrameBuffer
+    buffer = FrameBuffer()
+    colours = ["red", "green", "blue", "yellow", "magenta"]
+    held = []
+    for index, name in enumerate(colours):
+        size = 8 if index < 3 else 12                    # a resize midway
+        buffer.back_image(size, size, QColor(name))
+        buffer.publish()
+        held.append(buffer.take())
+    for (image, generation), (index, name) in zip(held, enumerate(colours)):
+        assert generation == index + 1
+        assert image.pixel(0, 0) == QColor(name).rgb(), f"frame {generation} changed"
+    assert held[-1][0].width() == 12 and held[0][0].width() == 8
+
+
+def test_an_unheld_frame_costs_no_copy():
+    """The copy only happens while the GUI still holds a frame: a frame let go
+    of (as paintEvent does) leaves the worker painting its own buffer."""
+    _qt()
+    from PyQt6.QtGui import QColor
+    from orion_core.gui.face_pipeline import FrameBuffer
+    buffer = FrameBuffer()
+    first = buffer.back_image(64, 64, QColor("red"))
+    buffer.publish()
+    second = buffer.back_image(64, 64, QColor("green"))
+    buffer.publish()
+    image, _ = buffer.take()
+    key = image.cacheKey()
+    del image                                            # paintEvent returns
+    again = buffer.back_image(64, 64, QColor("blue"))   # repaints the first buffer
+    assert again is first and again.cacheKey() != 0
+    shown, _ = buffer.take()
+    assert shown.cacheKey() == key, "the shown frame was copied though nobody held it"
+    del second, shown
+
+
+def test_stop_is_safe_before_start_and_when_repeated():
+    from types import SimpleNamespace
+    from orion_core.gui.face_pipeline import FaceRenderPipeline
+    pipeline = FaceRenderPipeline(SimpleNamespace())
+    assert pipeline.stop(timeout=0.1) is True and not pipeline.running
+    pipeline.start()
+    assert pipeline.stop(timeout=2) is True
+    assert pipeline.stop(timeout=0.1) is True and not pipeline.stopping

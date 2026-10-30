@@ -97,7 +97,7 @@ class DevelopmentDeckView(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
-        title = QLabel("DEVELOPMENT — WORKBENCH")
+        title = QLabel("Development — Workbench")
         title.setObjectName("titleLabel")
         outer.addWidget(title)
 
@@ -124,7 +124,7 @@ class DevelopmentDeckView(QWidget):
         return page
 
     def _build_repo_panel(self) -> QFrame:
-        frame, layout = _panel("REPOSITORY ANALYSIS")
+        frame, layout = _panel("Repository Analysis")
         row = QHBoxLayout()
         self.repo_path = QLineEdit()
         self.repo_path.setPlaceholderText("Repository path (blank = ORION's own root)")
@@ -139,7 +139,7 @@ class DevelopmentDeckView(QWidget):
         return frame
 
     def _build_command_panel(self) -> QFrame:
-        frame, layout = _panel("COMMAND RUNNER")
+        frame, layout = _panel("Command Runner")
         hint = QLabel(_DEV_COMMAND_HINT)
         hint.setObjectName("mutedLabel")
         hint.setWordWrap(True)
@@ -158,7 +158,7 @@ class DevelopmentDeckView(QWidget):
         return frame
 
     def _build_code_panel(self) -> QFrame:
-        frame, layout = _panel("CODE VIEWER")
+        frame, layout = _panel("Code Viewer")
         row = QHBoxLayout()
         self.file_path = QLineEdit()
         self.file_path.setPlaceholderText("File path")
@@ -186,7 +186,7 @@ class DevelopmentDeckView(QWidget):
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(0, 8, 0, 0)
-        frame, layout = _panel("PDB SESSION — real Python debugger, one session at a time")
+        frame, layout = _panel("PDB Session — Real Python Debugger, One Session at a Time")
 
         start_row = QHBoxLayout()
         self.debug_script = QLineEdit()
@@ -216,7 +216,7 @@ class DevelopmentDeckView(QWidget):
 
         command_row = QHBoxLayout()
         self.debug_command = QLineEdit()
-        self.debug_command.setPlaceholderText("pdb command, e.g. p some_variable, break file.py:12")
+        self.debug_command.setPlaceholderText("PDB command, e.g. p some_variable, break file.py:12")
         self.debug_command.returnPressed.connect(self._debug_send_input)
         command_row.addWidget(self.debug_command, 1)
         send_btn = QPushButton("Send")
@@ -290,7 +290,7 @@ class DevelopmentDeckView(QWidget):
         return page
 
     def _build_docker_containers_panel(self) -> QFrame:
-        frame, layout = _panel("CONTAINERS")
+        frame, layout = _panel("Containers")
         self.docker_list = QListWidget()
         layout.addWidget(self.docker_list, 1)
 
@@ -326,7 +326,7 @@ class DevelopmentDeckView(QWidget):
         return frame
 
     def _build_docker_logs_panel(self) -> QFrame:
-        frame, layout = _panel("LOGS / OUTPUT")
+        frame, layout = _panel("Logs / Output")
         self.docker_output = _mono_output()
         layout.addWidget(self.docker_output, 1)
         return frame

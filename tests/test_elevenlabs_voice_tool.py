@@ -101,3 +101,33 @@ def test_unknown_action_reports_the_supported_ones(tmp_path, monkeypatch):
 def test_tool_is_registered_in_the_handler_table():
     d = _dispatcher()
     assert d.handler_table()["elevenlabs_voice"] == d.elevenlabs_voice_tool
+
+
+# ── ORION's offline voice (voice_kokoro) through the same tool, 18 Oct ───────
+
+def test_offline_voice_is_chosen_kept_and_reported(tmp_path, monkeypatch):
+    from orion_core import voice_kokoro as vk
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(vk, "settings_path", lambda: tmp_path / "voices" / "kokoro.json")
+    d = _dispatcher()
+    result = d.elevenlabs_voice_tool({"action": "offline_voice"})
+    assert result.ok and "bm_george" in result.text                  # the default, reported
+    result = d.elevenlabs_voice_tool({"action": "offline_voice", "voice": "Lewis"})
+    assert result.ok and "bm_lewis" in result.text
+    assert vk.current_voice() == "bm_lewis" and vk.KokoroVoice().voice == "bm_lewis"
+    status = d.elevenlabs_voice_tool({"action": "status"})
+    assert "Offline voice: Kokoro bm_lewis" in status.text and "not set" in status.text.lower()
+    refused = d.elevenlabs_voice_tool({"action": "offline_voice", "voice": "Zelda"})
+    assert not refused.ok and vk.current_voice() == "bm_lewis"
+    listed = d.elevenlabs_voice_tool({"action": "offline_voices"})
+    assert listed.ok and "bm_george" in listed.text and "am_michael" in listed.text
+    unknown = d.elevenlabs_voice_tool({"action": "explode"})
+    assert "offline_voice" in unknown.text
+
+
+def test_the_schema_offers_the_offline_voice():
+    from orion_core.dispatch_schema import TOOL_DECLARATIONS
+    tool = next(t for t in TOOL_DECLARATIONS if t["name"] == "elevenlabs_voice")
+    properties = tool["parameters"]["properties"]
+    assert "offline_voice" in properties["action"]["description"] and "voice" in properties
+    assert "OFFLINE voice" in tool["description"] and "bm_george" in tool["description"]

@@ -51,6 +51,7 @@ class CognitiveLoopManager:
         workspace: Any | None = None,
         telemetry: Any | None = None,
         interval_s: float | None = None,
+        context_service: Any | None = None,
     ) -> None:
         self.bus = bus
         self.memory = memory
@@ -58,11 +59,17 @@ class CognitiveLoopManager:
         self.graph = graph                  # KnowledgeGraphEngine (optional)
         self.workspace = workspace          # WorkspaceManager (optional)
         self.telemetry = telemetry
+        self.context_service = context_service
         self.interval_s = float(interval_s or self.DEFAULT_INTERVAL_S)
         self._stop = asyncio.Event()
         self._ingested: set[str] = set()    # episode hashes already graphed
         self._cycles = 0
         self._last_digest: dict[str, Any] = {}
+        if self.context_service is not None:
+            try:
+                self.bus.context_event.connect(self._context_changed)
+            except AttributeError:
+                pass  # stripped-down buses used by headless callers
         if self.telemetry is not None:
             self.telemetry.health.register("cognitive_loop")
 
@@ -85,6 +92,20 @@ class CognitiveLoopManager:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.context_service is not None:
+            try:
+                self.bus.context_event.disconnect(self._context_changed)
+            except (AttributeError, TypeError):
+                pass
+
+    def _context_changed(self, event: Any) -> None:
+        if self._stop.is_set() or self.context_service is None:
+            return
+        digest = self.last_digest()
+        # Qt may deliver a queued observation after stop, expiry or coalescing.
+        if any(row["event_id"] == getattr(event, "event_id", None)
+               for row in digest["context"]["events"]):
+            self.bus.dashboard_event.emit("awareness", digest)
 
     # ── the awareness cycle (observe → remember → surface) ───────────────────
 
@@ -154,7 +175,7 @@ class CognitiveLoopManager:
             "graph": self.graph.stats() if self.graph is not None else {},
         }
         self._last_digest = digest
-        self.bus.dashboard_event.emit("awareness", digest)
+        self.bus.dashboard_event.emit("awareness", self.last_digest())
         if self.telemetry is not None:
             self.telemetry.health.beat(
                 "cognitive_loop", "OK",
@@ -169,25 +190,22 @@ class CognitiveLoopManager:
             state = self.cognition.snapshot()
         except Exception:
             return out
+        # The shared rule (owner_tasks): a bare date is due at the END of
+        # the day. This copy called a task due today "OVERDUE (11h ago)" at
+        # 11:00 while list_tasks and the briefing said it was still open.
+        from .owner_tasks import hours_until
         now = datetime.now()
         for task in (state.get("pending_tasks") or {}).values():
             if not isinstance(task, dict):
                 continue
-            due_raw = str(task.get("due") or "").strip()
             title = str(task.get("title") or "task")[:80]
-            if not due_raw:
+            hours = hours_until(task.get("due"), end=task.get("due_end"), now=now)
+            if hours is None:
                 continue
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
-                try:
-                    due = datetime.strptime(due_raw[: len(now.strftime(fmt))], fmt)
-                except ValueError:
-                    continue
-                hours = (due - now).total_seconds() / 3600.0
-                if hours < 0:
-                    out.append(f"OVERDUE: '{title}' ({abs(hours):.0f}h ago)")
-                elif hours <= self.DEADLINE_HORIZON_HOURS:
-                    out.append(f"'{title}' due in {hours:.0f}h")
-                break
+            if hours < 0:
+                out.append(f"OVERDUE: '{title}' ({abs(hours):.0f}h ago)")
+            elif hours <= self.DEADLINE_HORIZON_HOURS:
+                out.append(f"'{title}' due in {hours:.0f}h")
         return sorted(out)
 
     # ── on-demand awareness (the voice/tool channel asks; loop never speaks) ──
@@ -225,7 +243,12 @@ class CognitiveLoopManager:
                 f"{stats.get('relationships', 0)} relationships"
             )
         lines.append(f"- Awareness cycles this session: {self._cycles}")
+        if self.context_service is not None:
+            lines.append(self.context_service.report())
         return ToolResult("\n".join(lines))
 
     def last_digest(self) -> dict[str, Any]:
-        return dict(self._last_digest)
+        digest = dict(self._last_digest)
+        if self.context_service is not None:
+            digest["context"] = self.context_service.snapshot()
+        return digest

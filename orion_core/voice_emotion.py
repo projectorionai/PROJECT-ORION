@@ -531,7 +531,38 @@ class EmotionReader:
                 "Baselines so far: " + ", ".join(parts) + ".")
 
 
+# ── ORION's own delivery ──────────────────────────────────────────────────────
+#
+# The local voice (audio.SpeechSynthesiser) has asked for prosody_for since
+# emotional delivery (#14) was added, and it never existed: the import failed
+# inside a try/except and the local voice spoke every mood the same way. Found
+# by the installed-app parity check, 11 Oct 2026.
+
+#: How far ORION's local voice may flex with his mood. Delivery only - rate
+#: and volume - never which voice it is, and never more than these fractions.
+PROSODY_RATE_SPAN = 0.08
+PROSODY_VOLUME_SPAN = 0.06
+
+
+def prosody_for(emotion: str, base_rate: float, base_volume: float) -> tuple[int, float]:
+    """Speaking rate (words a minute) and volume (0-1) for *emotion*.
+
+    Keyed to the same profiles that drive the face (emotion.EMOTIONS): a
+    livelier profile speaks a little faster and fuller, a subdued one a little
+    slower and softer, each within PROSODY_RATE_SPAN / PROSODY_VOLUME_SPAN of
+    the base. An unknown emotion is neutral.
+    """
+    from .emotion import EMOTIONS
+    neutral = EMOTIONS["neutral"]
+    profile = EMOTIONS.get(str(emotion or "neutral").strip().lower(), neutral)
+    pace = max(-1.0, min(1.0, (profile.speed - neutral.speed) / 0.5))
+    energy = max(-1.0, min(1.0, (profile.glow - neutral.glow) / 0.45))
+    rate = int(round(float(base_rate) * (1.0 + pace * PROSODY_RATE_SPAN)))
+    volume = max(0.0, min(1.0, float(base_volume) * (1.0 + energy * PROSODY_VOLUME_SPAN)))
+    return rate, round(volume, 3)
+
+
 __all__ = [
-    "MIN_SECONDS", "NOMINAL_SR", "STATE_FILE", "EmotionBaseline",
-    "EmotionReader", "Features", "Reading", "extract",
+    "MIN_SECONDS", "NOMINAL_SR", "PROSODY_RATE_SPAN", "PROSODY_VOLUME_SPAN", "STATE_FILE",
+    "EmotionBaseline", "EmotionReader", "Features", "Reading", "extract", "prosody_for",
 ]

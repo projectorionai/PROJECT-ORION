@@ -38,9 +38,9 @@ from orion_core.gui.unified_dashboard import UnifiedDashboard
 # test_zone_mapping_covers_every_real_app_page below fails loudly if this
 # list and ZONE_PAGES drift apart.
 _REAL_PAGE_LABELS = [
-    "MISSION", "RESEARCH", "WORKBENCH", "DEVELOPMENT", "WIDGETS", "TOOLKIT",
+    "MISSION", "RESEARCH", "WORKBENCH", "DEVELOPMENT", "WIDGETS",
     "MARKETING", "LIBRARY", "OPS", "COGNITION", "AUTOMATION", "COMMAND CENTRE",
-    "DIAGNOSTICS", "GLOBE", "LOG", "MEMORY", "TELEMETRY", "CHESS", "SECURITY",
+    "DIAGNOSTICS", "GLOBE", "LOG", "MEMORY", "CHESS", "SECURITY",
 ]
 
 
@@ -147,7 +147,7 @@ def test_selecting_a_page_in_a_different_zone_rebuilds_the_row(_app):
     assert deck._zone_buttons["MONITORING"].isChecked() is True
     assert deck._zone_buttons["INTELLIGENCE"].isChecked() is False
     shown = {deck._pages[i][0] for i in deck._tabs}
-    assert shown == {"DIAGNOSTICS", "LOG", "TELEMETRY"}
+    assert shown == {"DIAGNOSTICS", "LOG"}           # Telemetry is a tab of Diagnostics now
 
 
 def test_clicking_a_zone_jumps_to_its_first_page(_app):
@@ -213,3 +213,48 @@ def test_zone_mapping_covers_every_real_app_page_exactly_once_or_not_at_all(_app
     for name, zone in zoned.items():
         assert zone is not None, f"{name} has no zone mapping"
         assert zone in UnifiedDashboard.ZONE_ORDER
+
+
+# ── pinned and recent pages ───────────────────────────────────────────────────
+
+def test_the_decks_page_history_is_written_off_the_gui_thread(tmp_path, monkeypatch):
+    """26 Oct 2026 log: each page switch paid a flushed write on the GUI
+    thread (106 ms, six opens running). The deck's copy writes on a worker,
+    and only the newest state."""
+    import threading
+
+    from orion_core.gui import deck_favourites
+    from orion_core.gui.deck_favourites import DeckFavourites
+
+    writers: list[str] = []
+    real = deck_favourites.atomic_write_text
+    monkeypatch.setattr(deck_favourites, "atomic_write_text",
+                        lambda *a, **k: writers.append(threading.current_thread().name) or real(*a, **k))
+    store = tmp_path / "deck_preferences.json"
+    deck = DeckFavourites(store, write_in_background=True)
+    for page in ("OPS", "LOG", "BRAIN"):
+        deck.visited(page)
+    deck.flush()
+    assert writers and threading.main_thread().name not in writers
+    assert DeckFavourites(store).recent[:3] == ["BRAIN", "LOG", "OPS"]
+
+
+def test_pins_and_recent_pages_survive_a_restart(tmp_path):
+    """The four or five pages somebody actually uses sit at the top of the
+    sidebar; pins persist until removed, recent pages are the last few
+    distinct pages opened, and a page that no longer exists drops out."""
+    from orion_core.gui.deck_favourites import DeckFavourites, RECENT_LIMIT
+
+    store = tmp_path / "deck.json"
+    first = DeckFavourites(store)
+    assert first.toggle_pin("CHESS") is True
+    for name in ("LOG", "CHESS", "LOG", "MEMORY", "GLOBE", "OPS", "TOOLKIT", "BRAIN"):
+        first.visited(name)
+    assert first.recent[0] == "BRAIN" and len(first.recent) == RECENT_LIMIT
+    assert len(set(first.recent)) == len(first.recent)
+
+    second = DeckFavourites(store)
+    assert second.pinned == ["CHESS"] and second.recent == first.recent
+    second.restrict_to({"BRAIN", "OPS"})
+    assert second.pinned == [] and set(second.recent) <= {"BRAIN", "OPS"}
+    assert second.toggle_pin("OPS") is True and second.toggle_pin("OPS") is False

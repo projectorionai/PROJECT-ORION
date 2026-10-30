@@ -207,6 +207,91 @@ def test_corroborating_claims_raise_confidence(evidence):
     assert max(confidences) >= 0.65
 
 
+@pytest.mark.parametrize("source_a,url_a,source_b,url_b", [
+    ("one publisher", "", " One   Publisher ", ""),
+    ("first note", "https://example.org/a", "second note", "https://www.EXAMPLE.org/b"),
+    ("first note", "https://example.org/a", "second note", "https://example.org./b"),
+    ("unknown", "", "unknown", ""),
+    ("unknown", "invalid://[", "another note", ""),
+])
+def test_same_or_unknown_source_does_not_corroborate_itself(
+        evidence, source_a, url_a, source_b, url_b):
+    evidence.record_claim("battery", "The test battery lasts twelve hours",
+                          source_a, url_a, confidence=0.6)
+    evidence.record_claim("battery", "The test battery remains usable for twelve hours",
+                          source_b, url_b, confidence=0.6)
+    assert [row["confidence"] for row in evidence.claims_for("battery")] == [0.6, 0.6]
+
+
+def test_distinct_publisher_urls_can_corroborate(evidence):
+    evidence.record_claim("battery", "The test battery lasts twelve hours",
+                          "unknown", "https://first.example/a", confidence=0.6)
+    evidence.record_claim("battery", "The test battery remains usable for twelve hours",
+                          "unknown", "https://second.example/b", confidence=0.6)
+    assert [row["confidence"] for row in evidence.claims_for("battery")] == [0.7, 0.7]
+
+
+@pytest.mark.parametrize("order", [(0, 1, 2), (0, 2, 1)])
+def test_publisher_repetitions_contribute_once_to_each_claim(evidence, order):
+    rows = [
+        ("The test battery lasts twelve hours", "a note", "https://a.example/one"),
+        ("The test battery remains usable for twelve hours", "renamed note", "https://www.a.example/two"),
+        ("The test battery provides twelve hours of use", "b note", "https://b.example/one"),
+    ]
+    for index in order:
+        claim, source, url = rows[index]
+        evidence.record_claim("battery", claim, source, url, confidence=0.6)
+    assert [row["confidence"] for row in evidence.claims_for("battery")] == [0.7] * 3
+
+
+def test_publisher_credit_survives_reopen_and_allows_a_new_publisher(tmp_path):
+    path = tmp_path / "publisher-credit.db"
+    engine = EvidenceEngine(path=path)
+    try:
+        engine.record_claim("battery", "The test battery lasts twelve hours",
+                            "a note", "https://a.example/one", confidence=0.6)
+        engine.record_claim("battery", "The test battery provides twelve hours of use",
+                            "b note", "https://b.example/one", confidence=0.6)
+    finally:
+        engine.close()
+    engine = EvidenceEngine(path=path)
+    try:
+        engine.record_claim("battery", "The test battery remains usable for twelve hours",
+                            "renamed note", "https://www.a.example/two", confidence=0.6)
+        assert [row["confidence"] for row in engine.claims_for("battery")] == [0.7] * 3
+        engine.record_claim("battery", "The test battery delivers twelve hours of power",
+                            "c note", "https://c.example/one", confidence=0.6)
+        assert [row["confidence"] for row in engine.claims_for("battery")] == pytest.approx([0.8] * 4)
+    finally:
+        engine.close()
+
+
+def test_conflicting_publisher_history_does_not_block_first_real_support(evidence):
+    evidence.record_claim("battery", "The test battery does not last twelve hours",
+                          "a note", "https://a.example/one", confidence=0.6)
+    b = evidence.record_claim("battery", "The test battery provides twelve hours of use",
+                              "b note", "https://b.example/one", confidence=0.6)
+    evidence.record_claim("battery", "The test battery remains usable for twelve hours",
+                          "updated note", "https://a.example/two", confidence=0.6)
+    assert evidence.provenance(b)["confidence"] == 0.7
+    assert evidence.detect_contradictions("battery")
+
+
+@pytest.mark.parametrize("order", [(0, 1, 2), (2, 1, 0)])
+def test_source_alias_bridges_do_not_double_count_for_a_new_claim(evidence, order):
+    rows = [
+        ("The test battery lasts twelve hours", "first note", "https://a.example/one"),
+        ("The test battery remains usable for twelve hours", "second note", "https://b.example/one"),
+        ("The test battery provides twelve hours of use", "first note", "https://b.example/two"),
+    ]
+    for index in order:
+        claim, source, url = rows[index]
+        evidence.record_claim("battery", claim, source, url, confidence=0.6)
+    new = evidence.record_claim("battery", "The test battery delivers twelve hours of power",
+                                "c note", "https://c.example/one", confidence=0.6)
+    assert evidence.provenance(new)["confidence"] == 0.7
+
+
 def test_contradiction_by_polarity_detected(evidence):
     evidence.record_claim(
         "hooks", "Short hooks increase viewer retention on TikTok", "a")
@@ -289,11 +374,12 @@ def test_completion_harvests_and_advances(director, tmp_path):
     assert "Findings" in findings.text
 
 
-def test_resume_pending_requeues_interrupted_runs(director):
+def test_resume_pending_marks_unfinished_runs_interrupted_without_replaying(director):
     director.cognition.upsert_research_session("interrupted", {"status": "running"})
     started = asyncio.run(director.resume_pending())
-    assert started == "interrupted"
-    assert ("interrupted", 20.0) in director.research.started
+    assert started == ""
+    assert director.research.started == []
+    assert director.cognition.state["research_sessions"]["interrupted"]["status"] == "interrupted"
 
 
 def test_agenda_and_reviewed(director):

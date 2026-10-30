@@ -304,3 +304,121 @@ def test_apply_still_gated_even_when_tests_pass(repair_env, tmp_path):
     _incident_for(agent, target, repaired=FIXED_SOURCE)
     asyncio.run(agent.repair_file("inc-t", confirm=False))
     assert target.read_text(encoding="utf-8") == ORIGINAL_SOURCE   # unchanged until confirm
+
+
+def test_skip_only_suite_is_not_evidence_of_a_working_repair(repair_env, tmp_path):
+    agent, target = repair_env
+    (tmp_path / "tests" / "test_fake_module.py").write_text(
+        "import pytest\n@pytest.mark.skip(reason='unavailable')\n"
+        "def test_value(): pass\n", encoding="utf-8")
+    passed, detail = agent._run_patched_tests(target, FIXED_SOURCE)
+    assert passed is None, detail
+    assert target.read_text(encoding="utf-8") == ORIGINAL_SOURCE
+
+
+def test_collection_failure_is_unavailable_evidence_not_a_reproduced_fault(repair_env, tmp_path):
+    agent, target = repair_env
+    (tmp_path / "tests" / "test_fake_module.py").write_text(
+        "import missing_repair_fixture_12345\n", encoding="utf-8")
+    passed, detail = agent._run_patched_tests(target, FIXED_SOURCE)
+    assert passed is None, detail
+
+
+def test_verifier_uses_root_test_hooks_and_private_config(repair_env, tmp_path, monkeypatch):
+    agent, target = repair_env
+    monkeypatch.setenv("ORION_CONFIG_DIR", str(tmp_path / "owner-data"))
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--this-option-must-not-reach-the-verifier")
+    (tmp_path / "conftest.py").write_text(
+        "import asyncio, inspect\n"
+        "def pytest_pyfunc_call(pyfuncitem):\n"
+        "    if inspect.iscoroutinefunction(pyfuncitem.obj):\n"
+        "        asyncio.run(pyfuncitem.obj()); return True\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_fake_module.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "async def test_private_config():\n"
+        "    assert Path(os.environ['ORION_CONFIG_DIR']).parent == Path.cwd()\n"
+        "    assert 'PYTEST_ADDOPTS' not in os.environ\n", encoding="utf-8")
+    passed, detail = agent._run_patched_tests(target, FIXED_SOURCE)
+    assert passed is True, detail
+    assert not (tmp_path / "owner-data").exists()
+
+
+def test_auto_repair_declines_a_suite_that_passed_before_the_fix(repair_env, tmp_path):
+    agent, target = repair_env
+    (tmp_path / "tests" / "test_fake_module.py").write_text(
+        "def test_irrelevant(): assert 1 + 1 == 2\n", encoding="utf-8")
+    incident = _incident_for(agent, target, repaired=FIXED_SOURCE)
+    asyncio.run(agent.attempt_auto_repair(incident))
+    assert not incident.applied
+    assert target.read_text(encoding="utf-8") == ORIGINAL_SOURCE
+    assert "auto_declined" in [entry["event"] for entry in agent.journal_tail()]
+
+
+def test_auto_repair_requires_same_tests_to_fail_then_pass(repair_env, tmp_path):
+    agent, target = repair_env
+    (tmp_path / "tests" / "test_fake_module.py").write_text(_PASSING_TEST, encoding="utf-8")
+    incident = _incident_for(agent, target, repaired=FIXED_SOURCE)
+    asyncio.run(agent.attempt_auto_repair(incident))
+    assert incident.applied
+    assert incident.baseline_tests_passed is False
+    assert incident.tests_passed is True
+    assert incident.verified_digest == incident.applied_digest
+    receipt = next(entry for entry in agent.journal_tail() if entry["event"] == "auto_applied")
+    assert receipt["incident_id"] == incident.id
+    assert receipt["candidate_digest"] == incident.applied_digest
+
+
+def test_auto_repair_cannot_replace_failing_checks_with_skipped_checks(repair_env, tmp_path):
+    agent, target = repair_env
+    (tmp_path / "tests" / "test_fake_module.py").write_text(
+        "import pytest\nfrom pkg.fake_module import VALUE\n"
+        "@pytest.mark.skipif(VALUE == 2, reason='candidate hides the fault')\n"
+        "def test_value(): assert VALUE == 2\n"
+        "def test_unrelated(): assert True\n", encoding="utf-8")
+    incident = _incident_for(agent, target, repaired=FIXED_SOURCE)
+    asyncio.run(agent.attempt_auto_repair(incident))
+    assert not incident.applied
+    assert target.read_text(encoding="utf-8") == ORIGINAL_SOURCE
+
+
+def test_before_after_share_one_snapshot_even_if_live_tests_change(repair_env, tmp_path, monkeypatch):
+    agent, target = repair_env
+    checks = tmp_path / "tests" / "test_fake_module.py"
+    checks.write_text(_PASSING_TEST, encoding="utf-8")
+    run = agent._run_test_evidence
+    snapshots = []
+    def observe(path, content, **kwargs):
+        snapshots.append(kwargs["snapshot"])
+        result = run(path, content, **kwargs)
+        if len(snapshots) == 1:
+            checks.write_text(_FAILING_TEST, encoding="utf-8")
+        return result
+    monkeypatch.setattr(agent, "_run_test_evidence", observe)
+    incident = _incident_for(agent, target, repaired=FIXED_SOURCE)
+    asyncio.run(agent.attempt_auto_repair(incident))
+    assert incident.applied
+    assert len(snapshots) == 2 and snapshots[0] == snapshots[1]
+    assert incident.verification_inputs_digest
+
+
+def test_auto_repair_declines_changed_test_collection(repair_env, tmp_path):
+    agent, target = repair_env
+    (tmp_path / "tests" / "test_fake_module.py").write_text(
+        "from pkg.fake_module import VALUE\n"
+        "if VALUE == 1:\n    def test_original(): assert False\n"
+        "else:\n    def test_replacement(): assert True\n", encoding="utf-8")
+    incident = _incident_for(agent, target, repaired=FIXED_SOURCE)
+    asyncio.run(agent.attempt_auto_repair(incident))
+    assert not incident.applied
+    assert "collection changed" in incident.tests_detail
+
+
+def test_isolated_candidate_preserves_exact_utf8_bytes(repair_env, tmp_path):
+    agent, target = repair_env
+    candidate = FIXED_SOURCE.replace("\r\n", "\n")
+    (tmp_path / "tests" / "test_fake_module.py").write_text(
+        "from pathlib import Path\nfrom pkg import fake_module\n"
+        f"def test_exact_bytes(): assert Path(fake_module.__file__).read_bytes() == {candidate.encode('utf-8')!r}\n",
+        encoding="utf-8")
+    passed, detail = agent._run_patched_tests(target, candidate)
+    assert passed is True, detail

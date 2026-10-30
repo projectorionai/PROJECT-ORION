@@ -167,7 +167,8 @@ def _launch_target() -> tuple[str, str, str]:
     A real executable is also what Windows pins to the taskbar cleanly (pinning
     a pythonw shortcut is the flaky path that produced "I can't pin the app").
     """
-    if STANDALONE_EXE.exists():
+    from .runtime_selection import bundle_is_current
+    if bundle_is_current(BASE_DIR, STANDALONE_EXE):
         return str(STANDALONE_EXE), "", str(STANDALONE_EXE.parent)
     if EXE_PATH.exists():
         return str(EXE_PATH), "", str(BASE_DIR)
@@ -272,7 +273,7 @@ def _desktop_dir() -> Path:
 
     This used to build the path from the ONEDRIVE environment variable. That
     is only ever a guess, and on a machine signed into TWO OneDrive accounts it
-    is the wrong one: ONEDRIVE named "OneDrive - Exeter College" while the
+    is the wrong one: ONEDRIVE named "OneDrive - Example College" while the
     redirected Desktop was "OneDrive - Example University". ORION
     dutifully refreshed a shortcut on a Desktop nobody looks at, and the stale
     one — still launching pythonw, which is why ORION "opens as Python 3.13" —

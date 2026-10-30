@@ -1,13 +1,11 @@
 """
 Reachable-endpoint discovery for the remote uplink (#12 — frictionless connect).
 
-The phone should never make the user type an IP. The desktop knows where it can
-be reached and hands that list to the paired device, which then auto-connects to
-whichever endpoint answers — preferring the Tailscale name, because it resolves
-to the same machine at home *and* on mobile data (Tailscale is a WireGuard mesh,
-so there's no NAT to punch and no port to forward).
+The phone should never make the user type an IP. In Tailscale Serve mode the
+desktop advertises only its HTTPS MagicDNS name on port 443. Explicit legacy
+direct-bind deployments may still advertise LAN and Tailscale IP fallbacks.
 
-Endpoint kinds, in the order the phone should try them:
+Legacy direct-bind endpoint kinds, in the order the phone should try them:
   1. ``tailscale``     — the MagicDNS name (e.g. orion-pc.tailXXXX.ts.net). Works
                          everywhere the phone has Tailscale up; the primary path.
   2. ``tailscale-ip``  — the 100.x.y.z address, as a fallback if MagicDNS is off.
@@ -21,13 +19,17 @@ injectable so this unit-tests without touching real sockets or subprocesses.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 
 # ── Tailscale ─────────────────────────────────────────────────────────────────
@@ -63,7 +65,7 @@ def tailscale_status_json(runner: Callable[..., Any] | None = None) -> dict[str,
         return {}
     run = runner or subprocess.run
     try:
-        proc = run([exe, "status", "--json"], capture_output=True, text=True,
+        proc = run([exe, "status", "--json"], capture_output=True, text=True, encoding="utf-8", errors="replace",
                    timeout=6.0)
     except Exception:
         return {}
@@ -97,8 +99,19 @@ def parse_tailscale_self(status: dict[str, Any]) -> dict[str, Any]:
 
 # ── LAN ───────────────────────────────────────────────────────────────────────
 
+_LAN_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in
+                      ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def _is_lan_ipv4(value: str) -> bool:
+    try:
+        address = ipaddress.IPv4Address(value)
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+    return any(address in network for network in _LAN_NETWORKS)
+
 def lan_ipv4_addresses() -> list[str]:
-    """Best-effort list of this host's private IPv4 addresses (no loopback)."""
+    """Best-effort RFC 1918 LAN addresses, excluding Tailscale's CGNAT range."""
     found: list[str] = []
     # The "connect a UDP socket to a public IP" trick reveals the primary
     # outbound interface address without sending a packet.
@@ -107,20 +120,45 @@ def lan_ipv4_addresses() -> list[str]:
         try:
             probe.connect(("8.8.8.8", 80))
             primary = probe.getsockname()[0]
-            if primary and not primary.startswith("127."):
+            if _is_lan_ipv4(primary):
                 found.append(primary)
         finally:
             probe.close()
     except Exception:
         pass
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            addr = info[4][0]
-            if addr and not addr.startswith("127.") and addr not in found:
-                found.append(addr)
-    except Exception:
-        pass
+    for addr in _host_addresses():
+        if _is_lan_ipv4(addr) and addr not in found:
+            found.append(addr)
     return found
+
+
+#: The longest the host-name lookup below may hold its caller.
+HOST_LOOKUP_TIMEOUT_S = 1.5
+
+
+def _host_addresses(timeout: float = HOST_LOOKUP_TIMEOUT_S) -> list[str]:
+    """IPv4 addresses for this PC's own host name, or [] if that takes too long.
+
+    getaddrinfo(gethostname()) is normally instant, but it goes through the
+    resolver: on 20 Oct it held ORION's startup for 17.9 s (the event loop,
+    via the remote uplink's "open this on your phone" line) while DNS timed
+    out. The lookup runs on a daemon thread and is abandoned after *timeout*;
+    the primary-interface probe above already found the address that matters.
+    """
+    result: list[str] = []
+    done = threading.Event()
+
+    def lookup() -> None:
+        try:
+            result.extend(info[4][0] for info in
+                          socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET))
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=lookup, name="orion-host-lookup", daemon=True).start()
+    return list(result) if done.wait(timeout) else []
 
 
 # ── assembly ──────────────────────────────────────────────────────────────────
@@ -131,10 +169,42 @@ def _url(scheme: str, host: str, port: int) -> str:
     return f"{scheme}://{hostpart}:{int(port)}/"
 
 
+def public_https_endpoint(value: str) -> dict[str, Any] | None:
+    """Validate the named HTTPS origin used by a dedicated reverse proxy.
+
+    Only a DNS hostname on the standard HTTPS port is advertised. A path,
+    credentials, or a local address would send paired phones to the wrong
+    destination, so these are rejected rather than silently corrected.
+    """
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        labels = host.split(".")
+        valid_host = (len(host) <= 253 and len(labels) >= 2 and all(
+            1 <= len(label) <= 63 and
+            re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+            for label in labels))
+        try:
+            ipaddress.ip_address(host)
+            valid_host = False
+        except ValueError:
+            pass
+        if (parsed.scheme != "https" or not valid_host or parsed.port not in (None, 443)
+                or parsed.username or parsed.password or parsed.path not in ("", "/")
+                or parsed.query or parsed.fragment):
+            return None
+        return {"kind": "reverse-proxy", "host": host, "port": 443,
+                "https": True, "url": _url("https", host, 443), "priority": 10}
+    except ValueError:
+        return None
+
+
 def detect_endpoints(
     port: int,
     https: bool = True,
     *,
+    serve: bool = False,
+    tailnet_only: bool = False,
     tailscale: dict[str, Any] | None = None,
     lan: list[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -143,9 +213,9 @@ def detect_endpoints(
     ``tailscale`` (a ``parse_tailscale_self`` result) and ``lan`` (a list of
     IPv4 strings) may be injected for tests; otherwise they're detected live.
     """
-    scheme = "https" if https else "http"
+    scheme = "https" if https or serve else "http"
     ts = tailscale if tailscale is not None else parse_tailscale_self(tailscale_status_json())
-    lan_ips = lan if lan is not None else lan_ipv4_addresses()
+    lan_ips = [] if serve or tailnet_only else (lan if lan is not None else lan_ipv4_addresses())
 
     endpoints: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -162,11 +232,23 @@ def detect_endpoints(
         })
 
     if ts.get("dns"):
-        add("tailscale", ts["dns"], 10)
+        add("tailscale-serve" if serve else "tailscale", ts["dns"], 10)
+    if serve:
+        # Serve terminates TLS on 443. A raw 100.x address or loopback port
+        # bypasses that TLS endpoint and can collide with mobile CGNAT routes.
+        for endpoint in endpoints:
+            endpoint.update(port=443, https=True,
+                            url=_url("https", endpoint["host"], 443))
+        return endpoints
+    if tailnet_only:
+        # The direct TLS listener is bound to this node's Tailscale IP. The
+        # phone uses the named HTTPS origin so certificate pinning stays stable.
+        return endpoints
     for ip in ts.get("ips", []):
         add("tailscale-ip", ip, 20)
     for ip in lan_ips:
-        add("lan", ip, 30)
+        if _is_lan_ipv4(ip):
+            add("lan", ip, 30)
 
     endpoints.sort(key=lambda e: e["priority"])
     return endpoints

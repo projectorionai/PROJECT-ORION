@@ -45,6 +45,36 @@ def test_normalise_handles_nonsense_safely():
     assert isinstance(normalise(None), str)
 
 
+def test_folder_location_alias_preserves_redirected_registry_path(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from orion_core.app_resolver import known_folder
+    redirected = tmp_path / "OneDrive" / "Pictures"
+    redirected.mkdir(parents=True)
+    class Key:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+    monkeypatch.setitem(sys.modules, "winreg", SimpleNamespace(
+        HKEY_CURRENT_USER=object(), OpenKey=lambda *_: Key(),
+        QueryValueEx=lambda _key, value: (str(redirected), 2)))
+    assert known_folder("my pictures", location=True) == redirected
+    assert known_folder("music") is None, "bare music should remain an app request"
+
+
+def test_unspecified_onedrive_does_not_guess_between_personal_and_work(tmp_path, monkeypatch):
+    from orion_core.app_resolver import known_folder
+    personal, work = tmp_path / "personal", tmp_path / "work"
+    personal.mkdir()
+    work.mkdir()
+    monkeypatch.setenv("OneDrive", str(personal))
+    monkeypatch.setenv("OneDriveConsumer", str(personal))
+    monkeypatch.setenv("OneDriveCommercial", str(work))
+    assert known_folder("my onedrive", location=True) is None
+    assert known_folder("work onedrive", location=True) == work
+
+
 # ── scoring ──────────────────────────────────────────────────────────────────
 
 def test_exact_beats_prefix_beats_substring():

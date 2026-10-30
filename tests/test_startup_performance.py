@@ -190,6 +190,12 @@ EAGER = re.compile(
 )
 
 
+def test_world_feed_discovery_does_not_import_http_support():
+    out = _in_fresh_process(
+        "import orion_core.world_feeds; print('loaded' if 'aiohttp' in sys.modules else 'deferred')")
+    assert out == "deferred"
+
+
 def test_no_module_eagerly_imports_the_deferred_packages():
     offenders = []
     for path in sorted((ROOT / "orion_core").rglob("*.py")):

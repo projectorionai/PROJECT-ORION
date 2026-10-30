@@ -626,6 +626,8 @@ class HoloHeadPanel(QWidget):
     a new face has to do to be swappable with the voxel one.
     """
 
+    supports_orb_hands = False
+
     def __init__(self, parent: QWidget | None = None, *, fps: int = 30) -> None:
         super().__init__(parent)
         self._head = HoloHead()
@@ -690,8 +692,14 @@ class HoloHeadPanel(QWidget):
     # ORION's face protocol ---------------------------------------------------
 
     def _ensure_pipeline(self) -> Any:
-        """Start the render thread, once, when there is something to draw."""
-        if not self._threaded or self._pipeline is not None:
+        """Start the render thread, once, when there is something to draw.
+        A pipeline whose last stop timed out is resumed, not replaced: its
+        worker still owns the head."""
+        if not self._threaded:
+            return self._pipeline
+        if self._pipeline is not None:
+            if self._pipeline.stopping:
+                self._pipeline.start()
             return self._pipeline
         try:
             from .face_pipeline import FaceRenderPipeline
@@ -726,12 +734,18 @@ class HoloHeadPanel(QWidget):
         down its graphics stack is how "destroyed but pending" becomes a crash
         on exit.
         """
-        pipeline, self._pipeline = self._pipeline, None
-        if pipeline is not None:
-            try:
-                pipeline.stop()
-            except Exception:
-                pass
+        pipeline = self._pipeline
+        if pipeline is None:
+            return
+        try:
+            finished = pipeline.stop()
+        except Exception:
+            finished = not getattr(pipeline, "running", False)
+        if finished is not False:
+            self._pipeline = None
+        # Otherwise its worker is still finishing and still owns the head: the
+        # pipeline is kept, so nothing here touches the head directly and a
+        # later show resumes that worker instead of adding a second one.
 
     def _to_head(self, name: str, *args: Any, **kwargs: Any) -> None:
         """Apply a change to the head — queued if the worker owns it."""
@@ -756,6 +770,12 @@ class HoloHeadPanel(QWidget):
         self._speaking = bool(active)
         if not self._speaking:
             self._to_head("set_viseme", 0.0, 0.0, 0.0)
+
+    def set_orb_camera_enabled(self, enabled: Any) -> None:
+        """Accept the shared face command; orb camera state is renderer-specific."""
+
+    def set_orb_hands(self, sample: Any) -> None:
+        """Accept shared orb hand samples; this face has no orb surface."""
 
     def set_viseme(self, openness: Any, width: Any = 0.0, closure: Any = 0.0) -> None:
         """Accepts either a viseme ID or a raw posture.
@@ -897,18 +917,21 @@ class HoloHeadPanel(QWidget):
         pipeline = self._pipeline
         if pipeline is not None:
             frame, generation = pipeline.frames.take()
-            if frame is not None:
-                painter = QPainter(self)
-                try:
+            painter = QPainter(self)
+            try:
+                painter.fillRect(self.rect(), self._background)
+                if frame is not None:
                     painter.setRenderHint(
                         QPainter.RenderHint.SmoothPixmapTransform, True)
                     painter.drawImage(self.rect(), frame)
-                finally:
-                    painter.end()
+            finally:
+                painter.end()
+            if frame is not None:
                 self._blit_generation = generation
-                return
-            # No frame yet — fall through and paint one synchronously so the
-            # first moments after launch are not an empty rectangle.
+            # Until the first immutable frame arrives, show the background.
+            # The worker owns the head even while starting or stopping; GUI
+            # fallback painting here would access that mutable rig concurrently.
+            return
 
         painter = QPainter(self)
         try:

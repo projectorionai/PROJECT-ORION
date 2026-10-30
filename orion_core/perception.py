@@ -19,7 +19,8 @@ The fix is not a faster shutter. It is to separate *watching* from
 
     Understanding is remote, occasional and expensive.  A cloud model is asked
     what something *is*, and it is asked only when the local layer has already
-    established that something happened worth naming.
+    established that something happened worth naming. Automatic cloud sharing
+    defaults off and requires a separate, session-only grant with a call limit.
 
 Between the two sits the part that makes it feel like sight rather than
 sampling: **scene memory with object permanence**. A tracked object that leaves
@@ -44,6 +45,7 @@ Two constraints shaped the design:
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -76,6 +78,8 @@ PERMANENCE_S = 8.0               # how long an unseen object keeps its identity
 MIN_CLOUD_INTERVAL_S = 6.0       # never call the cloud more often than this
 CLOUD_HEARTBEAT_S = 300.0        # ...but re-ground at least this often
 DEFAULT_FPS = 2.0
+CAMERA_HISTORY_SECONDS = 15.0
+CAMERA_HISTORY_FRAMES = 16
 
 # ── the naming layer (object detection, pose) ────────────────────────────────
 #
@@ -690,6 +694,10 @@ class PerceptionLoop:
         rules: Any | None = None,
         camera: Any | None = None,
         on_workflow: Callable[[str, str], Any] | None = None,
+        context_service: Any | None = None,
+        cloud_enabled: bool = False,
+        scene_recorder: Any | None = None,
+        retain_frames: bool | None = None,
     ) -> None:
         from .vision_lab import VisionLab
         self.bus = bus
@@ -710,6 +718,13 @@ class PerceptionLoop:
         self.rules = rules
         self.camera = camera
         self.on_workflow = on_workflow
+        self.context_service = context_service
+        self.scene_recorder = scene_recorder
+        self._context_session: Any = None
+        self.cloud_enabled = cloud_enabled is True
+        self.cloud_call_limit = 20
+        self.cloud_calls_this_grant = 0
+        self._cloud_epoch = 0
         self.overlay_needs: set[str] = set()     # set by the live overlay
         self.last_reading: Any = None
         self.last_detections: list[Any] = []
@@ -720,6 +735,13 @@ class PerceptionLoop:
         self._locally_named: set[int] = set()
         self._owns_camera = False
         self.events: deque[PerceptionEvent] = deque(maxlen=120)
+        # Text scene memories are the default. Retrospective JPEGs require an
+        # explicit opt-in and are volatile, expire after 15 s, and clear on stop.
+        self.retain_camera_history = (retain_frames is True if retain_frames is not None else
+                                      os.getenv("ORION_CAMERA_HISTORY", "0").strip().lower()
+                                      in {"1", "true", "on", "yes"})
+        self._camera_history: deque[tuple[float, bytes]] = deque(maxlen=CAMERA_HISTORY_FRAMES)
+        self._last_history_at = float("-inf")
         self.frames = 0
         self.blind_frames = 0
         self.last_description = ""
@@ -736,6 +758,9 @@ class PerceptionLoop:
     def start(self) -> str:
         if self.running:
             return "I am already watching."
+        from .resource_governor import optional_work_allowed
+        if not optional_work_allowed():
+            return "I can't start watching while memory pressure is limiting optional sensing."
         if self.frame_source is None:
             return ("I have no camera to watch through — nothing is holding a "
                     "frame source for me to borrow.")
@@ -754,8 +779,12 @@ class PerceptionLoop:
         camera_note = self._switch_camera_on()
         self._stop = asyncio.Event()
         self.started_at = self.clock()
+        self._camera_history.clear()
+        self._last_history_at = float("-inf")
         self.detector.reset()
         self.lab.reset()
+        if self.context_service is not None:
+            self._context_session = self.context_service.open_source("camera.local")
         self._task = loop.create_task(self._run(), name="orion-perception")
         self.bus.log.emit(f"PERCEPTION: watching at {self.fps:g} fps.")
         return f"Watching now — {self.fps:g} frames a second, locally.{camera_note}"
@@ -776,16 +805,23 @@ class PerceptionLoop:
         return f" ({getattr(result, 'text', 'the camera would not start')})"
 
     async def stop(self) -> str:
-        if not self.running:
-            return "I am not watching at the moment."
+        self.set_cloud_sharing(False)
+        if self._context_session is not None:
+            self._context_session.close()
+            self._context_session = None
+        was_running = self.running
         self._stop.set()
         task, self._task = self._task, None
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            task.cancel()
-        except Exception:
-            pass
+        if was_running and task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+                # Give cancellation a bounded chance to finish before the
+                # device owner is released, without retaining late context.
+                await asyncio.wait({task}, timeout=0.25)
+            except Exception:
+                pass
         if self.pose_tracker is not None:
             await asyncio.to_thread(self.pose_tracker.close)
         if self._owns_camera and self.camera is not None:
@@ -794,11 +830,17 @@ class PerceptionLoop:
                 await asyncio.to_thread(self.camera.stop)
             except Exception:
                 pass
-        self.bus.log.emit("PERCEPTION: stopped watching.")
-        return "I've stopped watching."
+        if was_running:
+            self.bus.log.emit("PERCEPTION: stopped watching.")
+        if self.scene_recorder is not None:
+            await self.scene_recorder.stop_pending()
+        self._camera_history.clear()
+        self.retain_camera_history = False
+        return "I've stopped watching." if was_running else "I am not watching at the moment."
 
     async def _run(self) -> None:
         interval = 1.0 / self.fps
+        context_session = self._context_session
         try:
             while not self._stop.is_set():
                 try:
@@ -806,6 +848,8 @@ class PerceptionLoop:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    if context_session is not None:
+                        context_session.available(False)
                     # One bad frame must never end the loop; eyes that close
                     # permanently on a malformed buffer are worse than no eyes.
                     self.bus.log.emit(f"PERCEPTION: frame fault - {first_line(exc, 120)}")
@@ -815,18 +859,27 @@ class PerceptionLoop:
                     continue
         except asyncio.CancelledError:
             pass
+        finally:
+            if context_session is not None:
+                context_session.close(failed=not self._stop.is_set())
 
     # ── one frame ─────────────────────────────────────────────────────────────
 
     async def tick(self) -> list[PerceptionEvent]:
         """Watch one frame. The whole loop, minus the waiting."""
+        context_session = self._context_session
+        observed_at = (self.context_service.clock()
+                       if self.context_service is not None else None)
         frame = self.frame_source() if self.frame_source is not None else None
         grid = to_grid(frame)
+        if context_session is not None:
+            context_session.available(grid is not None)
         if grid is None:
             self.blind_frames += 1
             return []
         self.frames += 1
         now = self.clock()
+        self._remember_camera_frame(frame, now)
         motion = self.detector.update(grid)
         # The instruments read every frame (a few ms, off the loop); optical
         # flow needs the previous frame, so this happens before any return.
@@ -835,6 +888,7 @@ class PerceptionLoop:
             self.last_reading = reading
         events: list[PerceptionEvent] = []
         if motion.first_frame:
+            self._remember_scene(frame, {"first_frame"})
             return []
         if motion.scene_changed:
             events.append(PerceptionEvent(
@@ -856,6 +910,8 @@ class PerceptionLoop:
         for event in events:
             self.events.append(event)
             self.bus.log.emit(f"PERCEPTION: {event.detail}")
+            if context_session is not None:
+                context_session.visual(event.kind, observed_at=observed_at)
         if events:
             try:
                 self.bus.dashboard_event.emit("perception", self.status())
@@ -863,20 +919,101 @@ class PerceptionLoop:
                 pass
 
         if self.rules is not None:
-            self._apply_rules(now, reading, detections, pose, events)
+            self._apply_rules(now, reading, detections, pose, events, frame=frame)
 
         # An arrival the detector has already named needs no paid look.
         for_cloud = [e for e in events if e.track_id is None or e.kind == "scene_changed"
                      or e.track_id not in self._locally_named]
         wanted, reason = self.policy.should_sample(for_cloud, now)
-        if wanted:
-            await self._understand(frame, reason, now)
+        description = ""
+        if wanted and self.cloud_enabled and not self._stop.is_set():
+            description = await self._understand(frame, reason, now) or ""
+        if not self._stop.is_set():
+            self._remember_scene(frame, {event.kind for event in events},
+                                 description=description, detections=detections)
         if self.telemetry is not None and events:
             try:
                 self.telemetry.metrics.incr("perception.events", len(events))
             except Exception:
                 pass
         return events
+
+    def _remember_camera_frame(self, frame: Any, now: float) -> None:
+        """Keep a sparse, bounded in-memory camera history while watching."""
+        if not self.retain_camera_history or not self.running or now - self._last_history_at < 1.0:
+            return
+        try:
+            import cv2
+            height, width = frame.shape[:2]
+            if max(height, width) > 640:
+                scale = 640 / max(height, width)
+                frame = cv2.resize(frame, (max(1, round(width * scale)),
+                                           max(1, round(height * scale))),
+                                   interpolation=cv2.INTER_AREA)
+            encoded, jpeg = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            if encoded:
+                self._camera_history.append((now, bytes(jpeg)))
+                self._last_history_at = now
+            self._prune_camera_history(now)
+        except Exception:
+            # The retrospective feature must not interrupt live perception.
+            pass
+
+    def _prune_camera_history(self, now: float) -> None:
+        while self._camera_history and now - self._camera_history[0][0] > CAMERA_HISTORY_SECONDS:
+            self._camera_history.popleft()
+
+    def recent_camera_frames(self, seconds: float = 10.0,
+                             max_frames: int = 8) -> list[tuple[float, bytes]]:
+        """Return ordered (offset, JPEG) frames from the current watch only."""
+        if not self.retain_camera_history or not self.running:
+            return []
+        now = self.clock()
+        self._prune_camera_history(now)
+        window = max(2.0, min(CAMERA_HISTORY_SECONDS, float(seconds)))
+        max_frames = max(2, min(8, int(max_frames)))
+        selected = [(at, jpeg) for at, jpeg in self._camera_history
+                    if now - at <= window]
+        if len(selected) > max_frames:
+            selected = [selected[round(i * (len(selected) - 1) / (max_frames - 1))]
+                        for i in range(max_frames)]
+        return [(round(at - selected[0][0], 2), jpeg) for at, jpeg in selected]
+
+    def set_frame_history(self, enabled: bool) -> str:
+        """Opt into bounded, volatile retrospective frames for this watch."""
+        self.retain_camera_history = enabled is True
+        if not self.retain_camera_history:
+            self._camera_history.clear()
+        self._last_history_at = float("-inf")
+        return ("Recent camera frames are enabled for this watch; they expire after "
+                "15 seconds and are cleared when watching stops." if self.retain_camera_history else
+                "Recent camera frames are off; camera memories contain text only.")
+
+    def clear_scene_memories(self) -> None:
+        """Clear cached observations too when written camera memories are forgotten."""
+        self._cloud_epoch += 1  # Discard a cloud description still in flight.
+        self.last_description = ""
+        self.events.clear()
+        self.scene.tracks.clear()
+        self._locally_named.clear()
+        self.last_detections, self.last_detections_at = [], None
+        self.last_pose, self.last_pose_at = None, None
+        self.last_reading = None
+        self._camera_history.clear()
+        self._last_history_at = float("-inf")
+        self.detector.reset()
+        self.lab.reset()
+
+    def _remember_scene(self, frame: Any, kinds: Iterable[str], *, description: str = "",
+                        detections: Any = None) -> None:
+        recorder = self.scene_recorder
+        if recorder is None:
+            return
+        try:
+            recorder.perception_event(frame, kinds, description=description, detections=detections)
+        except Exception as exc:
+            self.bus.log.emit(f"PERCEPTION: could not remember view - {first_line(exc, 120)}")
 
     # ── the naming layer ──────────────────────────────────────────────────────
 
@@ -923,7 +1060,7 @@ class PerceptionLoop:
         return named
 
     def _apply_rules(self, now: float, reading: Any, detections: Any, pose: Any,
-                     events: Sequence[PerceptionEvent]) -> None:
+                     events: Sequence[PerceptionEvent], frame: Any = None) -> None:
         from .vision_rules import Observation, act
         try:
             firings = self.rules.evaluate(Observation(now, reading, detections, pose, events))
@@ -933,11 +1070,25 @@ class PerceptionLoop:
         for firing in firings:
             try:
                 done = act(firing, say=self.bus.speak_request.emit, log=self.bus.log.emit,
-                           run_workflow=self.on_workflow)
+                           run_workflow=self.on_workflow,
+                           snapshot=lambda: self._rule_photo(frame))
             except Exception as exc:
                 done = f"failed: {first_line(exc, 100)}"
             self.events.append(PerceptionEvent(
                 "rule", utc_stamp(), f"{firing.rule.name}: {firing.detail} — {done}"))
+
+    @staticmethod
+    def _rule_photo(frame: Any) -> str | None:
+        """Save the frame that fired a photo rule to Pictures/ORION/Watch.
+        Only on a firing (a cooldown of at least 5 s apart), so the few
+        milliseconds of JPEG encoding never touch the watching itself."""
+        if frame is None:
+            return None
+        from . import camera_tools
+        folder = camera_tools.media_folder("pictures") / "Watch"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = camera_tools.save_image(frame, "watch", folder)
+        return str(path) if path else None
 
     # ── looking on demand (the tool's analyse / detect / pose) ────────────────
 
@@ -993,6 +1144,8 @@ class PerceptionLoop:
         reading = None
         for frame in frames:
             reading = await asyncio.to_thread(lab.read, frame)
+        if reading is not None and self.scene_recorder is not None:
+            await self.scene_recorder.remember_text(reading.summary(), source="camera_measure")
         return reading
 
     async def detect_now(self) -> tuple[list[Any] | None, str]:
@@ -1005,6 +1158,10 @@ class PerceptionLoop:
             return None, "I can't get a frame from the camera."
         detections = await asyncio.to_thread(self.objects.detect, frame)
         self.last_detections, self.last_detections_at = detections, self.clock()
+        if self.scene_recorder is not None and not self.running:
+            from .object_detection import describe
+            await self.scene_recorder.look(frame, source="camera_detect", allow_cloud=False,
+                                            description=describe(detections), detections=detections)
         return detections, ""
 
     async def pose_now(self) -> tuple[Any, str]:
@@ -1019,6 +1176,8 @@ class PerceptionLoop:
         if pose is None:
             return None, f"Pose tracking failed: {self.pose_tracker.error or 'no result'}."
         self.last_pose, self.last_pose_at = pose, self.clock()
+        if self.scene_recorder is not None and not self.running:
+            await self.scene_recorder.remember_text(pose.describe(), source="camera_pose")
         return pose, ""
 
     def instruments(self) -> str:
@@ -1032,18 +1191,44 @@ class PerceptionLoop:
             parts.append(f"{enabled} vision rule(s) armed" if enabled else "no vision rules")
         return "; ".join(parts) + "."
 
-    async def _understand(self, frame: Any, reason: str, now: float) -> None:
+    def set_cloud_sharing(self, enabled: bool, *, max_calls: int = 20) -> str:
+        """Grant a bounded session of automatic frame sharing, or revoke it."""
+        if type(enabled) is not bool:
+            raise ValueError("cloud sharing requires an explicit boolean")
+        if enabled and (type(max_calls) is not int or not 1 <= max_calls <= 60):
+            raise ValueError("cloud sharing max_calls must be between 1 and 60")
+        self._cloud_epoch += 1
+        self.cloud_enabled = enabled
+        self.cloud_calls_this_grant = 0
+        if enabled:
+            self.cloud_call_limit = max_calls
+        try:
+            self.bus.dashboard_event.emit("perception", self.status())
+        except Exception:
+            pass
+        return ((f"Automatic camera sharing is on for this session, up to {max_calls} "
+                 "cloud calls. Stopping the watch turns sharing off.") if enabled else
+                "Automatic camera sharing is off; watching uses local processing.")
+
+    async def _understand(self, frame: Any, reason: str, now: float) -> str | None:
         """Spend a cloud call: ask what the thing actually is."""
-        if self.describe is None:
+        if (self.describe is None or not self.cloud_enabled
+                or self.cloud_calls_this_grant >= self.cloud_call_limit):
             return
+        epoch = self._cloud_epoch
+        self.cloud_calls_this_grant += 1
         self.policy.record(now)
+        try:
+            self.bus.dashboard_event.emit("perception", self.status())
+        except Exception:
+            pass
         self.bus.log.emit(f"PERCEPTION: looking properly — {reason}.")
         try:
             description = str(await self.describe(frame)).strip()
         except Exception as exc:
             self.bus.log.emit(f"PERCEPTION: could not look - {first_line(exc, 120)}")
             return
-        if not description:
+        if not description or epoch != self._cloud_epoch:
             return
         self.last_description = description
         # Name the tracks that have no name yet, so permanence also preserves
@@ -1057,12 +1242,22 @@ class PerceptionLoop:
             self.bus.dashboard_event.emit("perception", self.status())
         except Exception:
             pass
+        return description
 
     # ── reporting ─────────────────────────────────────────────────────────────
 
     def status(self) -> dict[str, Any]:
+        source_state = (self.context_service.snapshot()["sources"]["camera.local"]["state"]
+                        if self.context_service is not None else
+                        "active" if self.running else "off")
         return {
             "watching": self.running,
+            "source_state": source_state,
+            "cloud_sharing": self.cloud_enabled,
+            "recent_frame_history": self.retain_camera_history,
+            "scene_memories_stored": getattr(self.scene_recorder, "stored", 0),
+            "cloud_calls_remaining": (max(0, self.cloud_call_limit - self.cloud_calls_this_grant)
+                                      if self.cloud_enabled else 0),
             "fps": self.fps,
             "frames": self.frames,
             "blind_frames": self.blind_frames,
@@ -1078,7 +1273,7 @@ class PerceptionLoop:
 
     def report(self) -> str:
         status = self.status()
-        if not status["watching"] and not status["frames"]:
+        if not status["watching"] and not status["frames"] and not status["cloud_sharing"]:
             return "I am not watching anything at the moment."
         efficiency = ""
         if status["frames"]:
@@ -1089,7 +1284,12 @@ class PerceptionLoop:
         head = ("Watching" if status["watching"] else "Not watching") + \
             f" — {status['in_view']} thing(s) in view, " \
             f"{status['remembered']} remembered.{efficiency}"
-        parts = [head, status["scene"]]
+        parts = [head, status["scene"],
+                 (f"Automatic camera sharing: on, {status['cloud_calls_remaining']} "
+                  "cloud call(s) remaining this session." if status["cloud_sharing"] else
+                  "Automatic camera sharing: off (local processing only).")]
+        if status["source_state"] == "degraded":
+            parts.insert(0, "Camera observations are unavailable or stale; live context is cleared.")
         if status["named_locally"]:
             parts.append(f"{status['named_locally']} arrival(s) named by the local object "
                          "detector, without asking the cloud.")

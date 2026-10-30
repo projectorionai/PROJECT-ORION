@@ -1,0 +1,45 @@
+{
+  "name": "jv_forge_trial",
+  "description": "Propose and review one bounded Forge experiment, run its contract/tests, inspect its result or roll its current generation back. No recursive unattended changes to ORION's core.",
+  "module": "jv_forge_trial_tool.py",
+  "version": "33.0.0",
+  "tier": "confirm",
+  "permissions": [
+    "network",
+    "filesystem",
+    "subprocess"
+  ],
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "The action to perform.",
+        "enum": [
+          "propose",
+          "list",
+          "status",
+          "run",
+          "rollback"
+        ]
+      },
+      "name": {
+        "type": "string",
+        "description": "Short proposed trial name."
+      },
+      "plan": {
+        "type": "string",
+        "description": "Purpose, measurable acceptance checks and known constraints."
+      },
+      "id": {
+        "type": "string",
+        "description": "Recorded trial id for run/status/rollback."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  },
+  "secrets": []
+}

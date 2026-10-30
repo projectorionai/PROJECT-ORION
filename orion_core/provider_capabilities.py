@@ -46,7 +46,8 @@ _EMBED_RE = re.compile(r"(?i)embed|text-embedding")
 _ASR_RE = re.compile(r"(?i)whisper|transcrib|speech-to-text|stt")
 _TTS_RE = re.compile(r"(?i)\btts\b|text-to-speech|speech-01|voice")
 _IMAGE_RE = re.compile(r"(?i)dall-?e|imagen|stable-?diffusion|flux|image")
-_VISION_RE = re.compile(r"(?i)vision|gpt-4o|gpt-4\.1|claude-3|claude-sonnet|claude-opus|gemini|llava|pixtral|grok")
+_VISION_RE = re.compile(r"(?i)vision|gpt-4o|gpt-4\.1|gemini|llava|pixtral|grok")
+_GEMINI_IMAGE_RE = re.compile(r"(?i)^gemini-[\w.-]+-image$")
 
 
 def provider_capabilities(profile: Any) -> set[Capability]:
@@ -75,6 +76,12 @@ def provider_capabilities(profile: Any) -> set[Capability]:
             }
         return caps
 
+    if kind == "gemma_native":
+        if has_key and model in {"gemma-4-26b-a4b-it", "gemma-4-31b-it"}:
+            return {Capability.TEXT_GENERATION, Capability.STREAMING_TEXT,
+                    Capability.TOOL_CALLING, Capability.VISION}
+        return caps
+
     if kind == "openai_compatible":
         usable = is_local or has_key
         if not usable:
@@ -87,6 +94,11 @@ def provider_capabilities(profile: Any) -> set[Capability]:
             return caps
         if _TTS_RE.search(model):
             caps.add(Capability.SPEECH_SYNTHESIS)
+            return caps
+        # Gemini image endpoints include "gemini" in their name.  Checking
+        # vision first would misroute them to chat with function declarations.
+        if _GEMINI_IMAGE_RE.search(model):
+            caps.add(Capability.IMAGE_GENERATION)
             return caps
         if _IMAGE_RE.search(model) and not _VISION_RE.search(model):
             caps.add(Capability.IMAGE_GENERATION)

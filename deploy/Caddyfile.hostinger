@@ -12,9 +12,8 @@
 # over plain HTTP, and Twilio will not fetch TwiML or open a media stream
 # against a self-signed certificate.
 #
-# ORION himself listens only on 127.0.0.1. Everything below is the only route
-# in, which is why the authentication lives here rather than being left to
-# each endpoint to remember.
+# Both application services listen only on 127.0.0.1. The remote gateway
+# checks pairing tokens and the telephony bridge checks Twilio signatures.
 # ─────────────────────────────────────────────────────────────────────────────
 
 orion.example.com {
@@ -35,23 +34,17 @@ orion.example.com {
 	# X-Twilio-Signature against the auth token. That check lives in
 	# orion_core/telephony_bridge.py and is the reason these paths are allowed
 	# through unauthenticated at this layer.
-	@telephony path /twilio/* /media/*
+	@telephony path /twilio/* /media /media/*
 	handle @telephony {
 		reverse_proxy 127.0.0.1:8790 {
-			# Media Streams is a long-lived WebSocket carrying live audio.
-			# The default 30s read timeout would cut every call at half a
-			# minute, which looks exactly like the far end hanging up.
-			transport http {
-				read_timeout 3600s
-				write_timeout 3600s
-			}
+			# Allow a live media WebSocket to finish during a config reload.
+			stream_close_delay 5m
 		}
 	}
 
 	# ── the phone / PWA uplink ───────────────────────────────────────────────
 	# Everything else is ORION's own gateway, which does its own pairing-token
-	# authentication. Rate-limited at the edge so a leaked URL cannot be used
-	# to grind at the pairing code.
+	# authentication and request throttling.
 	handle {
 		reverse_proxy 127.0.0.1:8765 {
 			transport http {

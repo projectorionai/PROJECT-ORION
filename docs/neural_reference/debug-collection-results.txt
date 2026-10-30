@@ -1,0 +1,53 @@
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_authentication_required
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_concurrent_planning_is_rejected_instead_of_queued
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_invalid_tool_is_rejected_by_request_schema
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_non_ascii_authentication_is_rejected_without_server_error
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_plan_does_not_execute_and_goal_creates_verified_file
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_plan_path_violation_returns_forbidden
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_provider_failure_is_reported_as_unavailable
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_replan_preserves_success_and_accepts_explicit_priority
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_resource_probe_failure_pauses_dispatch_and_is_visible
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_sqlite_failure_returns_unavailable_and_stops_admission
+docs/neural_reference/test_integration.py::APIIntegrationTests::test_unknown_job_is_not_found
+docs/neural_reference/test_integration.py::ChromaIntegrationTests::test_owner_isolation_and_persistence
+docs/neural_reference/test_ml.py::MLIntegrationTests::test_real_dpo_step_updates_only_adapter_and_saves_it
+docs/neural_reference/test_ml.py::MLIntegrationTests::test_real_generation_passes_through_planner_validation
+docs/neural_reference/test_ml.py::TrainingDataTests::test_duplicate_pair_rejected
+docs/neural_reference/test_ml.py::TrainingDataTests::test_empty_split_rejected
+docs/neural_reference/test_ml.py::TrainingDataTests::test_holdout_leakage_rejected
+docs/neural_reference/test_ml.py::TrainingDataTests::test_identical_completions_rejected
+docs/neural_reference/test_ml.py::TrainingDataTests::test_overlong_prompt_is_rejected_instead_of_truncated
+docs/neural_reference/test_ml.py::TrainingDataTests::test_valid_disjoint_preferences
+docs/neural_reference/test_reference.py::ContractTests::test_arbitrary_commands_rejected
+docs/neural_reference/test_reference.py::ContractTests::test_cycle_rejected
+docs/neural_reference/test_reference.py::ContractTests::test_duplicate_identifiers_rejected
+docs/neural_reference/test_reference.py::ContractTests::test_unknown_dependency_rejected
+docs/neural_reference/test_reference.py::FilePolicyTests::test_capability_is_enforced_at_execution
+docs/neural_reference/test_reference.py::FilePolicyTests::test_create_is_exclusive_and_verified
+docs/neural_reference/test_reference.py::FilePolicyTests::test_escape_device_stream_and_executable_paths_rejected
+docs/neural_reference/test_reference.py::SchedulerTests::test_dependencies_execute_in_order
+docs/neural_reference/test_reference.py::SchedulerTests::test_failure_blocks_transitive_dependants
+docs/neural_reference/test_reference.py::SchedulerTests::test_pause_does_not_cancel_current_step
+docs/neural_reference/test_reference.py::SchedulerTests::test_replan_preserves_completed_work
+docs/neural_reference/test_reference.py::SchedulerTests::test_reprioritisation_takes_effect_before_dispatch
+docs/neural_reference/test_reference.py::SchedulerTests::test_restart_does_not_replay_uncertain_side_effect
+docs/neural_reference/test_regressions.py::CancellationTests::test_cancel_during_submit_commit_keeps_memory_and_journal_consistent
+docs/neural_reference/test_regressions.py::CancellationTests::test_repeated_cancel_keeps_generation_slot_until_thread_finishes
+docs/neural_reference/test_regressions.py::SchedulerRegressionTests::test_external_worker_cancellation_marks_running_action_uncertain
+docs/neural_reference/test_regressions.py::SchedulerRegressionTests::test_failed_step_id_cannot_be_reused_after_an_intermediate_revision
+docs/neural_reference/test_regressions.py::SchedulerRegressionTests::test_journal_failure_stops_execution
+docs/neural_reference/test_regressions.py::SchedulerRegressionTests::test_old_revision_cannot_replace_a_newer_plan
+docs/neural_reference/test_regressions.py::SchedulerRegressionTests::test_one_owner_cannot_control_another_owners_job
+docs/neural_reference/test_regressions.py::SchedulerRegressionTests::test_second_start_is_rejected
+docs/neural_reference/test_regressions.py::FileRegressionTests::test_entire_plan_is_checked_before_any_effect
+docs/neural_reference/test_regressions.py::FileRegressionTests::test_hard_link_is_rejected
+docs/neural_reference/test_regressions.py::SystemProbeTests::test_live_fixed_nvidia_diagnostic
+docs/neural_reference/test_regressions.py::SystemProbeTests::test_live_resource_probe
+
+============================== warnings summary ===============================
+.neural-debug-env\Lib\site-packages\fastapi\testclient.py:1
+  .neural-debug-env\Lib\site-packages\fastapi\testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+45 tests collected in 11.19s

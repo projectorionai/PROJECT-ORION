@@ -1,63 +1,94 @@
-"""Verify multimodal HTTP payloads and literal evidence without a network."""
+"""Verify multimodal HTTP payloads and literal evidence against a local server."""
 import asyncio
 import base64
 import json
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from orion_core.providers import AIProviderProfile, OrionProviderSettings, ProviderRouter
 
 
-def test_image_is_sent_as_pixels_and_component_markings_are_not_rewritten(monkeypatch):
-    async def run(oversized=False):
-        raw_report = json.dumps({"summary": "ORIN marking visible", "observations": []})
-        body = json.dumps({"choices": [{"message": {"content": raw_report}}]}).encode()
-        if oversized:
-            body = b"x" * 262145
-        sent = []
+class _Remote(AIProviderProfile):
+    """Routed as a cloud provider; served from 127.0.0.1."""
 
-        class Response:
-            status = 200
+    is_local = property(lambda self: False)
 
-            def __init__(self):
-                self.content = self
 
-            async def iter_chunked(self, size):
-                for start in range(0, len(body), size):
-                    yield body[start:start + size]
+def _run(body: bytes, *, native: bool = False):
+    sent = []
 
-            async def __aenter__(self):
-                return self
+    async def openai(request):
+        sent.append(await request.json())
+        return web.Response(body=body, content_type="application/json")
 
-            async def __aexit__(self, *args):
-                pass
+    async def ollama_version(_request):
+        return web.json_response({"version": "0.32.6"})
 
-        class Session:
-            async def __aenter__(self):
-                return self
+    async def ollama_chat(request):
+        sent.append(await request.json())
+        reply = json.loads(body)["choices"][0]["message"]["content"] if len(body) < 262144 else body.decode()
+        response = web.StreamResponse(headers={"Content-Type": "application/x-ndjson"})
+        await response.prepare(request)
+        await response.write(json.dumps({"message": {"content": reply}, "done": False}).encode() + b"\n")
+        await response.write(json.dumps({"message": {"content": ""}, "done": True,
+                                         "eval_count": 1, "prompt_eval_count": 1}).encode() + b"\n")
+        await response.write_eof()
+        return response
 
-            async def __aexit__(self, *args):
-                pass
+    async def flow():
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", openai)
+        app.router.add_get("/api/version", ollama_version)
+        app.router.add_post("/api/chat", ollama_chat)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            base = str(server.make_url("/v1"))
+            if native:
+                profile = AIProviderProfile(name="local_ollama", kind="openai_compatible",
+                                            model="llava", base_url=base, api_key="local")
+            else:
+                profile = _Remote(name="test", kind="openai_compatible", model="gpt-4o-mini",
+                                  base_url=base, api_key="fixture")
+            bus = SimpleNamespace(log=SimpleNamespace(emit=lambda *_: None))
+            router = ProviderRouter(OrionProviderSettings(
+                active_provider=profile.name, provider_order=[profile.name],
+                providers={profile.name: profile}), bus, memory=object())
+            try:
+                return await router._openai_compatible_chat(
+                    profile, "Inspect", instruction="JSON", image_jpeg=b"fixture-image"), sent
+            finally:
+                await router.aclose()
+        finally:
+            await server.close()
 
-            def post(self, endpoint, **kwargs):
-                sent.append(kwargs["json"])
-                return Response()
+    return asyncio.run(flow())
 
-        import orion_core.providers as module
-        monkeypatch.setattr(module, "ClientSession", lambda **kwargs: Session())
-        bus = SimpleNamespace(log=SimpleNamespace(emit=lambda *_: None))
-        profile = AIProviderProfile(name="test", kind="openai_compatible", model="gpt-4o-mini",
-                                    base_url="https://fixture.invalid/v1", api_key="fixture")
-        router = ProviderRouter(OrionProviderSettings(active_provider="test", provider_order=["test"],
-                                                      providers={"test": profile}), bus, memory=object())
-        result = await router._openai_compatible_chat(profile, "Inspect", instruction="JSON",
-                                                     image_jpeg=b"fixture-image")
-        assert result == raw_report
-        content = sent[0]["messages"][1]["content"]
-        assert content[1]["image_url"]["url"] == "data:image/jpeg;base64," + base64.b64encode(b"fixture-image").decode()
-        assert sent[0]["max_tokens"] > 0
 
-    asyncio.run(run())
+RAW_REPORT = json.dumps({"summary": "ORIN marking visible", "observations": []})
+BODY = json.dumps({"choices": [{"message": {"content": RAW_REPORT}}]}).encode()
+
+
+def test_image_is_sent_as_pixels_and_component_markings_are_not_rewritten():
+    result, sent = _run(BODY)
+    assert result == RAW_REPORT
+    content = sent[0]["messages"][1]["content"]
+    assert content[1]["image_url"]["url"] == \
+        "data:image/jpeg;base64," + base64.b64encode(b"fixture-image").decode()
+    assert sent[0]["max_tokens"] > 0
+
+
+def test_an_oversized_vision_reply_is_refused():
     with pytest.raises(RuntimeError, match="size limit"):
-        asyncio.run(run(oversized=True))
+        _run(b"x" * 262145)
+
+
+def test_ollama_receives_the_image_in_its_native_field():
+    result, sent = _run(BODY, native=True)
+    assert result == RAW_REPORT                       # evidence kept literally
+    user = sent[0]["messages"][1]
+    assert user["content"] == "Inspect"
+    assert user["images"] == [base64.b64encode(b"fixture-image").decode()]

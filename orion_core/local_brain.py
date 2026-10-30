@@ -21,8 +21,7 @@ and help with tasks" true even with the tokens gone.
 
 from __future__ import annotations
 
-import ast
-import operator
+import json
 import random
 import re
 from datetime import datetime
@@ -30,7 +29,9 @@ from typing import Any, Optional
 
 from .bus import OrionBus
 from .data import ToolResult
+from .identity import CREATOR_QUESTION_RE, creator_answer
 from .knowledge import NeuroKnowledgeBase
+from .remote_capability import RemoteToolGate
 from .time_service import TIME
 from .utils import first_line
 
@@ -80,6 +81,50 @@ def detect_correction(text: str) -> Optional[str]:
     return correction or raw
 
 
+def _request_body(raw: str) -> Optional[str]:
+    """A direct request after polite address, or None for a quoted/negated mention.
+
+    This only narrows deterministic rules. Unrecognised prose remains available
+    to the conversational model; an action verb somewhere in prose is not
+    permission to perform that action.
+    """
+    body = raw.strip()
+    prefix = re.compile(
+        r"^(?:(?:hello|hi|hey|thanks|thank you|cheers|orion|please)[,!: ]+"
+        r"|(?:can|could|would|will)\s+you\s+(?:please\s+)?"
+        r"|i(?:'d| would)?\s+like\s+(?:you\s+)?to\s+"
+        r"|i\s+want\s+(?:you\s+)?to\s+"
+        r"|help\s+me(?:\s+to)?\s+(?=(?:open|close|launch|start|find|save|read|set|add)\b))",
+        re.IGNORECASE)
+    for _ in range(6):
+        match = prefix.match(body)
+        if match is None:
+            break
+        remainder = body[match.end():].strip()
+        if not remainder or remainder.lower().strip(" ,.!?") in {"orion", "there", "very much", "so much", "a lot", "again"}:
+            break  # preserve a standalone greeting such as "hey Orion"
+        body = remainder
+    if not body or body.startswith(('"', "'", "`", "“", "‘", ">")):
+        return None
+    if re.match(
+            r"^(?:do\s+not(?!\s+forget\b)|don['’]?t(?!\s+forget\b)|never|not|avoid|"
+            r"refrain\s+from|without)\b", body, re.IGNORECASE):
+        return None
+    if re.match(
+            r"^(?:explain|teach|understand|say|repeat|quote|translate)\b"
+            r"|^(?:describe|show|tell)(?:\s+me)?\s+(?:how|why)\b"
+            r"|^(?:list|show)(?:\s+me)?\s+(?:the\s+)?(?:steps|instructions|commands|examples)\b"
+            r"|^how\s+(?:do|can|could|would|to)\b"
+            r"|^what\s+(?:is|are)\s+(?:the\s+)?(?:command|instructions|meaning|example)\b"
+            r"|^what\s+can\s+you\s+do\s+(?:to|if|when)\b"
+            r"|^(?:i|we|he|she|they|someone|somebody)\s+(?:said|says|asked|told|wrote|mentioned)\b"
+            r"|^(?:my|our|the)\s+(?:friend|colleague|teacher|assistant|user|owner)\s+(?:said|says|asked|told|wrote|mentioned)\b"
+            r"|^the\s+(?:example|instruction|command|message|quote)\s+(?:says|was|is)\b",
+            body, re.IGNORECASE):
+        return None
+    return body
+
+
 class LocalBrain:
     """Rule-based, no-API conversational fallback with local tool routing."""
 
@@ -105,25 +150,49 @@ class LocalBrain:
 
     # ── public entry point ────────────────────────────────────────────────────
 
-    async def respond(self, text: str) -> str:
+    async def respond(self, text: str, *, allow_llm: bool = True) -> Optional[str]:
         """Return a spoken reply; may perform a local tool action en route."""
         raw = str(text or "").strip()
         if not raw:
-            return "I'm here."
+            return "I'm here." if allow_llm else None
         lowered = raw.lower().strip(" .!?")
-        if self.telemetry is not None:
-            self.telemetry.metrics.incr("local_brain.turns")
+        def count_turn() -> None:
+            if self.telemetry is None:
+                return
+            try:
+                self.telemetry.metrics.incr("local_brain.turns")
+            except Exception:
+                pass
+
+        if allow_llm:
+            count_turn()
+
+        def known(reply: str) -> str:
+            if not allow_llm:
+                count_turn()
+            return reply
+
+        body = _request_body(raw)
+        if body is None:
+            if not allow_llm:
+                return None
+            reply = await self._try_local_llm(raw)
+            return reply if reply is not None else self._chit_chat(lowered, raw)
+        raw = body
+        lowered = raw.lower().strip(" .!?")
 
         # §2.3: a casual "no, that's wrong" / "actually it's X" corrects the last
         # fact ORION gave (from KNOWLEDGE/memory) instead of being a fresh turn.
         corrected = await self._maybe_apply_correction(raw)
         if corrected is not None:
-            return corrected
+            return known(corrected)
 
         # Ordered intent resolution — first match wins.  Answers sourced from
         # memory/knowledge (recall, neuroscience) are remembered as correctable.
         _correctable = (self._intent_recall, self._intent_neuro)
         for handler in (
+            # First: "hey, who made you?" must not stop at the greeting.
+            self._intent_creator,
             self._intent_greeting,
             self._intent_wellbeing,
             self._intent_thanks,
@@ -144,12 +213,15 @@ class LocalBrain:
                 if handler in _correctable:
                     self._last_fact_topic = raw
                     self._last_fact_answer = reply
-                return reply
+                return known(reply)
 
         # Task intents run a real local tool and report the outcome.
         task_reply = await self._intent_task(lowered, raw)
         if task_reply is not None:
-            return task_reply
+            return known(task_reply)
+
+        if not allow_llm:
+            return None
 
         # A local LLM, if configured, handles open-ended chat.
         llm_reply = await self._try_local_llm(raw)
@@ -158,12 +230,22 @@ class LocalBrain:
 
         return self._chit_chat(lowered, raw)
 
+    async def try_known_response(self, text: str) -> Optional[str]:
+        """Rules/local tools only; an unknown request stays available to a model."""
+        return await self.respond(text, allow_llm=False)
+
     async def _maybe_apply_correction(self, raw: str) -> Optional[str]:
         """If ORION just gave a fact and the user disputes it, record an
         authoritative correction via the LearningService and confirm — instead
         of treating "no, that's wrong" as an ordinary turn. Returns the spoken
         acknowledgement, or None when this isn't a correction of a live fact."""
         if not self._last_fact_answer:
+            return None
+        if not re.match(
+                r"^(?:(?:no|nope|nah)\b[, ]*)?(?:actually\b|that'?s\b|that is\b|this is\b|"
+                r"you'?re\b|you are\b|i mean\b|it'?s actually\b|it is actually\b|"
+                r"should be\b|the correct\b|i (?:think|believe) (?:you|that|this)\b)",
+                raw, re.IGNORECASE):
             return None
         correction = detect_correction(raw)
         if not correction:
@@ -182,7 +264,10 @@ class LocalBrain:
             self.bus.log.emit(f"LOCAL_BRAIN: correction failed - {first_line(exc, 100)}")
             return None
         if self.telemetry is not None:
-            self.telemetry.metrics.incr("local_brain.corrections")
+            try:
+                self.telemetry.metrics.incr("local_brain.corrections")
+            except Exception:
+                pass
         return result.text
 
     async def try_task(self, text: str) -> Optional[str]:
@@ -201,7 +286,9 @@ class LocalBrain:
     # ── daily-conversation intents ────────────────────────────────────────────
 
     def _intent_greeting(self, low: str, raw: str) -> Optional[str]:
-        if re.search(r"\b(hello|hi|hey|good morning|good afternoon|good evening|greetings)\b", low):
+        if re.fullmatch(
+                r"(?:(?:hello|hi|hey|greetings)(?:[, ]+(?:there|orion))?"
+                r"|good (?:morning|afternoon|evening)(?:[, ]+orion)?)", low.strip(" ,.!?")):
             # Shared clock: this used an 18:00 evening boundary while the
             # briefing and the live worker used 17:00, so the offline brain
             # could greet you "good afternoon" in the same minute the HUD
@@ -227,7 +314,7 @@ class LocalBrain:
         return None
 
     def _intent_thanks(self, low: str, raw: str) -> Optional[str]:
-        if re.search(r"\b(thank you|thanks|cheers|appreciate)\b", low):
+        if re.fullmatch(r"(?:thank you|thanks|cheers|(?:i )?appreciate (?:it|that))(?: very much| so much| a lot| again|[, ]+orion)?", low):
             return random.choice(["A pleasure.", "Always.", "Think nothing of it."])
         return None
 
@@ -240,6 +327,11 @@ class LocalBrain:
             ])
         return None
 
+    def _intent_creator(self, low: str, raw: str) -> Optional[str]:
+        if CREATOR_QUESTION_RE.search(low):
+            return creator_answer()
+        return None
+
     def _intent_identity(self, low: str, raw: str) -> Optional[str]:
         if re.search(r"\bwho are you\b|\bwhat are you\b|\byour name\b", low):
             return ("I am ORION — your personal operating system and aide. At the "
@@ -248,7 +340,11 @@ class LocalBrain:
         return None
 
     def _intent_capabilities(self, low: str, raw: str) -> Optional[str]:
-        if re.search(r"\bwhat can you do\b|\bhelp me with\b|\byour (capabilities|features)\b", low):
+        if (re.fullmatch(
+                r"(?:(?:hello|hi|hey)[, ]+)?(?:what can you do(?: for me)?"
+                r"|(?:(?:what are|tell me about|describe|show me) )?your (?:capabilities|features))",
+                low.strip(" ,.!?"))
+                or low in {"help", "help me", "help me with"}):
             return ("Even offline, I can open and manage applications, search "
                     "your files, capture and read the screen, take notes and recall "
                     "them, manage your workspace, run desktop actions, discuss "
@@ -277,7 +373,11 @@ class LocalBrain:
         return None
 
     def _intent_system(self, low: str, raw: str) -> Optional[str]:
-        if re.search(r"\b(cpu|memory|ram|system|how('?s| is) the (pc|computer|machine)|resources)\b", low):
+        if (re.fullmatch(
+                r"(?:(?:what(?:'s| is| are)|show|check|read|tell me|report)\s+)?"
+                r"(?:(?:the|your|my)\s+)?(?:current\s+)?(?:cpu|memory|ram|system|resources)"
+                r"(?:\s+(?:usage|status|health|load|utilisation|utilization))?", low)
+                or re.fullmatch(r"how(?:'s| is) (?:the|my) (?:pc|computer|machine)(?: doing)?", low)):
             try:
                 import psutil
                 # interval=None samples against the PREVIOUS call instead of
@@ -297,43 +397,39 @@ class LocalBrain:
 
     # ── arithmetic ────────────────────────────────────────────────────────────
 
-    _MATH_OPS = {
-        ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-        ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
-        ast.USub: operator.neg, ast.FloorDiv: operator.floordiv,
-    }
-
     def _intent_math(self, low: str, raw: str) -> Optional[str]:
-        m = re.search(r"(?:what('?s| is)|calculate|compute|work out)\s+(.+)", low)
-        expr = m.group(2) if m else (low if re.fullmatch(r"[0-9\.\s\+\-\*/x%\^\(\)]+", low) else "")
-        if not expr:
-            return None
-        expr = expr.replace("x", "*").replace("plus", "+").replace("minus", "-")
-        expr = expr.replace("times", "*").replace("divided by", "/").replace("^", "**")
-        expr = re.sub(r"[^0-9\.\+\-\*/%\(\)\s]", "", expr).strip()
-        if not expr or not re.search(r"[0-9]", expr):
-            return None
-        try:
-            value = self._safe_eval(ast.parse(expr, mode="eval").body)
-        except Exception:
-            return None
-        if isinstance(value, float) and value.is_integer():
-            value = int(value)
-        return f"That's {value}."
+        """Sums and unit conversions, exactly (calculator.py).
 
-    def _safe_eval(self, node: ast.AST) -> float:
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-            return float(node.value)
-        if isinstance(node, ast.BinOp) and type(node.op) in self._MATH_OPS:
-            return self._MATH_OPS[type(node.op)](self._safe_eval(node.left), self._safe_eval(node.right))
-        if isinstance(node, ast.UnaryOp) and type(node.op) in self._MATH_OPS:
-            return self._MATH_OPS[type(node.op)](self._safe_eval(node.operand))
-        raise ValueError("unsupported expression")
+        The old version deleted every character that was not a digit or an
+        operator, so "what's 12 stone in kilos" answered "That's 12." and any
+        "what is ..." with a number in it got a confident wrong answer; and
+        its powers were unbounded ("9^9^9" would hang this brain).
+        """
+        asked = re.search(r"(?:what('?s| is)|calculate|compute|work out|convert|how many)\s+(.+)", low)
+        bare = re.fullmatch(r"[0-9\.\s\+\-\*/x%\^\(\),]+", low)
+        if not (asked or bare) or not re.search(r"\d", low) and "how many" not in low:
+            return None
+        from .calculator import calculate, convert
+        try:
+            converted = convert(raw)
+        except Exception:
+            converted = None
+        if converted:
+            return converted
+        if not re.search(r"\d", low):
+            return None
+        result = calculate(raw)
+        if not result.ok:
+            return None
+        return f"That's {result.text.rsplit(' = ', 1)[-1]}."
 
     # ── memory ────────────────────────────────────────────────────────────────
 
     def _intent_remember(self, low: str, raw: str) -> Optional[str]:
-        m = re.search(r"(?:remember|note|make a note|don'?t forget)\s+(?:that\s+)?(.+)", raw, re.IGNORECASE)
+        body = _request_body(raw)
+        if body is None:
+            return None
+        m = re.match(r"^(?:remember|note|make a note|don'?t forget|do not forget)\s+(?:that\s+)?(.+)", body, re.IGNORECASE)
         if not m:
             return None
         fact = m.group(1).strip(" .")
@@ -399,28 +495,54 @@ class LocalBrain:
     # ── task routing (real local tools) ───────────────────────────────────────
 
     async def _intent_task(self, low: str, raw: str) -> Optional[str]:
+        body = _request_body(raw)
+        if body is None:
+            return None
+        raw, low = body, body.lower().strip(" .!?")
+        phone_reply = await self._intent_phone_task(low, raw)
+        if phone_reply is not None:
+            return phone_reply
         # Explicit electronics inspection remains useful offline: the camera
         # and local quality/OCR checks work without a cloud conversation model.
-        if re.search(r"\b(?:scan|inspect|analyse|analyze|examine|look at)\s+(?:(?:this|the|my|a|these)\s+)?(?:pcb|circuit\s+board|electronics|electronic\s+(?:board|device|components?))\b", low):
+        if re.match(r"^(?:scan|inspect|analyse|analyze|examine|look at)\s+(?:(?:this|the|my|a|these)\s+)?(?:pcb|circuit\s+board|electronics|electronic\s+(?:board|device|components?))\b", low):
             result = await self._run_tool("vision_analyse", {"action": "pcb", "prompt": raw})
             if result.ok and result.evidence:
                 report = result.evidence[0]
                 return str(report.get("summary") or result.text)
             return self._spoken(result, None)
+        # Reminders, timers and alarms. Offline there was no route to them at
+        # all: "remind me in 20 minutes" got small talk, and "start a timer"
+        # fell to the open-an-app rule below and opened the Clock app.
+        if re.search(r"\b(?:remind me|reminders?|timers?|countdown|alarms?|wake me)\b", low):
+            if (re.match(r"^(?:list|show|check|read|any)\b", low)
+                    or re.match(r"^(?:what|which) (?:are|is) (?:my|the)\b", low)
+                    or re.fullmatch(r"help me with (?:a list of )?(?:my )?(?:reminders?|timers?|alarms?)", low)):
+                result = await self._run_tool("reminder", {"action": "list"})
+            elif re.match(r"^(?:cancel|stop|clear|delete|remove)\s+(?:(?:all|the|my|active)\s+)*(?:reminders?|timers?|alarms?)\b", low):
+                result = await self._run_tool("reminder", {"action": "cancel"})
+            elif (re.match(r"^(?:remind me|wake me)\b", low)
+                  or re.match(r"^(?:set|create|add|schedule|start)\s+(?:(?:a|an|the|my)\s+)?(?:(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:second|minute|hour)s?\s+)?(?:reminder|timer|alarm|countdown)\b", low)):
+                result = await self._run_tool("reminder", {"action": "add", "phrase": raw})
+            else:
+                result = None
+            # The tool's own sentence ("Timer set - 5 minutes (until 14:05)")
+            # is the confirmation; a preamble would replace it with "Done."
+            if result is not None:
+                return self._spoken(result, None)
         # Open an application or website.
-        m = re.search(r"\b(?:open|launch|start|run)\s+(.+)", raw, re.IGNORECASE)
+        m = re.match(r"^(?:open|launch|start|run)\s+(.+)", raw, re.IGNORECASE)
         if m:
             target = m.group(1).strip(" .")
             result = await self._run_tool("open_app", {"app_name": target})
             return self._spoken(result, f"Opening {target}.")
         # Close an application.
-        m = re.search(r"\b(?:close|quit|exit)\s+(.+)", raw, re.IGNORECASE)
+        m = re.match(r"^(?:close|quit|exit)\s+(.+)", raw, re.IGNORECASE)
         if m:
             target = m.group(1).strip(" .")
             result = await self._run_tool("close_app", {"app_name": target})
             return self._spoken(result, f"Closing {target}.")
         # Web search.
-        m = re.search(r"\b(?:search (?:for|the web for)?|google|look up)\s+(.+)", raw, re.IGNORECASE)
+        m = re.match(r"^(?:search(?: for| the web for)?|google|look up)\s+(.+)", raw, re.IGNORECASE)
         if m:
             query = m.group(1).strip(" .")
             result = await self._run_tool("web_search", {"query": query})
@@ -430,13 +552,13 @@ class LocalBrain:
             result = await self._run_tool("vision_analyse", {"action": "describe"})
             return self._spoken(result, "Let me look.")
         # Find files.
-        m = re.search(r"\bfind (?:my |the )?(?:file|files|folder|document)s?\s+(?:called |named |for )?(.+)", raw, re.IGNORECASE)
+        m = re.match(r"^find (?:my |the )?(?:file|files|folder|document)s?\s+(?:called |named |for )?(.+)", raw, re.IGNORECASE)
         if m:
             query = m.group(1).strip(" .")
             result = await self._run_tool("find_files", {"query": query})
             return self._spoken(result, f"Searching for {query}.")
         # Workspace snapshot / resume.
-        if re.search(r"\b(save|snapshot) (my )?workspace\b", low):
+        if re.match(r"^(save|snapshot) (my )?workspace\b", low):
             result = await self._run_tool("workspace_control", {"action": "save"})
             return self._spoken(result, "Saving your workspace.")
         if re.search(r"\bwhere (did we|were we|was i) (leave off|left off|up to)\b|\bresume (my )?work\b", low):
@@ -452,6 +574,135 @@ class LocalBrain:
             return self._spoken(result, None)
         return None
 
+    async def _intent_phone_task(self, low: str, raw: str) -> Optional[str]:
+        """Route phone-specific offline commands through the remote gate only."""
+        gate = self.dispatcher
+        if not isinstance(gate, RemoteToolGate):
+            return None
+        device_id = gate.request_device()
+        if not device_id:
+            return None
+
+        phone_screen = re.search(
+            r"\b(?:phone|mobile)\s+(?:screen|display|viewport)\b|"
+            r"\b(?:screen|display)\s+(?:on|of)\s+(?:my\s+)?phone\b|"
+            r"\b(?:what(?:'s| is)(?:\s+on)?|look at|read|describe|see)\s+(?:my|the)\s+screen\b",
+            low)
+        if phone_screen:
+            action = ("latest_frame" if re.search(r"\b(?:screenshot|screen\s*shot|frame|capture image)\b", low)
+                      else "capture_dom")
+            result = await self._run_tool("phone_device", {"action": action})
+            if action == "capture_dom" and result.ok and not result.media:
+                return self._phone_dom_summary(result.text)
+            return self._spoken(result, None)
+
+        target = r"([+0-9][+0-9() -]{2,39}|[^\W\d_][^\d_]{1,79}?)"
+        sms = re.match(rf"^(?:text|sms|send\s+(?:an?\s+)?sms\s+to)\s+{target}\s+(?:saying|that\s+says|message|:)\s+(.+)$", raw, re.IGNORECASE)
+        if sms:
+            result = await self._run_tool("phone_device", {
+                "action": "send_sms", "number": sms.group(1).strip(), "body": sms.group(2).strip(),
+            })
+            return self._spoken(result, None)
+        call = re.match(rf"^(?:call|dial)\s+{target}(?:\s+(?:on|from)\s+(?:my\s+)?phone)?\s*$", raw, re.IGNORECASE)
+        if call:
+            result = await self._run_tool("phone_device", {
+                "action": "make_call", "number": call.group(1).strip(),
+            })
+            return self._spoken(result, None)
+
+        if "phone" not in low and "mobile" not in low:
+            return None
+
+        app = re.match(r"^(?:open|launch|start)\s+(.+?)\s+(?:on\s+)?(?:my\s+)?(?:phone|mobile)\b", raw, re.IGNORECASE)
+        if app:
+            label = app.group(1).strip(" .").lower()
+            aliases = {
+                "settings": "com.android.settings",
+                "chrome": "com.android.chrome",
+                "gmail": "com.google.android.gm",
+                "google maps": "com.google.android.apps.maps",
+                "maps": "com.google.android.apps.maps",
+                "whatsapp": "com.whatsapp",
+                "youtube": "com.google.android.youtube",
+            }
+            package = aliases.get(label, label)
+            result = await self._run_tool("phone_device", {"action": "open_app", "package": package})
+            return self._spoken(result, None)
+
+        gesture = re.match(r"^(tap|click|press|scroll)\s+(?:(up|down|left|right)\s+)?(?:node\s+)?(0(?:/[0-9]{1,2}){0,12})\b", low)
+        if gesture:
+            bridge = gate.mobile_viewport
+            dom = bridge.latest_dom(device_id) if bridge is not None else None
+            if dom is None:
+                return "Please read the phone screen first so I have a fresh UI snapshot."
+            action = "scroll" if gesture.group(1) == "scroll" else "click"
+            args = {"action": action, "snapshotId": dom.snapshot.get("snapshotId"),
+                    "nodeId": gesture.group(3)}
+            if action == "scroll":
+                if gesture.group(2) is None:
+                    return "Which direction should I scroll: up, down, left, or right?"
+                args["direction"] = gesture.group(2)
+            result = await self._run_tool("phone_device", args)
+            return self._spoken(result, None)
+        named_tap = re.match(
+            r"^(?:tap|click|press)\s+(?:the\s+)?(.+?)\s+on\s+(?:my\s+)?(?:phone|mobile)\s*$",
+            raw, re.IGNORECASE)
+        if named_tap:
+            bridge = gate.mobile_viewport
+            dom = bridge.latest_dom(device_id) if bridge is not None else None
+            if dom is None:
+                return "Please read the phone screen first so I have a fresh UI snapshot."
+            label = named_tap.group(1).strip().casefold()
+            matches: list[str] = []
+
+            def find(node: Any, clickable_parent: str = "") -> None:
+                if not isinstance(node, dict):
+                    return
+                node_id = str(node.get("id") or "")
+                clickable = node_id if node.get("clickable") else clickable_parent
+                text = str(node.get("text") or node.get("contentDescription") or "").strip()
+                if text.casefold() == label and clickable:
+                    matches.append(clickable)
+                for child in node.get("children", []):
+                    find(child, clickable)
+
+            find(dom.snapshot.get("root"))
+            matches = list(dict.fromkeys(matches))
+            if len(matches) != 1:
+                return ("I found more than one matching control. Name a node ID from the phone screen."
+                        if matches else "I cannot find that control on the current phone screen.")
+            result = await self._run_tool("phone_device", {
+                "action": "click", "snapshotId": dom.snapshot.get("snapshotId"),
+                "nodeId": matches[0],
+            })
+            return self._spoken(result, None)
+        return None
+
+    @staticmethod
+    def _phone_dom_summary(raw: str) -> str:
+        try:
+            snapshot = json.loads(raw)
+        except (TypeError, ValueError):
+            return "I captured the phone's visible controls."
+        if not isinstance(snapshot, dict):
+            return "I captured the phone's visible controls."
+        labels: list[str] = []
+
+        def visit(node: Any) -> None:
+            if not isinstance(node, dict) or len(labels) >= 15:
+                return
+            label = str(node.get("text") or node.get("contentDescription") or "").strip()
+            if label:
+                labels.append(f"{node.get('id', '?')}: {label[:70]}")
+            for child in node.get("children", []):
+                visit(child)
+
+        visit(snapshot.get("root"))
+        package = str(snapshot.get("package") or "the phone")[:80]
+        if labels:
+            return f"I can read {package}: {'; '.join(labels)}"[:900]
+        return f"I captured {package}, but found no visible text labels."
+
     async def _run_tool(self, name: str, args: dict[str, Any]) -> ToolResult:
         try:
             return await self.dispatcher.dispatch(name, args)
@@ -459,6 +710,8 @@ class LocalBrain:
             return ToolResult(f"{name} failed: {first_line(exc, 80)}", ok=False)
 
     def _spoken(self, result: ToolResult, preamble: Optional[str]) -> str:
+        if result.media and result.media.get("confirm"):
+            return result.text
         line = (result.text or "").splitlines()[0] if result.text else ""
         if not result.ok:
             return f"I couldn't complete that. {line}"
@@ -471,13 +724,18 @@ class LocalBrain:
     async def _try_local_llm(self, raw: str) -> Optional[str]:
         if self.router is None:
             return None
-        local = [p for p in self.router.text_profiles()
-                 if p.base_url.startswith(("http://127.0.0.1", "http://localhost"))]
-        if not local:
-            return None
         try:
-            _profile, reply = await self.router.generate_text(raw)
-            return reply
+            profiles = getattr(self.router, "local_text_profiles", None)
+            local = (profiles() if callable(profiles) else
+                     [p for p in self.router.text_profiles() if getattr(p, "is_local", False)])
+            if not local:
+                return None
+            generate = getattr(self.router, "generate_local_text", None)
+            if callable(generate):
+                _profile, reply = await generate(raw, instruction="", task="offline-chat")
+            else:
+                _profile, reply = await self.router.generate_text_offline(raw)
+            return str(reply or "").strip() or None
         except Exception:
             return None
 
@@ -489,9 +747,7 @@ class LocalBrain:
                     "wider world for that — but ask me the time, your tasks, to open "
                     "something, to search your files, or anything in neuroscience, "
                     "and I'll handle it directly.")
-        return random.choice([
-            "Understood. What would you like me to do?",
-            "I'm with you. Shall I open something, take a note, or look "
-            "something up locally?",
-            "Very good. How can I be useful right now?",
-        ])
+        # Said word for word every time before (one line five times in the
+        # owner's last 500 replies); a fresh one each time now (voice_variety).
+        from .voice_variety import pick
+        return pick("local_idle")

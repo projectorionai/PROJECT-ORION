@@ -52,10 +52,12 @@ def test_set_voice_preserves_the_rest_of_api_keys_json(tmp_path, monkeypatch):
     ev.API_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     ev.API_CONFIG_PATH.write_text('{"providers": {"gemini": {"api_key": "g"}}}', encoding="utf-8")
     ev.set_voice(api_key="sk-test", voice_id="v123")
-    import json
-    data = json.loads(ev.API_CONFIG_PATH.read_text(encoding="utf-8"))
+    # Mark XXXX.3: keys are sealed on disk and opened by key_seal.
+    from orion_core import key_seal
+    data = key_seal.load_json(ev.API_CONFIG_PATH)
     assert data["providers"]["gemini"]["api_key"] == "g"
     assert data["elevenlabs"]["api_key"] == "sk-test"
+    assert "sk-test" not in ev.API_CONFIG_PATH.read_text(encoding="utf-8") or not key_seal.available()
 
 
 def test_describe_reflects_configuration_state(tmp_path, monkeypatch):

@@ -34,7 +34,6 @@ from pathlib import Path
 from typing import Any
 
 from .constants import API_CONFIG_PATH, CONFIG_DIR
-from .atomic_io import atomic_write_text
 
 API_BASE = "https://api.elevenlabs.io/v1"
 DEFAULT_MODEL_ID = "eleven_turbo_v2_5"
@@ -61,11 +60,9 @@ _DEFAULT_PRONUNCIATION = {
 # ── configuration (config/api_keys.json -> "elevenlabs") ────────────────────
 
 def _load_json(path: Path) -> dict[str, Any]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    from .key_seal import load_json
+
+    return load_json(path)
 
 
 def _elevenlabs_section() -> dict[str, Any]:
@@ -78,7 +75,9 @@ def _save_elevenlabs_section(section: dict[str, Any]) -> None:
         API_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         data = _load_json(API_CONFIG_PATH)
         data["elevenlabs"] = section
-        atomic_write_text(API_CONFIG_PATH, json.dumps(data, indent=2), encoding="utf-8")
+        from .key_seal import save_json
+
+        save_json(API_CONFIG_PATH, data, indent=2)
     except OSError:
         pass
 

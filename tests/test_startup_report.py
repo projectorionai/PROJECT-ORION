@@ -38,6 +38,83 @@ from orion_core.startup_report import (  # noqa: E402
 )
 
 
+def test_voice_diagnostics_selects_latest_session_and_never_copies_private_text():
+    import json
+
+    from tools.diagnose_voice import summarise
+
+    lines = [
+        "2026-10-18 10:00:00  ===== session older =====\n",
+        "2026-10-18 10:00:01  PERF: event loop blocked 900 ms by old()\n",
+        "2026-10-19 10:00:00  ===== session latest =====\n",
+        "2026-10-19 10:00:01  USER: private words sk-private-token\n",
+        "2026-10-19 10:00:02  PERF: event loop blocked 247 ms by native - meanwhile thread 'orion-intent-learner' ran 234 ms\n",
+        "2026-10-19 10:00:03  VOICE: Charon warm-up request refused - quota: private provider body\n",
+        "2026-10-19 10:00:04  VOICE: Charon offline cache - 9 of 187 of ORION's own lines\n",
+    ]
+    result = summarise(lines)
+    assert result["sessions_seen"] == 2
+    assert result["stalls"]["count"] == 1
+    assert result["stalls"]["max_ms"] == 247
+    assert result["stalls"]["coincident_workers"] == {"intent": 1}
+    assert result["speech"]["cache"] == {"available_lines": 9, "total_lines": 187}
+    assert result["speech"]["quota_refusals"] == 1
+    assert "private" not in json.dumps(result)
+
+
+def test_voice_diagnostics_detects_positive_old_device_evidence():
+    from tools.diagnose_voice import summarise
+
+    old = "Speakers (HyperX Cloud III S Wireless)"
+    new = "XV252Q (NVIDIA High Definition Audio)"
+    moved = f"AUDIO: the desktop's sound moved from {old} to {new} (Windows default output)."
+    bad = summarise([moved, "AUDIO: output renderer moved to [9] Speakers (HyperX Cloud III S Wi."])
+    good = summarise([moved, f"AUDIO: output renderer moved to [8] {new}."])
+    unknown = summarise([moved, "AUDIO: output renderer moved to system default."])
+    assert bad["audio"]["stale_output_reopens"] == 1
+    assert good["audio"]["stale_output_reopens"] == unknown["audio"]["stale_output_reopens"] == 0
+
+
+def test_voice_diagnostics_bounds_retained_timings_and_handles_empty_logs():
+    from tools.diagnose_voice import summarise
+
+    assert summarise([])["stalls"]["recent_p95_ms"] is None
+    result = summarise("PERF: event loop blocked 200 ms by native\n" for _ in range(4000))
+    assert result["stalls"]["count"] == 4000
+    assert result["stalls"]["timings_retained"] == 2048
+    assert result["stalls"]["recent_p95_ms"] == 200
+
+
+def test_voice_diagnostics_cli_preserves_existing_files(tmp_path, capsys):
+    from tools.diagnose_voice import main
+
+    source, target = tmp_path / "session.log", tmp_path / "report.json"
+    source.write_text("AUDIO: input status - input overflow\n", encoding="utf-8")
+    assert main(["--log", str(source), "--output", str(target)]) == 0
+    before = target.read_bytes()
+    assert main(["--log", str(source), "--output", str(target)]) == 2
+    assert target.read_bytes() == before
+    assert str(tmp_path) not in capsys.readouterr().out
+
+
+def test_voice_diagnostics_discards_long_line_tails_without_parsing_fragments():
+    from io import StringIO
+
+    from tools.diagnose_voice import _bounded_lines, summarise
+
+    class BoundedReader(StringIO):
+        def readline(self, size=-1):
+            assert 0 < size <= 8192, "unbounded physical line read"
+            return super().readline(size)
+
+    stream = BoundedReader("x" * 8192 + "AUDIO: input status - input overflow\n"
+                           "PERF: event loop blocked 200 ms by native\n")
+    result = summarise(_bounded_lines(stream))
+    assert result["lines_examined"] == 2
+    assert result["audio"]["input_overflows"] == 0
+    assert result["stalls"]["count"] == 1
+
+
 class _Dispatcher:
     """A dispatcher with a routing table and nothing else."""
 
@@ -238,7 +315,9 @@ def test_the_banner_opens_the_log():
 def test_the_roll_call_runs_at_boot():
     source = (ROOT / "orion_core" / "app.py").read_text(encoding="utf-8")
     assert "from .startup_report import report" in source
-    assert "report(dispatcher, bus=bus)" in source
+    # Beside the boot, not on it: listing audio host APIs starts PortAudio,
+    # MEASURED at 1.66 s on the thread that paints the first window.
+    assert "asyncio.to_thread(report, dispatcher, bus=bus)" in source
 
 
 def test_the_plugin_line_is_printed_when_loading_finishes():

@@ -174,10 +174,8 @@ def test_the_page_is_served_rather_than_set_as_html():
     # setHtml is wrong here, and matching prose put "setHtml" first and failed
     # a correct implementation.
     assert "self.view.setUrl(" in build, "the page is not navigated to"
-    assert build.index("self.view.setUrl(") < build.index(
-        "self.view.setHtml("), (
-        "setHtml is the fallback for when the scheme is unavailable, not the "
-        "primary path")
+    assert "self.view.setHtml(" not in build, (
+        "a failed local loader must show a software avatar instead of fetching a CDN")
 
 
 def test_the_face_rests_when_nothing_is_moving():
@@ -195,8 +193,10 @@ def test_the_face_rests_when_nothing_is_moving():
 
     loop = page[page.index("function animate()"):]
     loop = loop[:loop.index("composer.render()")]
-    assert "targetFrameMs()" in loop, (
+    assert "takeRenderFrame(now)" in loop, (
         "the governor is defined but the loop does not consult it")
+    scheduler = page[page.index("function takeRenderFrame("):page.index("function animate()")]
+    assert "targetFrameMs()" in scheduler
 
 
 def test_anything_moving_restores_the_full_frame_rate():
@@ -221,3 +221,97 @@ def test_the_failure_message_does_not_blame_the_network():
     """
     assert "needs an internet connection" not in face3d.FACE_HTML
     assert "streams from a CDN" not in face3d.FACE_HTML
+
+
+def _run_face_javascript(script):
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is needed to execute the renderer health checks")
+    result = subprocess.run([node, "-e", script], capture_output=True,
+                            text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_render_health_requires_a_completed_compositor_frame():
+    source = face3d.FACE_HTML.split("function animate(){", 1)[1]
+    source = "function animate(){" + source.split("\nlastT=performance.now();\nanimate();", 1)[0]
+    harness = """
+const assert=require('node:assert/strict');
+let now=40,lost=false,throws=true,boots=0,removed=0,lastT=0,frameEMA=16,stepFault='';
+const document={hidden:false,getElementById:()=>({remove:()=>removed++})};
+const performance={now:()=>now},requestAnimationFrame=()=>{},takeRenderFrame=()=>true;
+const window={__orionRender:{frames:0,lastAt:0,error:''},__orionFaceBooted:()=>boots++};
+window.__orionRenderFailed=reason=>{window.__orionRender.error=reason;};
+const renderer={getContext:()=>({isContextLost:()=>lost})};
+const composer={render:()=>{if(throws)throw Error('GPU refused draw');}};
+const step=()=>{};
+"""
+    _run_face_javascript(harness + source + """
+animate();assert.equal(window.__orionRender.frames,0);assert.equal(boots,0);
+assert.match(window.__orionRender.error,/GPU refused draw/);
+throws=false;now=80;animate();
+assert.equal(window.__orionRender.frames,1);assert.equal(boots,1);assert.equal(removed,1);
+assert.equal(window.__orionRender.lastAt,80);
+lost=true;now=120;animate();
+assert.equal(window.__orionRender.frames,1);assert.equal(window.__orionRender.lastAt,80);
+""")
+
+
+def test_live_health_rejects_stale_fps_context_loss_and_late_render_errors():
+    import json
+    from types import SimpleNamespace
+    scripts = []
+    page = SimpleNamespace(runJavaScript=lambda script, callback: scripts.append(script))
+    face = SimpleNamespace(view=SimpleNamespace(page=lambda: page), _render_failure="")
+    face3d.QuantumFace3D.check_state(face, lambda _state: None)
+    check = "const check=()=>eval(" + json.dumps(scripts[0]) + ");\n"
+    _run_face_javascript("""
+const assert=require('node:assert/strict');
+let now=100;
+const performance={now:()=>now},document={hidden:false};
+const window={__dbg:{fps:60},__orionRender:{frames:0,lastAt:0,lost:false,error:''}};
+""" + check + """
+assert.equal(check(),'loading');
+window.__orionRender.frames=1;window.__orionRender.lastAt=100;
+assert.equal(check(),'alive');
+now=10200;assert.equal(check(),'failed');
+document.hidden=true;assert.equal(check(),'alive');document.hidden=false;
+window.__orionRender.lastAt=now;window.__orionRender.lost=true;window.__orionRender.lostAt=now;
+assert.equal(check(),'loading');now+=5100;assert.equal(check(),'failed');
+window.__orionRender.lost=false;window.__orionRender.lastAt=now;
+window.__orionRender.error='shader failed';assert.equal(check(),'failed');
+""")
+
+
+def test_a_render_error_after_boot_is_still_reported():
+    script = re.search(r"<script>\s*(.*?)</script>", face3d.FACE_HTML, re.S).group(1)
+    _run_face_javascript("""
+const assert=require('node:assert/strict');
+const listeners={},timers=[];
+const document={getElementById:()=>null};
+const window={addEventListener:(name,handler)=>{listeners[name]=handler;}};
+const setTimeout=handler=>timers.push(handler);
+""" + script + """
+window.__orionFaceBooted();timers[0]();assert.equal(window.__orionFailed,undefined);
+listeners.error({message:'renderer failed after first frame'});
+assert.match(window.__orionFailed,/renderer failed after first frame/);
+""")
+
+
+def test_known_local_load_failure_reports_failed_without_javascript():
+    from types import SimpleNamespace
+    face = SimpleNamespace(view=object(), _render_failure="local handler unavailable")
+    answers = []
+    face3d.QuantumFace3D.check_state(face, answers.append)
+    assert answers == ["failed"]
+
+
+def test_missing_local_assets_cannot_start_a_network_dependent_face(monkeypatch):
+    from orion_core.gui import core_window, face_host
+    monkeypatch.setattr(face3d, "local_three", lambda: None)
+    monkeypatch.setattr(face_host, "enabled", lambda: False)
+    monkeypatch.setattr(face3d, "QuantumFace3D", lambda: object())
+    with pytest.raises(RuntimeError, match="local avatar assets"):
+        core_window._new_webgl_face()

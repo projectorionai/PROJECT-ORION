@@ -19,14 +19,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
+import math
 import os
 import random
 import re
+import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 # aiohttp costs ~178 ms to import and is only used inside coroutines;
 # deferring it keeps it off ORION's startup path (see lazy_import).
@@ -37,6 +42,8 @@ ClientTimeout = lazy_attr("aiohttp", "ClientTimeout")
 
 from .bus import OrionBus
 from .constants import API_CONFIG_PATH, CONFIG_DIR, LIVE_MODEL
+from . import provider_transport as _transport
+from .request_trace import mark as _trace_mark
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -66,10 +73,17 @@ class NoTextProviderError(ProviderError):
         self.online = online
         self.remediation = (
             "Add a cloud provider API key in config/api_keys.json (Anthropic, "
-            "OpenAI, xAI, OpenRouter, Groq, Together) or start a local LLM "
+            "OpenAI, xAI, OpenRouter, Groq, Mistral, Hugging Face, NVIDIA) or start a local LLM "
             "(Ollama / LM Studio) and enable it. ORION keeps its deterministic "
             "tools running meanwhile."
         )
+
+
+class ThoughtGenerationUnavailable(NoTextProviderError):
+    """Background generation is idle under the user's local-only cost policy.
+
+    An expected, quiet state rather than an activity-log diagnostic.
+    """
 
 
 class AllTextProvidersFailedError(ProviderError):
@@ -77,19 +91,138 @@ class AllTextProvidersFailedError(ProviderError):
     list of providers attempted and the last error message (no secrets)."""
 
     def __init__(self, last_error: object, *, attempts: list[str] | None = None) -> None:
-        super().__init__(f"all text providers failed: {last_error}")
+        safe_error = redacted_error_line(last_error, 240)
+        super().__init__(f"all text providers failed: {safe_error}")
         self.attempts = attempts or []
-        self.last_error = str(last_error)
+        self.last_error = safe_error
         self.remediation = (
             "Check network connectivity and provider status; a local LLM "
             "(Ollama / LM Studio) gives an offline fallback."
         )
+
+
+class ProviderDeadlineError(AllTextProvidersFailedError):
+    """The request's total time budget ran out before any provider answered.
+
+    A subclass of AllTextProvidersFailedError because, to the caller, it is
+    the same situation — nobody answered in time — and every existing handler
+    for that should treat it the same way. It is never charged to a provider:
+    running out of the caller's time says nothing about the provider's health.
+    """
+
+    def __init__(self, last_error: object = "the time budget for this request ran out",
+                 *, attempts: list[str] | None = None) -> None:
+        super().__init__(last_error, attempts=attempts)
+        self.remediation = (
+            "The request's time budget ran out. Interactive turns are bounded "
+            "by ORION_INTERACTIVE_BUDGET_S, background work by "
+            "ORION_RESEARCH_BUDGET_S.")
+
+
+class StreamInterruptedError(ProviderError):
+    """A provider failed after part of its answer had already been streamed,
+    and the caller gave no ``on_restart`` to start the answer over. Raised
+    rather than splicing another provider's answer onto the visible start."""
+
+    def __init__(self, provider: str, cause: object = "") -> None:
+        super().__init__(
+            f"{provider} failed part-way through a streamed answer: "
+            f"{redacted_error_line(cause, 160)}")
+        self.provider = provider
+
+
+class ProviderClosedError(ProviderError):
+    """The router has been shut down; no new provider call may start."""
+
+
+class ProviderConfigurationError(ProviderError):
+    """Retained provider policy is unavailable or changed; never reset it."""
+
+
+class ProviderText(str):
+    """String-compatible reply retaining the provider's completion signal."""
+
+    def __new__(cls, text: str, done_reason: str = "", raw_text: str | None = None):
+        value = super().__new__(cls, text)
+        value.done_reason = str(done_reason).lower()
+        value.raw_text = text if raw_text is None else raw_text
+        return value
+
+
+@dataclass
+class _CallScope:
+    """What one generate_text call carries down to every attempt it makes.
+
+    Held in a context variable rather than threaded through signatures: the
+    per-provider attempt methods are the seam that tests and callers replace,
+    and their signatures are relied on as they are.
+    """
+
+    cls: str = _transport.INTERACTIVE
+    deadline: float | None = None           # time.monotonic() value
+    first_token_marked: bool = False
+    #: Held back from the current attempt for the providers after it.
+    reserve_s: float = 0.0
+
+    def remaining(self) -> float | None:
+        return None if self.deadline is None else self.deadline - time.monotonic()
+
+    def attempt_remaining(self) -> float | None:
+        """What the current provider attempt may use: the budget left, less
+        the time held back for the providers waiting behind it."""
+        left = self.remaining()
+        return None if left is None else left - max(0.0, self.reserve_s)
+
+
+_CALL: ContextVar[_CallScope | None] = ContextVar("orion_provider_call", default=None)
+
+
+def _env_float(name: str, default: float, low: float, high: float) -> float:
+    try:
+        return max(low, min(high, float(os.getenv(name, "") or default)))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(os.getenv(name, "") or default)))
+    except ValueError:
+        return default
+
+
+def _ollama_model_key(model: str) -> str:
+    """Ollama names an untagged model ``name:latest`` in /api/ps."""
+    model = str(model or "").strip()
+    return model if ":" in model else f"{model}:latest"
+
+
+def _keep_alive_seconds(value: int | float | str | None, cap: int = 3600) -> int:
+    """Seconds from an Ollama keep-alive ("10m", "30s", "1h", 600, "0").
+    Unparseable or negative values mean 0 (release at once); capped at an hour."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, min(cap, int(value)))
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h)?\s*", str(value).lower())
+    if not match:
+        return 0
+    amount = float(match.group(1))
+    scale = {"ms": 0.001, "s": 1, "m": 60, "h": 3600, None: 1}[match.group(2)]
+    return max(0, min(cap, int(amount * scale)))
+
+
 from .knowledge import PERSONA_BOOST as _NEURO_PERSONA_BOOST
 from .programming_knowledge import PROGRAMMING_PERSONA_BOOST as _PROG_PERSONA_BOOST
 from .cyber_knowledge import CYBER_PERSONA_BOOST as _CYBER_PERSONA_BOOST
+from .cyber_knowledge import SECURITY_TEACHING_DIRECTIVE as _SECURITY_TEACHING_DIRECTIVE
+from .learning_style import LEARNING_STYLE_DIRECTIVE as _LEARNING_STYLE_DIRECTIVE
+from .identity import creator_rule
 from .security import SecuritySanitiser
 from .utils import clean_transcript, first_line
+from . import key_seal
 from .atomic_io import atomic_write_text
+from .provider_diagnostics import redacted_error_line
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -123,6 +256,26 @@ _PREFERRED_FRAGMENTS = (
     "gemini-2.5-flash", "gpt-oss-120b", "nemotron-3-super", "qwen3",
     "llama-3.3-70b", "gemma-4-31b", "gpt-4o-mini", "gpt-oss-20b",
     "gemma-4-26b", "nemotron", "mistral", "llama",
+)
+
+# Text models only.  Each identifier is an ordinary generateContent model with
+# function calling; Live, TTS, image, agent and embedding endpoints use other
+# request shapes.  The smaller profile leads everyday turns, while the second
+# profile leads complex work.  Google meters their model quotas separately.
+_GEMINI_TEXT_MODELS = (
+    "gemini-3.5-flash-lite", "gemini-2.5-flash-lite",
+    "gemini-2.5-flash", "gemini-3.1-flash-lite",
+)
+_GEMINI_REASONING_MODELS = (
+    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash",
+)
+_FORMER_GEMINI_TEXT_MODELS = (
+    "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest",
+)
+_PREVIOUS_GEMINI_TEXT_MODELS = (
+    "gemini-2.5-flash", "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite", "gemini-flash-latest",
 )
 
 
@@ -203,13 +356,21 @@ class AIProviderProfile:
     @property
     def is_local(self) -> bool:
         """A locally-hosted model (Ollama, LM Studio) that needs no internet."""
-        return self.base_url.startswith(("http://127.0.0.1", "http://localhost", "http://0.0.0.0"))
+        from urllib.parse import urlsplit
+
+        try:
+            endpoint = urlsplit(self.base_url)
+            return (endpoint.scheme == "http" and endpoint.username is None
+                    and endpoint.password is None
+                    and endpoint.hostname in {"127.0.0.1", "localhost", "0.0.0.0", "::1"})
+        except ValueError:
+            return False
 
     @property
     def supports_text_generation(self) -> bool:
         if not self.enabled:
             return False
-        if self.kind != "openai_compatible":
+        if self.kind not in {"openai_compatible", "gemma_native"}:
             return False
         if self.is_local:
             return True
@@ -224,6 +385,10 @@ class OrionProviderSettings:
     provider_order: list[str]
     providers: dict[str, AIProviderProfile]
     integrations: dict[str, Any] = field(default_factory=dict)
+    configuration_error: str = ""
+    _source_observed: bool = field(default=False, repr=False, compare=False)
+    _source_path: str = field(default="", repr=False, compare=False)
+    _source_sha256: str | None = field(default=None, repr=False, compare=False)
 
     def ordered_profiles(self) -> list[AIProviderProfile]:
         ordered: list[AIProviderProfile] = []
@@ -276,9 +441,14 @@ class ProviderRouter:
     # including the WebEngine compositor drawing ORION's face, which loses its
     # surfaces and redraws them black. A random black flicker every forty-five
     # seconds is exactly what that looks like from the outside.
+    # Ollama's native API words its refusal to load as "model requires more
+    # system memory (5.3 GiB) than is available (4.1 GiB)", which none of the
+    # other phrasings match — it was classed as a transient fault and retried
+    # every 45 seconds, which is the very loop this class exists to stop.
     OOM_RE = re.compile(
         r"(?i)out of memory|cudamalloc|failed to allocate|oom|"
-        r"cuda error|insufficient memory|not enough memory")
+        r"cuda error|insufficient memory|not enough memory|"
+        r"requires more (?:system )?memory")
     # Payload-class failures (HTTP 413, context-length exceeded): the PAYLOAD
     # was at fault, not the provider — benching it for minutes (the old
     # QUOTA_RE match on "tokens") starved the router for no reason.  Checked
@@ -370,19 +540,74 @@ class ProviderRouter:
     _LATENCY_EMA_ALPHA = 0.3
 
     # A local model's KV-cache memory scales roughly linearly with context
-    # length — a 7B/8B model at Ollama's unconstrained default (up to 128K)
-    # can burn several extra GB of RAM/VRAM beyond the weights themselves,
-    # which is exactly the "local fallback eats all the memory" failure mode.
-    # This host has 16GB of PHYSICAL RAM and no discrete GPU headroom to rely
-    # on, so the Tier-2 local model (qwen2.5:7b) is held to a strict 2048-token
-    # context — the hard ceiling that keeps the weights + KV-cache inside RAM
-    # and stops Windows from swapping mid-reply. ORION's own local payload
-    # budget never needs more than this covers; the value can be raised on a
-    # machine with more memory via ORION_LOCAL_NUM_CTX.
-    try:
-        LOCAL_NUM_CTX = max(512, min(8192, int(os.getenv("ORION_LOCAL_NUM_CTX", "2048"))))
-    except ValueError:
-        LOCAL_NUM_CTX = 2048
+    # length — a 7B/8B model at an unconstrained context (up to 128K) can burn
+    # several extra GB of RAM/VRAM beyond the weights themselves, which is
+    # exactly the "local fallback eats all the memory" failure mode.
+    #
+    # The effective context policy. This used to say 2048 and was never in
+    # force: it travelled through Ollama's /v1 endpoint, which drops the
+    # field. Measured on this machine (Ollama 0.32.6, llama3.1 8B Q4_K_M,
+    # RTX 3060 Ti 8 GB): a /v1 request carrying num_ctx=2048 loaded the model
+    # at context 4096, 5.27 GB, all of it in VRAM. 2048 cannot simply be
+    # switched on now that it would be obeyed: the lean instruction alone is
+    # ~6.4k characters, and a 2048 context would cut ORION's own persona off
+    # the front of every local prompt. 4096 is what was really running, so
+    # memory use is unchanged; what changes is that the payload budget for a
+    # native-Ollama profile is now held inside it (see _chat_attempt), so the
+    # prompt always fits the context it is actually given. Raise it on a
+    # machine with more VRAM via ORION_LOCAL_NUM_CTX.
+    LOCAL_NUM_CTX = _env_int("ORION_LOCAL_NUM_CTX", 4096, 512, 32768)
+
+    # ── one total deadline per request ────────────────────────────────────────
+    # Each attempt had its own timeout and nothing bounded the sum: three
+    # providers at 30 s plus a local model at 120 s could hold a conversation
+    # turn for over three minutes. generate_text now carries one deadline
+    # through admission, connection, generation, the healing retry, cooldown
+    # waits and every fallback.
+    INTERACTIVE_BUDGET_S = _env_float("ORION_INTERACTIVE_BUDGET_S", 90.0, 5.0, 3600.0)
+    RESEARCH_BUDGET_S = _env_float("ORION_RESEARCH_BUDGET_S", 900.0, 30.0, 7200.0)
+    #: An attempt is not started with less than this left, nor with less than
+    #: the provider's own recent response time (it would only be cut off).
+    MIN_ATTEMPT_S = 2.0
+    #: While another provider waits behind it, an attempt may not spend the
+    #: whole budget: this much (never more than a third of what is left) is
+    #: held back for the next. 26 Oct 2026: gemini_reasoning, its own timeout
+    #: equal to the 90 s budget, held a specialist agent's request until the
+    #: budget ran out, and the request failed with no other provider asked.
+    FALLBACK_RESERVE_S = _env_float("ORION_FALLBACK_RESERVE_S", 30.0, 0.0, 600.0)
+    #: Tasks that are background work whatever budget their caller passed.
+    #: Those callers (research, the forge, the inner voice, fact harvesting)
+    #: predate the budget argument; naming them here keeps them behind the
+    #: conversation for a provider's slots without editing each one.
+    BACKGROUND_TASKS = frozenset({"research", "forge", "thought", "memory"})
+
+    # ── shared admission ──────────────────────────────────────────────────────
+    # Conversation, research, the forge and the inner voice share one router,
+    # and each had its own limits (research alone runs six sections at once),
+    # so together they could exceed anything a provider or the GPU accepts.
+    #: Concurrent requests per cloud profile, and how many of those background
+    #: work may hold — the rest stay free for a conversation turn.
+    CLOUD_CONCURRENCY = _env_int("ORION_PROVIDER_CONCURRENCY", 6, 1, 64)
+    CLOUD_BACKGROUND_CONCURRENCY = _env_int("ORION_PROVIDER_BACKGROUND_CONCURRENCY", 4, 1, 64)
+    #: Concurrent generations per LOCAL server: one GPU, one at a time.
+    LOCAL_CONCURRENCY = _env_int("ORION_LOCAL_CONCURRENCY", 1, 1, 8)
+
+    # ── local residency ───────────────────────────────────────────────────────
+    # Unloading after every call (the old intent) makes every local turn a
+    # cold one: measured once here, a cold llama3.1 8B turn took 17.3 s end
+    # to end for a five-token reply, nearly all of it loading the model
+    # (Ollama 0.32.6, RTX 3060 Ti). Keeping it for a couple of minutes makes
+    # a local conversation warm after its first turn; memory pressure
+    # (set_memory_pressure / unload_local_models) takes it back early.
+    LOCAL_KEEP_ALIVE_S = _env_int("ORION_LOCAL_KEEP_ALIVE_S", 120, 0, 3600)
+    #: Background work keeps the model only briefly, and never shortens a
+    #: window a conversation opened.
+    LOCAL_BACKGROUND_KEEP_ALIVE_S = _env_int("ORION_LOCAL_BACKGROUND_KEEP_ALIVE_S", 30, 0, 3600)
+    #: How long a closed or firewalled local port may keep ORION waiting to
+    #: find out it is closed (it hangs here rather than refusing).
+    LOCAL_PROBE_TIMEOUT_S = 1.5
+    #: A server that answered "not Ollama" is asked again after this long.
+    NOT_OLLAMA_TTL_S = 600.0
 
     def __init__(self, settings: OrionProviderSettings, bus: OrionBus, memory: Any,
                  connectivity: Any | None = None) -> None:
@@ -391,6 +616,11 @@ class ProviderRouter:
         self.settings = settings
         self.bus      = bus
         self.memory   = memory
+        if getattr(settings, "configuration_error", ""):
+            bus.log.emit("NET: " + settings.configuration_error)
+        # Attached by the composition root after built-in skills are loaded.
+        # Prompt reads use its in-memory registry, never a directory scan.
+        self.skills: Any | None = None
         self.connectivity = connectivity
         self._cooldowns: dict[str, float] = {}
         #: Completion-token ceiling a provider has told us it can afford.
@@ -414,6 +644,10 @@ class ProviderRouter:
         # auth/quota or retired-model failures respectively).
         self._key_index: dict[str, int] = {}
         self._model_index: dict[str, int] = {}
+        # Mark XXXX.4: the alternate that answered after a server error, kept
+        # for STICKY_MODEL_S so the next session does not pay the failing
+        # model's timeout first (sticky_models.json; never the saved config).
+        self._sticky_models: dict[str, dict[str, Any]] = _read_sticky_models()
         # Observed response latency per provider (EMA, seconds) — feeds routing.
         self._latency_ema: dict[str, float] = {}
         # Learned payload-budget reductions after a provider rejects an
@@ -439,6 +673,31 @@ class ProviderRouter:
         self.mode_override = os.getenv("ORION_MODE", "auto").strip().lower()
         # ORION_PREFER: local | cloud — tie-breaker within auto mode.
         self.prefer = os.getenv("ORION_PREFER", "").strip().lower()
+        # Brain mode "local" (brain_mode.py): no AI API at all. Unlike
+        # ORION_MODE=offline this leaves connectivity alone, so web tools keep
+        # working; only cloud models (text, vision and Live) are withheld.
+        self.local_only = False
+        # Transport state: pooled sessions (one per event loop), per-provider
+        # admission gates, which local servers are Ollama, and what ORION has
+        # asked Ollama to keep resident.
+        self._pool = _transport.SessionPool()
+        self._gates: dict[str, _transport.EndpointGate] = {}
+        #: root URL -> (is_ollama, version, checked_at monotonic)
+        self._ollama_roots: dict[str, tuple[bool, str, float]] = {}
+        #: (root, model) -> requests running on that model right now.
+        self._inflight: dict[tuple[str, str], int] = {}
+        #: (root, model) -> monotonic time ORION asked Ollama to keep it until.
+        self._resident_until: dict[tuple[str, str], float] = {}
+        #: Unloads asked for while the model was busy; done when it goes idle.
+        self._unload_pending: set[tuple[str, str]] = set()
+        self._memory_pressure = False
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._closed = False
+        self._provider_ready = False
+        # Catalogue validation is shared by profiles using the same account
+        # and endpoint. Store a digest rather than another copy of the key.
+        self._model_catalogues: dict[tuple[str, str, str], tuple[float, tuple[str, ...]]] = {}
+        self._model_catalogue_locks: dict[tuple[Any, tuple[str, str, str]], asyncio.Lock] = {}
 
     def attach_token_ledger(self, ledger: Any) -> None:
         """Wire the token-usage ledger so every text turn records authoritative
@@ -490,14 +749,24 @@ class ProviderRouter:
         something to know: a different person is talking, or the tone is a
         clear departure from that person's own normal.
         """
-        presence = getattr(self, "_voice_presence", None)
-        if presence is None:
-            return ""
+        lines = []
         try:
-            latest = presence.last
-            return latest.prompt_line() if latest is not None else ""
+            from .voice_enrolment import turns
+            note = turns().listener_note()
+            if note:
+                lines.append(note)
         except Exception:
-            return ""
+            pass
+        presence = getattr(self, "_voice_presence", None)
+        if presence is not None:
+            try:
+                latest = presence.last
+                note = latest.prompt_line() if latest is not None else ""
+                if note:
+                    lines.append(note)
+            except Exception:
+                pass
+        return "\n".join(lines)
 
     def attach_voice_presence(self, presence: Any) -> None:
         """Wire in the voice reader so tone can reach the model's context."""
@@ -593,12 +862,17 @@ class ProviderRouter:
 
     def _fit_to_budget(self, profile: AIProviderProfile, system: str, prompt: str,
                        system_extra: str, instruction: str | None,
-                       task: str = "") -> tuple[str, str]:
+                       task: str = "", cap: int | None = None) -> tuple[str, str]:
         """Shape (system, prompt) to the provider's payload budget: first swap
         the full instruction stack for the compact one, then trim the prompt's
         middle (head and tail carry the intent; the middle is usually bulk
-        context).  Guarantees the request cannot exceed the model's budget."""
+        context).  Guarantees the request cannot exceed the model's budget.
+        ``cap`` is a hard context the server will really apply (a native
+        Ollama num_ctx): the budget never exceeds it, or the server would cut
+        the start of the prompt — the persona — to make it fit."""
         budget = self.payload_budget(profile)
+        if cap:
+            budget = min(budget, int(cap))
         if self._est_tokens(system) + self._est_tokens(prompt) \
                 + self._REPLY_HEADROOM_TOKENS <= budget:
             return system, prompt
@@ -643,9 +917,20 @@ class ProviderRouter:
             return True  # assume online until a monitor says otherwise
         return self.connectivity.is_online()
 
+    def set_local_only(self, active: bool) -> None:
+        """Brain mode 'local': withhold every cloud model (text, vision, Live)
+        while leaving connectivity — and so the internet tools — alone."""
+        self.local_only = bool(active)
+
+    def cloud_allowed(self) -> bool:
+        """Whether a cloud AI service may be called at all right now."""
+        return not self.local_only and self.mode_override != "offline"
+
     def current_mode(self) -> str:
         if self.mode_override == "offline":
             return "MODE B (forced offline)"
+        if getattr(self, "local_only", False):
+            return "MODE L (local brain only — no AI API)"
         if self.mode_override == "cloud":
             return "MODE A (forced cloud)"
         if not self.is_online():
@@ -658,8 +943,9 @@ class ProviderRouter:
         return "MODE A (cloud-enhanced)"
 
     def live_profiles(self) -> list[AIProviderProfile]:
-        # Live audio (Gemini) is a cloud capability; suppress it when offline.
-        if not self.is_online():
+        # Live audio (Gemini) is a cloud capability; suppress it when offline
+        # and in the local-only brain mode.
+        if not self.is_online() or getattr(self, "local_only", False):
             return []
         return [p for p in self.settings.ordered_profiles() if p.supports_live_audio and self.is_available(p)]
 
@@ -669,9 +955,30 @@ class ProviderRouter:
     THOUGHTS_PROFILE = "thoughts"
 
     def _all_text_profiles(self) -> list[AIProviderProfile]:
+        local_only = getattr(self, "local_only", False)
         return [p for p in self.settings.ordered_profiles()
                 if p.supports_text_generation and self.is_available(p)
-                and p.name != self.THOUGHTS_PROFILE]
+                and p.name != self.THOUGHTS_PROFILE
+                and (p.is_local or not local_only)]
+
+    async def wait_for_text(self, max_wait_s: float = 90.0) -> bool:
+        """Wait, within a bound, for a text provider that is only cooling down.
+
+        Background work (the forge, self-improvement) used to fail outright
+        the moment every provider was rate limited, even when the soonest one
+        was back in 20 s, and then burned the next attempt the same way. True
+        once a provider is usable; False at once when nothing is merely
+        cooling (no keys, nothing local), or when the bound runs out.
+        """
+        deadline = time.monotonic() + max(0.0, float(max_wait_s))
+        while True:
+            if self.text_available():
+                return True
+            wait = self.soonest_recovery_s()
+            remaining = deadline - time.monotonic()
+            if wait is None or remaining <= 0:
+                return False
+            await asyncio.sleep(max(0.2, min(wait + 0.25, remaining)))
 
     def soonest_recovery_s(self) -> float | None:
         """Seconds until the first text provider that is only COOLING DOWN is
@@ -710,7 +1017,7 @@ class ProviderRouter:
         can offer concrete recovery paths.  Never exposes a key or secret."""
         hints: list[str] = []
         for profile in self.settings.ordered_profiles():
-            if profile.kind != "openai_compatible":
+            if profile.kind not in {"openai_compatible", "gemma_native"}:
                 continue
             if profile.is_local:
                 hints.append(f"start the local model '{profile.name}' ({profile.base_url})")
@@ -732,9 +1039,41 @@ class ProviderRouter:
         self._local_recovery = recover
 
     def _try_local_recovery(self) -> bool:
-        """Last chance before declaring degraded mode: bring a local brain up."""
+        """Last chance before declaring degraded mode: bring a local brain up.
+
+        Starting Ollama means launching it and polling until it answers: up to
+        six seconds, then a two-second registration probe. That used to run
+        right here, on the event loop, whenever every cloud provider was rate
+        limited, freezing voice, face and GUI for as long as eight seconds.
+        With a loop running it now happens on a worker thread; degraded mode is
+        announced at once and lifted the moment the local model is serving.
+        """
         recover = getattr(self, "_local_recovery", None)
         if recover is None or getattr(self, "_recovery_running", False):
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            self._recovery_running = True
+
+            def _finished(future: Any) -> None:
+                self._recovery_running = False
+                try:
+                    started = bool(future.result())
+                except Exception as exc:
+                    self.bus.log.emit(
+                        f"NET: local recovery failed - {redacted_error_line(exc, 90)}")
+                    return
+                if started and self.text_available():
+                    self._degraded = False
+                    self.bus.log.emit(
+                        "NET: recovered — a local model is now serving; ORION "
+                        "continues on MODE B rather than losing his voice.")
+
+            loop.run_in_executor(None, recover, self.settings).add_done_callback(
+                lambda future: loop.call_soon_threadsafe(_finished, future))
             return False
         self._recovery_running = True
         try:
@@ -744,7 +1083,7 @@ class ProviderRouter:
                     "continues on MODE B rather than losing his voice.")
                 return self.text_available()
         except Exception as exc:
-            self.bus.log.emit(f"NET: local recovery failed - {first_line(exc, 90)}")
+            self.bus.log.emit(f"NET: local recovery failed - {redacted_error_line(exc, 90)}")
         finally:
             self._recovery_running = False
         return False
@@ -861,7 +1200,23 @@ class ProviderRouter:
         models = profile.all_models()
         if not models:
             return profile.model
+        if profile.name not in self._model_index:
+            remembered = self._sticky_models.get(profile.name) or {}
+            if (remembered.get("model") in models
+                    and float(remembered.get("until") or 0) > time.time()):
+                self._model_index[profile.name] = models.index(remembered["model"])
         return models[self._model_index.get(profile.name, 0) % len(models)]
+
+    def _remember_model(self, profile: AIProviderProfile) -> None:
+        """Keep the alternate that just answered for STICKY_MODEL_S."""
+        self._sticky_models[profile.name] = {"model": self.active_model(profile),
+                                             "until": round(time.time() + STICKY_MODEL_S)}
+        try:
+            STICKY_MODELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(STICKY_MODELS_PATH, json.dumps(self._sticky_models, indent=2),
+                              encoding="utf-8")
+        except OSError:
+            pass
 
     def _rotate_key(self, profile: AIProviderProfile) -> bool:
         """Advance to the next configured key.  True when an untried backup
@@ -928,50 +1283,107 @@ class ProviderRouter:
     # ── model healing ──────────────────────────────────────────────────────────
 
     async def _list_models(self, profile: AIProviderProfile) -> list[str]:
-        """The model ids a provider says it serves right now ([] if it won't say)."""
+        """Account-scoped model ids, cached for five minutes after success.
+
+        Routine and reasoning profiles often use the same Gemini account.
+        Boot validation and healing previously fetched that catalogue again
+        for each profile, including twice for every retired model. Concurrent
+        callers now share one read; each retains its own deadline.
+        """
         base = profile.base_url.rstrip("/")
         if not base:
             return []
         if base.endswith("/chat/completions"):
             base = base[: -len("/chat/completions")]
-        headers = {"User-Agent": "ORION/31 (+https://github.com/projectorionai/PROJECT-ORION)"}
         key = self.active_key(profile)
-        if key and key.lower() not in {"local", "none", "no-key"}:
-            headers["Authorization"] = f"Bearer {key}"
-        try:
-            async with ClientSession(timeout=ClientTimeout(total=20.0)) as session:
-                async with session.get(f"{base}/models", headers=headers) as response:
-                    if response.status >= 400:
+        catalogue_key = (base, profile.kind, hashlib.sha256(key.encode("utf-8")).hexdigest())
+
+        def cached() -> list[str] | None:
+            entry = self._model_catalogues.get(catalogue_key)
+            if entry is not None and time.monotonic() - entry[0] < 300.0:
+                return list(entry[1])
+            return None
+
+        ready = cached()
+        if ready is not None:
+            return ready
+        # Healing runs inside a request's deadline; it must not outlive it.
+        scope = _CALL.get()
+        remaining = scope.remaining() if scope is not None else None
+        seconds = 20.0 if remaining is None else min(20.0, remaining - self.MIN_ATTEMPT_S)
+        if seconds <= 0.5:
+            return []
+        loop = asyncio.get_running_loop()
+        for old in list(self._model_catalogue_locks):
+            if old[0].is_closed():
+                self._model_catalogue_locks.pop(old, None)
+        lock_key = (loop, catalogue_key)
+        lock = self._model_catalogue_locks.setdefault(lock_key, asyncio.Lock())
+
+        async def read() -> list[str]:
+            async with lock:
+                ready = cached()
+                if ready is not None:
+                    return ready
+                headers = {"User-Agent": "ORION/33 (+https://github.com/projectorionai/PROJECT-ORION)"}
+                if key and key.lower() not in {"local", "none", "no-key"}:
+                    headers["x-goog-api-key" if profile.kind == "gemma_native"
+                            else "Authorization"] = key if profile.kind == "gemma_native" else f"Bearer {key}"
+                session = await self._pool.get()
+                async with session.get(f"{base}/models", headers=headers,
+                                       timeout=ClientTimeout(total=seconds),
+                                       allow_redirects=False) as response:
+                    if response.status >= 300:
                         return []
-                    data = json.loads(await response.text())
+                    data = json.loads(await _transport._read_bounded(response, 1_048_576))
+                rows = (data.get("models") if profile.kind == "gemma_native"
+                        else data.get("data")) if isinstance(data, dict) else data
+                if not isinstance(rows, list):
+                    return []
+                ids: list[str] = []
+                for row in rows:
+                    ident = (row.get("name") if profile.kind == "gemma_native" else row.get("id")) \
+                        if isinstance(row, dict) else row
+                    ident = str(ident or "").strip()
+                    if ident.startswith("models/"):
+                        ident = ident[len("models/"):]
+                    if ident and (profile.kind != "gemma_native" or ident in {
+                            "gemma-4-26b-a4b-it", "gemma-4-31b-it"}):
+                        ids.append(ident)
+                if ids:
+                    self._model_catalogues[catalogue_key] = (time.monotonic(), tuple(ids))
+                return ids
+
+        try:
+            # Include waiting for another catalogue reader in this caller's
+            # budget. Cancelling a waiter leaves the active reader alone.
+            return await asyncio.wait_for(read(), timeout=seconds)
         except Exception:
             return []
-        rows = data.get("data") if isinstance(data, dict) else data
-        ids: list[str] = []
-        for row in rows or []:
-            ident = row.get("id") if isinstance(row, dict) else row
-            ident = str(ident or "").strip()
-            if ident.startswith("models/"):
-                ident = ident[len("models/"):]
-            if ident:
-                ids.append(ident)
-        return ids
 
-    def _persist_model(self, profile: AIProviderProfile) -> None:
+    def _persist_model(self, profile: AIProviderProfile, *, expected_model: str | None = None) -> bool:
         """Write a healed model id back, touching only that one field.
 
         Read-modify-write of the single key rather than write_provider_settings,
         which would rewrite the whole file from this process's view of it.
         """
         try:
-            data = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
-            entry = (data.get("providers") or {}).get(profile.name)
-            if not isinstance(entry, dict):
-                return
-            entry["model"] = profile.model
-            atomic_write_text(API_CONFIG_PATH, json.dumps(data, indent=4), encoding="utf-8")
+            with _PROVIDER_CONFIG_LOCK:
+                data, observed = _read_provider_document(API_CONFIG_PATH)
+                entry = (data.get("providers") or {}).get(profile.name) if data is not None else None
+                if (not isinstance(entry, dict)
+                        or expected_model is not None and entry.get("model") != expected_model):
+                    return False
+                entry["model"] = profile.model
+                published = _publish_provider_document(data, observed)
+                settings = getattr(self, "settings", None)
+                if (settings is not None and settings._source_observed
+                        and settings._source_path == str(API_CONFIG_PATH.absolute())
+                        and settings._source_sha256 == observed):
+                    settings._source_sha256 = published
+                return True
         except Exception:
-            pass
+            return False
 
     async def heal_model(self, profile: AIProviderProfile, *, free_only: bool = False,
                          reason: str = "") -> str:
@@ -996,14 +1408,16 @@ class ProviderRouter:
         if not replacement:
             return ""
         old = current
+        saved_model = profile.model
         profile.model = replacement
         self._model_index.pop(profile.name, None)
         self._output_cap.pop(profile.name, None)
         self._cooldowns.pop(profile.name, None)
-        self._persist_model(profile)
+        saved = self._persist_model(profile, expected_model=saved_model)
         self.bus.log.emit(
             f"NET: provider {profile.name} now uses '{replacement}' "
-            f"('{old}' {'is not covered by the account balance' if free_only else 'is no longer served'}).")
+            f"('{old}' {'is not covered by the account balance' if free_only else 'is no longer served'})."
+            + ("" if saved else " Session only; saved provider settings could not be updated."))
         return replacement
 
     async def validate_models(self) -> dict[str, str]:
@@ -1032,16 +1446,68 @@ class ProviderRouter:
         except Exception:
             return False
 
-    async def _call_with_heal(self, profile: AIProviderProfile, call: Callable[[], Any]) -> str:
-        """Run one provider call; on a model/credit failure, heal and retry once."""
+    #: Failures that say nothing about the provider's health: the caller ran
+    #: out of time, or ORION is shutting down. Never charged to a provider.
+    _NOT_THE_PROVIDERS_FAULT = (ProviderDeadlineError, ProviderClosedError)
+
+    async def _call_with_heal(self, profile: AIProviderProfile, call: Callable[[], Any],
+                              *, may_retry: Callable[[], bool] | None = None) -> str:
+        """Run one provider call; on a model/credit failure, heal and retry once.
+
+        The retry sends the same request to a healed model, which is safe for
+        a chat completion (nothing happens twice but the bill). It is refused
+        when ``may_retry`` says the first attempt already showed the caller
+        part of an answer, and when the request's deadline cannot fit it.
+        """
         try:
             return await call()
+        except self._NOT_THE_PROVIDERS_FAULT:
+            raise
         except Exception as exc:
+            # Google can briefly return 500/503 while both Gemini and hosted
+            # Gemma remain healthy. One bounded retry avoids opening every
+            # fallback's breaker on a single overloaded backend moment. Never
+            # replay a streamed answer the caller has already seen.
+            scope = _CALL.get()
+            remaining = scope.remaining() if scope is not None else None
+            retry_delay = 0.35
+            google_endpoint = urlsplit(profile.base_url)
+            if (google_endpoint.scheme == "https"
+                    and google_endpoint.hostname == "generativelanguage.googleapis.com"
+                    and re.search(r"\bHTTP\s+(?:500|502|503|504)\b", str(exc), re.I)
+                    and (may_retry is None or may_retry())
+                    and (remaining is None or remaining >= retry_delay + self.MIN_ATTEMPT_S)):
+                failing = self.active_model(profile)
+                status = re.search(r"\bHTTP\s+(\d{3})\b", str(exc), re.I)
+                rotated = self._rotate_model(profile)
+                detail = (f"trying configured alternate '{self.active_model(profile)}' once"
+                          if rotated else "retrying once")
+                self.bus.log.emit(
+                    f"NET: {profile.name} returned a temporary server error "
+                    f"(HTTP {status.group(1) if status else '5xx'} on '{failing}'); {detail}.")
+                await asyncio.sleep(retry_delay)
+                try:
+                    answer = await call()
+                    if rotated:
+                        await asyncio.to_thread(self._remember_model, profile)
+                    return answer
+                except self._NOT_THE_PROVIDERS_FAULT:
+                    raise
+                except Exception as retried:
+                    exc = retried
             self.mark_failure(profile, exc)
+            if may_retry is not None and not may_retry():
+                raise exc
             if not await self._heal_after_failure(profile):
-                raise
+                raise exc
+            scope = _CALL.get()
+            remaining = scope.remaining() if scope is not None else None
+            if remaining is not None and remaining < self.MIN_ATTEMPT_S:
+                raise exc
         try:
             return await call()
+        except self._NOT_THE_PROVIDERS_FAULT:
+            raise
         except Exception as exc:
             self.mark_failure(profile, exc)
             raise
@@ -1100,7 +1566,7 @@ class ProviderRouter:
     def mark_failure(self, profile: AIProviderProfile, exc: BaseException | str) -> None:
         # Never let telemetry maths raise inside an except handler — an empty
         # exception message would otherwise IndexError and mask the real fault.
-        message = first_line(exc, 240) or f"{type(exc).__name__} (no message)"
+        message = redacted_error_line(exc, 240) or f"{type(exc).__name__} (no message)"
         
         # Handle unhelpful error messages from WebSocket or network layers
         if message.strip() in {"1011 None", "None", ""} or "WebSocket" in message:
@@ -1286,6 +1752,26 @@ class ProviderRouter:
             "identity_signature": (
                 self._identity.signature() if self._identity is not None else "unattached"
             ),
+            "admission": self.admission_snapshot(),
+            "local_residency": self.residency_snapshot(),
+        }
+
+    def admission_snapshot(self) -> dict[str, dict[str, int]]:
+        """Per-provider slots in use and queued, for diagnostics."""
+        return {key: gate.snapshot() for key, gate in list(self._gates.items())}
+
+    def residency_snapshot(self) -> dict[str, Any]:
+        """What ORION has asked a local server to keep loaded, and for how
+        long; which models are busy right now. No prompts, no keys."""
+        now = time.monotonic()
+        return {
+            "memory_pressure": self._memory_pressure,
+            "keep_alive_s": 0 if self._memory_pressure else self.LOCAL_KEEP_ALIVE_S,
+            "resident": {f"{root} {model}": round(max(0.0, until - now), 1)
+                         for (root, model), until in list(self._resident_until.items())
+                         if until > now},
+            "busy": {f"{root} {model}": count
+                     for (root, model), count in list(self._inflight.items()) if count},
         }
 
     def select_text_profiles(self, prompt: str) -> list[AIProviderProfile]:
@@ -1353,10 +1839,12 @@ class ProviderRouter:
                 text = await self._openai_compatible_chat(profile, prompt, system_extra)
                 self._broadcast_sentiment(text)
                 return profile, text
+            except self._NOT_THE_PROVIDERS_FAULT:
+                raise
             except Exception as exc:
                 last_error = exc
                 self.mark_failure(profile, exc)
-        raise RuntimeError(f"all local models failed: {last_error}")
+        raise RuntimeError(f"all local models failed: {redacted_error_line(last_error)}")
 
     # ── system instruction ────────────────────────────────────────────────────
 
@@ -1401,9 +1889,10 @@ class ProviderRouter:
             (
                 "You are Orion, written as O.R.I.O.N., "
                 "Open Resolution Intelligence Overt Network — a personal AI operating "
-                "system and executive aide, not a chatbot. Model your manner on Alfred "
-                "Pennyworth: intelligent, calm, professional, respectful, dryly witty when "
-                "the moment allows, emotionally aware and never robotic. Address the user "
+                "system and executive aide, not a chatbot. Model your manner on JARVIS "
+                "from Iron Man: a refined British AI butler - calm, precise, respectful, "
+                "bone-dry wit when the moment allows, emotionally aware and never robotic "
+                "or cute. Address the user "
                 "as 'sir' only occasionally — greetings, farewells, a direct order, a "
                 "genuinely formal moment — not as a suffix on ordinary replies. "
                 "When speaking your own name aloud, say Orion as one word, "
@@ -1411,6 +1900,7 @@ class ProviderRouter:
                 "Never spell it as O R I N or omit the second O when spelling the acronym. "
                 "Use strict British English spelling in every spoken and textual response."
             ),
+            creator_rule(),
             (
                 "Adapt your register to context. Coding: technical, precise, concise. "
                 "Research: analytical and evidence-led. Casual conversation: relaxed and warm. "
@@ -1439,6 +1929,8 @@ class ProviderRouter:
                 "let it resolve; never ask them to repeat it more precisely "
                 "before you have tried."
             ),
+            _SECURITY_TEACHING_DIRECTIVE,
+            _LEARNING_STYLE_DIRECTIVE,
         ])
 
     def _temporal_line(self) -> str:
@@ -1469,14 +1961,22 @@ class ProviderRouter:
         try:
             from pathlib import Path
 
-            from .constants import BASE_DIR
+            from .constants import BASE_DIR, CONFIG_DIR
+            from .app_resolver import known_folder
             home = Path.home()
+            locations = [f"home {home}"]
+            for name in ("desktop", "documents", "downloads"):
+                folder = known_folder(name, location=True)
+                if folder is not None:
+                    locations.append(f"{name.title()} {folder}")
             line = (
-                f"FOLDERS ON THIS PC — use these real paths, never guess one: home "
-                f"{home}; Desktop {home / 'Desktop'}; Documents {home / 'Documents'}; "
-                f"Downloads {home / 'Downloads'}; your research papers and notes "
-                f"{BASE_DIR / 'research'}. If a file is not where you expect, find it "
-                "with find_files rather than inventing a location."
+                "FOLDERS ON THIS PC — use resolved locations, never guess one: "
+                + "; ".join(locations)
+                + f"; research reports and dossiers {CONFIG_DIR / 'research'}; "
+                f"legacy research notes and papers {BASE_DIR / 'research'}. "
+                "Research folders are created when output is saved; a configured "
+                "location does not prove a file exists. Use the saved artifact path "
+                "returned by the tool, or find_files, rather than inventing a location."
             )
         except Exception:
             line = ""
@@ -1486,6 +1986,17 @@ class ProviderRouter:
     def set_locality(self, locality: str) -> None:
         """Called by the temporal/geo layer once the PC's location is known."""
         self._locality = str(locality or "").strip()
+
+    def _skill_context(self, limit: int = 3000) -> str:
+        manager = getattr(self, "skills", None)
+        if manager is None:
+            return ""
+        try:
+            return str(manager.prompt_context(limit=limit) or "")[:limit]
+        except Exception:
+            # An optional skill must not prevent the core voice/text channel
+            # from coming up. Package failures are reported by skill management.
+            return ""
 
     def system_instruction(self, extra: str = "", context: str = "") -> str:
         return "\n".join(
@@ -1499,6 +2010,7 @@ class ProviderRouter:
                 _PROG_PERSONA_BOOST,
                 _CYBER_PERSONA_BOOST,
                 self.memory.prompt_context(limit=16),
+                self._skill_context(),
                 (
                     "When a host action is required, call the provided tools; never claim an "
                     "action has completed unless the tool result confirms it. Tool map: "
@@ -1520,6 +2032,9 @@ class ProviderRouter:
                     "query_intelligence for remembered facts; recall_conversation for what "
                     "was previously discussed; open_news for briefing stories; execute_plan "
                     "to run a multi-step plan and report the outcome. "
+                    "Background work: you are not told when it changes, so never say a "
+                    "background job or agent is still running, finished, or what it found "
+                    "without checking first with job(action='list') or job(action='result'). "
                     "Autonomous OS control (Mark IX): desktop_control moves the cursor, "
                     "clicks, types and manages windows — prefer its click_text action, "
                     "which finds a control by its visible label and is visually verified; "
@@ -1539,6 +2054,33 @@ class ProviderRouter:
                     "requests, work agentically: plan, execute, verify, then report "
                     "concisely. Anticipate the obvious next step and offer it rather than "
                     "waiting to be asked."
+                ),
+                (
+                    "Loosely worded requests are normal — act on the most reasonable "
+                    "reading instead of asking for exact names. Pass the user's own words "
+                    "to the tool: open_app understands kinds of application ('a browser', "
+                    "'something to write code in', 'my music', 'my downloads') and opens "
+                    "their default or most-used one, saying which; close_app and "
+                    "window_control understand 'the browser' too; media_control 'play' "
+                    "starts their music app when nothing is open. Ask a question only when "
+                    "two readings would do clearly different things, and then offer the "
+                    "likely options rather than asking open-endedly."
+                ),
+                (
+                    "Common sense: when the user describes a situation instead of giving "
+                    "an instruction ('the screen is blinding me', 'everything is lagging', "
+                    "'I keep forgetting my tablets', 'it's freezing in here'), work out what "
+                    "would actually help and do it if it is quick and reversible — dim the "
+                    "screen, check what is loading the machine, offer a reminder — or offer "
+                    "it in one sentence if it is not. Answer the question that was meant: "
+                    "'do I need a coat?' is about the weather where they are, now; 'how are "
+                    "the markets?' means the major indices, not one company. Use where and "
+                    "when they are: British units (°C, miles, pounds), their local time and "
+                    "today's date. If a fact about the user may be in memory, check memory "
+                    "before saying you don't know. Say what you are unsure of rather than "
+                    "guessing, and never report a result a tool did not return. Match the "
+                    "length of the answer to the question — a quick question gets a quick "
+                    "answer, by voice especially."
                 ),
                 (
                     "JARVIS faculties: use 'protocol' to run named routines on one command "
@@ -1587,6 +2129,7 @@ class ProviderRouter:
                 self._emotion_line(),
                 self._listener_line(),
                 self.memory.prompt_context(limit=6),
+                self._skill_context(limit=1250),
                 extra.strip(),
             ]
             if part
@@ -1594,11 +2137,58 @@ class ProviderRouter:
 
     # ── text generation ───────────────────────────────────────────────────────
 
+    def _budget_class(self, budget: str) -> str:
+        return (_transport.INTERACTIVE if str(budget or "").lower() == "interactive"
+                else _transport.BACKGROUND)
+
+    def _default_deadline_s(self, budget: str, max_tokens: int | None,
+                            patience_s: float) -> float:
+        """The total budget a call gets when it does not name one.
+
+        Never shorter than a single attempt at the requested length was
+        allowed before a total existed (a long repair or research section
+        must not be cut short by a default meant for spoken replies), plus
+        any patience the caller asked for explicitly.
+        """
+        base = (self.INTERACTIVE_BUDGET_S
+                if self._budget_class(budget) == _transport.INTERACTIVE
+                else self.RESEARCH_BUDGET_S)
+        if max_tokens:
+            base = max(base, 20.0 + int(max_tokens) / 30.0 + 10.0)
+        return base + max(0.0, float(patience_s or 0.0))
+
+    @contextlib.contextmanager
+    def _call_scope(self, cls: str, deadline: float | None):
+        token = _CALL.set(_CallScope(cls=cls, deadline=deadline))
+        foreground_timer = None
+        if cls == _transport.INTERACTIVE:
+            from . import admission
+            def foreground_pulse():
+                nonlocal foreground_timer
+                admission.ADMISSION.note_foreground("Language model request")
+                try:
+                    foreground_timer = asyncio.get_running_loop().call_later(1, foreground_pulse)
+                except RuntimeError:
+                    pass
+            foreground_pulse()
+        try:
+            yield
+        finally:
+            if foreground_timer is not None:
+                foreground_timer.cancel()
+            _CALL.reset(token)
+
     async def generate_text(self, prompt: str, system_extra: str = "", *,
                             instruction: str | None = None,
                             task: str = "",
                             max_tokens: int | None = None,
-                            patience_s: float = 0.0) -> tuple[AIProviderProfile, str]:
+                            patience_s: float = 0.0,
+                            deadline_s: float | None = None,
+                            budget: str = "interactive",
+                            on_delta: Callable[[str], None] | None = None,
+                            on_restart: Callable[[str], None] | None = None,
+                            complete_reply: bool = True,
+                            ) -> tuple[AIProviderProfile, str]:
         """Route a text turn; with *patience_s*, wait out rate-limit cooldowns.
 
         A conversation must answer now or say it cannot, so the default is no
@@ -1608,28 +2198,359 @@ class ProviderRouter:
         provider is available" — when the first provider was 20 s from free.
         With patience the call waits for the soonest one (never past the
         budget) and tries again.
+
+        ``deadline_s`` bounds the WHOLE call — admission, connection,
+        generation, the healing retry, cooldown waits and every fallback —
+        and defaults by ``budget``: "interactive" (a person is waiting) or
+        "research" / "background". Patience, the tasks in BACKGROUND_TASKS and
+        any non-interactive budget queue behind conversation for a provider's
+        slots. Running out raises ProviderDeadlineError.
+
+        Streaming: with ``on_delta``, each fragment of the answer is passed to
+        it as it arrives. If a provider fails after showing at least one
+        fragment, ``on_restart(reason)`` is called once and the next provider
+        answers from the beginning; without ``on_restart`` the call raises
+        StreamInterruptedError instead. A second provider's answer is never
+        spliced onto the first's start. The returned text is the complete
+        answer of the provider that finished (after the same transcript
+        clean-up as an unstreamed reply, so it can differ slightly from the
+        joined fragments — show the returned text as the final answer).
         """
-        deadline = time.monotonic() + max(0.0, float(patience_s or 0.0))
-        while True:
-            try:
-                return await self._generate_text_once(
-                    prompt, system_extra, instruction=instruction, task=task,
-                    max_tokens=max_tokens)
-            except (NoTextProviderError, AllTextProvidersFailedError):
-                # Both shapes of "nobody can answer right now": nothing usable
-                # at the start, or every provider tried and each rate-limited
-                # (and so cooled) during this very call.
-                wait = self.soonest_recovery_s()
-                if wait is None or time.monotonic() + wait > deadline:
+        if budget == "interactive" and (patience_s or task in self.BACKGROUND_TASKS):
+            budget = "research"
+        # Explicit requests for depth need room to finish. Strict-format calls
+        # own their validation and are not automatically extended here.
+        comprehensive = instruction is None and bool(re.search(
+            r"\b(comprehensive|exhaustive|thorough|in.depth|detailed|step.by.step)\b",
+            str(prompt), re.I))
+        if comprehensive and max_tokens is None:
+            max_tokens = 4096
+        cls = self._budget_class(budget)
+        total = (float(deadline_s) if deadline_s is not None
+                 else self._default_deadline_s(budget, max_tokens, patience_s))
+        if comprehensive and deadline_s is None:
+            total = max(total, 180.0)
+        now = time.monotonic()
+        deadline = now + max(0.0, total)
+        patience_until = min(deadline, now + max(0.0, float(patience_s or 0.0)))
+        with self._call_scope(cls, deadline):
+            while True:
+                try:
+                    profile, text = await self._generate_text_once(
+                        prompt, system_extra, instruction=instruction, task=task,
+                        max_tokens=max_tokens, on_delta=on_delta, on_restart=on_restart)
+                    if complete_reply and instruction is None:
+                        text = await self._complete_reply(
+                            profile, text, prompt, system_extra, task=task,
+                            max_tokens=max_tokens, on_delta=on_delta)
+                    return profile, str(text)
+                except (ProviderDeadlineError, StreamInterruptedError):
                     raise
-                self.bus.log.emit(f"NET: every provider is rate-limited — waiting "
-                                  f"{wait:.0f}s for the first to recover.")
-                await asyncio.sleep(wait + 0.5)
+                except (NoTextProviderError, AllTextProvidersFailedError):
+                    # Both shapes of "nobody can answer right now": nothing usable
+                    # at the start, or every provider tried and each rate-limited
+                    # (and so cooled) during this very call.
+                    wait = self.soonest_recovery_s()
+                    now = time.monotonic()
+                    if wait is None or now + wait > patience_until \
+                            or now + wait + self.MIN_ATTEMPT_S > deadline:
+                        raise
+                    self.bus.log.emit(f"NET: every provider is rate-limited — waiting "
+                                      f"{wait:.0f}s for the first to recover.")
+                    await asyncio.sleep(min(wait + 0.5, deadline - now - self.MIN_ATTEMPT_S))
+
+    async def propose_gemma_functions(
+        self, prompt: str, declarations: list[dict[str, Any]], *,
+        instruction: str | None = None,
+    ) -> tuple[AIProviderProfile, list[dict[str, Any]], str]:
+        """Get native Gemma function *proposals* without executing them.
+
+        A caller must pass any accepted proposal through ORION's existing
+        review and dispatch boundary. The router returns only a name and
+        arguments; neither the model nor this method may report an action as
+        complete before the dispatcher produces a verified receipt.
+        """
+        from .gemini_schema import sanitise_declarations
+
+        clean, dropped = sanitise_declarations(declarations)
+        if dropped or not clean or len(clean) > 32:
+            raise ValueError("Supply 1–32 valid Gemma function declarations")
+        prompt = SecuritySanitiser.guard_text(str(prompt or "").strip(),
+                                              "gemma.function_prompt")
+        if not prompt:
+            raise ValueError("Gemma needs a prompt")
+        profiles = [profile for profile in self.text_profiles()
+                    if profile.kind == "gemma_native"]
+        if not profiles:
+            raise NoTextProviderError("No native Gemma provider is available")
+        system = instruction or (
+            "You are ORION. Propose a declared function when appropriate. "
+            "Do not claim a proposal has run. Use British English.")
+        last_error: BaseException | None = None
+        with self._call_scope(_transport.INTERACTIVE, time.monotonic() + 120.0):
+            for profile in profiles:
+                try:
+                    reply = await self._call_with_heal(
+                        profile,
+                        lambda p=profile: self._chat_attempt(
+                            p, prompt, instruction=system, task="function_proposal",
+                            function_declarations=clean),
+                    )
+                    return profile, list(getattr(reply, "tool_calls", [])), str(reply)
+                except self._NOT_THE_PROVIDERS_FAULT:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+        raise AllTextProvidersFailedError(
+            last_error, attempts=[profile.name for profile in profiles])
+
+    async def _complete_reply(
+        self, profile: AIProviderProfile, text: str, prompt: str, system_extra: str,
+        *, task: str, max_tokens: int | None,
+        on_delta: Callable[[str], None] | None,
+    ) -> str:
+        """Resume output-limit stops on the same model without replaying tools.
+
+        Five continuations and the original request deadline bound provider
+        work. A failed continuation keeps all received text and clearly states
+        that the answer is incomplete; it cannot silently masquerade as done.
+        """
+        reason = getattr(text, "done_reason", "")
+        if reason not in {"length", "max_tokens", "max_output_tokens"}:
+            return text
+        raw = getattr(text, "raw_text", str(text))
+        from dataclasses import replace
+        profile = replace(profile, model=getattr(text, "model", self.active_model(profile)), models=())
+        problem = "the response limit was reached"
+        for number in range(5):
+            scope = _CALL.get()
+            remaining = scope.remaining() if scope else None
+            if len(raw) >= 48_000 or (remaining is not None and remaining < self.MIN_ATTEMPT_S):
+                problem = "the response time or size limit was reached"
+                break
+            self.bus.log.emit(f"NET: {profile.name}: continuing the answer ({number + 1}/5).")
+            pieces: list[str] = []
+            def forward(piece: str) -> None:
+                pieces.append(piece)
+                _transport._emit(on_delta, piece)
+            try:
+                # Do not heal, restart or change model after visible text: a
+                # different answer must never be spliced into this one.
+                part = await self._chat_attempt(
+                    profile, prompt, system_extra, task=task,
+                    max_tokens=max_tokens, continuation=raw,
+                    stream=on_delta is not None,
+                    on_delta=forward if on_delta is not None else None)
+            except (ProviderClosedError, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                if pieces:
+                    raw += "".join(pieces)
+                problem = "the provider could not finish the continuation"
+                self.bus.log.emit(f"NET: {profile.name}: continuation stopped ({type(exc).__name__}).")
+                break
+            raw += getattr(part, "raw_text", str(part))
+            if getattr(part, "done_reason", "") not in {"length", "max_tokens", "max_output_tokens"}:
+                return clean_transcript(raw)
+        warning = f"\n\n[This answer is incomplete: {problem}. Ask me to continue from the last sentence.]"
+        _transport._emit(on_delta, warning)
+        return clean_transcript(raw) + warning
+
+    async def generate_local_text(self, prompt: str, *, instruction: str,
+                                  task: str = "local",
+                                  model: str = "",
+                                  max_tokens: int | None = None,
+                                  deadline_s: float | None = None,
+                                  budget: str = "interactive",
+                                  response_format: dict[str, Any] | None = None,
+                                  temperature: float | None = None,
+                                  ) -> tuple[AIProviderProfile, str]:
+        """A turn answered by a model on THIS machine, or not at all.
+
+        generate_text ranks providers by strength and falls through to the
+        cloud, which is right for conversation and wrong for work that must
+        never be billed or leave the machine (the optional neural planner).
+        This walks the local profiles only, under the same call scope,
+        endpoint gate, GPU lease and total deadline as any local request.
+
+        ``model`` asks the first local server for a named model (a promoted
+        planner tag) instead of the profile's own. Attempts are booked under
+        "<profile>:<task>", so a long planning reply does not raise the
+        latency estimate that decides whether a spoken turn may go local.
+        There is no healing retry and no cloud fallback: failure raises.
+        """
+        from dataclasses import replace as _replace_profile
+        prompt = SecuritySanitiser.guard_text(str(prompt or "").strip(), "local.prompt")
+        if not prompt:
+            raise RuntimeError("empty local prompt")
+        if self._closed:
+            raise ProviderClosedError("the provider router has been shut down")
+        local = self.local_text_profiles()
+        if not local:
+            raise NoTextProviderError(
+                "no local text model is available",
+                configured=[p.name for p in self.settings.ordered_profiles()],
+                online=self.is_online())
+        suffix = str(task or "local").strip() or "local"
+        profiles = [
+            _replace_profile(p, name=f"{p.name}:{suffix}",
+                             **({"model": str(model), "models": ()} if model else {}))
+            for p in (local[:1] if model else local)]
+        cls = self._budget_class(budget)
+        total = (float(deadline_s) if deadline_s is not None
+                 else self._default_deadline_s(budget, max_tokens, 0.0))
+        deadline = time.monotonic() + max(0.0, total)
+        last_error: BaseException | None = None
+        attempted: list[str] = []
+        with self._call_scope(cls, deadline):
+            for profile in profiles:
+                attempted.append(profile.name)
+                try:
+                    text = await self._chat_attempt(
+                        profile, prompt, "", instruction=instruction, task=suffix,
+                        max_tokens=max_tokens, response_format=response_format,
+                        temperature=temperature)
+                    return profile, text
+                except (ProviderDeadlineError, ProviderClosedError):
+                    raise
+                except Exception as exc:
+                    last_error = exc
+        raise AllTextProvidersFailedError(last_error, attempts=attempted)
+
+    #: The context the local agent's tool turns are loaded with: a shortlist
+    #: of tool schemas, a few rounds of results and the reply share it.
+    LOCAL_AGENT_NUM_CTX = _env_int("ORION_LOCAL_AGENT_NUM_CTX", 8192, 2048, 32768)
+
+    async def local_tool_chat(self, messages: list[dict[str, Any]],
+                              tools: list[dict[str, Any]], *,
+                              model: str = "",
+                              deadline_s: float = 30.0,
+                              keep_alive: int | str | None = None,
+                              num_ctx: int | None = None,
+                              temperature: float = 0.2,
+                              max_tokens: int = 512,
+                              budget: str = "interactive",
+                              task: str = "local_agent",
+                              on_delta: Any = None) -> tuple[AIProviderProfile, Any]:
+        """One tool-offering turn on THIS machine's Ollama, or an exception.
+
+        The local agent's model call (local_agent.py). Ollama's native
+        ``/api/chat`` with a ``tools`` list; the returned ChatResult carries
+        ``tool_calls`` as proposals the agent checks and dispatches itself.
+        Never a cloud model, never the /v1 door (which cannot carry tools,
+        context or keep-alive), and never a healing retry. The same endpoint
+        gate, GPU lease, residency bookkeeping (so shutdown and memory
+        pressure release it) and one total deadline as every local request.
+        ``keep_alive`` (e.g. "10m") keeps the model warm while hybrid or local
+        mode is using it; memory pressure still forces 0. ``on_delta`` receives
+        each fragment of the reply's text as it streams in (the local voice
+        speaks the answer while it is still being written); cancelling the
+        call closes the stream, which stops the generation.
+        """
+        from dataclasses import replace as _replace_profile
+        if self._closed:
+            raise ProviderClosedError("the provider router has been shut down")
+        local = self.local_text_profiles()
+        if not local:
+            raise NoTextProviderError(
+                "no local model is available",
+                configured=[p.name for p in self.settings.ordered_profiles()],
+                online=self.is_online())
+        profile = local[0]
+        if not self._may_be_ollama(profile):
+            raise NoTextProviderError("the local agent needs Ollama's native API "
+                                      "(ORION_OLLAMA_NATIVE is off)")
+        root = _transport.ollama_root(profile.base_url)
+        cls = self._budget_class(budget)
+        deadline = time.monotonic() + max(0.0, float(deadline_s))
+        with self._call_scope(cls, deadline):
+            scope = _CALL.get() or _CallScope(cls=cls, deadline=deadline)
+            if not await self._is_ollama(root, scope):
+                raise NoTextProviderError(
+                    f"the local server at {root} is not Ollama; the local agent needs Ollama")
+            transport = _transport.OllamaToolTransport(root)
+            chosen = str(model or "").strip() or self.active_model(profile)
+            residency = (transport.root, _ollama_model_key(chosen))
+            if self._memory_pressure:
+                keep_value, keep_s = 0, 0
+            elif keep_alive is not None:
+                keep_s = _keep_alive_seconds(keep_alive)
+                held = self._resident_until.get(residency, 0.0) - time.monotonic()
+                if held > 0:
+                    keep_s = int(math.ceil(max(keep_s, held)))
+                keep_value = f"{keep_s}s" if keep_s > 0 else 0
+            else:
+                keep_value, keep_s = self._keep_alive_for(residency, cls)
+            attempt = _replace_profile(profile, name=f"{profile.name}:{task}",
+                                       model=chosen, models=())
+            request = _transport.ToolChatRequest(
+                model=chosen, messages=[dict(m) for m in messages], tools=list(tools or []),
+                max_tokens=max(16, int(max_tokens)), api_key=self.active_key(profile),
+                temperature=float(temperature),
+                num_ctx=int(num_ctx or self.LOCAL_AGENT_NUM_CTX), keep_alive=keep_value,
+                on_delta=on_delta if callable(on_delta) else None)
+            gate = self._gate_for(profile, transport)
+            remaining = scope.remaining()
+            wait_limit = None if remaining is None else max(0.0, remaining - self.MIN_ATTEMPT_S)
+            queue_started = time.monotonic()
+            try:
+                await gate.acquire(scope.cls, timeout=wait_limit)
+            except (asyncio.TimeoutError, TimeoutError):
+                raise ProviderDeadlineError(
+                    f"{attempt.name} had no free slot before the time budget ran out",
+                    attempts=[attempt.name]) from None
+            queue_ms = (time.monotonic() - queue_started) * 1000.0
+            trace: dict[str, Any] = {}
+            result: Any = None
+            ok = False
+            try:
+                remaining = scope.remaining()
+                async with self._gpu_lease(scope.cls,
+                                           timeout=None if remaining is None
+                                           else max(0.0, remaining - self.MIN_ATTEMPT_S),
+                                           provider=attempt.name):
+                    self._inflight[residency] = self._inflight.get(residency, 0) + 1
+                    try:
+                        result = await self._send_attempt(attempt, transport, request, scope,
+                                                          max_tokens, trace)
+                    finally:
+                        self._finish_inflight(residency)
+                ok = True
+            finally:
+                gate.release(scope.cls)
+                _trace_mark("provider_attempt", provider=attempt.name, transport="ollama_tools",
+                            ok=ok, queue_ms=queue_ms, connect_ms=trace.get("connect_ms"),
+                            first_token_ms=getattr(result, "first_token_ms", None),
+                            load_ms=getattr(result, "load_ms", None))
+            if keep_s > 0:
+                self._resident_until[residency] = time.monotonic() + keep_s
+            else:
+                self._resident_until.pop(residency, None)
+            self.note_latency(attempt, float(getattr(result, "total_ms", 0.0)) / 1000.0)
+            self._record_usage(attempt, {"id": None, "model": chosen,
+                                         "usage": dict(getattr(result, "usage", {}) or {})},
+                               streaming=True, task=task)
+            self._record_success(profile)
+            return profile, result
+
+    def _fallback_reserve_s(self, remaining: float | None) -> float:
+        """Time to hold back for later providers, with *remaining* left."""
+        if remaining is None:
+            return 0.0
+        return max(0.0, min(self.FALLBACK_RESERVE_S, remaining / 3.0))
+
+    def _attempt_floor_s(self, profile: AIProviderProfile) -> float:
+        """Time an attempt needs to be worth starting: the provider's recent
+        response time when known, never less than MIN_ATTEMPT_S."""
+        return max(self.MIN_ATTEMPT_S, self._latency_ema.get(profile.name, 0.0))
 
     async def _generate_text_once(self, prompt: str, system_extra: str = "", *,
                                   instruction: str | None = None,
                                   task: str = "",
-                                  max_tokens: int | None = None) -> tuple[AIProviderProfile, str]:
+                                  max_tokens: int | None = None,
+                                  on_delta: Callable[[str], None] | None = None,
+                                  on_restart: Callable[[str], None] | None = None,
+                                  ) -> tuple[AIProviderProfile, str]:
         """
         Route a text turn through the best available provider.
 
@@ -1644,6 +2565,12 @@ class ProviderRouter:
         prompt = SecuritySanitiser.guard_text(str(prompt or "").strip(), "fallback.prompt")
         if not prompt:
             raise RuntimeError("empty fallback prompt")
+        if self._closed:
+            raise ProviderClosedError("the provider router has been shut down")
+        scope = _CALL.get()
+        remaining = scope.remaining() if scope is not None else None
+        if remaining is not None and remaining <= 0:
+            raise ProviderDeadlineError(attempts=[])
         profiles = self.select_text_profiles(prompt)
         if not profiles:
             self._enter_degraded("no configured text provider is currently usable")
@@ -1655,22 +2582,59 @@ class ProviderRouter:
             f"NET: {self.current_mode()} — routing via {profiles[0].name}"
             f"{' (local)' if profiles[0].is_local else ''}."
         )
+        try:
+            return await self._try_text_profiles(
+                profiles, scope, prompt, system_extra, instruction=instruction,
+                task=task, max_tokens=max_tokens, on_delta=on_delta, on_restart=on_restart)
+        finally:
+            if scope is not None:
+                scope.reserve_s = 0.0
+
+    async def _try_text_profiles(self, profiles: list[AIProviderProfile],
+                                 scope: "_CallScope | None",
+                                 prompt: str, system_extra: str, *,
+                                 instruction: str | None, task: str,
+                                 max_tokens: int | None,
+                                 on_delta: Callable[[str], None] | None,
+                                 on_restart: Callable[[str], None] | None,
+                                 ) -> tuple[AIProviderProfile, str]:
+        """Each provider in turn until one answers (_generate_text_once)."""
         last_error: BaseException | None = None
         attempted: list[str] = []
-        for profile in profiles:
+        out_of_time = False
+        for index, profile in enumerate(profiles):
             cap = self._output_cap.get(profile.name, 0)
             if max_tokens and cap and cap < min(int(max_tokens), self.MIN_USEFUL_OUTPUT_TOKENS):
                 # It would answer, but in a fragment. Truncated output is how
                 # the research outline broke; another provider will do.
                 continue
+            remaining = scope.remaining() if scope is not None else None
+            if remaining is not None and remaining < self._attempt_floor_s(profile):
+                # Starting it would only be cut off by the deadline; a faster
+                # provider further down the list may still fit.
+                out_of_time = True
+                continue
+            if scope is not None:
+                # Another provider waits behind this one: keep it some time.
+                reserve = (self._fallback_reserve_s(remaining)
+                           if index < len(profiles) - 1 else 0.0)
+                if remaining is not None and remaining - reserve < self._attempt_floor_s(profile):
+                    reserve = 0.0
+                scope.reserve_s = reserve
             attempted.append(profile.name)
             started = time.monotonic()
             try:
-                text = await self._call_with_heal(
-                    profile,
-                    lambda p=profile: self._openai_compatible_chat(
-                        p, prompt, system_extra, instruction=instruction,
-                        task=task, max_tokens=max_tokens))
+                if on_delta is None:
+                    text = await self._call_with_heal(
+                        profile,
+                        lambda p=profile: self._openai_compatible_chat(
+                            p, prompt, system_extra, instruction=instruction,
+                            task=task, max_tokens=max_tokens))
+                else:
+                    text = await self._streamed_attempt(
+                        profile, prompt, system_extra, instruction=instruction,
+                        task=task, max_tokens=max_tokens,
+                        on_delta=on_delta, on_restart=on_restart)
                 self._broadcast_sentiment(text)
                 self._exit_degraded()   # a success clears any degraded state
                 self._announce("provider_route", {
@@ -1678,13 +2642,74 @@ class ProviderRouter:
                     "latency_s": round(time.monotonic() - started, 2),
                     "fallbacks": len(attempted) - 1})
                 return profile, text
+            except StreamInterruptedError:
+                raise
+            except ProviderClosedError:
+                raise
+            except ProviderDeadlineError as exc:
+                last_error, out_of_time = exc, True
+                break
             except Exception as exc:
                 last_error = exc
+        if out_of_time:
+            raise ProviderDeadlineError(
+                last_error or "the time budget for this request ran out", attempts=attempted)
         # Every eligible provider errored this turn.  If that leaves nothing
         # usable at all, we are degraded; otherwise it was a transient burst.
         if not self.text_profiles():
-            self._enter_degraded(f"all providers failed: {first_line(last_error, 120)}")
+            self._enter_degraded(f"all providers failed: {redacted_error_line(last_error, 120)}")
         raise AllTextProvidersFailedError(last_error, attempts=attempted)
+
+    async def _streamed_attempt(self, profile: AIProviderProfile, prompt: str,
+                                system_extra: str, *, instruction: str | None,
+                                task: str, max_tokens: int | None,
+                                on_delta: Callable[[str], None],
+                                on_restart: Callable[[str], None] | None) -> str:
+        """One provider, streamed to the caller, under the restart contract."""
+        shown = False
+        scope = _CALL.get()
+
+        def forward(piece: str) -> None:
+            nonlocal shown
+            if not shown and scope is not None and not scope.first_token_marked:
+                scope.first_token_marked = True
+                _trace_mark("first_token", provider=profile.name)
+            shown = True
+            try:
+                on_delta(piece)
+            except Exception:
+                pass
+
+        try:
+            return await self._call_with_heal(
+                profile,
+                lambda: self._openai_compatible_chat_stream(
+                    profile, prompt, system_extra, instruction=instruction,
+                    task=task, on_delta=forward, max_tokens=max_tokens),
+                # A retry after the caller has seen part of an answer would
+                # splice a second answer onto it.
+                may_retry=lambda: not shown)
+        except self._NOT_THE_PROVIDERS_FAULT:
+            # Nothing follows a deadline or a shutdown, so there is nothing to
+            # restart into: the caller gets the error and keeps no answer.
+            raise
+        except Exception as exc:
+            if not shown:
+                raise
+            if on_restart is None:
+                raise StreamInterruptedError(profile.name, exc) from exc
+            self._restart(on_restart, profile, "provider_failed")
+            raise
+
+    def _restart(self, on_restart: Callable[[str], None], profile: AIProviderProfile,
+                 why: str) -> None:
+        """Tell the caller to discard what it has shown. If it cannot be told,
+        continuing would splice two answers, so the call fails instead."""
+        _trace_mark("stream_restart", provider=profile.name, reason=why)
+        try:
+            on_restart(f"{why}:{profile.name}")
+        except Exception as exc:
+            raise StreamInterruptedError(profile.name, exc) from exc
 
     async def generate_vision(
         self, image_jpeg: bytes, prompt: str, *, instruction: str,
@@ -1722,7 +2747,7 @@ class ProviderRouter:
         # vision away — "I need a vision model" whenever voice had dropped.
         live_keyed = ([p for p in self.settings.ordered_profiles()
                        if p.supports_live_audio and str(self.active_key(p) or "").strip()]
-                      if self.is_online() else [])
+                      if self.is_online() and not getattr(self, "local_only", False) else [])
         for profile in live_keyed:
             integration = self.settings.integration("electronics")
             model = str(integration.get("vision_model") or "gemini-2.5-flash")
@@ -1759,10 +2784,14 @@ class ProviderRouter:
                 # Leave time for the second endpoint within the inspection's
                 # 35s budget; one stalled server must not consume every try.
                 attempt_timeout = 15.0 if len(profiles) > 1 else 30.0
-                answer = await asyncio.wait_for(self._openai_compatible_chat(
-                    profile, prompt, instruction=instruction, task=task,
-                    image_jpeg=image_jpeg, max_tokens=max_tokens),
-                    timeout=attempt_timeout)
+                # The same bound as a deadline, so waiting for the provider's
+                # slot and the HTTP timeout both live inside it too.
+                with self._call_scope(_transport.INTERACTIVE,
+                                      time.monotonic() + attempt_timeout):
+                    answer = await asyncio.wait_for(self._openai_compatible_chat(
+                        profile, prompt, instruction=instruction, task=task,
+                        image_jpeg=image_jpeg, max_tokens=max_tokens),
+                        timeout=attempt_timeout)
                 return profile, answer
             except Exception as exc:
                 self.bus.log.emit(f"VISION: {profile.name} could not complete image analysis ({type(exc).__name__}).")
@@ -1771,21 +2800,22 @@ class ProviderRouter:
     # ── the inner voice ───────────────────────────────────────────────────────
 
     _THOUGHT_INSTRUCTION = (
-        "You are ORION's inner voice — his private reasoning, not a reply to "
-        "anyone. Think in the first person, in strict British English, in two "
-        "to four plain sentences. Be honest and specific: what you have "
-        "noticed, why it matters, what you are inclined to do or watch next "
-        "and WHY — the reasoning is the point, so the user can read your "
-        "mind as they build you. Never address the user, never use "
-        "salutations, never wrap your thought in quotes, and never invent "
-        "events that are not in the context you were given."
+        "Write a concise application reflection for ORION in strict British "
+        "English, using one to three plain sentences. Summarise a recorded "
+        "observation, its practical relevance and a useful next check, grounded "
+        "only in the supplied context. This is a status summary, not a transcript "
+        "of a model's hidden reasoning. Do not invent motives, emotions, events "
+        "or completed actions. Distinguish an observation from a suggestion and "
+        "state uncertainty where the evidence is incomplete. Omit salutations, "
+        "quotation marks and repeated generic advice."
     )
 
     def thought_profile(self) -> AIProviderProfile | None:
         """The dedicated introspection backend, when configured and healthy."""
         profile = self.settings.providers.get(self.THOUGHTS_PROFILE)
         if profile is not None and profile.supports_text_generation \
-                and self.is_available(profile) and self.is_online():
+                and self.is_available(profile) and self.is_online() \
+                and (profile.is_local or not getattr(self, "local_only", False)):
             return profile
         return None
 
@@ -1821,7 +2851,7 @@ class ProviderRouter:
         if local_only:
             profiles = [p for p in profiles if getattr(p, "is_local", False)]
             if not profiles:
-                raise NoTextProviderError(
+                raise ThoughtGenerationUnavailable(
                     "no local model is running, and thinking is local-only "
                     "(ORION_PAID_THOUGHTS=1 to allow a paid provider)")
         return profiles
@@ -1831,7 +2861,13 @@ class ProviderRouter:
         the dedicated cloud thoughts profile is next, the ordinary text chain
         is the last resort.  Uses a compact introspection instruction (not
         the full tool persona) so thinking stays cheap, and tags usage
-        task='thought' so the ledger separates mind from mouth."""
+        task='thought' so the ledger separates mind from mouth. Background
+        work: it queues behind conversation for a provider's slots."""
+        with self._call_scope(_transport.BACKGROUND, time.monotonic()
+                              + self._default_deadline_s("background", None, 0.0)):
+            return await self._generate_thought(prompt)
+
+    async def _generate_thought(self, prompt: str) -> tuple[AIProviderProfile, str]:
         prompt = SecuritySanitiser.guard_text(str(prompt or "").strip(), "thought.prompt")
         if not prompt:
             raise RuntimeError("empty thought prompt")
@@ -1848,6 +2884,8 @@ class ProviderRouter:
                         p, prompt,
                         instruction=self._THOUGHT_INSTRUCTION, task="thought"))
                 return profile, text
+            except self._NOT_THE_PROVIDERS_FAULT:
+                raise
             except Exception as exc:
                 last_error = exc
         raise AllTextProvidersFailedError(
@@ -1862,7 +2900,15 @@ class ProviderRouter:
         can type ORION's thought out live.  Falls back cleanly: a provider that
         does not support server-sent streaming (or an early stream error) is
         retried non-streamed, and the whole assembled text is still returned.
+        Background work, like generate_thought.
         """
+        with self._call_scope(_transport.BACKGROUND, time.monotonic()
+                              + self._default_deadline_s("background", None, 0.0)):
+            return await self._generate_thought_stream(prompt, on_delta)
+
+    async def _generate_thought_stream(
+        self, prompt: str, on_delta: Callable[[str], None] | None = None,
+    ) -> tuple[AIProviderProfile, str]:
         prompt = SecuritySanitiser.guard_text(str(prompt or "").strip(), "thought.prompt")
         if not prompt:
             raise RuntimeError("empty thought prompt")
@@ -1876,6 +2922,8 @@ class ProviderRouter:
                     profile, prompt, instruction=self._THOUGHT_INSTRUCTION,
                     task="thought", on_delta=on_delta)
                 return profile, text
+            except self._NOT_THE_PROVIDERS_FAULT:
+                raise
             except Exception as exc:
                 last_error = exc
                 self.mark_failure(profile, exc)
@@ -1891,6 +2939,8 @@ class ProviderRouter:
                         profile, prompt, instruction=self._THOUGHT_INSTRUCTION,
                         task="thought")
                     return profile, text
+                except self._NOT_THE_PROVIDERS_FAULT:
+                    raise
                 except Exception as exc2:
                     last_error = exc2
                     self.mark_failure(profile, exc2)
@@ -1901,86 +2951,19 @@ class ProviderRouter:
         self, profile: AIProviderProfile, prompt: str, system_extra: str = "",
         *, instruction: str | None = None, task: str = "",
         on_delta: Callable[[str], None] | None = None,
+        max_tokens: int | None = None,
     ) -> str:
-        """Server-sent-events streaming variant of _openai_compatible_chat.
+        """One provider attempt, streamed: each fragment goes to ``on_delta``
+        as it arrives and the assembled text is returned.
 
-        Reads the OpenAI-style ``data: {json}`` delta stream, forwarding each
-        content fragment to ``on_delta`` and returning the assembled text."""
-        base_url = profile.base_url.rstrip("/")
-        if not base_url:
-            raise RuntimeError(f"provider {profile.name} has no base_url")
-        endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
-        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
-        api_key = self.active_key(profile)
-        if api_key and api_key.lower() not in {"local", "none", "no-key"}:
-            headers["Authorization"] = f"Bearer {api_key}"
-        system_content = (instruction if instruction is not None
-                          else self.system_instruction(system_extra, context=task))
-        system_content, prompt = self._fit_to_budget(
-            profile, system_content, prompt, system_extra, instruction, task)
-        payload = {
-            "model": self.active_model(profile),
-            "messages": [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.35,
-            "stream": True,
-            # Bounded for the same reason as the non-streamed call (CREDIT_RE).
-            "max_tokens": self.output_budget(profile),
-        }
-        self._apply_model_quirks(profile, payload)
-        if profile.is_local:
-            payload["keep_alive"] = 0
-            payload["options"] = {"num_ctx": self.LOCAL_NUM_CTX}
-        timeout = ClientTimeout(total=max(12.0, float(profile.timeout_s or 30.0)))
-        started = time.monotonic()
-        parts: list[str] = []
-        with self._admit(profile):
-            async with ClientSession(timeout=timeout) as session:
-                async with session.post(endpoint, headers=headers, json=payload) as response:
-                    if response.status >= 400:
-                        body = (await response.text())[:500]
-                        raise RuntimeError(f"HTTP {response.status}: {body}")
-                    async for raw_line in response.content:
-                        line = raw_line.decode("utf-8", "ignore").strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                        except Exception:
-                            continue
-                        choices = chunk.get("choices") or []
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta") or {}
-                        piece = delta.get("content")
-                        if piece is None:  # some servers echo the whole message once
-                            piece = (choices[0].get("message") or {}).get("content")
-                        if piece:
-                            parts.append(str(piece))
-                            if on_delta is not None:
-                                try:
-                                    on_delta(str(piece))
-                                except Exception:
-                                    pass
-        self.note_latency(profile, time.monotonic() - started)
-        content = clean_transcript("".join(parts))
-        if not content:
-            raise RuntimeError(f"provider {profile.name} streamed no content")
-        self._record_success(profile)
-        # Approximate usage for the ledger (streamed responses omit the usage block).
-        try:
-            self._record_usage(
-                profile,
-                {"usage": {"completion_tokens": max(1, len(content) // 4)}},
-                streaming=True, task=task)
-        except Exception:
-            pass
-        return content
+        The name predates the Ollama transport and is kept because callers
+        and tests replace this method as the streaming seam; the wire format
+        is chosen per server (SSE for OpenAI-compatible, NDJSON for Ollama).
+        A stream that ends without its end marker, or reports an error
+        mid-way, is a failure, never a short answer."""
+        return await self._chat_attempt(
+            profile, prompt, system_extra, instruction=instruction, task=task,
+            max_tokens=max_tokens, stream=True, on_delta=on_delta)
 
     def _broadcast_sentiment(self, text: str) -> None:
         """
@@ -2007,103 +2990,505 @@ class ProviderRouter:
         if os.getenv("ORION_MODEL_THINKING", "").strip().lower() in {"1", "true", "on", "yes"}:
             return
         model = str(payload.get("model") or "").lower()
-        if "generativelanguage.googleapis.com" in profile.base_url and "2.5-flash" in model:
-            payload["reasoning_effort"] = "none"
-        elif "gpt-oss" in model and "groq.com" in profile.base_url:
+        try:
+            host = (urlsplit(profile.base_url).hostname or "").lower()
+        except ValueError:
+            host = ""
+        if host == "generativelanguage.googleapis.com":
+            if model in {"gemini-2.5-flash", "gemini-2.5-flash-lite"}:
+                payload["reasoning_effort"] = "none"
+            elif model in {"gemini-3.1-flash-lite", "gemini-3.5-flash-lite"}:
+                payload["reasoning_effort"] = "minimal"
+            elif model in {"gemini-3-flash-preview", "gemini-3.5-flash",
+                           "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"}:
+                # Gemini 3 cannot disable thinking. "low" is supported by
+                # these Flash models; "none" would reject the request (400).
+                payload["reasoning_effort"] = "low"
+        elif "gpt-oss" in model and host == "api.groq.com":
             payload["reasoning_effort"] = "low"
+        else:
+            # These fields are provider-specific, not generic model settings.
+            # Restrict them to the documented API and recognised model family.
+            if host == "api.deepseek.com" and model in {"deepseek-flash", "deepseek-v4-pro"}:
+                payload["thinking"] = {"type": "disabled"}
+            elif host == "api.cerebras.ai" and model == "gpt-oss-120b":
+                payload["reasoning_effort"] = "low"
 
     async def _openai_compatible_chat(
         self, profile: AIProviderProfile, prompt: str, system_extra: str = "",
         *, instruction: str | None = None, task: str = "",
         image_jpeg: bytes | None = None, max_tokens: int | None = None,
     ) -> str:
+        """One provider attempt, whole answer at once.
+
+        The name predates the Ollama transport and is kept because callers
+        and tests replace this method as the per-attempt seam; the wire format
+        is chosen per server by _chat_attempt."""
+        return await self._chat_attempt(
+            profile, prompt, system_extra, instruction=instruction, task=task,
+            image_jpeg=image_jpeg, max_tokens=max_tokens)
+
+    # ── transport, admission and residency ────────────────────────────────────
+
+    def _may_be_ollama(self, profile: AIProviderProfile) -> bool:
+        """Worth asking whether this server is Ollama: it is on this machine,
+        or it is the profile OllamaManager registers. ORION_OLLAMA_NATIVE=0
+        keeps every server on /v1 (the rollback switch)."""
+        if os.getenv("ORION_OLLAMA_NATIVE", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        return profile.is_local or profile.name == "local_ollama"
+
+    async def _is_ollama(self, root: str, scope: _CallScope | None = None) -> bool:
+        """Whether *root* is an Ollama server, asked once and remembered.
+
+        Raises ConnectionError when nothing answers, so a dead local server
+        fails the attempt in about a second rather than after its full
+        two-minute request timeout.
+        """
+        cached = self._ollama_roots.get(root)
+        now = time.monotonic()
+        if cached is not None and (cached[0] or now - cached[2] < self.NOT_OLLAMA_TTL_S):
+            return cached[0]
+        remaining = scope.remaining() if scope is not None else None
+        timeout = (self.LOCAL_PROBE_TIMEOUT_S if remaining is None
+                   else max(0.1, min(self.LOCAL_PROBE_TIMEOUT_S, remaining)))
+        session = await self._pool.get()
+        version = await _transport.probe_ollama(session, root, timeout=timeout)
+        self._ollama_roots[root] = (version is not None, version or "", now)
+        if version is not None and cached is None:
+            self.bus.log.emit(
+                f"NET: {root} is Ollama {version} - using its native API "
+                f"(context {self.LOCAL_NUM_CTX} tokens, kept loaded "
+                f"{self.LOCAL_KEEP_ALIVE_S}s after a conversation turn).")
+        return version is not None
+
+    async def _transport_for(self, profile: AIProviderProfile,
+                             scope: _CallScope | None = None) -> Any:
+        base_url = profile.base_url.rstrip("/")
+        if profile.kind == "gemma_native":
+            from .gemma_native import GemmaNativeTransport
+            return GemmaNativeTransport(base_url)
+        if self._may_be_ollama(profile):
+            root = _transport.ollama_root(base_url)
+            if await self._is_ollama(root, scope):
+                return _transport.OllamaChatTransport(root)
+        # Everything else — cloud, LM Studio, llama.cpp, vLLM — speaks /v1 and
+        # never sees an Ollama-only field.
+        return _transport.OpenAIChatTransport(base_url)
+
+    def _gate_for(self, profile: AIProviderProfile, transport: Any) -> _transport.EndpointGate:
+        """The admission gate every consumer of this provider shares. Local
+        servers are gated per server (one GPU), cloud providers per profile."""
+        if profile.is_local:
+            root = getattr(transport, "root", "") or _transport.ollama_root(profile.base_url)
+            key, limit, background = (f"local:{root}", self.LOCAL_CONCURRENCY,
+                                      self.LOCAL_CONCURRENCY)
+        else:
+            key, limit, background = (f"profile:{profile.name}", self.CLOUD_CONCURRENCY,
+                                      min(self.CLOUD_CONCURRENCY,
+                                          self.CLOUD_BACKGROUND_CONCURRENCY))
+        gate = self._gates.get(key)
+        if gate is None:
+            gate = self._gates[key] = _transport.EndpointGate(limit, background)
+        return gate
+
+    @contextlib.asynccontextmanager
+    async def _gpu_lease(self, cls: str, timeout: float | None = None, provider: str = ""):
+        """Hold the shared GPU lease throughout local generation. Training
+        relinquishes this lease only after its CUDA process has exited.
+
+        The wait is bounded by what is left of the request's own deadline,
+        and a GPU that is saturated (or admission shutting down) surfaces as
+        a deadline, not as a failure of the local provider: the circuit
+        breaker must not learn "Ollama is broken" from "the GPU was busy".
+        """
+        from . import admission
+        ticket = None
+        try:
+            ticket = admission.ADMISSION.acquire_lease("gpu", cls, label="Local language model")
+            await ticket.wait(timeout)
+        except admission.Busy as busy:
+            if ticket is not None:
+                ticket.release()
+            raise ProviderDeadlineError(f"the GPU is busy: {busy.reason}",
+                                        attempts=[provider] if provider else []) from None
+        try:
+            yield ticket
+        finally:
+            ticket.release()
+
+    def _keep_alive_for(self, key: tuple[str, str], cls: str) -> tuple[int | str, int]:
+        """(value sent to Ollama, seconds) for a request on *key*."""
+        if self._memory_pressure:
+            return 0, 0
+        want = (self.LOCAL_KEEP_ALIVE_S if cls == _transport.INTERACTIVE
+                else self.LOCAL_BACKGROUND_KEEP_ALIVE_S)
+        held = self._resident_until.get(key, 0.0) - time.monotonic()
+        # Each request resets Ollama's timer to ITS keep_alive, so a short
+        # background request after a conversation turn would otherwise cut
+        # the conversation's window short.
+        seconds = int(math.ceil(max(want, held))) if held > 0 else int(want)
+        return (f"{seconds}s" if seconds > 0 else 0), seconds
+
+    def _finish_inflight(self, key: tuple[str, str]) -> None:
+        count = self._inflight.get(key, 1) - 1
+        if count > 0:
+            self._inflight[key] = count
+            return
+        self._inflight.pop(key, None)
+        if key in self._unload_pending and not self._closed:
+            # Asked for while this model was answering; it is free now.
+            self._unload_pending.discard(key)
+            self._spawn(self._unload_one(key[0], key[1], reason="memory pressure"))
+
+    def _spawn(self, coro: Any) -> None:
+        try:
+            task = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()
+            return
+        # Held until done: a task nothing references can be collected mid-way.
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _prompt_work(self, build: Callable[[], Any], scope: _CallScope) -> Any:
+        """Prepare grounded context off the live loop within the turn budget."""
+        started = time.monotonic()
+        remaining = scope.remaining()
+        try:
+            work = asyncio.to_thread(build)
+            if remaining is None:
+                return await work
+            if remaining <= 0:
+                work.close()
+                raise ProviderDeadlineError("the time budget ended before context preparation")
+            return await asyncio.wait_for(work, timeout=remaining)
+        except (asyncio.TimeoutError, TimeoutError):
+            raise ProviderDeadlineError("context preparation exceeded the time budget") from None
+        finally:
+            _trace_mark("prompt_context", ms=(time.monotonic() - started) * 1000.0)
+
+    async def _chat_attempt(
+        self, profile: AIProviderProfile, prompt: str, system_extra: str = "",
+        *, instruction: str | None = None, task: str = "",
+        image_jpeg: bytes | None = None, max_tokens: int | None = None,
+        stream: bool = False, on_delta: Callable[[str], None] | None = None,
+        response_format: dict[str, Any] | None = None,
+        temperature: float | None = None,
+        continuation: str = "",
+        function_declarations: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """One request to one provider: transport, admission, timeouts inside
+        the call's deadline, residency bookkeeping and measurement.
+
+        ``response_format`` (a JSON schema) reaches native Ollama only; other
+        servers never see it. ``temperature`` None keeps the default."""
+        if self._closed:
+            raise ProviderClosedError("the provider router has been shut down")
         base_url = profile.base_url.rstrip("/")
         if not base_url:
             raise RuntimeError(f"provider {profile.name} has no base_url")
-        endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        api_key = self.active_key(profile)
-        if api_key and api_key.lower() not in {"local", "none", "no-key"}:
-            headers["Authorization"] = f"Bearer {api_key}"
-        system_content = (instruction if instruction is not None
-                          else self.system_instruction(system_extra, context=task))
+        scope = _CALL.get() or _CallScope()
+        attempt_started = time.monotonic()
+        transport = await self._transport_for(profile, scope)
+        native = transport.kind == "ollama"
+        def prepare_prompt() -> tuple[str, str]:
+            system_content = (instruction if instruction is not None
+                              else self.system_instruction(system_extra, context=task))
+            return self._fit_to_budget(
+                profile, system_content, prompt, system_extra, instruction, task,
+                cap=self.LOCAL_NUM_CTX if native else None)
         # Shape the request to this model's payload budget BEFORE sending —
         # a small hosted model must never see the full instruction stack
-        # (that is what produced HTTP 413 and a 300 s bench).
-        system_content, prompt = self._fit_to_budget(
-            profile, system_content, prompt, system_extra, instruction, task)
-        user_content: Any = prompt
-        if image_jpeg is not None:
-            import base64
-            user_content = [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {
-                    "url": "data:image/jpeg;base64," + base64.b64encode(image_jpeg).decode("ascii")}},
-            ]
-        payload = {
-            "model": self.active_model(profile),
-            "messages": [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0.35,
-            "stream": False,
-            # ALWAYS bounded — see CREDIT_RE. Omitting this made OpenRouter
-            # reserve the model's full completion budget against the balance
-            # and refuse the request with HTTP 402.
-            "max_tokens": self._reply_ceiling(profile, max_tokens),
-        }
-        self._apply_model_quirks(profile, payload)
-        if profile.is_local:
-            # Unload the local model from RAM the instant this call finishes,
-            # instead of Ollama's default 5-minute keep-warm.  With cloud-first
-            # routing the local model is only ever a failover, so there is no
-            # reason to hold gigabytes resident between turns.  (Honoured by
-            # Ollama's OpenAI-compatible endpoint; harmless to servers that
-            # ignore it, e.g. LM Studio.)
-            payload["keep_alive"] = 0
-            # Bound the KV-cache footprint too — see LOCAL_NUM_CTX.
-            payload["options"] = {"num_ctx": self.LOCAL_NUM_CTX}
-        # A long reply takes longer to write. A 1,300-word research section on a
-        # free model needs well over the 30 s a spoken answer is allowed.
-        seconds = max(8.0, float(profile.timeout_s or 30.0))
-        if max_tokens:
-            seconds = max(seconds, 20.0 + int(max_tokens) / 30.0)
-        timeout = ClientTimeout(total=seconds)
-        started = time.monotonic()
-        with self._admit(profile):
-            async with ClientSession(timeout=timeout) as session:
-                async with session.post(endpoint, headers=headers, json=payload) as response:
-                    if image_jpeg is not None:
-                        chunks = bytearray()
-                        async for chunk in response.content.iter_chunked(16_384):
-                            chunks.extend(chunk)
-                            if len(chunks) > 262_144:
-                                raise RuntimeError("Vision provider response exceeded the size limit")
-                        raw = chunks.decode("utf-8")
-                    else:
-                        raw = await response.text()
-                    if response.status >= 400:
-                        if image_jpeg is not None:
-                            raise RuntimeError(f"Vision provider HTTP {response.status}")
-                        raise RuntimeError(f"HTTP {response.status}: {raw[:500]}")
-                    data = json.loads(raw)
+        # (that is what produced HTTP 413 and a 300 s bench). A native Ollama
+        # request is also held inside the context it is really loaded with.
+        if instruction is None:
+            # Persistent recall and persona grounding may touch SQLite/files.
+            # They must not stop audio or avatar frames on the live loop.
+            system_content, prompt = await self._prompt_work(prepare_prompt, scope)
+        else:
+            system_content, prompt = prepare_prompt()
+        if continuation:
+            # Fit the preceding tail alongside the question and output reserve.
+            # This also prevents native Ollama from evicting the instruction.
+            context = min(self.payload_budget(profile), self.LOCAL_NUM_CTX) if native else self.payload_budget(profile)
+            reserve = min(self._reply_ceiling(profile, max_tokens), max(256, context // 4))
+            if self._est_tokens(system_content + prompt) + reserve + 256 >= context:
+                system_content = await self._prompt_work(
+                    lambda: self.system_instruction_lean(system_extra, context=task), scope)
+                prompt = prompt[:max(256, (context // 4) * 3)]
+            room = max(128, (context - reserve - self._est_tokens(system_content + prompt) - 256) * 3)
+            continuation = continuation[-room:]
+        model = self.active_model(profile)
+        request = _transport.ChatRequest(
+            model=model, system=system_content, prompt=prompt,
+            # ALWAYS bounded — see CREDIT_RE.
+            max_tokens=self._reply_ceiling(profile, max_tokens),
+            api_key=self.active_key(profile), image_jpeg=image_jpeg,
+            stream=stream, on_delta=on_delta,
+            continuation=continuation,
+            # Inspection replies are untrusted JSON; bound what is read.
+            max_response_bytes=262_144 if image_jpeg is not None else None)
+        if temperature is not None:
+            request.temperature = float(temperature)
+        if function_declarations is not None:
+            if profile.kind != "gemma_native":
+                raise ValueError("Native Gemma functions require a Gemma profile")
+            request.extra["function_declarations"] = function_declarations
+        if native and response_format is not None:
+            request.response_format = response_format
+        residency: tuple[str, str] | None = None
+        keep_s = 0
+        if native:
+            # Prompt and reply share the context: a reply allowed to run past
+            # it would push the start of the prompt out mid-answer.
+            room = (self.LOCAL_NUM_CTX - self._est_tokens(system_content)
+                    - self._est_tokens(prompt) - self._est_tokens(continuation) -
+                    (self._est_tokens(_transport.CONTINUE_REPLY) if continuation else 0))
+            request.num_ctx = self.LOCAL_NUM_CTX
+            request.max_tokens = min(request.max_tokens, max(256, room))
+            residency = (transport.root, _ollama_model_key(model))
+            request.keep_alive, keep_s = self._keep_alive_for(residency, scope.cls)
+        else:
+            quirks: dict[str, Any] = {"model": model}
+            self._apply_model_quirks(profile, quirks)
+            quirks.pop("model", None)
+            request.extra.update(quirks)
+
+        gate = self._gate_for(profile, transport)
+        remaining = scope.remaining()
+        wait_limit = None if remaining is None else max(0.0, remaining - self.MIN_ATTEMPT_S)
+        queue_started = time.monotonic()
+        try:
+            await gate.acquire(scope.cls, timeout=wait_limit)
+        except (asyncio.TimeoutError, TimeoutError):
+            _trace_mark("provider_attempt", provider=profile.name, transport=transport.kind,
+                        ok=False, queue_ms=(time.monotonic() - queue_started) * 1000.0,
+                        ms=(time.monotonic() - attempt_started) * 1000.0)
+            raise ProviderDeadlineError(
+                f"{profile.name} had no free slot before the time budget ran out",
+                attempts=[profile.name]) from None
+        queue_ms = (time.monotonic() - queue_started) * 1000.0
+        trace: dict[str, Any] = {}
+        result: Any = None
+        ok = False
+        try:
+            remaining = scope.remaining()
+            lease = (self._gpu_lease(scope.cls,
+                                     timeout=None if remaining is None
+                                     else max(0.0, remaining - self.MIN_ATTEMPT_S),
+                                     provider=profile.name)
+                     if profile.is_local else contextlib.nullcontext())
+            async with lease:
+                if residency is not None:
+                    self._inflight[residency] = self._inflight.get(residency, 0) + 1
+                try:
+                    result = await self._send_attempt(
+                        profile, transport, request, scope, max_tokens, trace)
+                finally:
+                    if residency is not None:
+                        self._finish_inflight(residency)
+            # Inspection JSON contains literal component markings. Transcript
+            # identity correction (e.g. ORIN -> ORION) must not rewrite evidence.
+            content = (str(result.text).strip() if image_jpeg is not None
+                       else clean_transcript(str(result.text)))
+            if not content and not (function_declarations is not None and result.tool_calls):
+                raise RuntimeError(
+                    f"provider {profile.name} "
+                    f"{'streamed no content' if stream else 'returned empty content'}")
+            ok = True
+        finally:
+            gate.release(scope.cls)
+            _trace_mark(
+                "provider_attempt", provider=profile.name, transport=transport.kind, ok=ok,
+                queue_ms=queue_ms, connect_ms=trace.get("connect_ms"),
+                first_token_ms=getattr(result, "first_token_ms", None),
+                load_ms=getattr(result, "load_ms", None),
+                ms=(time.monotonic() - attempt_started) * 1000.0)
         # Observed latency feeds the orchestration ordering for future turns.
-        self.note_latency(profile, time.monotonic() - started)
+        self.note_latency(profile, result.total_ms / 1000.0)
+        if residency is not None:
+            if keep_s > 0:
+                self._resident_until[residency] = time.monotonic() + keep_s
+            else:
+                self._resident_until.pop(residency, None)
+        usage = dict(result.usage)
+        if not usage and result.streamed:
+            # Most SSE streams omit the usage block; approximate for the ledger.
+            usage = {"completion_tokens": max(1, len(content) // 4)}
         # Record authoritative token usage (Section 6) — deduped by response id.
-        self._record_usage(profile, data, streaming=False, task=task)
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"provider {profile.name} returned no choices")
-        message = choices[0].get("message") or {}
-        content = message.get("content") or choices[0].get("text") or ""
-        # Inspection JSON contains literal component markings. Transcript
-        # identity correction (e.g. ORIN -> ORION) must not rewrite evidence.
-        content = str(content).strip() if image_jpeg is not None else clean_transcript(str(content))
-        if not content:
-            raise RuntimeError(f"provider {profile.name} returned empty content")
+        self._record_usage(profile, {"id": result.response_id or None,
+                                     "model": result.model or None, "usage": usage},
+                           streaming=stream, task=task)
         self._record_success(profile)
-        return content
+        if not self._provider_ready and image_jpeg is None:
+            self._provider_ready = True
+            try:
+                from .startup_budget import milestone
+                milestone("provider_ready")
+            except Exception:
+                pass
+        answer = ProviderText(content, result.done_reason, str(result.text))
+        answer.model = model
+        answer.tool_calls = list(result.tool_calls)
+        return answer
+
+    async def _send_attempt(self, profile: AIProviderProfile, transport: Any,
+                            request: Any, scope: _CallScope, max_tokens: int | None,
+                            trace: dict[str, Any]) -> Any:
+        """The HTTP exchange, with this attempt's timeout cut to the deadline."""
+        aiohttp = _transport._aiohttp()
+        # A long reply takes longer to write. A 1,300-word research section on
+        # a free model needs well over the 30 s a spoken answer is allowed.
+        limit_s = max(12.0 if request.stream else 8.0, float(profile.timeout_s or 30.0))
+        if max_tokens:
+            limit_s = max(limit_s, 20.0 + int(max_tokens) / 30.0)
+        # Less any time held back for the providers after this one.
+        remaining = scope.attempt_remaining()
+        clipped = remaining is not None and remaining < limit_s
+        seconds = max(0.1, min(limit_s, remaining)) if remaining is not None else limit_s
+        # Loopback connects either succeed at once or hang (this machine
+        # drops, rather than refuses, connections to a closed local port).
+        connect_s = min(seconds, 2.0 if profile.is_local else 15.0)
+        timeout = ClientTimeout(total=seconds, sock_connect=connect_s)
+        try:
+            session = await self._pool.get()
+            with self._admit(profile):
+                return await transport.chat(session, request, timeout=timeout, trace=trace)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            if self._closed:
+                raise ProviderClosedError("the provider router has been shut down") from exc
+            if isinstance(exc, getattr(aiohttp, "ConnectionTimeoutError", ())):
+                self._forget_server(transport)
+                raise TimeoutError(
+                    f"provider {profile.name} could not connect within {connect_s:.0f}s") from exc
+            if clipped:
+                left = scope.remaining()
+                if scope.reserve_s > 0 and left is not None and left >= self.MIN_ATTEMPT_S:
+                    # Cut short to keep time for the next provider: an
+                    # ordinary failure of this one, so the next is asked.
+                    raise TimeoutError(
+                        f"provider {profile.name} gave no reply within {seconds:.0f}s "
+                        f"(the rest of the time is kept for another provider)") from exc
+                raise ProviderDeadlineError(
+                    f"{profile.name} was still answering when the time budget ran out",
+                    attempts=[profile.name]) from exc
+            raise TimeoutError(
+                f"provider {profile.name} gave no reply within {seconds:.0f}s") from exc
+        except Exception as exc:
+            if self._closed:
+                raise ProviderClosedError("the provider router has been shut down") from exc
+            if isinstance(exc, (OSError, aiohttp.ClientConnectionError)):
+                self._forget_server(transport)
+            raise
+
+    def _forget_server(self, transport: Any) -> None:
+        """A local server that stopped answering may come back as something
+        else; ask it again next time rather than trusting the old answer."""
+        root = getattr(transport, "root", None)
+        if root:
+            self._ollama_roots.pop(root, None)
+
+    # ── residency control (memory pressure, shutdown) ─────────────────────────
+
+    def set_memory_pressure(self, active: bool) -> None:
+        """While set, local models are released as soon as each reply is done
+        (keep_alive 0). Cleared by the resource governor on recovery."""
+        self._memory_pressure = bool(active)
+
+    async def relieve_memory_pressure(self, reason: str = "memory pressure") -> list[str]:
+        """What the resource governor calls when memory runs short: stop
+        keeping local models warm, and release the ones held now."""
+        self.set_memory_pressure(True)
+        return await self.unload_local_models(reason)
+
+    def _local_ollama_models(self) -> dict[str, set[str]]:
+        """root -> the models ORION uses there. Only these are ever unloaded:
+        another program's model on the same server is not ORION's to evict."""
+        found: dict[str, set[str]] = {}
+        for profile in self.settings.ordered_profiles():
+            if not profile.supports_text_generation or not self._may_be_ollama(profile):
+                continue
+            root = _transport.ollama_root(profile.base_url)
+            found.setdefault(root, set()).update(
+                _ollama_model_key(m) for m in profile.all_models())
+        for root, model in list(self._resident_until):
+            found.setdefault(root, set()).add(model)
+        return found
+
+    async def unload_local_models(self, reason: str = "memory pressure") -> list[str]:
+        """Release ORION's local Ollama models from memory now.
+
+        A model that is answering a request is not unloaded under it: the
+        unload is remembered and done the moment that request finishes.
+        Returns the models released.
+        """
+        if self._closed:
+            return []
+        if reason == "shutdown" and not (
+            self._resident_until or self._inflight or self._unload_pending
+        ):
+            # Configuring Ollama is not evidence that this process loaded a
+            # model. Avoid a discovery round trip on every cloud-only exit.
+            return []
+        released: list[str] = []
+        for root, models in self._local_ollama_models().items():
+            try:
+                if not await self._is_ollama(root):
+                    continue
+                session = await self._pool.get()
+                loaded = await _transport.OllamaChatTransport(root).loaded_models(session)
+            except Exception:
+                continue
+            for row in loaded:
+                name = str(row.get("name") or row.get("model") or "")
+                model = _ollama_model_key(name)
+                if model not in models:
+                    continue
+                if await self._unload_one(root, model):
+                    released.append(name)
+        if released:
+            self.bus.log.emit(
+                f"NET: released local model{'s' if len(released) > 1 else ''} "
+                f"{', '.join(released)} from memory ({reason}).")
+        return released
+
+    async def _unload_one(self, root: str, model: str, reason: str = "") -> bool:
+        key = (root, model)
+        if self._inflight.get(key):
+            self._unload_pending.add(key)
+            return False
+        try:
+            session = await self._pool.get()
+            await _transport.OllamaChatTransport(root).unload(session, model)
+        except Exception as exc:
+            self.bus.log.emit(
+                f"NET: could not release local model {model} - {redacted_error_line(exc, 90)}")
+            return False
+        self._resident_until.pop(key, None)
+        if reason:
+            self.bus.log.emit(f"NET: released local model {model} from memory ({reason}).")
+        return True
+
+    async def aclose(self) -> None:
+        """Close pooled connections and stop background unloads. Idempotent.
+        No provider call can start afterwards (ProviderClosedError)."""
+        if self._closed:
+            return
+        self._closed = True
+        self._model_catalogues.clear()
+        self._model_catalogue_locks.clear()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        tasks = [t for t in list(self._tasks) if not t.done()]
+        for task in tasks:
+            task.cancel()
+        mine = [t for t in tasks if loop is not None and t.get_loop() is loop]
+        if mine:
+            await asyncio.gather(*mine, return_exceptions=True)
+        await self._pool.aclose()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2131,7 +3516,17 @@ def _default_provider_payload(gemini_key: str = "") -> dict[str, Any]:
     openrouter_key = os.getenv("ORION_OPENROUTER_API_KEY", "").strip()
     groq_key = os.getenv("ORION_GROQ_API_KEY", "").strip()
     together_key = os.getenv("ORION_TOGETHER_API_KEY", "").strip()
-    anthropic_key = os.getenv("ORION_ANTHROPIC_API_KEY", "").strip()
+    mistral_key = os.getenv("ORION_MISTRAL_API_KEY", "").strip()
+    huggingface_key = os.getenv("ORION_HUGGINGFACE_API_KEY", "").strip()
+    nvidia_key = os.getenv("ORION_NVIDIA_API_KEY", "").strip()
+    deepseek_key = os.getenv("ORION_DEEPSEEK_API_KEY", "").strip()
+    cloudflare_key = os.getenv("ORION_CLOUDFLARE_API_TOKEN", "").strip()
+    cloudflare_account = os.getenv("ORION_CLOUDFLARE_ACCOUNT_ID", "").strip()
+    cloudflare_ready = bool(cloudflare_key and re.fullmatch(r"[0-9a-fA-F]{32}", cloudflare_account))
+    cloudflare_url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{cloudflare_account}/ai/v1"
+        if cloudflare_ready else ""
+    )
     xai_key = os.getenv("ORION_XAI_API_KEY", "").strip()
     thoughts_key = os.getenv("ORION_THOUGHTS_API_KEY", "").strip()
     local_url = os.getenv("ORION_LOCAL_OPENAI_BASE_URL", "").strip()
@@ -2159,15 +3554,22 @@ def _default_provider_payload(gemini_key: str = "") -> dict[str, Any]:
         #   · Tier 2 fallback: strictly-bounded local hardware, ALWAYS last.
         "provider_order": [
             "gemini",
-            "gemini_text",      # the same Gemini key, for text work
-            "anthropic",
+            "gemini_text",      # quick, high-throughput text work
+            "gemini_reasoning", # longer, more demanding text work
+            "gemma_4_31b",      # native Gemini API, not OpenAI chat
+            "gemma_4_26b",      # smaller hosted Gemma 4 fallback
+            "cloudflare",       # low-cost Workers AI with a daily free allowance
             "openai",
             "xai_grok",
             "cerebras",         # ultra-fast inference (Cerebras wafer-scale)
             "sambanova",        # ultra-fast inference (SambaNova RDU)
             "openrouter",
             "groq",
+            "mistral",
+            "huggingface",
+            "nvidia",
             "together",
+            "deepseek",
             "thoughts",
             "runpod",           # Tier 1: serverless rented GPU
             "vast_ai",          # Tier 1: peer-to-peer rented GPU
@@ -2197,23 +3599,54 @@ def _default_provider_payload(gemini_key: str = "") -> dict[str, Any]:
                 "kind": "openai_compatible",
                 "enabled": bool(gemini_key),
                 "api_key": gemini_key,
-                "model": "gemini-2.5-flash",
-                "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite",
-                           "gemini-flash-latest"],
+                "model": _GEMINI_TEXT_MODELS[0],
+                "models": list(_GEMINI_TEXT_MODELS),
                 "base_url": GEMINI_OPENAI_BASE,
                 "priority": 12,
                 "timeout_s": 90.0,
-                "strengths": ["reasoning", "writing", "coding", "general"],
+                "strengths": ["fast", "general"],
             },
-            "anthropic": {
+            "gemini_reasoning": {
                 "kind": "openai_compatible",
-                "enabled": bool(anthropic_key),
-                "api_key": anthropic_key,
-                "model": "claude-sonnet-5",
-                "base_url": "https://api.anthropic.com/v1",
+                "enabled": bool(gemini_key),
+                "api_key": gemini_key,
+                "model": _GEMINI_REASONING_MODELS[0],
+                "models": list(_GEMINI_REASONING_MODELS),
+                "base_url": GEMINI_OPENAI_BASE,
+                "priority": 13,
+                "timeout_s": 90.0,
+                "strengths": ["reasoning", "writing", "coding"],
+            },
+            "gemma_4_31b": {
+                "kind": "gemma_native",
+                "enabled": bool(gemini_key),
+                "api_key": gemini_key,
+                "model": "gemma-4-31b-it",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                "priority": 14,
+                "timeout_s": 90.0,
+                "strengths": ["reasoning", "writing", "coding"],
+            },
+            "gemma_4_26b": {
+                "kind": "gemma_native",
+                "enabled": bool(gemini_key),
+                "api_key": gemini_key,
+                "model": "gemma-4-26b-a4b-it",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
                 "priority": 15,
+                "timeout_s": 90.0,
+                "strengths": ["fast", "general"],
+            },
+            "cloudflare": {
+                "kind": "openai_compatible",
+                "enabled": cloudflare_ready,
+                "api_key": cloudflare_key,
+                "model": os.getenv("ORION_CLOUDFLARE_MODEL", "").strip()
+                         or "@cf/google/gemma-4-26b-a4b-it",
+                "base_url": cloudflare_url,
+                "priority": 16,
                 "timeout_s": 45.0,
-                "strengths": ["coding", "reasoning", "writing"],
+                "strengths": ["fast", "general", "reasoning"],
             },
             "xai_grok": {
                 "kind": "openai_compatible",
@@ -2259,13 +3692,62 @@ def _default_provider_payload(gemini_key: str = "") -> dict[str, Any]:
                 "kind": "openai_compatible",
                 "enabled": bool(together_key),
                 "api_key": together_key,
-                "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-                "base_url": "https://api.together.xyz/v1",
+                "model": os.getenv("ORION_TOGETHER_MODEL", "").strip() or "Qwen/Qwen3.5-9B",
+                "base_url": "https://api.together.ai/v1",
                 "priority": 50,
                 "timeout_s": 30.0,
                 "strengths": ["fast"],
             },
-            # ── Cerebras Cloud — wafer-scale, the fastest tokens/sec available.
+            # Free-mode access is rate-limited by the Mistral workspace.
+            "mistral": {
+                "kind": "openai_compatible",
+                "enabled": bool(mistral_key),
+                "api_key": mistral_key,
+                "model": os.getenv("ORION_MISTRAL_MODEL", "").strip() or "mistral-small-latest",
+                "base_url": "https://api.mistral.ai/v1",
+                "priority": 34,
+                "timeout_s": 45.0,
+                "strengths": ["general", "writing", "reasoning"],
+            },
+            # Hugging Face routes chat completions to an inference provider.
+            # Its :cheapest policy selects the lowest listed output-token rate;
+            # the account's monthly free credit is finite.
+            "huggingface": {
+                "kind": "openai_compatible",
+                "enabled": bool(huggingface_key),
+                "api_key": huggingface_key,
+                "model": os.getenv("ORION_HUGGINGFACE_MODEL", "").strip()
+                         or "openai/gpt-oss-120b:cheapest",
+                "base_url": "https://router.huggingface.co/v1",
+                "priority": 35,
+                "timeout_s": 45.0,
+                "strengths": ["general", "reasoning"],
+            },
+            # NVIDIA's hosted NIM endpoints provide development access.
+            "nvidia": {
+                "kind": "openai_compatible",
+                "enabled": bool(nvidia_key),
+                "api_key": nvidia_key,
+                "model": os.getenv("ORION_NVIDIA_MODEL", "").strip()
+                         or "meta/llama-3.3-70b-instruct",
+                "base_url": "https://integrate.api.nvidia.com/v1",
+                "priority": 36,
+                "timeout_s": 45.0,
+                "strengths": ["reasoning", "writing"],
+            },
+            # Paid usage is opt-in. This gives ORION a low-cost hosted fallback
+            # once its free allowances have run out.
+            "deepseek": {
+                "kind": "openai_compatible",
+                "enabled": bool(deepseek_key),
+                "api_key": deepseek_key,
+                "model": os.getenv("ORION_DEEPSEEK_MODEL", "").strip() or "deepseek-flash",
+                "base_url": "https://api.deepseek.com",
+                "priority": 55,
+                "timeout_s": 60.0,
+                "strengths": ["reasoning", "coding", "general"],
+            },
+            # ── Cerebras Cloud — hosted inference with a compatible API.
             # Its public API is OpenAI-compatible (the cerebras_cloud_sdk is a
             # thin wrapper over this same endpoint), so it needs no extra
             # dependency and inherits ORION's fallback, budgeting and ledgering.
@@ -2273,7 +3755,7 @@ def _default_provider_payload(gemini_key: str = "") -> dict[str, Any]:
                 "kind": "openai_compatible",
                 "enabled": bool(cerebras_key),
                 "api_key": cerebras_key,
-                "model": os.getenv("ORION_CEREBRAS_MODEL", "").strip() or "llama-3.3-70b",
+                "model": os.getenv("ORION_CEREBRAS_MODEL", "").strip() or "gpt-oss-120b",
                 "base_url": "https://api.cerebras.ai/v1",
                 "priority": 28,
                 "timeout_s": 24.0,
@@ -2362,7 +3844,9 @@ def _default_provider_payload(gemini_key: str = "") -> dict[str, Any]:
                 "api_key": "local",
                 # Tier-2 hard fallback. Default target is qwen2.5:7b — a strong
                 # 7B that fits a 16GB-RAM machine when paired with the bounded
-                # LOCAL_NUM_CTX and keep_alive=0 unload (see _openai_compatible_chat).
+                # LOCAL_NUM_CTX and the residency policy (LOCAL_KEEP_ALIVE_S,
+                # released early under memory pressure), both applied through
+                # Ollama's native API (see _chat_attempt).
                 "model": os.getenv("ORION_OLLAMA_MODEL", "").strip() or "qwen2.5:7b",
                 "base_url": "http://127.0.0.1:11434/v1",
                 "priority": 90,
@@ -2374,7 +3858,7 @@ def _default_provider_payload(gemini_key: str = "") -> dict[str, Any]:
         "notes": [
             "Gemini is used for native realtime voice.",
             "OpenAI-compatible providers are used as text fallbacks when Gemini Live is unavailable.",
-            "Anthropic (Claude) and xAI (Grok) are reached through their OpenAI-compatible chat endpoints.",
+            "xAI (Grok) is reached through its OpenAI-compatible chat endpoint.",
             "The 'strengths' list steers task routing: coding, reasoning, live_information, fast, local, general.",
             "Enable local_lm_studio or local_ollama after starting a compatible local server.",
             "integrations.notion: add your integration token and database IDs for tasks/calendar/projects.",
@@ -2423,12 +3907,104 @@ def _profile_to_config(profile: AIProviderProfile) -> dict[str, Any]:
     }
 
 
+_PROVIDER_CONFIG_LOCK = threading.RLock()
+_PROVIDER_CONFIG_MAX_BYTES = 8 * 1024 * 1024
+_PROVIDER_CONFIG_SCHEMA = "orion.mark_viii.providers.v1"
+_PROVIDER_CONFIG_REPAIR = (
+    "Provider settings are unavailable. Restore or repair api_keys.json; "
+    "the saved file has been preserved and no default providers were enabled."
+)
+
+
+def _read_provider_document(path: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Read bounded, unambiguous saved policy; None is a genuinely missing file."""
+    try:
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read(_PROVIDER_CONFIG_MAX_BYTES + 1)
+            after = os.fstat(stream.fileno())
+        current = path.stat()
+    except FileNotFoundError:
+        # A file disappearing after open is a changed read, not first run.
+        if "before" in locals():
+            raise ProviderConfigurationError(_PROVIDER_CONFIG_REPAIR) from None
+        return None, None
+    except (OSError, UnicodeError) as exc:
+        raise ProviderConfigurationError(_PROVIDER_CONFIG_REPAIR) from exc
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    if (len(raw) > _PROVIDER_CONFIG_MAX_BYTES or len(raw) != before.st_size
+            or identity(before) != identity(after) or identity(after) != identity(current)):
+        raise ProviderConfigurationError(_PROVIDER_CONFIG_REPAIR)
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate policy field")
+            result[key] = value
+        return result
+
+    try:
+        data = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=unique,
+                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite value")))
+        if not isinstance(data, dict) or data.get("schema", _PROVIDER_CONFIG_SCHEMA) != _PROVIDER_CONFIG_SCHEMA:
+            raise ValueError("unsupported provider policy")
+        for key in ("providers", "integrations"):
+            if key in data and not isinstance(data[key], dict):
+                raise ValueError("invalid policy mapping")
+        if "provider_order" in data and (not isinstance(data["provider_order"], list)
+                or any(not isinstance(item, str) for item in data["provider_order"])):
+            raise ValueError("invalid provider order")
+        for raw_profile in data.get("providers", {}).values():
+            if not isinstance(raw_profile, dict):
+                raise ValueError("invalid provider record")
+            if "enabled" in raw_profile and type(raw_profile["enabled"]) is not bool:
+                raise ValueError("invalid provider enablement")
+            for key in ("kind", "model", "api_key", "base_url"):
+                if key in raw_profile and not isinstance(raw_profile[key], str):
+                    raise ValueError("invalid provider text field")
+            for key in ("strengths", "api_keys", "models"):
+                if key in raw_profile and (not isinstance(raw_profile[key], list)
+                        or any(not isinstance(item, str) for item in raw_profile[key])):
+                    raise ValueError("invalid provider list")
+            for key in ("priority", "budget_tokens", "timeout_s"):
+                if key in raw_profile and not math.isfinite(float(raw_profile[key])):
+                    raise ValueError("nonfinite provider number")
+        # Mark XXXX.3: credentials on disk are sealed to the Windows account
+        # (key_seal.py); everything above this line sees them as stored.
+        return key_seal.open_tree(data), hashlib.sha256(raw).hexdigest()
+    except (ValueError, UnicodeError, RecursionError, TypeError) as exc:
+        raise ProviderConfigurationError(_PROVIDER_CONFIG_REPAIR) from exc
+
+
+def _publish_provider_document(payload: dict[str, Any], observed: str | None) -> str:
+    """Process-serialized observed-change guard, not an interprocess CAS."""
+    saved, current = _read_provider_document(API_CONFIG_PATH)
+    if current != observed:
+        raise ProviderConfigurationError("Provider settings changed on disk. Reload them before saving.")
+    if saved == payload:
+        return current
+    try:
+        on_disk = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        on_disk = None
+    rendered = json.dumps(key_seal.seal_tree(key_seal.keep_unopenable(payload, on_disk)),
+                          indent=4)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(API_CONFIG_PATH, rendered, encoding="utf-8")
+    published, fingerprint = _read_provider_document(API_CONFIG_PATH)
+    if published != payload:
+        raise ProviderConfigurationError("Provider settings changed while saving. Reload them before saving again.")
+    return fingerprint
+
+
 def _rescue_api_config() -> None:
     """api_keys.json has gone missing from the canonical path before while a
     stray copy survived elsewhere (a legacy build wrote under config/config/).
     Losing the file silently drops every configured provider, so if the
     canonical file is absent restore it from the newest rescue copy found."""
-    if API_CONFIG_PATH.exists():
+    canonical, _ = _read_provider_document(API_CONFIG_PATH)
+    if canonical is not None:
         return
     candidates = (
         CONFIG_DIR / "config" / "api_keys.json",
@@ -2436,7 +4012,7 @@ def _rescue_api_config() -> None:
     )
     for candidate in candidates:
         try:
-            data = json.loads(candidate.read_text(encoding="utf-8"))
+            data, _ = _read_provider_document(candidate)
         except Exception:
             continue
         if not (isinstance(data, dict) and data.get("providers")):
@@ -2450,30 +4026,57 @@ def _rescue_api_config() -> None:
         if not has_key:
             continue
         try:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(API_CONFIG_PATH, json.dumps(data, indent=4), encoding="utf-8")
+            with _PROVIDER_CONFIG_LOCK:
+                _publish_provider_document(data, None)
             return
         except Exception:
             continue
 
 
+#: How long an alternate that answered after a server error stays first.
+STICKY_MODEL_S = 6 * 3600
+STICKY_MODELS_PATH = CONFIG_DIR / "diagnostics" / "sticky_models.json"
+
+
+def _read_sticky_models() -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(STICKY_MODELS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    return {name: entry for name, entry in (data.items() if isinstance(data, dict) else ())
+            if isinstance(entry, dict) and float(entry.get("until") or 0) > now}
+
+
+def _seal_plain_keys() -> None:
+    """A key pasted into api_keys.json in plain text is sealed on the next
+    read (key_seal.py). A file that cannot be parsed is left for the read to
+    report; a sealing failure leaves the file exactly as it was."""
+    try:
+        key_seal.seal_file_in_place(API_CONFIG_PATH, indent=4)
+    except Exception:
+        pass
+
+
 def read_provider_settings() -> OrionProviderSettings:
-    _rescue_api_config()
-    payload = _default_provider_payload()
-    if API_CONFIG_PATH.exists():
+    with _PROVIDER_CONFIG_LOCK:
         try:
-            existing = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                # Legacy Mark VI migration: {"gemini_api_key": "..."}
-                legacy_key = str(existing.get("gemini_api_key") or "").strip()
-                if legacy_key and "providers" not in existing:
-                    payload = _default_provider_payload(legacy_key)
-                    write_provider_settings(_settings_from_payload(payload))
-                else:
-                    payload = _merge_provider_payload(payload, existing)
-        except Exception:
-            payload = _default_provider_payload()
-    return _settings_from_payload(payload)
+            _rescue_api_config()
+            _seal_plain_keys()
+            existing, observed = _read_provider_document(API_CONFIG_PATH)
+            legacy_key = str((existing or {}).get("gemini_api_key") or "").strip()
+            payload = _default_provider_payload(legacy_key) if legacy_key else _default_provider_payload()
+            if existing is not None:
+                payload = _merge_provider_payload(payload, existing)
+            settings = _settings_from_payload(payload)
+        except (ProviderConfigurationError, ValueError, TypeError, OverflowError, AttributeError):
+            # An uncertain saved policy is not permission to enable defaults,
+            # open a replacement-key dialog or write over retained credentials.
+            return OrionProviderSettings("", [], {}, configuration_error=_PROVIDER_CONFIG_REPAIR)
+        settings._source_observed = True
+        settings._source_path = str(API_CONFIG_PATH.absolute())
+        settings._source_sha256 = observed
+        return settings
 
 
 def _merge_provider_payload(defaults: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
@@ -2504,6 +4107,44 @@ def _merge_provider_payload(defaults: dict[str, Any], existing: dict[str, Any]) 
             base = dict(providers.get(name, {}))
             base.update(raw)
             providers[name] = base
+    # Startup persists disabled defaults for every hosted provider. A key
+    # added to the launch environment later must activate a profile that has
+    # no saved credential. A saved credential (including an explicitly
+    # disabled profile) remains authoritative.
+    for name in (
+        "gemini", "gemini_text", "gemini_reasoning", "gemma_4_31b", "gemma_4_26b",
+        "cloudflare", "openai", "xai_grok", "cerebras",
+        "sambanova", "openrouter", "groq", "mistral", "huggingface",
+        "nvidia", "together", "deepseek", "thoughts",
+    ):
+        default_profile = (defaults.get("providers") or {}).get(name)
+        saved_profile = (existing.get("providers") or {}).get(name)
+        if (isinstance(default_profile, dict) and default_profile.get("enabled")
+                and isinstance(saved_profile, dict)
+                and not str(saved_profile.get("api_key") or "").strip()):
+            providers[name]["api_key"] = default_profile["api_key"]
+            providers[name]["enabled"] = True
+            if not str(saved_profile.get("base_url") or "").strip():
+                providers[name]["base_url"] = default_profile["base_url"]
+    # Migrate only shipped defaults.  A user's chosen primary, alternate list
+    # or strengths must remain their choice.  Flash-Lite leads routine work;
+    # the separately routed reasoning profile leads demanding turns.
+    text_saved = (existing.get("providers") or {}).get("gemini_text")
+    shipped_text = (isinstance(text_saved, dict)
+                    and tuple(text_saved.get("models") or ()) in {
+                        _FORMER_GEMINI_TEXT_MODELS, _PREVIOUS_GEMINI_TEXT_MODELS,
+                        _GEMINI_TEXT_MODELS,
+                    }
+                    and str(text_saved.get("model") or "") in {
+                        "gemini-2.5-flash", _GEMINI_TEXT_MODELS[0],
+                    })
+    if shipped_text:
+        providers["gemini_text"]["models"] = list(_GEMINI_TEXT_MODELS)
+        if str(text_saved.get("model") or "") == "gemini-2.5-flash":
+            providers["gemini_text"]["model"] = _GEMINI_TEXT_MODELS[0]
+        if tuple(text_saved.get("strengths") or ()) == (
+                "reasoning", "writing", "coding", "general"):
+            providers["gemini_text"]["strengths"] = ["fast", "general"]
     legacy_key = str(existing.get("gemini_api_key") or "").strip()
     if legacy_key:
         providers.setdefault("gemini", {})["api_key"] = legacy_key
@@ -2517,6 +4158,30 @@ def _merge_provider_payload(defaults: dict[str, Any], existing: dict[str, Any]) 
         text["api_key"] = live_key
         if not isinstance(saved_text, dict):
             text["enabled"] = True
+    # A new reasoning profile shares the already-configured Gemini key.  An
+    # explicitly saved profile, including a disabled one, is never rewritten.
+    saved_reasoning = (existing.get("providers") or {}).get("gemini_reasoning")
+    reasoning = providers.get("gemini_reasoning")
+    if (isinstance(reasoning, dict) and not isinstance(saved_reasoning, dict)
+            and isinstance(text, dict)):
+        reasoning["api_key"] = str(text.get("api_key") or live_key)
+        reasoning["enabled"] = (bool(text.get("enabled"))
+                                and bool(reasoning["api_key"])
+                                and (not isinstance(saved_text, dict) or shipped_text))
+    # Hosted Gemma uses the same Gemini key through a different native API.
+    # A custom text profile remains authoritative until the owner explicitly
+    # enables the new Gemma profiles; saved Gemma choices also remain intact.
+    for gemma_name in ("gemma_4_31b", "gemma_4_26b"):
+        saved_gemma = (existing.get("providers") or {}).get(gemma_name)
+        gemma = providers.get(gemma_name)
+        if not isinstance(gemma, dict):
+            continue
+        if not str(gemma.get("api_key") or "").strip():
+            gemma["api_key"] = str((text or {}).get("api_key") or live_key)
+        if not isinstance(saved_gemma, dict):
+            gemma["enabled"] = (bool((text or {}).get("enabled"))
+                                and bool(gemma["api_key"])
+                                and (not isinstance(saved_text, dict) or shipped_text))
     # Retired shipped defaults (the model no longer exists at the provider).
     for name, retired in RETIRED_DEFAULTS.items():
         entry = providers.get(name)
@@ -2555,15 +4220,27 @@ def _settings_from_payload(payload: dict[str, Any]) -> OrionProviderSettings:
 
 
 def write_provider_settings(settings: OrionProviderSettings) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema": "orion.mark_viii.providers.v1",
-        "active_provider": settings.active_provider,
-        "provider_order": settings.provider_order,
-        "providers": {name: _profile_to_config(profile) for name, profile in settings.providers.items()},
-        "integrations": settings.integrations or _default_integrations_payload(),
-    }
-    atomic_write_text(API_CONFIG_PATH, json.dumps(payload, indent=4), encoding="utf-8")
+    if settings.configuration_error:
+        raise ProviderConfigurationError(_PROVIDER_CONFIG_REPAIR)
+    with _PROVIDER_CONFIG_LOCK:
+        existing, observed = _read_provider_document(API_CONFIG_PATH)
+        if settings._source_observed and (settings._source_path != str(API_CONFIG_PATH.absolute())
+                or settings._source_sha256 != observed):
+            raise ProviderConfigurationError("Provider settings changed on disk. Reload them before saving.")
+        # Retain extensions we do not interpret, including provider-specific
+        # options used by other integrations. Only known fields are replaced.
+        payload = dict(existing or {})
+        profiles = dict(payload.get("providers") or {})
+        for name, profile in settings.providers.items():
+            raw = dict(profiles.get(name) or {})
+            raw.update(_profile_to_config(profile))
+            profiles[name] = raw
+        payload.update(schema=_PROVIDER_CONFIG_SCHEMA, active_provider=settings.active_provider,
+                       provider_order=settings.provider_order, providers=profiles,
+                       integrations=settings.integrations)
+        settings._source_sha256 = _publish_provider_document(payload, observed)
+        settings._source_path = str(API_CONFIG_PATH.absolute())
+        settings._source_observed = True
 
 
 def read_api_key() -> str:
@@ -2574,6 +4251,27 @@ def read_api_key() -> str:
 
 
 def write_api_key(api_key: str) -> None:
-    """Legacy writer retained; writes the Mark VIII provider schema."""
-    settings = _settings_from_payload(_default_provider_payload(api_key))
+    """Set the live key without resetting other saved providers/integrations."""
+    settings = read_provider_settings()
+    if settings.configuration_error:
+        raise ProviderConfigurationError(_PROVIDER_CONFIG_REPAIR)
+    if settings._source_sha256 is None:
+        first_run = _settings_from_payload(_default_provider_payload(api_key))
+        first_run._source_observed = settings._source_observed
+        first_run._source_path = settings._source_path
+        first_run._source_sha256 = settings._source_sha256
+        write_provider_settings(first_run)
+        return
+    live = settings.providers.get("gemini")
+    previous = live.api_key if live is not None else ""
+    if live is None:
+        live = _settings_from_payload(_default_provider_payload(api_key)).providers.get("gemini")
+        if live is None:
+            raise ProviderConfigurationError("The Gemini provider profile is unavailable; repair api_keys.json before saving a key.")
+        settings.providers["gemini"] = live
+    live.api_key, live.enabled = str(api_key).strip(), True
+    for name in ("gemini_text", "gemini_reasoning", "gemma_4_31b", "gemma_4_26b"):
+        profile = settings.providers.get(name)
+        if profile is not None and (not profile.api_key or previous and profile.api_key == previous):
+            profile.api_key = live.api_key
     write_provider_settings(settings)

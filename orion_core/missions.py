@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -87,17 +88,38 @@ class MissionEngine:
         except Exception:
             return {}
 
+    def _load_for_write(self) -> dict[str, Any] | ToolResult:
+        """A failed read must never become an empty board to overwrite."""
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            return ToolResult("Mission storage could not be read. No changes were saved.", ok=False)
+        if (not isinstance(data, dict) or not isinstance(data.get("missions"), dict)
+                or any(not isinstance(record, dict)
+                       or any(bucket in record and not isinstance(record[bucket], list)
+                              for bucket in ("tasks", "goals", "notes", "files", "research",
+                                             "reports", "workflows", "agents"))
+                       or any(not isinstance(item, dict)
+                              for bucket in ("tasks", "goals") for item in record.get(bucket, []))
+                       for record in data["missions"].values())):
+            return ToolResult("Mission storage is invalid. No changes were saved.", ok=False)
+        return data
+
     def _save(self, data: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(self.path, json.dumps(data, indent=2), encoding="utf-8")
 
     def _seed(self) -> None:
         with self._lock:
-            data = self.load()
-            if data.get("missions"):
+            # An existing board belongs to the operator, including an empty
+            # one. Truth-testing its missions resurrected every starter after
+            # the last mission was deleted. Also leave unreadable/malformed
+            # files intact so startup cannot overwrite recoverable history.
+            if self.path.exists():
                 return
             starters = user_profile.missions()
-            current = next((name for name, _ in starters if name == "Develop ORION"), starters[0][0])
+            current = next((name for name, _ in starters if name == "Develop ORION"),
+                           starters[0][0] if starters else "")
             data = {"current": current, "missions": {}}
             for name, brief in starters:
                 data["missions"][name] = self._blank(name, brief)
@@ -114,16 +136,21 @@ class MissionEngine:
 
     # ── mutation helpers ──────────────────────────────────────────────────────
 
-    def _with_mission(self, name: str, mutate: Any) -> dict[str, Any] | None:
+    def _with_mission(self, name: str, mutate: Any) -> dict[str, Any] | ToolResult | None:
         """Run *mutate(record)* under the lock; returns the record or None."""
         name = str(name or "").strip()
         with self._lock:
-            data = self.load()
+            data = self._load_for_write()
+            if isinstance(data, ToolResult):
+                return data
             missions = data.setdefault("missions", {})
             record = self._resolve(missions, name)
             if record is None:
                 return None
+            previous = deepcopy(record)
             mutate(record)
+            if record == previous:
+                return record
             record["updated_at"] = utc_stamp()
             self._save(data)
         if self.bus is not None:
@@ -133,15 +160,21 @@ class MissionEngine:
 
     @staticmethod
     def _resolve(missions: dict[str, Any], name: str) -> dict[str, Any] | None:
+        name = str(name or "").strip()
         if not name:
             return None
         if name in missions:
             return missions[name]
-        lowered = name.lower()
-        for key, record in missions.items():
-            if lowered in key.lower():
-                return record
-        return None
+        lowered = name.casefold()
+        exact = [record for key, record in missions.items()
+                 if lowered == key.casefold()]
+        if exact:
+            return exact[0] if len(exact) == 1 else None
+        matches = [record for key, record in missions.items()
+                   if lowered in key.casefold()]
+        # A shorthand must identify one mission. Insertion order is never
+        # sufficient evidence for deleting or changing a similarly named one.
+        return matches[0] if len(matches) == 1 else None
 
     # ── the operating surface ─────────────────────────────────────────────────
 
@@ -152,10 +185,15 @@ class MissionEngine:
 
     def set_current(self, name: str) -> ToolResult:
         with self._lock:
-            data = self.load()
+            data = self._load_for_write()
+            if isinstance(data, ToolResult):
+                return data
             record = self._resolve(data.get("missions") or {}, str(name or ""))
             if record is None:
                 return ToolResult(f"No mission matching '{name}'.", ok=False)
+            if record.get("status") == "archived":
+                return ToolResult(f"Mission '{record['name']}' is archived and cannot "
+                                  "be the current mission.", ok=False)
             data["current"] = record["name"]
             self._save(data)
         if self.bus is not None:
@@ -168,30 +206,45 @@ class MissionEngine:
         if not name:
             return ToolResult("Every mission needs a name.", ok=False)
         with self._lock:
-            data = self.load()
+            data = self._load_for_write()
+            if isinstance(data, ToolResult):
+                return data
             missions = data.setdefault("missions", {})
             if name in missions:
                 return ToolResult(f"Mission '{name}' already exists.", ok=False)
             missions[name] = self._blank(name, str(brief or "")[:300])
+            if not data.get("current"):
+                data["current"] = name
             self._save(data)
+        if self.bus is not None:
+            self.bus.dashboard_event.emit("mission", {"name": name,
+                                                      "status": "created"})
         return ToolResult(f"Mission '{name}' is on the board.")
 
     def add_goal(self, mission: str, goal: str) -> ToolResult:
         goal = str(goal or "").strip()[:200]
+        if not goal:
+            return ToolResult("Mission or goal missing.", ok=False)
         record = self._with_mission(
             mission, lambda r: r["goals"].append(
                 {"goal": goal, "done": False, "at": utc_stamp()}))
-        if record is None or not goal:
+        if isinstance(record, ToolResult):
+            return record
+        if record is None:
             return ToolResult("Mission or goal missing.", ok=False)
         return ToolResult(f"Goal added to {record['name']}: {goal}")
 
     def add_task(self, mission: str, task: str, due: str = "") -> ToolResult:
         task = str(task or "").strip()[:200]
+        if not task:
+            return ToolResult("Mission or task missing.", ok=False)
         record = self._with_mission(
             mission, lambda r: r["tasks"].append(
                 {"task": task, "done": False, "due": str(due or ""),
                  "at": utc_stamp()}))
-        if record is None or not task:
+        if isinstance(record, ToolResult):
+            return record
+        if record is None:
             return ToolResult("Mission or task missing.", ok=False)
         return ToolResult(f"Task logged against {record['name']}: {task}")
 
@@ -211,6 +264,8 @@ class MissionEngine:
                         return
 
         record = self._with_mission(mission, mutate)
+        if isinstance(record, ToolResult):
+            return record
         if record is None:
             return ToolResult(f"No mission matching '{mission}'.", ok=False)
         if not hit:
@@ -259,6 +314,8 @@ class MissionEngine:
                         return
 
         record = self._with_mission(mission, mutate)
+        if isinstance(record, ToolResult):
+            return record
         if record is None:
             return ToolResult(f"No mission matching '{mission}'.", ok=False)
         if not removed:
@@ -276,10 +333,17 @@ class MissionEngine:
         if not wanted:
             return ToolResult("Name the mission to delete.", ok=False)
         with self._lock:
-            data = self.load()
+            data = self._load_for_write()
+            if isinstance(data, ToolResult):
+                return data
             missions = data.setdefault("missions", {})
             record = self._resolve(missions, wanted)
             if record is None:
+                matches = [key for key in missions if wanted.casefold() in key.casefold()]
+                if len(matches) > 1:
+                    return ToolResult(
+                        f"More than one mission matches '{name}'. Use the full name: "
+                        + "; ".join(matches) + ".", ok=False)
                 return ToolResult(f"No mission matching '{name}'.", ok=False)
             real = record["name"]
             key = next((k for k, v in missions.items() if v is record), real)
@@ -288,7 +352,8 @@ class MissionEngine:
             missions.pop(key, None)
             if str(data.get("current") or "") in (key, real):
                 # Never leave the board pointing at something that is gone.
-                data["current"] = next(iter(missions), "")
+                data["current"] = next((k for k, v in missions.items()
+                                        if v.get("status") != "archived"), "")
             self._save(data)
         if self.bus is not None:
             self.bus.dashboard_event.emit("mission", {"name": real,
@@ -296,25 +361,50 @@ class MissionEngine:
         carried = f" It carried {goals} goal(s) and {tasks} task(s)." if (goals or tasks) else ""
         return ToolResult(f"Deleted the {real} mission.{carried}")
 
+    def clear_all(self) -> ToolResult:
+        """Remove every mission, keeping an explicitly empty durable board."""
+        with self._lock:
+            data = self._load_for_write()
+            if isinstance(data, ToolResult):
+                return ToolResult(data.text + " No missions were deleted.", ok=False)
+            missions = data["missions"]
+            count = len(missions)
+            tasks = sum(len(record.get("tasks") or []) for record in missions.values())
+            goals = sum(len(record.get("goals") or []) for record in missions.values())
+            data["missions"] = {}
+            data["current"] = ""
+            self._save(data)
+        if self.bus is not None:
+            self.bus.dashboard_event.emit("mission", {"name": "*",
+                                                      "status": "deleted"})
+        if not count:
+            return ToolResult("No missions on the board to delete.")
+        return ToolResult(f"Deleted all {count} mission(s). "
+                          f"They carried {goals} goal(s) and {tasks} task(s).")
+
     def archive(self, name: str) -> ToolResult:
         """Take a mission off the active board without destroying it.
 
         The gentler option, and the right default for "I'm finished with this":
         the record and its history survive, it simply stops occupying the deck.
         """
-        def mutate(record: dict[str, Any]) -> None:
-            record["status"] = "archived"
-
-        record = self._with_mission(name, mutate)
-        if record is None:
-            return ToolResult(f"No mission matching '{name}'.", ok=False)
         with self._lock:
-            data = self.load()
+            data = self._load_for_write()
+            if isinstance(data, ToolResult):
+                return data
+            record = self._resolve(data.get("missions") or {}, str(name or ""))
+            if record is None:
+                return ToolResult(f"No mission matching '{name}'.", ok=False)
+            record["status"] = "archived"
+            record["updated_at"] = utc_stamp()
             if str(data.get("current") or "") == record["name"]:
                 active = [k for k, v in (data.get("missions") or {}).items()
                           if v.get("status") != "archived"]
                 data["current"] = active[0] if active else ""
-                self._save(data)
+            self._save(data)
+        if self.bus is not None:
+            self.bus.dashboard_event.emit("mission", {"name": record["name"],
+                                                      "status": "archived"})
         return ToolResult(f"Archived {record['name']} — it is off the board but "
                           "nothing was lost.")
 
@@ -333,17 +423,24 @@ class MissionEngine:
 
         if mission.strip():
             record = self._with_mission(mission, sweep)
+            if isinstance(record, ToolResult):
+                return record
             if record is None:
                 return ToolResult(f"No mission matching '{mission}'.", ok=False)
             where = record["name"]
         else:
             with self._lock:
-                data = self.load()
+                data = self._load_for_write()
+                if isinstance(data, ToolResult):
+                    return data
                 for record in (data.get("missions") or {}).values():
+                    before_sweep = swept["n"]
                     sweep(record)
-                    record["updated_at"] = utc_stamp()
-                self._save(data)
-            if self.bus is not None:
+                    if swept["n"] != before_sweep:
+                        record["updated_at"] = utc_stamp()
+                if swept["n"]:
+                    self._save(data)
+            if self.bus is not None and swept["n"]:
                 self.bus.dashboard_event.emit("mission", {"name": "*",
                                                           "status": "updated"})
             where = "the whole board"
@@ -386,6 +483,8 @@ class MissionEngine:
                 "plus the value.", ok=False)
         record = self._with_mission(
             mission, lambda r: r[kind].append({"value": value, "at": utc_stamp()}))
+        if isinstance(record, ToolResult):
+            return record
         if record is None:
             return ToolResult(f"No mission matching '{mission}'.", ok=False)
         # Research attachments can go straight onto the research agenda.
@@ -451,7 +550,8 @@ class MissionEngine:
 
     def overview(self) -> ToolResult:
         data = self.load()
-        missions = data.get("missions") or {}
+        missions = {name: record for name, record in (data.get("missions") or {}).items()
+                    if record.get("status") != "archived"}
         if not missions:
             return ToolResult("No missions on the board yet.")
         current = str(data.get("current") or "")
@@ -514,7 +614,8 @@ class MissionEngine:
                                   if not t.get("done")),
                 "risks": self.risks(record),
                 "recommendation": (self.recommendations(record) or [""])[0],
-            } for name, record in missions.items()],
+            } for name, record in missions.items()
+              if record.get("status") != "archived"],
         }
 
     async def handle(self, args: dict[str, Any]) -> ToolResult:
@@ -552,6 +653,8 @@ class MissionEngine:
             return self.remove_item(name, text, str(args.get("kind") or ""))
         if action in {"delete_mission", "remove_mission"}:
             return self.delete(name or text)
+        if action in {"clear_all", "delete_all", "remove_all"}:
+            return self.clear_all()
         if action in {"archive", "shelve", "retire"}:
             return self.archive(name or text)
         if action in {"clear_completed", "sweep", "tidy"}:
@@ -559,7 +662,7 @@ class MissionEngine:
         return ToolResult(
             "Unsupported mission action. Use overview, status, current, "
             "create, goal, task, complete, attach, remove, delete, archive "
-            "or clear_completed.", ok=False)
+            "or clear_completed. Use clear_all to delete every mission.", ok=False)
 
 
 __all__ = ["DEFAULT_MISSIONS", "MissionEngine"]

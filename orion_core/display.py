@@ -37,7 +37,9 @@ from __future__ import annotations
 import json
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any, Optional
 
 from .constants import CONFIG_DIR
@@ -45,6 +47,43 @@ from .data import ToolResult
 from .atomic_io import atomic_write_text
 
 _DISPLAY_NAMES_PATH = CONFIG_DIR / "display_names.json"
+
+
+@contextmanager
+def _physical_pixel_context():
+    """Temporarily use physical pixels on a reused native worker thread.
+
+    Qt or an input library may already have set the process DPI policy before
+    display construction. Windows lets each worker override that policy and
+    restore it afterwards, without changing the GUI thread's layout.
+    """
+    setter = previous = None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            setter = ctypes.windll.user32.SetThreadDpiAwarenessContext
+            setter.argtypes = [ctypes.c_void_p]
+            setter.restype = ctypes.c_void_p
+            previous = setter(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+        except (AttributeError, OSError):
+            setter = None
+    try:
+        yield
+    finally:
+        if setter is not None and previous:
+            try:
+                setter(previous)
+            except OSError:
+                pass  # Restoration must not replay an already issued action.
+
+
+def physical_pixels(method):
+    """Run one native operation in a reversible physical-pixel DPI scope."""
+    @wraps(method)
+    def scoped(*args, **kwargs):
+        with _physical_pixel_context():
+            return method(*args, **kwargs)
+    return scoped
 
 
 @dataclass
@@ -205,6 +244,7 @@ class DisplayTopologyManager:
         self._last_signature = signature
         return self._topology
 
+    @physical_pixels
     def _enumerate_windows(self) -> list[Monitor]:
         """Enumerate via Win32 with per-monitor DPI (authoritative on Windows)."""
         try:
@@ -232,9 +272,21 @@ class DisplayTopologyManager:
                             ("szDevice", wintypes.WCHAR * 32)]
 
             MonitorEnumProc = ctypes.WINFUNCTYPE(
-                ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.POINTER(RECT), ctypes.c_double,
+                wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.POINTER(RECT), ctypes.c_ssize_t,
             )
+            # ctypes otherwise defaults native arguments/returns to 32-bit
+            # integers, truncating monitor handles on 64-bit Windows.
+            user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFOEXW)]
+            user32.GetMonitorInfoW.restype = wintypes.BOOL
+            user32.EnumDisplayMonitors.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT),
+                                                   MonitorEnumProc, ctypes.c_ssize_t]
+            user32.EnumDisplayMonitors.restype = wintypes.BOOL
+            if shcore is not None:
+                shcore.GetDpiForMonitor.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                   ctypes.POINTER(wintypes.UINT),
+                                                   ctypes.POINTER(wintypes.UINT)]
+                shcore.GetDpiForMonitor.restype = ctypes.c_long
 
             index_box = [0]
 
@@ -316,7 +368,7 @@ class DisplayTopologyManager:
         for m in self.topology().monitors:
             if m.index == index:
                 return m
-        return self.primary()
+        return None
 
     # ── coordinate translation ────────────────────────────────────────────────
 
@@ -324,8 +376,29 @@ class DisplayTopologyManager:
         """(monitor-local) → virtual-desktop coordinates."""
         mon = self.monitor_by_index(monitor_index)
         if mon is None:
-            return (local_x, local_y)
+            raise ValueError(f"Monitor {monitor_index} is not connected.")
         return (mon.x + int(local_x), mon.y + int(local_y))
+
+    def resolve_point(self, x: int, y: int,
+                      monitor: int | None = None) -> tuple[int, int]:
+        """Validate an exact physical-pixel target without moving it elsewhere.
+
+        Bounding boxes can include empty gaps between offset monitors. A
+        pointer action in a gap, outside a screen or on a disconnected screen
+        must fail rather than being clamped onto an unrelated control.
+        Monitor-local pixels are already physical; do not apply DPI twice.
+        """
+        if monitor is not None:
+            mon = self.monitor_by_index(monitor)
+            if mon is None:
+                raise ValueError(f"Monitor {monitor} is not connected.")
+            if not (0 <= x < mon.width and 0 <= y < mon.height):
+                raise ValueError(f"Coordinates ({x}, {y}) are outside monitor {monitor}.")
+            return (mon.x + int(x), mon.y + int(y))
+        vx, vy = int(x), int(y)
+        if not any(m.contains(vx, vy) for m in self.topology().monitors):
+            raise ValueError(f"Coordinates ({vx}, {vy}) are outside the connected screens.")
+        return (vx, vy)
 
     def to_monitor(self, vx: int, vy: int) -> tuple[int, int, int]:
         """virtual → (monitor_index, local_x, local_y)."""
@@ -343,12 +416,13 @@ class DisplayTopologyManager:
         """Fractional (0..1) position on a monitor → virtual pixel coordinates."""
         mon = self.monitor_by_index(monitor_index)
         if mon is None:
-            return (0, 0)
+            raise ValueError(f"Monitor {monitor_index} is not connected.")
         return (mon.x + int(max(0.0, min(1.0, nx)) * (mon.width - 1)),
                 mon.y + int(max(0.0, min(1.0, ny)) * (mon.height - 1)))
 
     # ── cursor ────────────────────────────────────────────────────────────────
 
+    @physical_pixels
     def cursor_position(self) -> tuple[int, int]:
         if sys.platform == "win32":
             try:

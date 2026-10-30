@@ -1,0 +1,7 @@
+# ── O.R.I.O.N. requirements: research and documents ───────────────────────
+# Hard-to-fetch pages, Word export and PDF text. Without this group research
+# still reads ordinary pages and reports come out as text/HTML.
+
+curl_cffi>=0.7,<1                        # Chrome-fingerprint retry for sites that refuse plain HTTP clients
+python-docx>=1.1,<2                      # DOCX report export
+pypdf>=4,<7                              # PDF text extraction (literature vault, file scans)

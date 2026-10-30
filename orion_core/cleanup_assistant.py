@@ -82,6 +82,7 @@ class CleanupCandidate:
     proposed_action: ProposedAction
     is_secret_bearing: bool = False
     gitignore_suggestion: str | None = None
+    size_complete: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +90,7 @@ class CleanupCandidate:
             "relpath": self.relpath,
             "file_type": self.file_type,
             "size_bytes": self.size_bytes,
+            "size_complete": self.size_complete,
             "reason": self.reason,
             "risk": self.risk.value,
             "tracked_by_git": self.tracked_by_git,
@@ -102,6 +104,9 @@ class CleanupCandidate:
 class CleanupReport:
     candidates: list[CleanupCandidate] = field(default_factory=list)
     gitignore_suggestions: list[str] = field(default_factory=list)
+    complete: bool = True
+    stop_reason: str = ""
+    inspected: int = 0
 
     def deletable(self) -> list[CleanupCandidate]:
         return [c for c in self.candidates
@@ -111,6 +116,9 @@ class CleanupReport:
         return {
             "candidates": [c.as_dict() for c in self.candidates],
             "gitignore_suggestions": list(self.gitignore_suggestions),
+            "complete": self.complete,
+            "stop_reason": self.stop_reason,
+            "inspected": self.inspected,
             "summary": {
                 "total": len(self.candidates),
                 "deletable": len(self.deletable()),
@@ -173,35 +181,52 @@ class CleanupAssistant:
         self._log = logger or (lambda _m: None)
         self._audit_sink = audit_sink
         self._plans: dict[str, DeletionPlan] = {}
+        self._partial_sizes: set[str] = set()
 
     # ── analysis ──────────────────────────────────────────────────────────────
 
-    def scan(self) -> CleanupReport:
+    def scan(self, *, max_seconds: float = 5.0, max_entries: int = 30_000,
+             cancelled: Callable[[], bool] | None = None) -> CleanupReport:
         report = CleanupReport()
+        deadline = time.monotonic() + max(0.0, max_seconds)
+        self._partial_sizes: set[str] = set()
         gitignore: set[str] = set()
         for root in self.roots:
             if not root.exists():
                 continue
-            for path in self._walk(root):
+            for path in self._walk(root, deadline=deadline, cancelled=cancelled):
+                if path is None or (cancelled is not None and cancelled()) or report.inspected >= max_entries or time.monotonic() >= deadline:
+                    report.complete = False
+                    report.stop_reason = "cancelled" if cancelled is not None and cancelled() else "scan budget reached"
+                    break
+                report.inspected += 1
                 candidate = self._classify(path, root)
                 if candidate is None:
                     continue
+                candidate.size_complete = candidate.path not in self._partial_sizes
                 report.candidates.append(candidate)
                 if candidate.gitignore_suggestion:
                     gitignore.add(candidate.gitignore_suggestion)
+            if not report.complete:
+                break
         report.gitignore_suggestions = sorted(gitignore)
         return report
 
-    def _walk(self, root: Path):
-        skip = _CACHE_DIRS | _ENV_DIRS | {".git"}
+    def _walk(self, root: Path, *, deadline: float = float("inf"), cancelled=None):
         for dirpath, dirnames, filenames in os.walk(root):
+            if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
+                yield None
+                return
             here = Path(dirpath)
             # Yield artefact directories themselves (as a single candidate), and
             # do not descend into caches/venvs we already flag.
             pruned = []
             for d in list(dirnames):
                 low = d.lower()
-                if low in _CACHE_DIRS or low in _BUILD_DIRS or low in _ENV_DIRS or low in _IDE_DIRS:
+                child = here / d
+                if child.is_symlink() or getattr(child, "is_junction", lambda: False)():
+                    pruned.append(d)
+                elif low in _CACHE_DIRS or low in _BUILD_DIRS or low in _ENV_DIRS or low in _IDE_DIRS:
                     yield here / d
                     pruned.append(d)
                 elif low == ".git":
@@ -219,11 +244,18 @@ class CleanupAssistant:
             resolved = path.resolve()
         except Exception:
             return None
+        if not _is_within(resolved, root):
+            return None
         name = path.name
         low = name.lower()
         suffix = path.suffix.lower()
         try:
-            size = self._dir_size(path) if path.is_dir() else path.stat().st_size
+            if path.is_dir():
+                size, complete = self._dir_size(path)
+                if not complete:
+                    self._partial_sizes.add(str(resolved))
+            else:
+                size = path.stat().st_size
         except Exception:
             size = 0
         rel = self._relpath(resolved, root)
@@ -317,15 +349,32 @@ class CleanupAssistant:
         return any(part.lower() in _PROTECTED_DIRS for part in path.parts)
 
     @staticmethod
-    def _dir_size(path: Path) -> int:
+    def _dir_size(path: Path) -> tuple[int, bool]:
+        """Bound directory accounting; partial totals are labelled explicitly."""
         total = 0
-        for dp, _dn, fn in os.walk(path):
+        complete = True
+        entries = 0
+        deadline = time.monotonic() + 0.04
+        for dp, dn, fn in os.walk(path):
+            for d in list(dn):
+                child = Path(dp) / d
+                if child.is_symlink() or getattr(child, "is_junction", lambda: False)():
+                    dn.remove(d)
+                    complete = False
             for f in fn:
+                entries += 1
+                if entries > 2000 or time.monotonic() >= deadline:
+                    return total, False
                 try:
-                    total += (Path(dp) / f).stat().st_size
+                    file = Path(dp) / f
+                    if file.is_symlink():
+                        complete = False
+                        continue
+                    total += file.stat().st_size
                 except Exception:
+                    complete = False
                     continue
-        return total
+        return total, complete
 
     def _relpath(self, resolved: Path, root: Path) -> str:
         try:
@@ -466,8 +515,20 @@ class CleanupAssistant:
 
 
 def _default_trash() -> Callable[[str], None] | None:
-    """Recoverable deletion via send2trash when installed; None otherwise (the
-    caller then requires a second confirmation for permanent deletion)."""
+    """Recoverable deletion: on Windows the Recycle Bin through recycle_bin,
+    whose refusal() stops the shell DESTROYING what the bin cannot hold (a
+    260+ character path inside, an item bigger than the bin) - send2trash
+    uses the same shell call without that check, so it is only the fallback
+    elsewhere. None when neither exists (the caller then requires a second
+    confirmation for permanent deletion)."""
+    from . import recycle_bin
+    if recycle_bin.available():
+        def _recycle(p: str) -> None:
+            if not recycle_bin.send_to_recycle_bin(p):
+                why = recycle_bin.refusal(p) if os.path.exists(p) else None
+                raise OSError(f"could not move {p} to the Recycle Bin"
+                              + (f": {why} - left in place" if why else ""))
+        return _recycle
     try:
         from send2trash import send2trash  # type: ignore
         return lambda p: send2trash(p)

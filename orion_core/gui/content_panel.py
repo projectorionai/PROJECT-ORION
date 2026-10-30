@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QVBoxLayout,
     QWidget,
+    QTextBrowser,
 )
 
 from .style import C, rgba
@@ -219,6 +220,47 @@ class ContentPanel(QWidget):
             card.deleteLater()
         self._cards.clear()
         self._empty.show()
+
+    def show_presentation(self, payload: dict) -> None:
+        """Render already sanitised markup with no implicit network loading."""
+        from ..presentation import public_url
+        from PyQt6.QtGui import QTextDocument
+        class DisplayText(QTextBrowser):
+            def loadResource(self, resource_type, url):  # noqa: N802
+                if resource_type == QTextDocument.ResourceType.ImageResource and url.scheme() == "data":
+                    return super().loadResource(resource_type, url)
+                return None
+        card = QFrame()
+        card.title = str(payload.get("title", "ORION display"))
+        layout = QVBoxLayout(card)
+        heading = QLabel(card.title)
+        heading.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(heading)
+        body = DisplayText()
+        body.setOpenLinks(False)
+        body.setOpenExternalLinks(False)
+        def open_link(url):
+            try:
+                QDesktopServices.openUrl(QUrl(public_url(url.toString())))
+            except ValueError:
+                pass
+        body.anchorClicked.connect(open_link)
+        body.document().setDefaultStyleSheet(
+            "body{color:#ededed;} table{border-collapse:collapse;} td,th{padding:6px;} "
+            "a{color:#67d4f3;} img{max-width:100%;}")
+        body.setHtml(payload["html"])
+        body.setMinimumHeight(180)
+        body.setMaximumHeight(340)
+        layout.addWidget(body)
+        self._empty.hide()
+        self._stack.insertWidget(0, card)
+        self._cards.insert(0, card)
+        while len(self._cards) > MAX_CARDS:
+            stale = self._cards.pop()
+            stale.setParent(None)
+            stale.deleteLater()
+        self._scroll.verticalScrollBar().setValue(0)
+        self.arrived.emit(1)
 
     @property
     def count(self) -> int:

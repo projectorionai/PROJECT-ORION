@@ -24,7 +24,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -38,6 +38,19 @@ from .utils import first_line
 #: "2026-09-24T08:38:00". Exact, so a following "08:38: Lab" colon is not
 #: swallowed into the time (which printed as "at 2026-09-24 08:38:.").
 _STAMP = r"\d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?"
+
+
+def _how_long(hours: float) -> str:
+    """'40 minutes', '5 hours', '3 days' - said, not '72h'."""
+    hours = max(0.0, float(hours))
+    if hours < 1:
+        minutes = max(1, round(hours * 60))
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    if hours < 48:
+        whole = round(hours)
+        return f"{whole} hour{'s' if whole != 1 else ''}"
+    days = round(hours / 24)
+    return f"{days} days"
 
 
 @dataclass
@@ -63,6 +76,7 @@ class ProactiveIntelligence:
         workspace: Any | None = None,
         interval_s: float | None = None,
         pattern_detector: Any | None = None,
+        context_service: Any | None = None,
     ) -> None:
         self.bus = bus
         self.outlook = outlook
@@ -71,6 +85,7 @@ class ProactiveIntelligence:
         self.telemetry = telemetry
         self.workspace = workspace
         self.pattern_detector = pattern_detector
+        self.context_service = context_service
         # Attached after construction (built later in app.py). Tasks the user
         # removed there are never raised again from Notion either.
         self.cognition: Any | None = None
@@ -107,12 +122,13 @@ class ProactiveIntelligence:
 
     async def check_now(self) -> ToolResult:
         suggestions = await self._survey(announce=False)
-        if not suggestions:
-            return ToolResult("Nothing pressing. Your desk is clear.")
-        lines = ["Proactive briefing — items for your attention:"]
+        lines = (["Proactive briefing — items for your attention:"] if suggestions
+                 else ["No pressing findings from the connected sources."])
         for s in sorted(suggestions, key=lambda x: -x.salience):
             mark = "‼" if s.salience >= 3 else "•"
             lines.append(f"{mark} {s.text}")
+        if self.context_service is not None:
+            lines.append(self.context_service.report())
         return ToolResult("\n".join(lines))
 
     def latest(self) -> list[dict[str, Any]]:
@@ -171,18 +187,41 @@ class ProactiveIntelligence:
             at=time.monotonic(),
         )]
 
+    #: Overdue by more than this (two weeks), a board entry is left over.
+    STALE_OVERDUE_H = 14 * 24
+
     async def _check_tasks_and_calendar(self) -> list[Suggestion]:
         if not getattr(self.notion, "available", False):
             return []
         out: list[Suggestion] = []
         try:
-            tasks = await self.notion.list_tasks(limit=20)
+            # The board's structured rows and the one due rule the briefing
+            # and the awareness tool use (owner_tasks): a bare date is due at
+            # the END of the day and a range when it ends. Parsing the listed
+            # text called a task due today "overdue" from midnight.
+            from .owner_tasks import hours_until
             dismissed = getattr(self.cognition, "is_dismissed", None)
-            for title, due in self._parse_dated_rows(tasks.text):
-                if dismissed is not None and dismissed(title):
+            if callable(getattr(self.notion, "open_tasks", None)):
+                rows = await self.notion.open_tasks(limit=20)
+                try:   # list_tasks refreshed the deck's task panel; keep that
+                    self.bus.dashboard_event.emit("tasks", rows)
+                except Exception:
+                    pass
+                dated = [(str(r.get("title") or "")[:60], str(r.get("date_raw") or r.get("date") or ""),
+                          str(r.get("date_end") or "")) for r in rows]
+            else:
+                tasks = await self.notion.list_tasks(limit=20)
+                dated = [(title, due, "") for title, due in self._parse_dated_rows(tasks.text)]
+            for title, due, end in dated:
+                if not due or (dismissed is not None and dismissed(title)):
                     continue
-                hours = self._hours_until(due)
+                hours = hours_until(due, end=end)
                 if hours is None:
+                    continue
+                if hours < -self.STALE_OVERDUE_H:
+                    # Weeks past its date it is a trip or a day that has been
+                    # and gone, left on the board - not a task to nag about
+                    # ("'Away (a trip)' was due 1007h ago", 26 Oct).
                     continue
                 if hours < 0:
                     # Keywords, not positions: the fields run key, TEXT,
@@ -191,19 +230,23 @@ class ProactiveIntelligence:
                     # so ranking them crashed the survey.
                     out.append(Suggestion(
                         key=f"task_overdue:{title}", salience=3,
-                        text=f"Task overdue: '{title}' was due {abs(hours):.0f}h ago.",
+                        text=f"'{title}' was due {_how_long(-hours)} ago.",
                         at=time.monotonic()))
                 elif hours <= 48:
                     sal = 3 if hours <= 12 else 2
                     out.append(Suggestion(
                         key=f"task_due:{title}", salience=sal,
-                        text=f"'{title}' is due in {hours:.0f} hours.",
+                        text=f"'{title}' is due in {_how_long(hours)}.",
                         at=time.monotonic()))
         except Exception:
             pass
         try:
-            events = await self.notion.upcoming_events(days=1, limit=10)
-            for title, when in self._parse_dated_rows(events.text):
+            # Entries dated today, structured: upcoming_events(days=1) also
+            # covers tomorrow, which was then called "Today's schedule".
+            events = await self.notion.events_on(datetime.now().date(), limit=10)
+            for event in events or []:
+                title = str(event.get("title") or "")[:60]
+                when = str(event.get("date") or "")
                 hours = self._hours_until(when)
                 if hours is not None and 0 <= hours <= 24:
                     out.append(Suggestion(
@@ -280,14 +323,14 @@ class ProactiveIntelligence:
         try:
             porcelain = subprocess.run(
                 ["git", "-C", str(root), "status", "--porcelain"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             if porcelain.returncode != 0:
                 return None
             changed = len([ln for ln in porcelain.stdout.splitlines() if ln.strip()])
             branch_proc = subprocess.run(
                 ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             branch = (branch_proc.stdout or "?").strip() or "?"
             return (changed, branch)

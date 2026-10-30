@@ -227,6 +227,7 @@ def test_gate_confirm_parks_notifies_and_defers_until_approved():
         assert notified and notified[-1][0] == "phone"
         conf = reg.get(parked.media["confirm"]["id"])
         assert conf is not None
+        assert reg.resolve(conf.id, conf.token, True, device_id="phone") is conf
         # The approval finally runs the real tool.
         out = await gate.run_approved(conf)
         assert out.ok
@@ -259,3 +260,132 @@ def test_concurrent_remote_turns_keep_their_own_device():
     asyncio.run(scenario())
     assert len(reg.pending_for("phone-a")) == 1
     assert len(reg.pending_for("phone-b")) == 1
+
+# ── folded in from test_telegram_approvals.py (Mark XXXX.3: approve phone requests from Telegram with buttons.) ────
+
+import asyncio
+from types import SimpleNamespace
+
+from orion_core.remote_capability import RemoteConfirmationRegistry
+from orion_core.telegram_remote import APPROVAL_NOTE, BUTTON_NOTE, TelegramRemote
+
+CHAT = "4242"
+
+
+class FakeHttp:
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, url, payload=None, timeout=0.0):
+        self.calls.append((url.rsplit("/", 1)[-1].split("?")[0], payload or {}))
+        return {"ok": True, "result": []}
+
+    def sent(self, method):
+        return [payload for name, payload in self.calls if name == method]
+
+
+def _remote(pending=None, decide=None, http=None):
+    async def answer(text, chat_id):
+        return "That would delete a file. I've sent it to your phone to approve - tap to confirm."
+    return TelegramRemote(answer, token="123:abc", chats=frozenset({CHAT}), http=http or FakeHttp(),
+                          clock=lambda: 1000.0, pending=pending, decide=decide)
+
+
+def _message(text, chat=CHAT, kind="private"):
+    return {"update_id": 1, "message": {"chat": {"id": int(chat), "type": kind},
+                                        "from": {"id": int(chat)}, "date": 1000, "text": text}}
+
+
+def _tap(data, chat=CHAT, sender=CHAT, kind="private"):
+    return {"update_id": 2, "callback_query": {
+        "id": "tap1", "data": data, "from": {"id": int(sender)},
+        "message": {"message_id": 77, "chat": {"id": int(chat), "type": kind}}}}
+
+
+def test_an_approval_comes_back_with_buttons():
+    http = FakeHttp()
+    waiting = [{"id": "abcd1234", "token": "tok_tok_tok_tok", "summary": "delete notes.txt"}]
+    remote = _remote(pending=lambda chat: waiting, decide=None, http=http)
+    remote._decide = lambda *a: None                       # buttons on
+    reply = asyncio.run(remote.handle(_message("delete notes.txt")))
+    assert BUTTON_NOTE in reply
+    offers = [p for p in http.sent("sendMessage") if "reply_markup" in p]
+    assert len(offers) == 1
+    keys = offers[0]["reply_markup"]["inline_keyboard"][0]
+    assert [k["callback_data"] for k in keys] == ["ok:abcd1234:tok_tok_tok_tok",
+                                                  "no:abcd1234:tok_tok_tok_tok"]
+    asyncio.run(remote.offer_approvals(CHAT))              # never offered twice
+    assert len([p for p in http.sent("sendMessage") if "reply_markup" in p]) == 1
+
+
+def test_without_buttons_the_old_note_stands():
+    reply = asyncio.run(_remote().handle(_message("delete notes.txt")))
+    assert APPROVAL_NOTE in reply
+
+
+def test_a_tap_from_the_allowed_chat_decides_and_clears_the_buttons():
+    http = FakeHttp()
+    decided = []
+
+    async def decide(chat, conf_id, token, approve):
+        decided.append((chat, conf_id, token, approve))
+        return "Deleted notes.txt."
+    remote = _remote(pending=lambda chat: [], decide=decide, http=http)
+    outcome = asyncio.run(remote.handle(_tap("ok:abcd1234:tok_tok_tok_tok")))
+    assert outcome == "Deleted notes.txt."
+    assert decided == [(CHAT, "abcd1234", "tok_tok_tok_tok", True)]
+    assert http.sent("editMessageReplyMarkup")[0]["reply_markup"] == {"inline_keyboard": []}
+    assert http.sent("answerCallbackQuery")
+
+
+def test_taps_from_anyone_else_are_ignored():
+    decided = []
+
+    async def decide(*args):
+        decided.append(args)
+        return "ran"
+    remote = _remote(pending=lambda chat: [], decide=decide)
+    assert asyncio.run(remote.handle(_tap("ok:abcd1234:tok_tok_tok_tok", chat="999", sender="999"))) is None
+    assert asyncio.run(remote.handle(_tap("ok:abcd1234:tok_tok_tok_tok", sender="555"))) is None
+    assert asyncio.run(remote.handle(_tap("ok:abcd1234:tok_tok_tok_tok", kind="group"))) is None
+    assert asyncio.run(remote.handle(_tap("rm -rf:x:y"))) is None
+    assert decided == []
+
+
+def _gateway(registry, ran):
+    from orion_core.remote import RemoteGateway
+
+    async def run_approved(conf):
+        ran.append(conf.tool)
+        return SimpleNamespace(text="Done it.", ok=True)
+    gateway = RemoteGateway.__new__(RemoteGateway)
+    gateway.confirmations = registry
+    gateway.tool_gate = SimpleNamespace(run_approved=run_approved)
+    gateway.bus = SimpleNamespace(log=SimpleNamespace(emit=lambda line: None))
+    return gateway
+
+
+def test_the_gateway_only_lets_the_asking_chat_approve():
+    registry = RemoteConfirmationRegistry()
+    conf = registry.create("file_delete", {"path": "x"}, f"telegram:{CHAT}", "delete x")
+    ran: list[str] = []
+    gateway = _gateway(registry, ran)
+    assert gateway.pending_for_channel("") == []
+    assert [c["id"] for c in gateway.pending_for_channel(f"telegram:{CHAT}")] == [conf.id]
+    other = asyncio.run(gateway.decide_for_channel("telegram:999", conf.id, conf.token, True))
+    assert "expired" in other and ran == []
+    wrong_token = asyncio.run(gateway.decide_for_channel(f"telegram:{CHAT}", conf.id, "nope", True))
+    assert "expired" in wrong_token and ran == []
+    done = asyncio.run(gateway.decide_for_channel(f"telegram:{CHAT}", conf.id, conf.token, True))
+    assert done == "Done it." and ran == ["file_delete"]
+    again = asyncio.run(gateway.decide_for_channel(f"telegram:{CHAT}", conf.id, conf.token, True))
+    assert "expired" in again and ran == ["file_delete"]
+
+
+def test_declining_runs_nothing():
+    registry = RemoteConfirmationRegistry()
+    conf = registry.create("file_delete", {"path": "x"}, f"telegram:{CHAT}", "delete x")
+    ran: list[str] = []
+    out = asyncio.run(_gateway(registry, ran).decide_for_channel(
+        f"telegram:{CHAT}", conf.id, conf.token, False))
+    assert out.startswith("Declined") and ran == []

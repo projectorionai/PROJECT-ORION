@@ -20,6 +20,8 @@ Documentation=file:/opt/orion/deploy/README_HOSTINGER.md
 # seconds of starting, and "an interface exists" is not "routing works".
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -35,8 +37,10 @@ Environment=QT_QPA_PLATFORM=offscreen
 # No GUI means no face to rasterise; the render thread would be paying for
 # frames nobody can see.
 Environment=ORION_FACE_THREAD=0
+Environment=ORION_CONFIG_DIR=/opt/orion/config
 Environment=ORION_REMOTE_HOST=127.0.0.1
 Environment=ORION_REMOTE_PORT=8765
+Environment=ORION_REMOTE_EXPOSURE=reverse-proxy
 Environment=PYTHONUNBUFFERED=1
 # Keys and numbers live in files, not in this unit — a systemd unit is
 # world-readable and ends up in support pastes.
@@ -52,8 +56,6 @@ Restart=always
 RestartSec=10
 # ...but a true crash loop must not hammer the box for ever. Five starts in
 # five minutes and systemd gives up until someone looks.
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # ── resource limits ──────────────────────────────────────────────────────────
 # A VPS has no headroom to absorb a runaway. MemoryMax is a hard ceiling —
@@ -82,6 +84,7 @@ ReadWritePaths=/opt/orion/config
 ReadWritePaths=/opt/orion/research
 ReadWritePaths=/opt/orion/reports
 ReadWritePaths=/opt/orion/logs
+ReadWritePaths=/opt/orion/conversations
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,61 @@
+{
+  "name": "jv_game_updater",
+  "description": "Inspect, install or update games with the supplied Steam/Epic integration. Launcher/account support is required. Completion is reported from client evidence, not inferred from a click. Unattended PC shutdown is disabled.",
+  "module": "jv_game_updater_tool.py",
+  "version": "33.0.0",
+  "tier": "confirm",
+  "permissions": [
+    "filesystem",
+    "subprocess",
+    "input",
+    "network"
+  ],
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "The action to perform.",
+        "enum": [
+          "list",
+          "download_status",
+          "install",
+          "update",
+          "schedule",
+          "cancel_schedule",
+          "schedule_status"
+        ]
+      },
+      "platform": {
+        "type": "string",
+        "description": "Gaming client.",
+        "enum": [
+          "steam",
+          "epic",
+          "both"
+        ]
+      },
+      "game_name": {
+        "type": "string",
+        "description": "User-chosen game title."
+      },
+      "app_id": {
+        "type": "string",
+        "description": "Steam AppID supplied by the user."
+      },
+      "hour": {
+        "type": "integer",
+        "description": "Daily schedule hour, 0\u201323."
+      },
+      "minute": {
+        "type": "integer",
+        "description": "Daily schedule minute, 0\u201359."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  },
+  "secrets": []
+}

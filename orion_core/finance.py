@@ -17,6 +17,8 @@ from __future__ import annotations
 import csv
 import io
 import sqlite3
+import threading
+from functools import wraps
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -43,7 +45,10 @@ def _pence(amount: object) -> int:
         raise ValueError(f"not an amount of money: {amount!r}") from None
     if not value.is_finite():
         raise ValueError(f"not an amount of money: {amount!r}")
-    return int((value * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    try:
+        return int((value * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, OverflowError, ValueError):
+        raise ValueError(f"not a supported amount of money: {amount!r}") from None
 
 
 def _money(pence: int | Decimal) -> float:
@@ -106,10 +111,19 @@ class Subscription:
     id: int | None = None
 
 
+def _store_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class FinanceStore:
     def __init__(self, path: Path | str | None = None) -> None:
         self.path = Path(path) if path is not None else (CONFIG_DIR / "finance.db")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._db = sqlite3.connect(str(self.path), check_same_thread=False)
         # Mark XXVI: WAL + relaxed fsync - a committed write costs
         # 0.03 ms instead of 2.81 ms, and that time is paid on the
@@ -139,21 +153,27 @@ class FinanceStore:
         self._db.commit()
 
     # -- accounts --
+    @_store_locked
     def add_account(self, a: Account) -> Account:
-        cur = self._db.execute(
-            "INSERT INTO accounts (name, kind, currency, opening_balance, created_at) "
-            "VALUES (?,?,?,?,?)",
-            (a.name, a.kind, a.currency, a.opening_balance, a.created_at or _iso(_now())))
-        self._db.commit()
+        with self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            if self._db.execute("SELECT 1 FROM accounts WHERE lower(name)=lower(?)", (a.name,)).fetchone():
+                raise ValueError(f"Account '{a.name}' already exists; its balance was not changed")
+            cur = self._db.execute(
+                "INSERT INTO accounts (name, kind, currency, opening_balance, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (a.name, a.kind, a.currency, a.opening_balance, a.created_at or _iso(_now())))
         a.id = int(cur.lastrowid)
         return a
 
+    @_store_locked
     def accounts(self) -> list[Account]:
         return [Account(id=r["id"], name=r["name"], kind=r["kind"],
                         currency=r["currency"], opening_balance=r["opening_balance"],
                         created_at=r["created_at"] or "")
                 for r in self._db.execute("SELECT * FROM accounts ORDER BY id").fetchall()]
 
+    @_store_locked
     def account_by_name(self, name: str) -> Account | None:
         r = self._db.execute("SELECT * FROM accounts WHERE lower(name)=lower(?)",
                              (name,)).fetchone()
@@ -162,37 +182,68 @@ class FinanceStore:
                 if r else None)
 
     # -- transactions --
+    @_store_locked
     def add_txn(self, t: Transaction) -> Transaction:
-        cur = self._db.execute(
-            "INSERT INTO transactions (account_id, amount, direction, at, category, "
-            "merchant, note, source) VALUES (?,?,?,?,?,?,?,?)",
-            (t.account_id, abs(t.amount), t.direction, t.at or _iso(_now()),
-             t.category, t.merchant, t.note, t.source))
-        self._db.commit()
+        with self._db:
+            cur = self._db.execute(
+                "INSERT INTO transactions (account_id, amount, direction, at, category, "
+                "merchant, note, source) VALUES (?,?,?,?,?,?,?,?)",
+                (t.account_id, abs(t.amount), t.direction, t.at or _iso(_now()),
+                 t.category, t.merchant, t.note, t.source))
         t.id = int(cur.lastrowid)
         return t
 
-    def transactions(self, since: datetime | None = None) -> list[Transaction]:
-        if since is not None:
-            rows = self._db.execute("SELECT * FROM transactions WHERE at>=? ORDER BY at",
-                                    (_iso(since),)).fetchall()
-        else:
-            rows = self._db.execute("SELECT * FROM transactions ORDER BY at").fetchall()
+    @_store_locked
+    def import_transactions(self, rows: list[tuple[str, float, str, str]], account: str = "") -> int:
+        """One import is one commit, including any new account; errors roll it back."""
+        if not rows:
+            return 0
+        with self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            found = (self._db.execute("SELECT id FROM accounts WHERE lower(name)=lower(?) ORDER BY id LIMIT 1",
+                                      (account,)).fetchone() if account else
+                     self._db.execute("SELECT id FROM accounts ORDER BY id LIMIT 1").fetchone())
+            if found is None:
+                cur = self._db.execute(
+                    "INSERT INTO accounts (name,kind,currency,opening_balance,created_at) VALUES (?,?,?,?,?)",
+                    (account.strip() or "Main", "current", "GBP", 0, _iso(_now())))
+                account_id = int(cur.lastrowid)
+            else:
+                account_id = int(found["id"])
+            self._db.executemany(
+                "INSERT INTO transactions (account_id,amount,direction,at,merchant,category,source) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ((account_id, abs(amount), "in" if amount >= 0 else "out", at, desc, category, "csv")
+                 for at, amount, desc, category in rows))
+        return len(rows)
+
+    @_store_locked
+    def transactions(self, since: datetime | None = None,
+                     until: datetime | None = None) -> list[Transaction]:
+        clauses, values = [], []
+        for operator, moment in ((">=", since), ("<=", until)):
+            if moment is not None:
+                clauses.append(f"at{operator}?")
+                values.append(_iso(moment))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._db.execute("SELECT * FROM transactions" + where + " ORDER BY at", values).fetchall()
         return [Transaction(id=r["id"], account_id=r["account_id"], amount=r["amount"],
                             direction=r["direction"], at=r["at"] or "", category=r["category"] or "",
                             merchant=r["merchant"] or "", note=r["note"] or "",
                             source=r["source"] or "manual") for r in rows]
 
     # -- subscriptions --
+    @_store_locked
     def add_subscription(self, s: Subscription) -> Subscription:
-        cur = self._db.execute(
-            "INSERT INTO subscriptions (name, amount, cadence_days, next_due, category, active) "
-            "VALUES (?,?,?,?,?,?)",
-            (s.name, s.amount, s.cadence_days, s.next_due, s.category, int(s.active)))
-        self._db.commit()
+        with self._db:
+            cur = self._db.execute(
+                "INSERT INTO subscriptions (name, amount, cadence_days, next_due, category, active) "
+                "VALUES (?,?,?,?,?,?)",
+                (s.name, s.amount, s.cadence_days, s.next_due, s.category, int(s.active)))
         s.id = int(cur.lastrowid)
         return s
 
+    @_store_locked
     def subscriptions(self, active_only: bool = True) -> list[Subscription]:
         q = "SELECT * FROM subscriptions" + (" WHERE active=1" if active_only else "")
         return [Subscription(id=r["id"], name=r["name"], amount=r["amount"],
@@ -200,6 +251,7 @@ class FinanceStore:
                              category=r["category"] or "", active=bool(r["active"]))
                 for r in self._db.execute(q + " ORDER BY next_due").fetchall()]
 
+    @_store_locked
     def close(self) -> None:
         try:
             self._db.close()
@@ -214,8 +266,11 @@ class FinanceEngine:
     # -- authoring --
     def add_account(self, name: str, kind: str = "current",
                     opening_balance: float = 0.0, currency: str = "GBP") -> Account:
+        kind = str(kind or "current").strip().lower()
+        if kind not in LIQUID_KINDS | {"credit"}:
+            raise ValueError("account kind must be current, savings, credit or cash")
         return self.store.add_account(Account(
-            name=name.strip() or "Main", kind=(kind or "current"),
+            name=name.strip() or "Main", kind=kind,
             currency=currency, opening_balance=_to_pennies(opening_balance)))
 
     def _resolve_account(self, name: str = "") -> Account:
@@ -231,18 +286,19 @@ class FinanceEngine:
     def add_txn(self, amount: float, direction: str = "out", *, account: str = "",
                 category: str = "", merchant: str = "", note: str = "",
                 source: str = "manual", at: datetime | None = None) -> Transaction:
+        amount = abs(_to_pennies(amount))
+        at_text = _iso(at or _now())
         acc = self._resolve_account(account)
         return self.store.add_txn(Transaction(
-            account_id=int(acc.id), amount=abs(_to_pennies(amount)),
+            account_id=int(acc.id), amount=amount,
             direction=("in" if str(direction).lower() in {"in", "income", "credit"} else "out"),
-            at=_iso(at or _now()), category=category, merchant=merchant, note=note, source=source))
+            at=at_text, category=category, merchant=merchant, note=note, source=source))
 
     def import_csv(self, text: str, *, account: str = "") -> int:
         """Import rows of ``date, amount, description[, category]``. A negative
         amount is an expense (out), positive is income (in). Bad rows are skipped
         rather than aborting the import."""
-        acc = self._resolve_account(account)
-        count = 0
+        rows = []
         reader = csv.reader(io.StringIO(text.strip()))
         for row in reader:
             if len(row) < 2:
@@ -257,61 +313,66 @@ class FinanceEngine:
                 continue
             desc = row[2].strip() if len(row) > 2 else ""
             category = row[3].strip() if len(row) > 3 else ""
-            self.store.add_txn(Transaction(
-                account_id=int(acc.id), amount=abs(amount),
-                direction=("in" if amount >= 0 else "out"), at=_iso(when),
-                merchant=desc, category=category, source="csv"))
-            count += 1
-        return count
+            rows.append((_iso(when), amount, desc, category))
+        return self.store.import_transactions(rows, account=account)
 
     def add_subscription(self, name: str, amount: float, cadence_days: int = 30,
                          next_due: datetime | None = None, category: str = "subscription") -> Subscription:
+        if isinstance(cadence_days, bool) or not isinstance(cadence_days, int) or cadence_days <= 0:
+            raise ValueError("subscription cadence_days must be a positive whole number")
+        if not name.strip():
+            raise ValueError("subscription needs a name")
         return self.store.add_subscription(Subscription(
             name=name.strip(), amount=_to_pennies(amount), cadence_days=int(cadence_days),
             next_due=_iso(next_due or (_now() + timedelta(days=int(cadence_days)))),
             category=category))
 
     # -- reporting --
-    def _balances_pence(self) -> dict[int, int]:
-        """Every account's balance in whole pence, from ONE pass over the ledger.
+    def _balances_pence(self, now: datetime | None = None) -> dict[int, int]:
+        """Current balances: stored opening basis plus postings through one cutoff.
 
         balance() used to re-read every transaction once PER ACCOUNT, and
         report() reached it through liquid_cash() twice — so one report read
         the whole ledger about three times for every account.
         """
         totals = {int(acc.id): _pence(acc.opening_balance) for acc in self.store.accounts()}
-        for t in self.store.transactions():
+        for t in self.store.transactions(until=now or _now()):
             if t.account_id in totals:
                 amount = _pence(t.amount)
                 totals[t.account_id] += amount if t.direction == "in" else -amount
         return totals
 
-    def balance(self, account: str = "") -> float:
-        totals = self._balances_pence()
+    def balance(self, account: str = "", *, now: datetime | None = None) -> float:
+        totals = self._balances_pence(now)
         if not account:
             return _money(sum(totals.values()))
         acc = self.store.account_by_name(account)
-        return _money(totals.get(int(acc.id), 0)) if acc is not None else 0.0
+        if acc is None:
+            raise ValueError(f"No account named '{account}'")
+        return _money(totals.get(int(acc.id), 0))
 
-    def liquid_cash(self) -> float:
-        totals = self._balances_pence()
+    def liquid_cash(self, *, now: datetime | None = None) -> float:
+        totals = self._balances_pence(now)
         return _money(sum(totals.get(int(a.id), 0) for a in self.store.accounts()
                           if a.kind in LIQUID_KINDS))
 
     def monthly_net_burn(self, months: int = 3, now: datetime | None = None) -> float:
         """Average monthly (out − in) over the trailing window. Positive = burning."""
         now = now or _now()
-        txns = self.store.transactions(since=now - timedelta(days=months * 30))
+        if isinstance(months, bool) or not isinstance(months, int) or months <= 0:
+            raise ValueError("months must be a positive whole number")
+        txns = self.store.transactions(since=now - timedelta(days=months * 30), until=now)
         out = sum(_pence(t.amount) for t in txns if t.direction == "out")
         inc = sum(_pence(t.amount) for t in txns if t.direction == "in")
         return _money(Decimal(out - inc) / max(1, months))
 
     def runway_months(self, months: int = 3, now: datetime | None = None) -> float | None:
         """Cash ÷ average monthly burn. None when not burning (income covers it)."""
+        now = now or _now()
         burn = self.monthly_net_burn(months, now)
         if burn <= 0:
             return None
-        return round(self.liquid_cash() / burn, 1)
+        return round(self.liquid_cash(now=now) / burn, 1)
 
     def upcoming_subscriptions(self, days: int = 14, now: datetime | None = None) -> list[Subscription]:
         now = now or _now()
@@ -333,11 +394,13 @@ class FinanceEngine:
 
     def report(self, now: datetime | None = None) -> dict[str, object]:
         now = now or _now()
+        cash = self.liquid_cash(now=now)
+        burn = self.monthly_net_burn(now=now)
         return {
-            "cash": self.liquid_cash(),
+            "cash": cash,
             "accounts": len(self.store.accounts()),
-            "monthly_burn": self.monthly_net_burn(now=now),
-            "runway_months": self.runway_months(now=now),
+            "monthly_burn": burn,
+            "runway_months": round(cash / burn, 1) if burn > 0 else None,
             "subscriptions": len(self.store.subscriptions()),
             "monthly_subscriptions": self.monthly_subscription_cost(),
             "upcoming": len(self.upcoming_subscriptions(now=now)),

@@ -1,11 +1,11 @@
 """
 Streaming silence compression — the last of the "why does he sound halting?".
 
-Adapted from MARK XL's ``_compress_silence`` (core/tts.py), which caps a neural
+Adapted from MARK XXXX's ``_compress_silence`` (core/tts.py), which caps a neural
 voice's punctuation pauses so a long reply keeps its rhythm. Two changes were
 needed to make it usable here:
 
-  * MARK XL compresses a COMPLETE utterance array. ORION streams — chunks
+  * MARK XXXX compresses a COMPLETE utterance array. ORION streams — chunks
     arrive from ElevenLabs and go straight into the renderer's queue, so the
     compressor has to work on a chunk at a time and carry its silence run
     ACROSS chunk boundaries. A per-chunk implementation that forgot its state

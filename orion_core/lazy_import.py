@@ -151,6 +151,7 @@ STARTUP_DEFERRED: tuple[str, ...] = (
     "google.genai",        # ~1280 ms — live_worker
     "aiohttp",             # ~178 ms  — providers, utils and 9 others
     "sounddevice",         # ~162 ms  — audio
+    "mss",                 # vision: warm after first paint; capture stays on its worker
 )
 
 #: ORION's OWN heavy modules, deferred out of ``app.py``'s module scope.
@@ -194,24 +195,42 @@ def warm(*modules: str, log: Callable[[str], None] | None = None) -> Any:
     # second of first paint); genai is not needed until the Live session
     # connects, well after. So the slowest, latest-needed import goes last.
     targets = modules or (STARTUP_DEFERRED_LOCAL + STARTUP_DEFERRED)
+    # sounddevice starts PortAudio, which enumerates every host API and device:
+    # MEASURED 1.66 s on the user's machine (the ~162 ms above was an older,
+    # emptier audio setup). Queued behind genai it finished ~3 s in, after the
+    # Command Deck and the audio engine had already asked for it on the loop.
+    # It is native work, so it runs beside the Python imports, not after them.
+    early = tuple(name for name in targets if name in _NATIVE_EARLY)
+    if early:
+        threading.Thread(target=lambda: _import_all(early, log),
+                         name="orion-import-warm-audio", daemon=True).start()
+    targets = tuple(name for name in targets if name not in early)
 
     def _run() -> None:
-        import time as _time
-        for name in targets:
-            start = _time.perf_counter()
-            try:
-                importlib.import_module(name)
-            except Exception:
-                continue          # surfaces at the point of use, not here
-            if log is not None:
-                try:
-                    log(f"warmed {name} in {(_time.perf_counter()-start)*1000:.0f} ms")
-                except Exception:
-                    pass
+        _import_all(targets, log)
 
     _warm_thread = threading.Thread(target=_run, name="orion-import-warm", daemon=True)
     _warm_thread.start()
     return _warm_thread
+
+
+#: Imports that are mostly native start-up work and are needed early in boot.
+_NATIVE_EARLY: frozenset[str] = frozenset({"sounddevice"})
+
+
+def _import_all(names: Any, log: Callable[[str], None] | None) -> None:
+    import time as _time
+    for name in names:
+        start = _time.perf_counter()
+        try:
+            importlib.import_module(name)
+        except Exception:
+            continue          # surfaces at the point of use, not here
+        if log is not None:
+            try:
+                log(f"warmed {name} in {(_time.perf_counter()-start)*1000:.0f} ms")
+            except Exception:
+                pass
 
 
 def warmed(module: str) -> bool:

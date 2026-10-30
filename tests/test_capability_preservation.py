@@ -29,3 +29,11 @@ def test_duplicate_names_and_local_plugin_loss_are_detected():
     assert not compare({"tools": ["one"]}, {"tools": ["one", "one"]})["ok"]
     assert not compare({"local_plugins": ["one"]}, {"local_plugins": []}, include_local=True)["ok"]
     assert compare({"local_plugins": ["one"]}, {"local_plugins": []})["ok"]
+
+
+def test_inventory_includes_all_declared_tools():
+    from orion_core.dispatch_schema import TOOL_DECLARATIONS
+
+    actual = inventory(ROOT, {})
+    assert set(actual["tools"]) == {d["name"] for d in TOOL_DECLARATIONS}
+

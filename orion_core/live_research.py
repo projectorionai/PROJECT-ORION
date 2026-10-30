@@ -70,6 +70,9 @@ SEARCH_TIMEOUT_S = 15.0
 #: Most characters kept from one page. Enough for the model to work from,
 #: bounded so a single enormous article cannot swallow the context budget.
 MAX_PAGE_CHARS = 12_000
+#: Most of a page downloaded. Only MAX_PAGE_CHARS of its text is kept, and a
+#: 5 MB page took 117 ms to clean - on the event loop, beside his voice.
+MAX_PAGE_BYTES = 2_000_000
 
 #: Pages read at once. Small deliberately — this is meant to look like
 #: reading, the remote hosts have not agreed to be hammered, and a burst of
@@ -111,11 +114,244 @@ def _clean(raw: str) -> str:
     return _BLANK.sub("\n\n", text).strip()
 
 
+def _digest(body: str) -> tuple[str, str]:
+    """A page's title and readable text (off the event loop: see MAX_PAGE_BYTES)."""
+    body = body[:MAX_PAGE_BYTES]
+    title = _TITLE.search(body)
+    return (_clean(title.group(1))[:200] if title else ""), _clean(body)
+
+
 def _host(url: str) -> str:
     try:
         return (urlparse(url).hostname or "").lower()
     except Exception:
         return ""
+
+
+# ── evidence: what was read, and which claim rests on which source ───────────
+# Mark XXXX.9 (owner, 30 Oct 2026: "if ORION's researching it must be more
+# accurate"). The timed run and the dossier handed the model search snippets
+# and headlines - "11 sources" in his log, not one page opened - and asked for
+# a note that cited nothing, with "reason from established knowledge" as the
+# fallback. These helpers are shared by every engine so a note says which
+# source each claim rests on, a claim resting on none is marked, and a page
+# that was read is told apart from a snippet that was only seen.
+
+#: How a source was seen, as the reader is told.
+EVIDENCE_LABELS = {"page": "page read", "encyclopaedia": "encyclopaedia summary",
+                   "snippet": "search snippet only", "headline": "headline only"}
+#: Of a read page, the passages that bear on the question go to the model.
+PASSAGE_CHARS = 1400
+#: The mark on a claim no listed source supports.
+UNSOURCED = "[unsourced]"
+
+
+def evidence_kind(source: Any) -> str:
+    """"page", "encyclopaedia", "snippet" or "headline" for a source row."""
+    kind = str((source.get("evidence") if isinstance(source, dict)
+                else getattr(source, "evidence", "")) or "")
+    if kind in EVIDENCE_LABELS:
+        return kind
+    title = str((source.get("title") if isinstance(source, dict)
+                 else getattr(source, "title", "")) or "")
+    return "encyclopaedia" if title.startswith("Wikipedia:") else "snippet"
+
+
+def describe_evidence(sources: Iterable[Any]) -> tuple[str, str]:
+    """(level, phrase): what a run's sources really were, said plainly.
+
+    level is "pages", "snippets_only", "encyclopaedia_only" or "none". An
+    encyclopaedia-only or snippet-only run is said to be one: "no sources
+    found", "only an encyclopaedia answered" and "pages were read" are three
+    different results and must not read alike."""
+    kinds = [evidence_kind(s) for s in sources]
+    pages = kinds.count("page")
+    other = len(kinds) - pages
+    if not kinds:
+        return "none", "no sources"
+    if pages:
+        phrase = f"{pages} page{'s' if pages != 1 else ''} read"
+        if other:
+            phrase += (f" and {other} search snippet{'s' if other != 1 else ''}, headline"
+                       f"{'s' if other != 1 else ''} or summar{'ies' if other != 1 else 'y'} not opened")
+        return "pages", phrase
+    if all(kind == "encyclopaedia" for kind in kinds):
+        return "encyclopaedia_only", "an encyclopaedia summary only - no web page was opened"
+    return "snippets_only", "search snippets and headlines only - no web page was opened"
+
+
+_STOP = frozenset("""what which when where whom whose does have been being were with from
+    that this these those into onto about than then there their they them your some many
+    much more most other such only also very could would should might must between among
+    across over under after before during within without upon please find tell give how
+    why does""".split())
+
+
+def relevant_passages(text: str, question: str, limit: int = PASSAGE_CHARS) -> str:
+    """The sentences of *text* that bear on *question*, in page order.
+
+    A news excerpt used to be the first 700 characters of prose - the
+    introduction, usually - so a fact further down never reached the model.
+    Sentences are scored by the question's words they contain (six-letter
+    prefixes, so "delayed" meets "delay"), a figure counts for a little, and
+    the best fill *limit*; gaps are shown as an ellipsis. Pure and cheap: no
+    model call."""
+    words = {w[:6] for w in re.findall(r"[a-z0-9]+", str(question).lower())
+             if len(w) >= 4 and w not in _STOP}
+    sentences: list[str] = []
+    seen: set[str] = set()
+    for line in str(text or "").splitlines():
+        if len(line.split()) < 8:              # menus, captions, buttons
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", line.strip()):
+            key = sentence.lower()
+            if len(sentence.split()) >= 5 and key not in seen:
+                seen.add(key)
+                sentences.append(sentence)
+    if not sentences:
+        return ""
+
+    def score(sentence: str) -> float:
+        low = sentence.lower()
+        return sum(1 for w in words if w in low) + (0.5 if re.search(r"\d", sentence) else 0.0)
+
+    ranked = sorted(range(len(sentences)), key=lambda i: (-score(sentences[i]), i))
+    chosen: list[int] = []
+    used = 0
+    for index in ranked:
+        if chosen and used + len(sentences[index]) > limit:
+            break
+        chosen.append(index)
+        used += len(sentences[index]) + 1
+    chosen.sort()
+    parts: list[str] = []
+    previous = None
+    for index in chosen:
+        if previous is not None and index != previous + 1:
+            parts.append("…")
+        parts.append(sentences[index])
+        previous = index
+    return " ".join(parts)[:limit]
+
+
+@dataclass
+class CitationCheck:
+    """What a note's citations amount to, counted rather than trusted."""
+
+    claims: int = 0
+    cited: int = 0
+    on_pages: int = 0
+    unsourced: int = 0
+    removed: int = 0
+    disagreements: int = 0
+    numbers: list[int] = field(default_factory=list)
+
+    def line(self) -> str:
+        """One plain sentence for the foot of a note."""
+        if not self.claims:
+            return "Evidence check: no factual claims to check."
+        text = (f"Evidence check: {self.cited} of {self.claims} claim{'s' if self.claims != 1 else ''}"
+                f" cite a source ({self.on_pages} citing a page that was read)")
+        if self.unsourced:
+            text += f"; {self.unsourced} marked {UNSOURCED}"
+        if self.removed:
+            text += (f"; {self.removed} citation{'s' if self.removed != 1 else ''} to a source "
+                     "that was never given removed")
+        if self.disagreements:
+            text += f"; sources disagree on {self.disagreements} point{'s' if self.disagreements != 1 else ''}"
+        return text + "."
+
+
+_CITATION = re.compile(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})*)\]")
+#: Lines that already say what they are: not claims to be checked.
+_LABELLED = ("sources disagree", "not in the sources", "not in the notes", "unverified",
+             "disagreements", "evidence check", "sources cited")
+#: Sentences about the evidence itself ("the sources do not say..."), not claims.
+_ABOUT_SOURCES = re.compile(
+    r"^(?:no (?:source|note|page)|none of the (?:sources|notes|pages)|"
+    r"(?:the |these )?(?:sources?|notes?|pages?)\b[^.]{0,60}\b(?:do not|does not|don't|did not|"
+    r"cannot|can't|never|neither)\b)", re.IGNORECASE)
+
+
+def check_citations(text: str, kinds: dict[int, str]) -> tuple[str, CitationCheck]:
+    """*text* with every claim's citations checked against the sources given.
+
+    *kinds* maps each source number the writer was given to its evidence kind.
+    A citation to a number that was never given (the model's invention) is
+    removed; a factual sentence left with no valid citation is marked
+    [unsourced]. Nothing is reworded and nothing is added beyond the mark."""
+    check = CitationCheck()
+    valid = set(kinds)
+
+    def keep(match: re.Match) -> str:
+        numbers = [int(n) for n in re.findall(r"\d+", match.group(1))]
+        good = [n for n in numbers if n in valid]
+        check.removed += len(numbers) - len(good)
+        return "".join(f"[{n}]" for n in good)
+
+    out_lines: list[str] = []
+    for line in str(text or "").splitlines():
+        if _CITATION.search(line):
+            line = _CITATION.sub(keep, line)
+            # "...hours. [3]" -> "...hours [3]." so the citation stays with its
+            # claim; a removed one leaves no "fortnight ." behind.
+            line = re.sub(r"([.!?])\s*((?:\[\d{1,3}\])+)", r" \2\1", line)
+            line = re.sub(r"[ \t]+([.!?,;])", r"\1", line)
+        stripped = line.strip()
+        bare = stripped.lstrip("-*• ").lower()
+        if (not stripped or stripped.startswith(("#", "_", "|", ">"))
+                or bare.startswith(_LABELLED)):
+            if bare.startswith(("sources disagree", "disagreements")):
+                check.disagreements += 1
+            out_lines.append(line)
+            continue
+        pieces = re.split(r"(?<=[.!?])(\s+)", line)
+        rebuilt: list[str] = []
+        for piece in pieces:
+            words = re.findall(r"[A-Za-z]+", piece)
+            opening = piece.strip().lstrip("-*• ")
+            if opening.lower().startswith(_LABELLED):        # labelled mid-paragraph
+                if opening.lower().startswith(("sources disagree", "disagreements")):
+                    check.disagreements += 1
+                rebuilt.append(piece)
+                continue
+            if piece.isspace() or len(words) < 6 or _ABOUT_SOURCES.match(opening):
+                rebuilt.append(piece)
+                continue
+            check.claims += 1
+            cited = [int(n) for n in re.findall(r"\[(\d{1,3})\]", piece)]
+            if cited:
+                check.cited += 1
+                check.numbers.extend(n for n in cited if n not in check.numbers)
+                if any(kinds.get(n) == "page" for n in cited):
+                    check.on_pages += 1
+                rebuilt.append(piece)
+                continue
+            check.unsourced += 1
+            body = piece.rstrip()
+            tail = piece[len(body):]
+            if body and body[-1] in ".!?":
+                rebuilt.append(f"{body[:-1].rstrip()} {UNSOURCED}{body[-1]}{tail}")
+            else:
+                rebuilt.append(f"{body} {UNSOURCED}{tail}")
+        out_lines.append("".join(rebuilt))
+    return "\n".join(out_lines), check
+
+
+async def read_page(url: str, timeout: float = PAGE_TIMEOUT_S) -> tuple[str, str]:
+    """(title, readable text) of one page, through the investigation's own
+    reader - a browser's agent where sites demand one, Wikimedia's where it
+    does, a Chrome TLS retry on a refusal, bounded size, cleaned off the
+    loop. ("", "") when the page will not open; text "" when it is a cookie
+    wall or script shell. Used by the timed run and the dossier, which never
+    opened a search result before (Mark XXXX.9)."""
+    body = await LiveResearcher(ask=None)._fetch(url, timeout)
+    if not body:
+        return "", ""
+    title, text = await asyncio.to_thread(_digest, body)
+    if len(text) < 400:
+        return title, ""
+    return title, text[:MAX_PAGE_CHARS * 5]
 
 
 @dataclass
@@ -232,12 +468,15 @@ class LiveResearcher:
 
     def __init__(self, ask: Callable[..., Any], bus: Any = None,
                  on_event: Callable[[dict], None] | None = None,
-                 root: Path | str | None = None) -> None:
+                 root: Path | str | None = None, activity: Any = None) -> None:
         self.ask = ask
         self.bus = bus
         self.on_event = on_event
         self.root = Path(root) if root else None
         self._seen: set[str] = set()
+        #: research_runs.ActivitySignal of the run this reading belongs to (a
+        #: paper passes its own); None and investigate() reports its own run.
+        self.activity = activity
 
     # ── saying what is happening ─────────────────────────────────────────────
 
@@ -250,6 +489,11 @@ class LiveResearcher:
         told anybody anything.
         """
         payload = {"kind": kind, "message": message, "at": time.time(), **extra}
+        if kind == "search" and self.activity is not None:
+            try:
+                self.activity.progress(str(extra.get("query") or ""))
+            except Exception:
+                pass
         if self.bus is not None:
             try:
                 self.bus.log.emit(f"[Research] {message}")
@@ -300,10 +544,9 @@ class LiveResearcher:
         body = await self._fetch(finding.url, PAGE_TIMEOUT_S)
         if not body:
             return ""
-        title = _TITLE.search(body)
+        title, text = await asyncio.to_thread(_digest, body)
         if title and not finding.title:
-            finding.title = _clean(title.group(1))[:200]
-        text = _clean(body)
+            finding.title = title
         # A page that yields almost nothing is a cookie wall, a login page or
         # a JavaScript shell. Saying so is better than taking a note from it.
         if len(text) < 400:
@@ -350,7 +593,21 @@ class LiveResearcher:
                         kind = str(response.headers.get("Content-Type") or "")
                         if "html" not in kind and "text" not in kind:
                             return ""
-                        return await response.text(errors="replace")
+                        # Read to the end or the cap. content.read(n) returns
+                        # whatever has ARRIVED - the first chunk, usually just
+                        # the <head> - so pages came back "thin" (Mark XXXX.4).
+                        chunks: list[bytes] = []
+                        size = 0
+                        async for chunk in response.content.iter_chunked(65536):
+                            chunks.append(chunk)
+                            size += len(chunk)
+                            if size >= MAX_PAGE_BYTES:
+                                break
+                        raw = b"".join(chunks)[:MAX_PAGE_BYTES]
+                        try:
+                            return raw.decode(response.charset or "utf-8", errors="replace")
+                        except LookupError:
+                            return raw.decode("utf-8", errors="replace")
         except asyncio.TimeoutError:
             self._say("unreachable", f"{_host(url)} took too long", url=url)
             return ""
@@ -410,13 +667,21 @@ class LiveResearcher:
             f"sentences — of what THIS PAGE says that bears on the question. "
             f"Quote a figure or a phrase where the page gives one.\n\n"
             f"Report only what is on the page. If it does not really address "
-            f"the question, say exactly that in one line instead of writing a "
-            f"note from your own knowledge.\n\n"
+            f"the question, reply with exactly NOT RELEVANT and nothing else, "
+            f"instead of writing a note from your own knowledge.\n\n"
             f"PAGE: {finding.title}\n"
             f"URL: {finding.url}\n\n"
             f"{text}")
         body = str(await self._ask(prompt, "research reader") or "").strip()
         if not body:
+            return None
+        # A page that does not answer the question is not a source for it.
+        # Its "note" used to be kept, numbered and listed under Sources, so a
+        # pasta recipe could make a sleep investigation look one page better
+        # sourced than it was (Mark XXXX.9).
+        if body.upper().startswith("NOT RELEVANT") or "does not really address" in body.lower():
+            self._say("irrelevant", f"{_host(finding.url)} does not address the question",
+                      url=finding.url, question=question)
             return None
         note = Note(question=question, title=finding.title, url=finding.url,
                     note=body, chars=len(text))
@@ -470,6 +735,25 @@ class LiveResearcher:
         *rounds* is how many times what was found is allowed to decide what to
         look at next. One round is a survey; two or more is research.
         """
+        if self.activity is not None:          # part of a larger run (a paper)
+            return await self._investigate(topic, questions, per_question, rounds, deadline_s)
+        from .research_runs import ActivitySignal
+        own = self.activity = ActivitySignal(self.bus, topic, "browse")
+        own.start()
+        status = "failed"
+        try:
+            run = await self._investigate(topic, questions, per_question, rounds, deadline_s)
+            status = "done" if run.notes else "failed"
+            return run
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        finally:
+            own.finish(status)
+            self.activity = None
+
+    async def _investigate(self, topic: str, questions: int, per_question: int,
+                           rounds: int, deadline_s: float) -> Investigation:
         run = Investigation(topic=topic)
         self._say("start", f"starting research: {topic}", topic=topic)
         ends_at = (time.monotonic() + deadline_s) if deadline_s else 0.0
@@ -557,7 +841,9 @@ class LiveResearcher:
                 except Exception as exc:
                     run.failed.append((finding.url, f"note failed: {exc}"))
                     continue
-                if note is not None and len(notes) < wanted:
+                if note is None:
+                    run.failed.append((finding.url, "did not address the question"))
+                elif len(notes) < wanted:
                     notes.append(note)
 
         await asyncio.gather(*(worker() for _ in range(min(CONCURRENT_READS, wanted))))
@@ -579,13 +865,20 @@ class LiveResearcher:
             f"TOPIC: {run.topic}\n\n"
             f"These are notes I took from pages I actually read:\n\n{digest}\n\n"
             f"Write the findings in British English. Say what the sources "
-            f"agree on, name any disagreement explicitly and say which sources "
-            f"disagree, and state plainly what is still unanswered. Cite as "
-            f"[1], [2] against the numbered notes.\n\n"
+            f"agree on, name any disagreement explicitly on a line beginning "
+            f"\"Sources disagree:\" and say which sources disagree, and state "
+            f"plainly what is still unanswered. End every finding with its "
+            f"citation, [1], [2], against the numbered notes - only those "
+            f"numbers exist.\n\n"
             f"Use only these notes. Where they do not cover something, say so "
             f"rather than filling the gap from your own knowledge — the point "
             f"of this exercise is what the sources said.")
-        return str(await self._ask(prompt, "research writer") or "").strip()
+        text = str(await self._ask(prompt, "research writer") or "").strip()
+        # Checked, not trusted (Mark XXXX.9): a citation to a note that does
+        # not exist is removed and a finding resting on no note is marked, so
+        # the write-up cannot carry a reference nobody can follow.
+        checked, _check = check_citations(text, {i: "page" for i in range(1, len(run.notes) + 1)})
+        return checked
 
     def write_folder(self, run: Investigation, summary: str = "") -> Path | None:
         """Save the notes and the summary, one file per note.
@@ -596,23 +889,37 @@ class LiveResearcher:
         """
         if self.root is None:
             return None
+        from .research_docx import write_text_artifact
         slug = re.sub(r"[^a-z0-9]+", "_", run.topic.lower()).strip("_")[:60]
-        folder = self.root / f"{time.strftime('%Y-%m-%d')}_{slug or 'research'}"
+        stem = f"{time.strftime('%Y-%m-%d')}_{slug or 'research'}"
         try:
-            (folder / "notes").mkdir(parents=True, exist_ok=True)
+            self.root.mkdir(parents=True, exist_ok=True)
+            for index in range(1000):
+                folder = self.root / f"{stem}{'_' + str(index + 1) if index else ''}"
+                try:
+                    folder.mkdir()
+                except FileExistsError:
+                    continue
+                break
+            else:
+                raise FileExistsError("No unused research folder was available")
+            (folder / "notes").mkdir()
             for index, note in enumerate(run.notes, start=1):
                 name = re.sub(r"[^a-z0-9]+", "_",
                               (note.title or _host(note.url)).lower())[:50]
-                (folder / "notes" / f"{index:02d}_{name or 'note'}.md").write_text(
+                write_text_artifact(folder / "notes" / f"{index:02d}_{name or 'note'}.md",
                     f"# {note.title or note.url}\n\n"
                     f"Source: {note.url}\n\n"
                     f"Question: {note.question}\n\n{note.note}\n",
-                    encoding="utf-8")
+                    )
             if summary:
-                (folder / "SUMMARY.md").write_text(
+                # Numbered as the summary cites them: [n] is the n-th note,
+                # and every one of these pages was opened and read.
+                write_text_artifact(folder / "SUMMARY.md",
                     f"# {run.topic}\n\n{summary}\n\n## Sources\n\n"
-                    + "\n".join(f"- {url}" for url in run.sources) + "\n",
-                    encoding="utf-8")
+                    + "\n".join(f"[{i}] {note.title or _host(note.url)} — {note.url} (page read)"
+                                for i, note in enumerate(run.notes, start=1)) + "\n",
+                    )
             atomic_write_text((folder / "run.json"), json.dumps({
                 "topic": run.topic,
                 "questions": run.questions,
@@ -628,6 +935,8 @@ class LiveResearcher:
 
 
 __all__ = [
-    "CONCURRENT_READS", "MAX_PAGE_CHARS", "PAGE_TIMEOUT_S", "SKIP_HOSTS",
-    "Finding", "Investigation", "LiveResearcher", "Note",
+    "CONCURRENT_READS", "EVIDENCE_LABELS", "MAX_PAGE_CHARS", "PAGE_TIMEOUT_S", "PASSAGE_CHARS",
+    "SKIP_HOSTS", "UNSOURCED", "CitationCheck", "Finding", "Investigation", "LiveResearcher",
+    "Note", "check_citations", "describe_evidence", "evidence_kind", "read_page",
+    "relevant_passages",
 ]

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import time
 from typing import Any
 
@@ -34,12 +35,20 @@ from .data import ToolResult
 # normal desktop activity every time an application creates a helper process.
 _ROUTINE_PROCESS_NAMES = frozenset({
     "agent", "applicationframehost", "battle.net", "battlenet", "blizzard",
-    "chatgpt", "chrome", "claude", "cmd", "code", "conhost", "discord",
+    "chatgpt", "chrome", "cmd", "code", "conhost", "discord",
     "discordcanary", "discordptb", "dwm", "explorer", "firefox", "msedge",
     "msedgewebview2", "notepad", "obs", "obs64", "onedrive", "powershell",
     "runtimebroker", "searchhost", "shellexperiencehost", "sihost", "slack",
     "spotify", "startmenuexperiencehost", "steam", "teams", "terminal",
     "textinputhost", "widgetservice", "widgets", "windows terminal",
+    # ORION's own local model runs inside Ollama's runner, and Windows Defender
+    # scans and updates itself: all were alerted as "unfamiliar heavyweight"
+    # programs in the owner's metrics (llama-server again on 29 Oct 2026).
+    "ollama", "ollama app", "ollama_llama_server", "llama-server", "lm studio", "lms",
+    "msmpeng", "mpsigstub", "mpdefendercoreservice", "nissrv", "securityhealthservice",
+    # The owner's everyday programs: his games and Android Studio.
+    "riotclientservices", "riotclientux", "riotclientcrashhandler", "valorant",
+    "valorant-win64-shipping", "vgc", "vgtray", "studio64",
 })
 
 
@@ -53,6 +62,24 @@ def is_routine_process(process_name: str) -> bool:
     normalised = str(process_name or "").strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
     stem = normalised.removesuffix(".exe")
     return normalised in _ROUTINE_PROCESS_NAMES or stem in _ROUTINE_PROCESS_NAMES
+
+
+def is_orion_process(proc: Any) -> bool:
+    """ORION itself or a process it started (the globe's renderer, a worker).
+
+    26 Oct 2026: the sentinel logged "an unfamiliar heavyweight process
+    started - ORION.exe using 323 megabytes" - ORION's own globe process."""
+    me = os.getpid()
+    try:
+        if proc.pid == me or any(parent.pid == me for parent in proc.parents()):
+            return True
+    except (psutil.Error, OSError):
+        pass
+    try:
+        exe = os.path.basename(sys.executable).lower()
+        return exe.startswith("orion") and proc.name().lower() == exe
+    except (psutil.Error, OSError):
+        return False
 
 
 class SentinelAgent:
@@ -176,7 +203,7 @@ class SentinelAgent:
                 proc = psutil.Process(pid)
                 rss = proc.memory_info().rss / (1024 * 1024)
                 name = proc.name()
-                if rss > 300 and not is_routine_process(name):
+                if rss > 300 and not is_routine_process(name) and not is_orion_process(proc):
                     # AMBIENT by policy: a process starting is not dangerous
                     # and does not affect the user. Banner + log only — this is
                     # the exact narration the user asked to stop.

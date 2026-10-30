@@ -3,7 +3,7 @@ Tests for the free-thinking stream (ThoughtStream + the router's thought path).
 
 * The 'thoughts' profile is reserved: it never appears in normal text routing,
   and generate_thought prefers it with the compact introspection instruction.
-* Thoughts are broadcast on bus.thought, echoed to the log, journalled to
+* Reflections are broadcast on bus.thought, kept out of the terminal, journalled to
   JSONL, and tagged task='thought' in the token ledger.
 * Reflections are frugal: an unchanged context does not re-think; decision
   commentary is rate-limited by the gap timer.
@@ -41,6 +41,9 @@ class _Signal:
 
     def connect(self, handler):
         self._handlers.append(handler)
+
+    def disconnect(self, handler):
+        self._handlers.remove(handler)
 
 
 class _StubBus:
@@ -125,7 +128,8 @@ def test_generate_thought_prefers_dedicated_profile_and_tags_usage(paid_thoughts
     assert profile.name == "thoughts"
     name, instruction, task = calls[0]
     assert task == "thought"
-    assert "inner voice" in instruction         # compact persona, not the tool map
+    assert "application reflection" in instruction
+    assert "private reasoning" not in instruction
     assert text.startswith("I noticed")
 
 
@@ -211,7 +215,7 @@ def _stream(tmp_path, router, bus):
     )
 
 
-def test_reflection_broadcasts_logs_and_journals(tmp_path):
+def test_reflection_broadcasts_and_journals_without_terminal_spam(tmp_path):
     router, bus = _router()
 
     async def fake_thought(prompt):
@@ -224,7 +228,10 @@ def test_reflection_broadcasts_logs_and_journals(tmp_path):
     assert thoughts and thoughts[0]["text"] == "I am watching the deploy."
     assert thoughts[0]["kind"] == "reflection"
     logs = [p for (n, p) in bus.events if n == "log"]
-    assert any("THOUGHT: I am watching the deploy." in str(entry) for entry in logs)
+    assert not any("I am watching the deploy." in str(entry) for entry in logs)
+    snapshots = [p for (n, p) in bus.events if n == "dashboard_event"
+                 and p[0] == "reflections"]
+    assert snapshots[-1][1]["entries"][-1]["text"] == "I am watching the deploy."
     lines = (tmp_path / "journal.jsonl").read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[0])["kind"] == "reflection"
     assert stream.recent[-1]["text"] == "I am watching the deploy."
@@ -327,6 +334,241 @@ def test_provider_failure_is_contained(tmp_path):
     asyncio.run(stream._reflection_thought())   # must not raise
     assert not [p for (n, p) in bus.events if n == "thought"]
     assert any("THOUGHT: skipped" in str(p) for (n, p) in bus.events if n == "log")
+
+
+def test_failure_cooldown_keeps_observed_activity_useful_without_new_model_calls(tmp_path, monkeypatch):
+    import orion_core.thought_stream as module
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    router, bus = _router()
+    calls = []
+
+    async def unavailable(prompt):
+        calls.append(prompt)
+        raise RuntimeError("No local reflection provider is available")
+
+    router.generate_thought = unavailable
+    stream = _stream(tmp_path, router, bus)
+    stream._note_decision("Desktop", "Calculator launch requested")
+    asyncio.run(stream._decision_thought())
+    assert len(calls) == 1
+    assert stream._retry_at == 1060.0
+    assert stream.recent[-1]["origin"] == "observation"
+    assert stream.recent[-1]["evidence"] == ["Desktop Calculator launch requested"]
+    assert "requested" in stream.recent[-1]["text"]
+    assert "succeeded" not in stream.recent[-1]["text"]
+    # New observed activity is useful while generation is cooling down.
+    clock[0] = 1015.0
+    stream._note_decision("Browser", "Page navigation requested")
+    asyncio.run(stream._decision_thought())
+    assert len(calls) == 1
+    assert len(stream.recent) == 2
+    assert stream.recent[-1]["evidence"] == ["Browser Page navigation requested"]
+    assert len([p for name, p in bus.events if name == "log"]) == 1
+
+
+def test_identical_provider_errors_are_coalesced_and_backoff_is_bounded(tmp_path, monkeypatch):
+    import orion_core.thought_stream as module
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    router, bus = _router()
+
+    async def unavailable(prompt):
+        raise RuntimeError("Provider unavailable")
+
+    router.generate_thought = unavailable
+    stream = _stream(tmp_path, router, bus)
+    asyncio.run(stream._reflection_thought())
+    clock[0] = stream._retry_at
+    asyncio.run(stream._reflection_thought())
+    assert stream._retry_at == 1180.0
+    assert len([p for name, p in bus.events if name == "log"]) == 1
+    for _ in range(10):
+        clock[0] = stream._retry_at
+        asyncio.run(stream._reflection_thought())
+    assert stream._retry_at - clock[0] == stream.MAX_FAILURE_RETRY_S
+    assert len([p for name, p in bus.events if name == "log"]) == 1
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_local_only_unavailability_never_spams_the_log(tmp_path, monkeypatch, streaming):
+    import orion_core.thought_stream as module
+
+    monkeypatch.delenv("ORION_PAID_THOUGHTS", raising=False)
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    router, bus = _router()
+    # Exercise the real policy rather than matching a truncated error string.
+    monkeypatch.setattr(router, "_thought_profiles", lambda prompt: [router.settings.providers["chat"]])
+    stream = ThoughtStream(bus, _StubMemory(), router, journal_path=tmp_path / "j.jsonl")
+    if not streaming:
+        router.generate_thought_stream = None
+    else:
+        async def duplicate_call(prompt):
+            pytest.fail("an expected idle state must not retry non-streamed")
+        router.generate_thought = duplicate_call
+    for _ in range(12):
+        stream._note_decision("Desktop", "Calculator launch requested")
+        asyncio.run(stream._decision_thought())
+        clock[0] = stream._retry_at
+    assert not [p for name, p in bus.events if name == "log"]
+    assert stream.recent[-1]["origin"] == "observation"
+    assert "requested" in stream.recent[-1]["text"]
+
+
+def test_a_real_failure_can_be_reported_again_after_recovery(tmp_path, monkeypatch):
+    import orion_core.thought_stream as module
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    router, bus = _router()
+    failed = [True]
+
+    async def generate(prompt):
+        if failed[0]:
+            raise RuntimeError("Provider unavailable")
+        return router.settings.providers["thoughts"], "Review the latest task outcome."
+
+    router.generate_thought = generate
+    stream = _stream(tmp_path, router, bus)
+    asyncio.run(stream._reflection_thought())
+    failed[0] = False
+    clock[0] = stream._retry_at
+    asyncio.run(stream._reflection_thought())
+    failed[0] = True
+    stream._last_context_digest = ""
+    asyncio.run(stream._reflection_thought())
+    assert len([p for name, p in bus.events if name == "log"]) == 2
+
+
+def test_success_resets_failure_backoff(tmp_path, monkeypatch):
+    import orion_core.thought_stream as module
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    router, bus = _router()
+    calls = []
+
+    async def recovering(prompt):
+        calls.append(prompt)
+        if len(calls) == 1:
+            raise RuntimeError("Temporarily unavailable")
+        return router.settings.providers["thoughts"], "Review the latest task outcome."
+
+    router.generate_thought = recovering
+    stream = _stream(tmp_path, router, bus)
+    asyncio.run(stream._reflection_thought())
+    clock[0] = stream._retry_at
+    asyncio.run(stream._reflection_thought())
+    assert stream._failure_count == 0
+    assert stream._retry_at == 0.0
+    assert stream.recent[-1]["origin"] == "generated_reflection"
+
+
+def test_empty_model_response_also_cools_down_instead_of_repeating_expensive_calls(tmp_path):
+    router, bus = _router()
+    calls = []
+
+    async def empty(prompt):
+        calls.append(prompt)
+        return router.settings.providers["thoughts"], " "
+
+    router.generate_thought = empty
+    stream = _stream(tmp_path, router, bus)
+    asyncio.run(stream._reflection_thought())
+    asyncio.run(stream._reflection_thought())
+    assert len(calls) == 1
+    assert stream._failure_count == 1
+    assert "provider returned no reflection text" in [
+        payload for name, payload in bus.events if name == "log"][0]
+
+
+def test_late_page_snapshot_is_bounded_and_excludes_raw_conversation(tmp_path):
+    router, bus = _router()
+    stream = _stream(tmp_path, router, bus)
+    for number in range(75):
+        stream._emit("A useful observation.", "reflection", "", number,
+                     context={"focus": "Writing", "recent_conversation": "private turn"})
+    latest = [payload for name, payload in bus.events
+              if name == "dashboard_event" and payload[0] == "reflections"][-1][1]
+    assert len(latest["entries"]) == 50
+    assert latest["entries"][-1]["context"] == {"focus": "Writing"}
+    assert "private turn" not in json.dumps(latest)
+    assert not [payload for name, payload in bus.events if name == "log"]
+
+
+def test_external_forge_and_maintenance_notes_join_late_page_history_once(tmp_path):
+    router, bus = _router()
+    stream = _stream(tmp_path, router, bus)
+    note = {"id": "forge:round-12", "at": "09:00:00", "origin": "observation",
+            "text": "Candidate checks passed; activation is awaiting approval.",
+            "context": {"active_project": "ORION", "secret_field": "excluded"},
+            "evidence": ["Benchmark: 12 cases passed"]}
+    bus.thought.emit(note)
+    bus.thought.emit(dict(note))
+    assert len(stream.recent) == 1
+    assert stream.recent[0]["context"] == {"active_project": "ORION"}
+    assert stream.recent[0]["origin"] == "observation"
+    snapshots = [payload[1] for name, payload in bus.events
+                 if name == "dashboard_event" and payload[0] == "reflections"]
+    assert snapshots[-1]["entries"][0]["text"] == note["text"]
+    lines = (tmp_path / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert note["id"] == "forge:round-12"  # Signal consumers retain their original event.
+    assert not [payload for name, payload in bus.events if name == "log"]
+
+
+def test_own_note_is_not_journalled_twice_by_the_external_observer(tmp_path):
+    router, bus = _router()
+    stream = _stream(tmp_path, router, bus)
+    stream._emit("A useful reflection.", "reflection", "thoughts", 1)
+    assert len(stream.recent) == 1
+    assert len((tmp_path / "journal.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_shutdown_disconnects_the_external_note_observer_and_ignores_late_delivery(tmp_path):
+    router, bus = _router()
+    stream = _stream(tmp_path, router, bus)
+    assert stream._remember_external_note in bus.thought._handlers
+    stream.stop()
+    stream.stop()  # Closing twice is harmless.
+    assert stream._remember_external_note not in bus.thought._handlers
+    bus.thought.emit({"text": "Late note", "origin": "observation"})
+    stream._remember_external_note({"text": "Queued callback after disconnect"})
+    stream._note_decision("Late activity")
+    assert not stream.recent
+    assert not stream._pending_decisions
+    assert not (tmp_path / "journal.jsonl").exists()
+
+
+def test_late_model_completion_cannot_publish_after_shutdown(tmp_path):
+    router, bus = _router()
+    stream = _stream(tmp_path, router, bus)
+
+    async def late(prompt):
+        stream.stop()
+        return router.settings.providers["thoughts"], "Too late."
+
+    router.generate_thought = late
+    assert asyncio.run(stream._think("summarise", "reflection")) is False
+    assert not stream.recent
+    assert not (tmp_path / "journal.jsonl").exists()
+
+
+def test_late_model_failure_cannot_publish_a_fallback_after_shutdown(tmp_path):
+    router, bus = _router()
+    stream = _stream(tmp_path, router, bus)
+
+    async def late_failure(prompt):
+        stream.stop()
+        raise RuntimeError("Closed while generating")
+
+    router.generate_thought = late_failure
+    assert asyncio.run(stream._think("summarise", "decision",
+                                    evidence=["Calculator launch requested"])) is False
+    assert not stream.recent
+    assert not [payload for name, payload in bus.events if name == "log"]
 
 
 def test_stream_holds_no_dispatcher():

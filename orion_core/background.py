@@ -107,7 +107,23 @@ def spawn(coro: Awaitable[Any], name: str = "") -> asyncio.Task | None:
             except Exception:
                 pass
         return None
+    # ensure_future returns a plain Future unchanged. Such an object has no
+    # get_name/set_name, so diagnostics and the failure callback would crash.
+    # Wrap non-coroutine awaitables so every owned handle really is a Task.
+    async def await_result(awaitable: Awaitable[Any]) -> Any:
+        return await awaitable
+
     task = asyncio.ensure_future(coro)
+    if not isinstance(task, asyncio.Task):
+        future = task
+        task = asyncio.create_task(await_result(future))
+
+        def cancel_future(finished: asyncio.Task) -> None:
+            # Cancellation can happen before await_result ever starts.
+            if finished.cancelled():
+                future.cancel()
+
+        task.add_done_callback(cancel_future)
     if name:
         try:
             task.set_name(name)
@@ -115,6 +131,21 @@ def spawn(coro: Awaitable[Any], name: str = "") -> asyncio.Task | None:
             pass
     _RUNNING.add(task)
     task.add_done_callback(_report)
+    return task
+
+
+def adopt(task: asyncio.Task) -> asyncio.Task:
+    """Put a task someone else created under this registry's shutdown.
+
+    ``tasks.spawn`` keeps its own failure reporting (a caller-supplied handler
+    and label), but its tasks were never cancelled or drained at shutdown —
+    nothing in teardown knew they existed. Adopting them gives every owned
+    background task ONE owner for cancellation, draining and "what is still
+    running?", without reporting a failure twice.
+    """
+    if not task.done():
+        _RUNNING.add(task)
+        task.add_done_callback(_RUNNING.discard)
     return task
 
 
@@ -151,4 +182,4 @@ def cancel_all() -> int:
     return cancelled
 
 
-__all__ = ["attach_bus", "cancel_all", "drain", "in_flight", "names", "spawn"]
+__all__ = ["adopt", "attach_bus", "cancel_all", "drain", "in_flight", "names", "spawn"]

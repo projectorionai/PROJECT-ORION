@@ -53,6 +53,8 @@ COOLDOWN_S = 300.0
 
 _USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/122.0 Safari/537.36")
+_GOOGLE_REDIRECT_HOSTS = frozenset({"vertexaisearch.cloud.google.com",
+                                    "www.google.com", "google.com"})
 
 #: Wikimedia's robot policy REFUSES a generic agent — "ORION-Research/1.0"
 #: earned a 403 and a link to the policy, which is a polite way of saying
@@ -143,7 +145,7 @@ async def _get(url: str, headers: dict, params: dict | None = None) -> tuple[int
     try:
         async with ClientSession(timeout=ClientTimeout(total=TIMEOUT_S)) as session:
             async with session.get(url, headers=headers, params=params,
-                                   allow_redirects=True) as response:
+                                   allow_redirects=False) as response:
                 return response.status, await response.text(errors="replace")
     except Exception:
         return 0, ""
@@ -233,7 +235,7 @@ async def search_wikipedia(query: str, limit: int) -> list[Hit]:
 GEMINI_SEARCH_ENDPOINT = ("https://generativelanguage.googleapis.com/v1beta/"
                           "models/{model}:generateContent")
 #: Tried in turn when the search model's quota refuses (each has its own).
-SEARCH_FALLBACK_MODELS = ("gemini-2.5-flash-lite",)
+SEARCH_FALLBACK_MODELS = ("gemini-2.5-flash-lite", "gemini-3.1-flash-lite")
 
 
 def _retry_delay(raw: str) -> float:
@@ -250,7 +252,9 @@ def gemini_key() -> str:
     try:
         from .constants import API_CONFIG_PATH
 
-        providers = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8")).get("providers") or {}
+        from .key_seal import load_json
+
+        providers = load_json(API_CONFIG_PATH).get("providers") or {}
         for name in ("gemini_text", "gemini"):
             entry = providers.get(name) or {}
             value = str(entry.get("api_key") or "").strip()
@@ -262,7 +266,13 @@ def gemini_key() -> str:
 
 
 async def _resolve_redirect(url: str) -> str:
-    """Follow one redirect hop without downloading the page."""
+    """Resolve a Google grounding wrapper without fetching arbitrary results."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in _GOOGLE_REDIRECT_HOSTS:
+            return url
+    except ValueError:
+        return url
     try:
         from aiohttp import ClientSession, ClientTimeout
     except Exception:
@@ -272,7 +282,11 @@ async def _resolve_redirect(url: str) -> str:
             async with session.get(url, allow_redirects=False,
                                    headers={"User-Agent": _USER_AGENT}) as response:
                 location = response.headers.get("Location") or ""
-                return location if location.startswith("http") else url
+                try:
+                    target = urlparse(location)
+                    return location if target.scheme in {"http", "https"} and target.hostname else url
+                except ValueError:
+                    return url
     except Exception:
         return url
 
@@ -308,7 +322,7 @@ async def search_google(query: str, limit: int) -> list[Hit]:
     # it up and every search after them came back 429. Flash-Lite has an
     # allowance of its own, so a refusal moves down the list before standing
     # the backend down.
-    models = list(dict.fromkeys([os.getenv("ORION_SEARCH_MODEL", "gemini-2.5-flash"),
+    models = list(dict.fromkeys([os.getenv("ORION_SEARCH_MODEL", "gemini-3.5-flash-lite"),
                                  *SEARCH_FALLBACK_MODELS]))
     status, raw, retry_after = 0, "", 0.0
     all_daily = True
@@ -318,7 +332,8 @@ async def search_google(query: str, limit: int) -> list[Hit]:
                 async with session.post(GEMINI_SEARCH_ENDPOINT.format(model=model),
                                         json=body, headers={
                         "x-goog-api-key": key,
-                        "Content-Type": "application/json"}) as response:
+                        "Content-Type": "application/json"},
+                                        allow_redirects=False) as response:
                     status, raw = response.status, await response.text(errors="replace")
                 if status != 429:
                     break

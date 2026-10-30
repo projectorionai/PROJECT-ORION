@@ -84,9 +84,9 @@ def test_instruments_panel_lists_available_tools(_app):
     assert "knowledge_graph" in view.tools_label.text()
 
 
-def test_instruments_panel_explains_when_none_are_attached(_app):
+def test_instruments_panel_says_when_none_are_attached(_app):
     view = _view()
-    assert "no read-only instruments" in view.tools_label.text().lower()
+    assert view.tools_label.text() == "No tools attached"
 
 
 # ── quick prompts ────────────────────────────────────────────────────────────

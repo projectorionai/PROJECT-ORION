@@ -102,3 +102,84 @@ MIT-licensed (https://huggingface.co/qualcomm/YamNet); the original YAMNet
 model and AudioSet class map are Copyright Google LLC, Apache-2.0
 (https://github.com/tensorflow/models/tree/master/research/audioset/yamnet).
 Retained unmodified.
+
+
+Android offline map renderer and map data
+-----------------------------------------
+Mapsforge 0.25.0 libraries are obtained as Gradle dependencies from Maven
+Central. Copyright Mapsforge contributors. Licence: LGPL v3 with the
+Mapsforge project waiver of sections 4(d) and 4(e); see
+https://github.com/mapsforge/mapsforge and its COPYING.LESSER file.
+The transitive AndroidSVG 1.4 dependency is supplied by its author; see
+https://github.com/BigBadaboom/androidsvg for its licence and source.
+
+Optional downloadable Great Britain and Ireland/Northern Ireland map packs
+are Mapsforge-format extracts of OpenStreetMap data. © OpenStreetMap
+contributors; Open Database Licence (ODbL). See
+https://www.openstreetmap.org/copyright . The packs are kept outside the APK.
+
+
+assets/hand/gesture_recognizer.task
+----------------------------------
+Google MediaPipe Gesture Recognizer pretrained model bundle, float16 version 1,
+retained unmodified. Source:
+https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task
+Official model guide and model-card links are retained in assets/hand/README.md.
+The source audit verifies the exact upstream bytes pinned by GestureEngine.
+
+
+Offline voice (Kokoro) - redistributed in the standalone build only
+--------------------------------------------------------------------
+ORION's offline voice (orion_core/voice_kokoro.py) uses the components below.
+None of them is stored in this repository: build_standalone.py copies them
+into dist/ORION/_internal when it builds the installed application.
+
+Kokoro-82M v1.0 model (kokoro-v1.0.onnx, voices-v1.0.bin)
+
+    Source    : https://huggingface.co/hexgrad/Kokoro-82M ; ONNX export
+                published at https://github.com/thewh1teagle/kokoro-onnx/releases
+                (model-files-v1.0)
+    Copyright : hexgrad
+    Licence   : Apache License, Version 2.0
+
+    Licensed under the Apache License, Version 2.0 (the "License"); you may
+    not use this file except in compliance with the License. You may obtain a
+    copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+    License for the specific language governing permissions and limitations
+    under the License.
+
+Retained unmodified; both files are pinned by size and SHA-256 in
+orion_core/voice_kokoro.py and verified by the build before bundling.
+
+kokoro-onnx 0.6.1 - runs the model through onnxruntime.
+
+    Source    : https://github.com/thewh1teagle/kokoro-onnx
+    Copyright : Copyright (c) 2025 github.com/thewh1teagle
+    Licence   : MIT
+
+espeak-ng (espeak-ng.dll and espeak-ng-data), as packaged by espeakng-loader
+0.2.4 - turns text into phonemes for the model.
+
+    Source    : https://github.com/espeak-ng/espeak-ng ;
+                https://github.com/thewh1teagle/espeakng-loader
+    Licence   : GNU General Public License, version 3 or (at your option)
+                any later version
+
+phonemizer 3.4.0 - drives espeak-ng from Python.
+
+    Source    : https://github.com/bootphon/phonemizer
+    Copyright : Copyright 2015-2021 Mathieu Bernard and contributors
+    Licence   : GNU General Public License, version 3 or (at your option)
+                any later version
+
+ORION is licensed under the GNU Affero General Public License, version 3 or
+later. Section 13 of the GNU GPL v3 and of the GNU AGPL v3 permits combining
+the two in one work; each GPL-licensed component keeps its own licence, and
+its complete source is available at the addresses above. The MIT and Apache
+2.0 components are compatible with both.

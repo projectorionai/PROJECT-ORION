@@ -50,6 +50,20 @@ from typing import Iterable
 #: Written per tool from its purpose. Kept as plain strings; the resolver
 #: tokenises them the same way it tokenises a description.
 VOCABULARY: dict[str, str] = {
+    "project_rehearsal": (
+        "project rehearsal simulate deadline risk critical path slack bottleneck "
+        "monte carlo optimistic pessimistic likely duration estimate what if "
+        "finish on time delay dependency dependencies speedup schedule confidence"
+    ),
+    "context_capsule": (
+        "context capsule handoff checkpoint park this work pick up where i left off "
+        "resume project next step blockers assumptions references save my place"
+    ),
+    "experiment_notebook": (
+        "experiment notebook hypothesis baseline trial observation measurement "
+        "compare results preregister personal experiment did this change help "
+        "test a routine measure improvement"
+    ),
     # ── learning and recall ──────────────────────────────────────────────────
     "study": (
         "quiz test me flashcard flashcards revise revision memorise memorize "
@@ -92,6 +106,15 @@ VOCABULARY: dict[str, str] = {
         "decide judgement judgment calibration calibrated brier prediction "
         "forecast confidence bet call it right wrong"
     ),
+    # Personal goals: how people talk about aiming at something and how far
+    # along they are. "revision" is left to study on purpose — "how is my
+    # revision going" is a flashcard question far more often than a goal one.
+    "goals": (
+        "goal target objective aim aiming ambition resolution milestone milestones "
+        "key results okr on track off track behind at risk pace deadline achieve "
+        "achieved hit my target working towards personal best ran km kilometres "
+        "marathon lose weight kilos saved saving up fund"
+    ),
 
     # ── money ────────────────────────────────────────────────────────────────
     "finance": (
@@ -114,11 +137,23 @@ VOCABULARY: dict[str, str] = {
     ),
     "web_search": (
         "search google look up online web find on the internet what is the "
-        "price of who is"
+        "price of who is "
+        # Live information, the owner's second commonest ask (Oct 2026):
+        # "university events", "latest AI models", "best AI PCs".
+        "events happening campus university uni society latest newest current "
+        "best reviews"
     ),
     "research": (
         "deep dive investigate thesis paper write me a report in depth "
         "thorough findings sources"
+    ),
+    "antigravity_research": (
+        "delegate a public investigation to antigravity gather evidence "
+        "browse public sources with a specialist agent cite sources"
+    ),
+    "semantic_compare": (
+        "compare meanings rank phrases by similarity closest matching "
+        "sentence embedding related text candidates"
     ),
     "recall_conversation": (
         "remember talked about said discussed conversation earlier yesterday "
@@ -146,10 +181,14 @@ VOCABULARY: dict[str, str] = {
     "geo": (
         "weather temperature forecast rain where is location place city town "
         "country postcode post code address distance how far map coordinates "
-        "latitude longitude nearby directions"
+        "latitude longitude nearby directions coat jacket umbrella brolly sunny "
+        "cold chilly warm hot windy snow frost ice sunscreen outside tonight tomorrow "
+        "route journey drive driving how long to drive sunset sunrise get dark traffic commute "
+        "nearest near me pharmacy chemist cash machine petrol station supermarket takeaway pizza place restaurant"
     ),
     "globe": (
-        "earth world map fly to zoom show me on the spin"
+        "earth world map fly to zoom show me on the spin radar wildfires storms hurricane "
+        "typhoon volcano earthquakes night side city lights measure distance"
     ),
     "aviation": (
         "plane planes aircraft airplane aeroplane jet jets airliner helicopter "
@@ -168,7 +207,7 @@ VOCABULARY: dict[str, str] = {
     ),
     "process_file": (
         "fetch local file read this summarise summarize document pdf spreadsheet csv "
-        "what does this say tell me what is in analyse this file contents"
+        "what does this say tell me what is in analyse this file contents review dropped files recall previous file review"
     ),
     "fetch_url": (
         "fetch url web link webpage page online file read the link website "
@@ -195,11 +234,13 @@ VOCABULARY: dict[str, str] = {
         "what can you hear audio recording soundtrack identify the sound"
     ),
     "vision_analyse": (
+        "recall camera memory what was behind me on desk earlier compare camera scenes forget camera memories "
         "look see read the text image picture screenshot what does it say "
         "describe what you see camera photo ocr error message on screen "
         "what am i typing read my notepad read this page read the web page "
         "what is in my word document read the chat what does this window say "
         "exact text in the game on my screen "
+        "take a photo selfie qr code barcode scan this document page letter record a clip "
         "pcb circuit board electronics inspect scan components solder markings "
         # The words people actually point a camera and say. Without them
         # "why is this motherboard dead" scored as a system-diagnostics
@@ -230,19 +271,33 @@ VOCABULARY: dict[str, str] = {
         "enter button move the mouse control my computer"
     ),
     "window_control": (
-        "window minimise maximise close bring up switch to"
+        # Not "exit"/"quit": "exit orion" is shutdown_orion's, and the
+        # handler resolves those words itself (action_aliases).
+        "window windows minimise maximise close bring up switch to front"
+    ),
+    "software_install": (
+        "install installs installing installer uninstalled winget setup"
     ),
     "open_app": (
-        "open launch start run app application program"
+        "open launch start run fire up app application program browser internet "
+        "music player text editor code editor terminal command line folder "
+        "downloads spotify discord steam excel teams whatsapp"
+    ),
+    "calculate": (
+        "calculate work out maths arithmetic multiply divide unit conversion "
+        "stone kilos pints litres inches celsius fahrenheit how many days until "
+        "weeks from today days since christmas easter sleeps bank holiday "
+        "currency exchange rate dollars euros pounds in dollars yen convert money"
     ),
     "close_app": (
         "close quit exit kill shut down the app stop the program"
     ),
     "media_control": (
-        "play pause skip next track volume louder quieter mute music"
+        "play pause skip next track song volume louder quieter mute music "
+        "now playing resume spotify playlist album artist"
     ),
     "peripherals": (
-        "volume brightness wifi bluetooth screen off lock sleep hardware"
+        "volume brightness dim brighter unmute wifi bluetooth screen off lock sleep hardware"
     ),
     "clipboard_operate": (
         "clipboard copy paste copied"
@@ -266,8 +321,11 @@ VOCABULARY: dict[str, str] = {
     # ── ORION about himself ──────────────────────────────────────────────────
     "diagnostics": (
         "diagnostic health check working properly broken faulty everything ok "
+        "benchmark benchmarks self-benchmark "
         "self test why can you not what is wrong problems lagging slow "
-        "performance latency"
+        "performance latency crash crashed crashes closed unexpectedly unable cannot limitations "
+        "stopped talking quiet silent freeze froze frozen stuck cut out unresponsive "
+        "responding dropped happened incident"
     ),
     "capabilities": (
         "what can you do abilities capable features what are you able to"
@@ -281,7 +339,8 @@ VOCABULARY: dict[str, str] = {
     ),
     "resource_status": (
         "cpu memory ram usage load system performance resources how hard are "
-        "you working machine pressure disk"
+        "you working machine pressure disk "
+        "storage space left free disk space hard drive ssd how full is my drive battery"
     ),
     "token_usage": (
         "tokens quota limit budget how much left allowance credits spent "
@@ -291,15 +350,37 @@ VOCABULARY: dict[str, str] = {
         "what changed what did you change recently updated modified your code "
         "new since"
     ),
+    "robot_control": (
+        "robot rover drive the robot robot forward robot backward motors wheels servo "
+        "estop emergency stop the robot software robot robot simulator robot sensors"
+    ),
+    "away_mode": (
+        "away mode keep the pc awake stay awake for my phone"
+    ),
+    "troubleshooting_guide": (
+        "your manual user guide troubleshooting guide"
+    ),
+    "erase_my_data": (
+        "erase all my data delete all my data wipe everything you know about me "
+        "right to erasure gdpr start fresh delete my account data"
+    ),
+    "robot_firmware": (
+        "robot firmware arduino esp32 microcontroller sketch flash the board "
+        "compile firmware upload firmware robot code"
+    ),
     "patch_notes": (
-        "updates changelog release what is new version"
+        "updates update changelog release what is new version patch notes "
+        "improvements upgraded latest features"
     ),
     "code_changes": (
         "your code source files functions you edited"
     ),
     "awareness": (
         "what are you aware of what have you been doing thinking noticing "
-        "up to right now"
+        "up to right now "
+        # "I've done all those tasks" (complete_tasks marks them done here AND
+        # on the Notion board), which ranked notion_workspace first.
+        "tasks task i've done finished completed all those ticked"
     ),
     "catch_up": (
         "catch me up brief me situation report where do things stand what is new"
@@ -325,14 +406,22 @@ VOCABULARY: dict[str, str] = {
 
     # ── communication ────────────────────────────────────────────────────────
     "messaging": (
-        "text message whatsapp telegram send a message tell them message him "
-        "message her notify"
+        "text message whatsapp telegram discord send a message tell them message him "
+        "message her notify contact chat recipient background send without moving mouse "
+        "keep typing do not interrupt keyboard clipboard owned profile connect messaging "
+        "whatsapp pairing login connection status check connection email smtp "
+        "saying push notification ifttt ntfy pushover"
+    ),
+    "smart_home": (
+        "lights light lamp lamps bulbs turn the lights off dim the lights brightness "
+        "hue home assistant scene routine goodnight bedtime switch plug fan room house"
     ),
     "outlook_mail": (
         "email inbox mail outlook unread reply draft send an email"
     ),
     "notion_workspace": (
-        "notion task tasks todo to do calendar event schedule my list"
+        "notion task tasks todo to do calendar event schedule my list "
+        "i've done those finished completed them take them off tick off mark done"
     ),
     # Ringing a real phone, as opposed to handing the user's own handset a
     # pre-filled dialler. Deliberately does NOT claim "text" or "message" on
@@ -353,7 +442,8 @@ VOCABULARY: dict[str, str] = {
         "android mobile hand off to my phone"
     ),
     "reminder": (
-        "remind alarm alert me wake me at nudge me later do not let me forget"
+        "remind alarm alert me wake me at nudge me later do not let me forget "
+        "timer countdown set a timer minute timer egg timer how long left on my timer"
     ),
 
     # ── news and briefing ────────────────────────────────────────────────────
@@ -370,13 +460,15 @@ VOCABULARY: dict[str, str] = {
     # ── security ─────────────────────────────────────────────────────────────
     "security_recon": (
         "scan network ports nmap pentest penetration test vulnerability recon "
-        "my network open ports"
+        "my network open ports devices connected to my wifi what is on my network lan"
     ),
     "breach_check": (
         "leaked password pwned data breach compromised my email exposed"
     ),
     "security_watch": (
-        "security posture listening ports suspicious processes"
+        "security posture listening ports suspicious processes how secure safe "
+        "protected is my computer pc laptop security audit score hardening defences "
+        "firewall remote desktop phone control stop everything from my phone"
     ),
     "undo": (
         "undo revert take that back put it back reverse restore that "
@@ -394,7 +486,9 @@ VOCABULARY: dict[str, str] = {
 
     # ── play ─────────────────────────────────────────────────────────────────
     "chess": (
-        "game play move board opening checkmate best move white black piece pawn"
+        "game play move board opening checkmate best move white black piece pawn "
+        "elo rating your elo chess rating how strong how good grandmaster stockfish "
+        "lichess challenge"
     ),
     "gaming": (
         "steam epic library installed games play a game"
@@ -405,7 +499,11 @@ VOCABULARY: dict[str, str] = {
 
     # ── work and business ────────────────────────────────────────────────────
     "agent_dispatch": (
-        "specialist expert advice consult ask an agent second opinion"
+        "specialist expert advice consult ask an agent second opinion "
+        "reliability incident investigator integrations api contract oauth "
+        "pagination continuity project handoff unfinished next steps "
+        "files operator multi step disk analysis clear junk tidy downloads "
+        "triage unmet requests improve yourself crashed froze"
     ),
     "business_advisor": (
         "business advice clients pricing offer agency grow revenue"
@@ -435,6 +533,14 @@ VOCABULARY: dict[str, str] = {
     ),
     "elevenlabs_voice": (
         "voice accent how you sound speech synthesis elevenlabs"
+    ),
+    "sing": (
+        "sing singing sang sung song songs serenade lullaby karaoke croon jingle "
+        "melody tune hum lyrics verse chorus carol ballad shanty rhyme birthday duet"
+    ),
+    "conversation_recording": (
+        "record recording conversation meeting people transcription speaker speakers diarisation "
+        "stop recording start recording recorded conversations consent"
     ),
     "emotion": (
         "face expression look mood on your face"
@@ -468,13 +574,14 @@ VOCABULARY: dict[str, str] = {
     ),
 
     # ── remaining surface (added after the first coverage pass) ──────────────
-    "ai_mode": "online offline cloud local which brain are you using mode",
+    "ai_mode": "online offline cloud local which brain are you using mode hybrid "
+               "local brain local only own model no api switch brain",
     "audio_studio": "audio track mix vocal stem master song production podcast",
     "autoplan": "do all of this by yourself plan it out multi step autonomously",
     "execute_plan": "run these steps in order carry out the plan step by step",
     "campaign_pipeline": "kanban client pipeline board deliverable agency stage",
     "cleanup_review": "tidy the repo unnecessary files github prep removable clutter",
-    "codebase_copilot": "repository codebase whole project dependency graph hotspots refactor",
+    "codebase_copilot": "repository codebase whole project dependency graph hotspots refactor where is it defined in the repo source code",
     "dev_workbench": "engineering workbench read the code run the tests repo",
     "debugger": "step through breakpoint debug this script pdb inspect variables",
     "docker": "container containers image images compose service",
@@ -482,13 +589,20 @@ VOCABULARY: dict[str, str] = {
     "companion": "continuity what was i doing pick up where we left off recap",
     "competitor_intel": "competitor rival their store their offer benchmark against",
     "conversation_recall": "time scoped what did we discuss on which day we spoke about",
-    "cyber_curriculum": "training curriculum modules course syllabus red blue team",
+    "cyber_curriculum": (
+        "training curriculum modules course syllabus red blue team teach cybersecurity "
+        "secure coding code example python exercise quiz answer feedback beginner learning path "
+        "electronics fundamentals voltage current resistance ohm led simulation "
+        "hardware protection esd usb firmware security signed updates"
+        " adhd learning difficulty attention concentration disengage overwhelmed "
+        "short lesson small steps simpler repeat pause my lesson resume my lesson learning coach"
+    ),
     "pentest_lab": "hands on lab guided exercise practise attacking walkthrough",
     "display_info": "monitor monitors screens resolution dpi scaling how many displays",
     "document_export": "docx word document deck slides export a brief produce a file",
     "draft_report": "draft write up structured professional markdown html",
     "founder_knowledge": "hormozi vaynerchuk blakely bezos founder operator playbook",
-    "gesture_control": "hand gestures wave webcam control with my hands",
+    "gesture_control": "hand gestures wave webcam control with my hands list mappings map gesture sensitivity low power calibrate test pinch swipe",
     "instagram_intel": "instagram influencer partnership reel niche discovery",
     "tiktok_intel": "tiktok shop virality trend assessment",
     "job": "background dont wait run it in the background long running while we talk",
@@ -502,9 +616,17 @@ VOCABULARY: dict[str, str] = {
     "social_media": "post to social my account publish a post logged in real account",
     "standing_questions": "keep watching keep an eye on tell me when something new",
     "system_startup": "start with windows autostart boot on login default browser",
-    "voice_speaker_id": "who is this who is speaking who said that enrol my voice recognise know it is me by name specific person only listen to me ignore other voices other people talking tell my voice apart from others voiceprint answer only my voice",
+    "voice_speaker_id": "who is this who is speaking who said that enrol my voice get to know my voice forget my voice voice learning progress cancel voice learning recognise know it is me by name specific person only listen to me ignore other voices other people talking tell my voice apart from others voiceprint answer only my voice",
     "workflow_patterns": "keep repeating same sequence worth saving pattern i always",
     "workspace_control": "desktop layout arrange windows save my workspace restore layout",
+    "display": "desktop visuals draw a card show a graphical response change the visual presentation",
+    "ui_theme": "change the theme palette background colours recolour the dashboard",
+    "ui_reactor": "change the central reactor shape energy core visual",
+    "ui_orbit": "animate the orb rings particles spin orbital visual",
+    "ui_chrome": "show or hide telemetry conversation panels dashboard controls",
+    "ui_effect": "play a brief visual pulse glow flash ripple on the dashboard",
+    "ui_screen": "change a screen panel arrangement visibility and layout",
+    "ui_reset": "restore default visuals return the dashboard appearance to normal",
 }
 
 

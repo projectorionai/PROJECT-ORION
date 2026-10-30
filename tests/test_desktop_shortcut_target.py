@@ -5,7 +5,7 @@ had already been written:
 
   * `_desktop_dir()` built the path from the ONEDRIVE environment variable.
     That is a guess, and on a machine signed into two OneDrive accounts it was
-    the wrong one — ONEDRIVE named "OneDrive - Exeter College" while the
+    the wrong one — ONEDRIVE named "OneDrive - Example College" while the
     redirected Desktop was "OneDrive - Example University". ORION
     refreshed a shortcut nobody looks at.
   * so the real Desktop kept a stale shortcut launching pythonw with orion.py,
@@ -27,13 +27,27 @@ sys.path.insert(0, str(ROOT))
 from orion_core import desktop_app  # noqa: E402
 
 
-def test_the_shortcut_launches_orion_not_an_interpreter():
-    """The whole point of the standalone build is that ORION.exe IS the
-    process. A shortcut to pythonw throws that away."""
+@pytest.mark.parametrize("current", [True, False])
+def test_the_shortcut_launches_current_orion_code(tmp_path, monkeypatch, current):
+    """A stale standalone build must not hide fixes in the source checkout."""
+    import os
+
+    root = tmp_path / "ORION"
+    root.mkdir()
+    source = root / "orion.py"
+    source.write_text("# Source entry point\n", encoding="utf-8")
+    standalone = root / "dist" / "ORION" / "ORION.exe"
+    standalone.parent.mkdir(parents=True)
+    standalone.touch()
+    launcher = root / "ORION.exe"
+    launcher.touch()
+    os.utime(source, (200, 200))
+    os.utime(standalone, (300, 300) if current else (100, 100))
+    monkeypatch.setattr(desktop_app, "BASE_DIR", root)
+    monkeypatch.setattr(desktop_app, "STANDALONE_EXE", standalone)
+    monkeypatch.setattr(desktop_app, "EXE_PATH", launcher)
     target, arguments, _workdir = desktop_app._launch_target()
-    if not desktop_app.STANDALONE_EXE.exists():
-        pytest.skip("no standalone build on this machine")
-    assert target == str(desktop_app.STANDALONE_EXE)
+    assert target == str(standalone if current else launcher)
     assert "python" not in Path(target).name.lower()
     assert arguments == "", "a real executable needs no script argument"
 

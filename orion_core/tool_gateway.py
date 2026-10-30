@@ -42,9 +42,25 @@ sound_sense web_search browser_control web_control open_news save_memory
 query_intelligence recall_conversation awareness reminder telephony messaging
 outlook_mail notion_workspace morning_briefing research capabilities audio_devices
 system_notify shutdown_orion restart_orion execute_plan mission globe aviation
-catch_up agent_dispatch resource_status undo document_export protocol
+catch_up agent_dispatch resource_status undo document_export protocol calculate
+geo peripherals goals
+sing patch_notes self_changes code_changes
 find_tool use_tool
 """.split())
+# sing, patch_notes, self_changes and code_changes joined 23 Oct 2026 (~3.6k
+# characters, ~6% of core; sing's description trimmed to pay for part of it).
+# The owner asked "what changed / your updates / what can we improve" about
+# 19 times across ten sessions and was answered from resource_status or old
+# notes, because the three change tools were a find_tool hop away and the
+# model took the nearest direct tool instead; "sing me a song" got "not quite
+# equipped" for the same reason.
+# geo (weather, how far, directions) and peripherals (brightness, lock, Wi-Fi,
+# screen off) joined 5 Oct 2026: "what's the weather" and "dim the screen" are
+# among the commonest spoken requests, and each cost a find_tool round trip
+# (or a web search standing in for the forecast). +~970 tokens, ~8% of core.
+# goals joined 17 Oct 2026 (~800 tokens): "I ran 5k today" is a STATEMENT, not
+# a request, so a model one find_tool hop away congratulates the user and logs
+# nothing. Spoken progress logging only works if the tool is already in hand.
 
 GATEWAY_NOTE = (
     "TOOLS: your direct tools cover everyday actions. For anything else — "
@@ -94,6 +110,54 @@ def _signature(decl: dict[str, Any]) -> str:
     return "; ".join(parts) or "no arguments"
 
 
+#: The best matches are shown whole. Their first sentence and ten parameters
+#: cut at 80 characters hid exactly what use_tool needs: chess's action list
+#: lost rating, practice and every lichess_* action, perception's lost recall,
+#: compare and forget_memory, so the model called them with guessed actions.
+FULL_DETAIL_RESULTS = 2
+#: Bounds on one fully shown tool, so a huge MCP schema cannot flood the turn.
+_FULL_DESCRIPTION_CHARS = 1500
+_FULL_PARAMETER_CHARS = 600
+_FULL_PARAMETERS = 40
+
+
+def _kind(spec: dict[str, Any]) -> str:
+    kind = str(spec.get("type") or "string").lower()
+    if kind == "array" and isinstance(spec.get("items"), dict):
+        return f"array of {str(spec['items'].get('type') or 'string').lower()}"
+    return kind
+
+
+def _full_signature(decl: dict[str, Any]) -> str:
+    """Every parameter: name, required mark, type, whole description, choices."""
+    params = decl.get("parameters") or {}
+    props = params.get("properties") or {}
+    required = set(params.get("required") or [])
+    lines = []
+    for name, spec in list(props.items())[:_FULL_PARAMETERS]:
+        spec = spec if isinstance(spec, dict) else {}
+        text = " ".join(str(spec.get("description") or "").split())
+        if len(text) > _FULL_PARAMETER_CHARS:
+            text = text[:_FULL_PARAMETER_CHARS - 1] + "…"
+        items = spec.get("items") if isinstance(spec.get("items"), dict) else {}
+        choices = spec.get("enum") or items.get("enum")
+        if isinstance(choices, list) and choices:
+            text = (text + " " if text else "") + "One of: " + ", ".join(map(str, choices)) + "."
+        lines.append(f"    {name}{'*' if name in required else ''} ({_kind(spec)})"
+                     + (f": {text}" if text else ""))
+    if len(props) > _FULL_PARAMETERS:
+        lines.append(f"    … and {len(props) - _FULL_PARAMETERS} more")
+    return "\n".join(lines) or "    no arguments"
+
+
+def _full_entry(decl: dict[str, Any]) -> str:
+    description = " ".join(str(decl.get("description") or "").split())
+    if len(description) > _FULL_DESCRIPTION_CHARS:
+        description = description[:_FULL_DESCRIPTION_CHARS - 1] + "…"
+    return (f"- {decl['name']}: {description}\n  Arguments (* = required):\n"
+            f"{_full_signature(decl)}")
+
+
 def find_tool(dispatcher: Any, args: dict[str, Any]) -> ToolResult:
     need = str(args.get("need") or args.get("query") or args.get("text") or "").strip()
     if not need:
@@ -101,14 +165,21 @@ def find_tool(dispatcher: Any, args: dict[str, Any]) -> ToolResult:
     declarations = [d for d in (getattr(dispatcher, "TOOL_DECLARATIONS", None) or [])
                     if d.get("name") not in {"find_tool", "use_tool"}]
     try:
-        from . import tool_resolver as tr
-        scorer = getattr(tr, "hybrid_scores", None) or tr.lexical_scores
-        ranked = tr.resolve(need, None, declarations, enabled=True, max_tools=9, scorer=scorer)
-        ranked = [d for d in ranked if d.get("name") not in tr.ALWAYS_INCLUDE] or ranked
+        # Ranked by words, meaning and the learned intent network — straight
+        # from the scores. This used to go through resolve(), whose safety
+        # floor pins catch_up, reason and capabilities to the front, and then
+        # removed those three: so "think this through properly" could never
+        # find reason, however well it scored.
+        from .intent_brain import routing_scores
+        scores = routing_scores(need, declarations)
+        ranked = sorted(declarations, key=lambda d: (-scores.get(d["name"], 0.0), d["name"]))
     except Exception:
         ranked = declarations[:6]
     lines = [f"Tools for '{need}' (call use_tool with name and arguments as JSON):"]
-    for decl in ranked[:6]:
+    for position, decl in enumerate(ranked[:6]):
+        if position < FULL_DETAIL_RESULTS:
+            lines.append(_full_entry(decl))
+            continue
         lines.append(f"- {decl['name']}: {_first_sentence(decl.get('description', ''))} "
                      f"Arguments: {_signature(decl)}")
     return ToolResult("\n".join(lines))

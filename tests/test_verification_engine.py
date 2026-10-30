@@ -214,15 +214,14 @@ def test_click_element_clicks_centre_and_verifies():
     assert "verified" in result.text
 
 
-def test_click_element_relocates_moved_element_on_retry():
-    # The element moves between attempts; the retry must click the NEW
-    # coordinates from the live UIA tree, not the stale first position.
+def test_click_element_observes_delayed_change_without_repeating():
+    # The view may move after a successful click while its repaint is delayed.
     vision = _StubVision([_element("Save", 100, 200), _element("Save", 300, 400)])
     control = _StubControl()
     eng = _engine(vision, control, ratios=[0.0, 0.9])
     result = asyncio.run(eng.click_element("Save", attempts=2))
     assert result.ok
-    assert control.clicks == [(100, 200), (300, 400)]
+    assert control.clicks == [(100, 200)]
 
 
 def test_click_element_missing_element_fails_informatively():
@@ -236,7 +235,7 @@ def test_click_element_gives_up_after_bounded_attempts():
     control = _StubControl()
     eng = _engine(vision, control, ratios=[0.0, 0.0, 0.0])
     result = asyncio.run(eng.click_element("Noop", attempts=3))
-    assert not result.ok and len(control.clicks) == 3
+    assert not result.ok and len(control.clicks) == 1
     assert "could not visually confirm" in result.text
 
 
@@ -330,13 +329,13 @@ def test_ocr_fallback_is_not_tried_when_uia_already_found_it():
     assert control.clicks == [(10, 10)]         # the UIA coordinates were used
 
 
-def test_click_via_ocr_relocates_on_retry_like_click_element():
+def test_click_via_ocr_observes_delayed_change_without_repeating():
     vision = _StubVision(ocr_elements=[_element("Icon", 10, 10), _element("Icon", 40, 40)])
     control = _StubControl()
     eng = _engine(vision, control, ratios=[0.0, 0.9])
     result = asyncio.run(eng.click_via_ocr("Icon", attempts=2))
     assert result.ok
-    assert control.clicks == [(10, 10), (40, 40)]
+    assert control.clicks == [(10, 10)]
 
 
 def test_click_via_ocr_fails_informatively_when_ocr_also_finds_nothing():

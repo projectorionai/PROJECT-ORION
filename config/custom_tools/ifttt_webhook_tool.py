@@ -29,6 +29,16 @@ import urllib.request
 from pathlib import Path
 
 TIMEOUT = 15
+
+
+MAX_RESPONSE_BYTES = 1_000_000
+
+
+def _bounded_http_body(response) -> bytes:
+    data = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise ValueError("Remote response exceeded its size limit; completion is unverified")
+    return data
 CONFIG_NAME = "ifttt.json"
 ENDPOINT = "https://maker.ifttt.com/trigger/{event}/with/key/{key}"
 
@@ -88,7 +98,7 @@ def _run_impl(**kwargs) -> ToolResult:
         method="POST")
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            body = response.read().decode("utf-8", errors="replace")
+            body = _bounded_http_body(response).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             return ToolResult("IFTTT rejected the key (401). Check it has not been reset.", ok=False)

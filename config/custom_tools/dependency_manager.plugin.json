@@ -3,6 +3,7 @@
   "description": "Automates the identification and installation of dependencies for module forging.",
   "module": "dependency_manager_tool.py",
   "tier": "confirm",
+  "permissions": ["filesystem", "subprocess"],
   "requires": [],
   "parameters": {
     "type": "object",

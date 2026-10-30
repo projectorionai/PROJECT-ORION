@@ -83,7 +83,7 @@ class FocusTimer(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 12)
         layout.setSpacing(6)
-        layout.addWidget(self._h("FOCUS TIMER"))
+        layout.addWidget(self._h("Focus Timer"))
 
         self._work, self._break = 25 * 60, 5 * 60
         self._remaining = self._work
@@ -97,15 +97,15 @@ class FocusTimer(QFrame):
         self.clock.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.clock.setStyleSheet(
             f"font-size:32px;font-weight:800;color:{C.PRI_HI};")
-        self.phase = QLabel("Focus block — ready when you are.")
+        self.phase = QLabel("Ready")
         self.phase.setObjectName("mutedLabel")
         self.phase.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.bar = QProgressBar(); self.bar.setRange(0, self._work); self.bar.setValue(self._work)
         self.bar.setTextVisible(False)
 
         row = QHBoxLayout()
-        self.start_btn = QPushButton("START"); self.start_btn.clicked.connect(self._toggle)
-        reset = QPushButton("RESET"); reset.clicked.connect(self._reset)
+        self.start_btn = QPushButton("Start"); self.start_btn.clicked.connect(self._toggle)
+        reset = QPushButton("Reset"); reset.clicked.connect(self._reset)
         row.addWidget(self.start_btn); row.addWidget(reset)
 
         for w in (self.task, self.clock, self.phase, self.bar):
@@ -119,13 +119,13 @@ class FocusTimer(QFrame):
 
     def _toggle(self) -> None:
         self._running = not self._running
-        self.start_btn.setText("PAUSE" if self._running else "START")
+        self.start_btn.setText("Pause" if self._running else "Start")
         self._timer.start() if self._running else self._timer.stop()
 
     def _reset(self) -> None:
         self._timer.stop(); self._running = False; self._on_break = False
-        self._remaining = self._work; self.start_btn.setText("START")
-        self.phase.setText("Focus block — ready when you are.")
+        self._remaining = self._work; self.start_btn.setText("Start")
+        self.phase.setText("Ready")
         self.bar.setRange(0, self._work); self.bar.setValue(self._work); self._render()
 
     def _tick(self) -> None:
@@ -158,7 +158,7 @@ class FocusTimer(QFrame):
 class MarginCalculator(QFrame):
     def __init__(self) -> None:
         super().__init__()
-        layout = _setup(self, "MARGIN & PRICING")
+        layout = _setup(self, "Margin & Pricing")
         self.cost = QLineEdit(); self.cost.setPlaceholderText("Unit cost (e.g. 6.50)")
         self.price = QLineEdit(); self.price.setPlaceholderText("Sale price (e.g. 24.99)")
         self.fee = QLineEdit(); self.fee.setPlaceholderText("Platform fee % (e.g. 8)")
@@ -199,7 +199,7 @@ class MarginCalculator(QFrame):
 class AdCalculator(QFrame):
     def __init__(self) -> None:
         super().__init__()
-        layout = _setup(self, "AD PERFORMANCE")
+        layout = _setup(self, "Ad Performance")
         self.spend = QLineEdit(); self.spend.setPlaceholderText("Ad spend (e.g. 200)")
         self.revenue = QLineEdit(); self.revenue.setPlaceholderText("Revenue from ads (e.g. 900)")
         self.orders = QLineEdit(); self.orders.setPlaceholderText("Orders (e.g. 30)")
@@ -239,7 +239,7 @@ class CurrencyConverter(QFrame):
 
     def __init__(self, bus: OrionBus) -> None:
         super().__init__()
-        layout = _setup(self, "CURRENCY CONVERTER")
+        layout = _setup(self, "Currency Converter")
         self.bus = bus
         self.amount = QLineEdit("100"); self.amount.textChanged.connect(self._convert)
         layout.addWidget(self.amount)
@@ -292,12 +292,25 @@ class CurrencyConverter(QFrame):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class WorldClock(QFrame):
-    ZONES = (("London", 0), ("New York", -5), ("Los Angeles", -8),
-             ("Dubai", 4), ("Shenzhen", 8), ("Tokyo", 9))
+    # Real time zones. Fixed offsets (London 0, New York -5, LA -8) ignored
+    # daylight saving, so for seven months a year London, New York and Los
+    # Angeles were an hour wrong - and so was whether the LSE and NYSE were
+    # open. The offsets stay only as a fallback for a machine with no tz data.
+    ZONES = (("London", "Europe/London", 0), ("New York", "America/New_York", -5),
+             ("Los Angeles", "America/Los_Angeles", -8), ("Dubai", "Asia/Dubai", 4),
+             ("Shenzhen", "Asia/Shanghai", 8), ("Tokyo", "Asia/Tokyo", 9))
+
+    @staticmethod
+    def _local(now: datetime, zone: str, fallback: int) -> datetime:
+        try:
+            from zoneinfo import ZoneInfo
+            return now.astimezone(ZoneInfo(zone))
+        except Exception:
+            return now + timedelta(hours=fallback)
 
     def __init__(self) -> None:
         super().__init__()
-        layout = _setup(self, "WORLD CLOCK & MARKETS")
+        layout = _setup(self, "World Clock & Markets")
         self.labels: list[QLabel] = []
         for _ in self.ZONES:
             lab = QLabel(); lab.setObjectName("mutedLabel"); layout.addWidget(lab); self.labels.append(lab)
@@ -316,12 +329,12 @@ class WorldClock(QFrame):
 
     def _render_clocks(self) -> None:
         now = datetime.now(timezone.utc)
-        for lab, (name, off) in zip(self.labels, self.ZONES):
-            local = now + timedelta(hours=off); hour = local.hour
-            state = "🌙" if (hour < 7 or hour >= 21) else "☀"
-            lab.setText(f"{state}  {name:<12} {local.strftime('%H:%M %a')}")
-        lse = self._market_open(now + timedelta(hours=0), 8, 0, 16, 30)
-        nyse = self._market_open(now + timedelta(hours=-5), 9, 30, 16, 0)
+        for lab, (name, zone, off) in zip(self.labels, self.ZONES):
+            local = self._local(now, zone, off); hour = local.hour
+            night = "  · night" if (hour < 7 or hour >= 21) else ""
+            lab.setText(f"{name:<12} {local.strftime('%H:%M %a')}{night}")
+        lse = self._market_open(self._local(now, "Europe/London", 0), 8, 0, 16, 30)
+        nyse = self._market_open(self._local(now, "America/New_York", -5), 9, 30, 16, 0)
         self.markets.setText(f"LSE: {'OPEN' if lse else 'closed'}   ·   NYSE: {'OPEN' if nyse else 'closed'}")
 
     @staticmethod
@@ -339,16 +352,16 @@ class WorldClock(QFrame):
 class IdeaCapture(QFrame):
     def __init__(self, bus: OrionBus, memory: Any) -> None:
         super().__init__()
-        layout = _setup(self, "IDEA CAPTURE")
+        layout = _setup(self, "Idea Capture")
         self.bus = bus; self.memory = memory
         row = QHBoxLayout()
         self.input = QLineEdit(); self.input.setPlaceholderText("Capture a product or business idea…")
         self.input.returnPressed.connect(self._save)
-        save = QPushButton("SAVE"); save.clicked.connect(self._save)
+        save = QPushButton("Save"); save.clicked.connect(self._save)
         row.addWidget(self.input, 1); row.addWidget(save)
         layout.addLayout(row)
         self.list = QListWidget(); self.list.setMaximumHeight(120); layout.addWidget(self.list)
-        delete = QPushButton("DELETE SELECTED"); delete.clicked.connect(self._delete); layout.addWidget(delete)
+        delete = QPushButton("Delete Selected"); delete.clicked.connect(self._delete); layout.addWidget(delete)
         self._load()
 
     def _save(self) -> None:
@@ -363,14 +376,14 @@ class IdeaCapture(QFrame):
             # "captured" anyway told the user it had been kept, and the text
             # was already cleared from the box — so the only copy was gone.
             # Leave the input alone so nothing is lost, and say what happened.
-            self.list.insertItem(0, f"⚠ NOT SAVED — {idea}")
+            self.list.insertItem(0, f"NOT SAVED — {idea}")
             self.bus.log.emit(
                 f"IDEA: could not save — {first_line(exc, 120)}. "
                 "The text is still in the box; try again."
             )
             return
         self.input.clear()
-        self.list.insertItem(0, f"💡 {idea}")
+        self.list.insertItem(0, idea)
         self.bus.log.emit(f"IDEA: captured — {idea[:60]}")
 
     def _delete(self) -> None:
@@ -383,7 +396,7 @@ class IdeaCapture(QFrame):
             for r in self.memory.query("Business idea", limit=12):
                 val = str(r.get("value", "")).replace("Business idea: ", "")
                 if val:
-                    self.list.addItem(f"💡 {val}")
+                    self.list.addItem(val)
         except Exception:
             pass
 
@@ -395,12 +408,12 @@ class IdeaCapture(QFrame):
 class KPITracker(QFrame):
     def __init__(self, bus: OrionBus, memory: Any) -> None:
         super().__init__()
-        layout = _setup(self, "KPI TRACKER")
+        layout = _setup(self, "KPI Tracker")
         self.bus = bus; self.memory = memory
         row = QHBoxLayout()
         self.rev = QLineEdit(); self.rev.setPlaceholderText("Revenue today (£)")
         self.ord = QLineEdit(); self.ord.setPlaceholderText("Orders")
-        log = QPushButton("LOG"); log.clicked.connect(self._log)
+        log = QPushButton("Log"); log.clicked.connect(self._log)
         row.addWidget(self.rev); row.addWidget(self.ord); row.addWidget(log)
         layout.addLayout(row)
         self.out = QLabel(); self.out.setObjectName("mutedLabel"); self.out.setWordWrap(True)
@@ -442,12 +455,12 @@ class KPITracker(QFrame):
 class DeadlineCountdown(QFrame):
     def __init__(self, bus: OrionBus, memory: Any) -> None:
         super().__init__()
-        layout = _setup(self, "DEADLINE COUNTDOWN")
+        layout = _setup(self, "Deadline Countdown")
         self.bus = bus; self.memory = memory
         row = QHBoxLayout()
         self.name = QLineEdit(); self.name.setPlaceholderText("Deadline name")
         self.date = QLineEdit(); self.date.setPlaceholderText("YYYY-MM-DD")
-        add = QPushButton("ADD"); add.clicked.connect(self._add)
+        add = QPushButton("Add"); add.clicked.connect(self._add)
         row.addWidget(self.name, 1); row.addWidget(self.date); row.addWidget(add)
         layout.addLayout(row)
         self.list = QListWidget(); self.list.setMaximumHeight(120); layout.addWidget(self.list)
@@ -498,10 +511,10 @@ class DeadlineCountdown(QFrame):
                 continue
             delta = target - now
             if delta.total_seconds() < 0:
-                self.list.addItem(f"⛔ {name} — passed")
+                self.list.addItem(f"{name} — passed")
             else:
                 days = delta.days; hours = delta.seconds // 3600
-                self.list.addItem(f"⏳ {name} — {days}d {hours}h ({date})")
+                self.list.addItem(f"{name} — {days}d {hours}h ({date})")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -511,17 +524,20 @@ class DeadlineCountdown(QFrame):
 class RemindersWidget(QFrame):
     def __init__(self, bus: OrionBus, reminders: Any) -> None:
         super().__init__()
-        layout = _setup(self, "REMINDERS")
+        layout = _setup(self, "Reminders")
         self.bus = bus; self.reminders = reminders
+        self._action_task = None
         row = QHBoxLayout()
         self.text = QLineEdit(); self.text.setPlaceholderText("Remind me to…")
         self.mins = QLineEdit(); self.mins.setPlaceholderText("mins"); self.mins.setFixedWidth(60)
-        add = QPushButton("SET"); add.clicked.connect(self._add)
+        add = QPushButton("Set"); add.clicked.connect(self._add)
+        self._set_button = add
         self.text.returnPressed.connect(self._add)
         row.addWidget(self.text, 1); row.addWidget(self.mins); row.addWidget(add)
         layout.addLayout(row)
         self.list = QListWidget(); self.list.setMaximumHeight(120); layout.addWidget(self.list)
-        clear = QPushButton("CLEAR ALL"); clear.clicked.connect(self._clear); layout.addWidget(clear)
+        clear = QPushButton("Clear All"); clear.clicked.connect(self._clear); layout.addWidget(clear)
+        self._clear_button = clear
         self.bus.dashboard_event.connect(self._on_event)
         self._timer = QTimer(self); self._timer.setInterval(5000); self._timer.timeout.connect(self._refresh)
         # _refresh_list, not _refresh: the priming paint must bypass the
@@ -533,14 +549,44 @@ class RemindersWidget(QFrame):
         if not text:
             return
         mins = _num(self.mins.text(), 0)
-        result = self.reminders.add(text=text, minutes=mins if mins > 0 else None,
-                                    phrase="" if mins > 0 else text)
-        self.bus.log.emit(f"REMINDER: {result.text}")
-        self.text.clear(); self.mins.clear()
-        self._refresh_list()   # the user just acted — show it now, guard or not
+        self._begin_action(self.reminders.add, clear_inputs=True, text=text,
+                           minutes=mins if mins > 0 else None, phrase="" if mins > 0 else text)
 
     def _clear(self) -> None:
-        self.reminders.cancel(); self._refresh_list()
+        self._begin_action(self.reminders.cancel)
+
+    def _set_busy(self, busy: bool) -> None:
+        for control in (self.text, self.mins):
+            control.setEnabled(not busy)
+        writable = not busy and not getattr(self.reminders, "storage_error", "")
+        for control in (self._set_button, self._clear_button):
+            control.setEnabled(bool(writable))
+
+    def _begin_action(self, operation: Any, *, clear_inputs: bool = False, **arguments: Any) -> None:
+        if self._action_task is not None and not self._action_task.done():
+            return
+        self._set_busy(True)
+
+        async def perform() -> None:
+            from PyQt6 import sip
+            try:
+                result = await asyncio.to_thread(operation, **arguments)
+                if sip.isdeleted(self):
+                    return
+                self.bus.log.emit(f"REMINDER: {result.text}")
+                if result.ok and clear_inputs:
+                    self.text.clear(); self.mins.clear()
+                self._refresh_list()
+            except Exception as exc:
+                self.bus.log.emit(f"REMINDER: action failed — {first_line(exc)}")
+            finally:
+                if not sip.isdeleted(self):
+                    self._set_busy(False)
+
+        self._action_task = background.spawn(perform(), name="orion-reminder-widget")
+        if self._action_task is None:
+            self._set_busy(False)
+            self.bus.log.emit("REMINDER: action wasn't started because ORION is shutting down.")
 
     def _on_event(self, channel: str, _payload: Any) -> None:
         if channel == "reminder_fired":
@@ -554,10 +600,14 @@ class RemindersWidget(QFrame):
 
     def _refresh_list(self) -> None:
         self.list.clear()
+        self._set_busy(self._action_task is not None and not self._action_task.done())
+        if getattr(self.reminders, "storage_error", ""):
+            self.list.addItem("Saved reminders are unavailable. Check the activity log for details.")
+            return
         for r in self.reminders.active():
             import time as _t
             remaining = max(0, int(r.due_at - _t.monotonic()))
-            self.list.addItem(f"⏰ {r.text} — at {r.wall_due} ({remaining // 60}m {remaining % 60}s)")
+            self.list.addItem(f"{r.text} — at {r.wall_due} ({remaining // 60}m {remaining % 60}s)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -567,14 +617,14 @@ class RemindersWidget(QFrame):
 class ProtocolsWidget(QFrame):
     def __init__(self, bus: OrionBus, protocols: Any) -> None:
         super().__init__()
-        layout = _setup(self, "PROTOCOLS")
+        layout = _setup(self, "Protocols")
         self.bus = bus; self.protocols = protocols
         self.combo = QComboBox()
         for name in protocols.all_protocols():
             self.combo.addItem(name.replace("_", " ").title(), name)
-        run = QPushButton("ENGAGE PROTOCOL"); run.clicked.connect(self._run)
+        run = QPushButton("Engage Protocol"); run.clicked.connect(self._run)
         layout.addWidget(self.combo); layout.addWidget(run)
-        self.out = QLabel("Select and engage a protocol."); self.out.setObjectName("mutedLabel")
+        self.out = QLabel(""); self.out.setObjectName("mutedLabel")
         self.out.setWordWrap(True); layout.addWidget(self.out)
 
     def _run(self) -> None:
@@ -609,17 +659,16 @@ class EntrepreneurDeck(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
-        heading = QLabel("ENTREPRENEUR TOOLKIT")
-        heading.setObjectName("panelHeading")
-        outer.addWidget(heading)
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         holder = QWidget()
         grid = QGridLayout(holder); grid.setSpacing(10)
 
+        # No FocusTimer: the Focus tab beside this one is the focus timer
+        # (Mark XXXVIII - two timers on one page was the repeat).
         widgets: list[QWidget] = [
-            FocusTimer(bus), MarginCalculator(), AdCalculator(),
+            MarginCalculator(), AdCalculator(),
             CurrencyConverter(bus), WorldClock(), IdeaCapture(bus, memory),
             KPITracker(bus, memory), DeadlineCountdown(bus, memory),
         ]

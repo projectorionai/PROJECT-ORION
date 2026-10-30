@@ -1,0 +1,62 @@
+{
+  "name": "jv_chat_takeover",
+  "description": "Draft replies from a named conversation window; optionally monitor for up to thirty minutes. Sending requires an explicit platform, recipient and final text. No background auto-sending.",
+  "module": "jv_chat_takeover_tool.py",
+  "version": "33.0.0",
+  "tier": "confirm",
+  "permissions": [
+    "network",
+    "screen",
+    "input"
+  ],
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "The action to perform.",
+        "enum": [
+          "draft",
+          "start",
+          "stop",
+          "status",
+          "send"
+        ]
+      },
+      "window": {
+        "type": "string",
+        "description": "Conversation window title to read."
+      },
+      "query": {
+        "type": "string",
+        "description": "User's purpose and desired tone."
+      },
+      "duration_minutes": {
+        "type": "number",
+        "description": "Monitor for 1\u201330 minutes; default 5."
+      },
+      "platform": {
+        "type": "string",
+        "description": "Platform for send.",
+        "enum": [
+          "telegram",
+          "whatsapp",
+          "discord"
+        ]
+      },
+      "contact": {
+        "type": "string",
+        "description": "Explicit recipient."
+      },
+      "message": {
+        "type": "string",
+        "description": "Approved final message text."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  },
+  "secrets": []
+}

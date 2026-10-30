@@ -1,5 +1,5 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# O.R.I.O.N. — what must never leave this machine.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# O.R.I.O.N. â€” what must never leave this machine.
 #
 # The rule here is DENY BY DEFAULT for anything ORION writes at runtime.
 # An earlier version of this file named each offender individually, which meant
@@ -9,15 +9,16 @@
 # few files that are genuinely source.
 #
 # NOTE: .gitignore does NOT apply to files git already tracks. If something
-# personal is still tracked, `git rm --cached <path>` it — the pattern alone
+# personal is still tracked, `git rm --cached <path>` it â€” the pattern alone
 # will not remove it from the current index or from older commits.
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # 1. Secrets and credentials
 **/*api_keys*.json
 config/messaging.json
 config/remote_secret.key
 config/remote_devices.json
+config/mobile_ai_permissions.json
 *.env
 **/.env*
 !.env.example
@@ -26,7 +27,7 @@ config/remote_devices.json
 *.jks
 *.keystore
 
-# 2. Runtime config — deny by default, then allow back the source files.
+# 2. Runtime config â€” deny by default, then allow back the source files.
 #    (Covers databases, identity, cognitive state, browser profile, crash
 #    reports, self-repair proposals, forged-tool output, caches and anything
 #    added in future.)
@@ -121,13 +122,12 @@ env/
 **/__pycache__/
 *.pyc
 .pytest_cache/
-/.test-tmp*/
+# Isolated audit/test output is local evidence, never release source.
+/.bugfix-baseline-*/
 
 # 8. Editor, OS and tooling artefacts
-#    Every root-level dot-folder is local tooling or environment state (editor
-#    settings carry absolute home paths); .github is the one shared folder.
-/.*/
-!/.github/
+# Local coordination board between contributors' tooling; never source.
+.coordination/
 .vscode/
 .idea/
 Thumbs.db
@@ -138,31 +138,93 @@ Thumbs.db
 *.utf16.bak
 *.log
 recursive_file_list.txt
-/PLANS.md
 
 # 9. Office lock/temp files and generated documents
 ~$*
 *.docx
 !docs/**/*.docx
 
-# 10. Reviewed plugins that ship with ORION (see PUBLIC_CONFIG_FILES in
-#     tools/prepare_public_source.py). They sit under the ignored
-#     config/custom_tools/ like forged tools, but are part of the application.
 !config/custom_tools/emotional_monitor_tool.py
 !config/custom_tools/emotional_monitor.plugin.json
+
+!config/custom_tools/emotional_monitor_tool.py
+!config/custom_tools/emotional_monitor.plugin.json
+
 !config/custom_tools/error_handler_tool.py
 !config/custom_tools/error_handler.plugin.json
+
 !config/custom_tools/synthesis_enhancer_tool.py
 !config/custom_tools/synthesis_enhancer.plugin.json
+
 !config/custom_tools/fitness_goal_tracker_tool.py
 !config/custom_tools/fitness_goal_tracker.plugin.json
+
 !config/custom_tools/fitness_progress_monitor_tool.py
 !config/custom_tools/fitness_progress_monitor.plugin.json
+
 !config/custom_tools/dependency_manager_tool.py
+
 !config/custom_tools/dependency_manager.plugin.json
+
 !config/custom_tools/dependency_resolver_tool.py
+
 !config/custom_tools/dependency_resolver.plugin.json
+
 !config/custom_tools/emotional_insight_generator_tool.py
+
 !config/custom_tools/emotional_insight_generator.plugin.json
+
 !config/custom_tools/self_repair_agent_tool.py
+
 !config/custom_tools/self_repair_agent.plugin.json
+
+# Local audit scratch data and deliberately staged Android downloads.
+.test-runs/
+.runtime-cache/
+releases/android/*.apk
+
+# Mark XXXIII audit and isolated training scratch.
+/.audit_tmp/
+/.neural-debug-env/
+/.ruff_cache/
+
+# Reviewed native adapters for the supplied JV plugin collection.
+!config/custom_tools/jv_document_review_tool.py
+!config/custom_tools/jv_document_review.plugin.json
+!config/custom_tools/jv_quiz_tool.py
+!config/custom_tools/jv_quiz.plugin.json
+!config/custom_tools/jv_pomodoro_tool.py
+!config/custom_tools/jv_pomodoro.plugin.json
+!config/custom_tools/jv_water_reminder_tool.py
+!config/custom_tools/jv_water_reminder.plugin.json
+!config/custom_tools/jv_excel_writer_tool.py
+!config/custom_tools/jv_excel_writer.plugin.json
+!config/custom_tools/jv_calorie_counter_tool.py
+!config/custom_tools/jv_calorie_counter.plugin.json
+!config/custom_tools/jv_game_updater_tool.py
+!config/custom_tools/jv_game_updater.plugin.json
+!config/custom_tools/jv_chat_takeover_tool.py
+!config/custom_tools/jv_chat_takeover.plugin.json
+!config/custom_tools/jv_telegram_remote_tool.py
+!config/custom_tools/jv_telegram_remote.plugin.json
+!config/custom_tools/jv_cloud_agent_tool.py
+!config/custom_tools/jv_cloud_agent.plugin.json
+!config/custom_tools/jv_reminder_tool.py
+!config/custom_tools/jv_reminder.plugin.json
+!config/custom_tools/jv_forge_trial_tool.py
+!config/custom_tools/jv_forge_trial.plugin.json
+
+# Reviewed original analysis plugins; private generated tools remain ignored.
+!config/custom_tools/orion_latency_report_tool.py
+!config/custom_tools/orion_latency_report.plugin.json
+!config/custom_tools/orion_batch_planner_tool.py
+!config/custom_tools/orion_batch_planner.plugin.json
+
+!config/custom_tools/orion_dataset_compare_tool.py
+!config/custom_tools/orion_dataset_compare.plugin.json
+# The software robot, built from robot/sim/orl_sim.c on first use.
+robot/sim/orl_sim
+robot/sim/orl_sim.exe
+robot/sim/*.pdb
+robot/sim/*.ilk
+robot/sim/*.lib

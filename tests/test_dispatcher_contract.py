@@ -217,3 +217,283 @@ def test_forged_tool_failure_contained():
     d._tool_handlers = {"bad_forged": _boom}
     result = asyncio.run(d.dispatch("bad_forged", {}))
     assert not result.ok and "forge fault" in result.text
+
+
+# ── file work off the shared loop (audit 6 Oct 2026, A02) ────────────────────
+
+def _file_host(tmp_path, monkeypatch, files):
+    from collections import deque
+    from types import SimpleNamespace
+
+    import orion_core.dispatcher as dispatcher_module
+    logged = []
+    monkeypatch.setattr(dispatcher_module, "_gap_ledger",
+                        lambda: SimpleNamespace(note_tool_call=lambda: None))
+    return SimpleNamespace(
+        handler_table=lambda: {"file_controller": files.file_controller},
+        _coerce_to_schema=lambda _name, args: (args, None), _swarm_launch=lambda *_a: None,
+        active_tools=0, recent_tools=deque(maxlen=60), telemetry=None,
+        bus=SimpleNamespace(log=SimpleNamespace(emit=logged.append))), logged
+
+
+class _SlowFiles:
+    """file_controller with a controlled stand-in for a slow drive."""
+
+    def __init__(self, delay):
+        self.delay = delay
+
+    def file_controller(self, args):
+        import time as _time
+        from orion_core.data import ToolResult
+        _time.sleep(self.delay)
+        return ToolResult(f"listed {args.get('path')}")
+
+
+def test_file_work_leaves_the_loop_free(tmp_path, monkeypatch):
+    import asyncio
+
+    from orion_core.dispatcher import OrionDispatcher
+    host, _logged = _file_host(tmp_path, monkeypatch, _SlowFiles(0.15))
+
+    async def run():
+        beats = []
+
+        async def heartbeat():
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+                beats.append(asyncio.get_running_loop().time())
+        monitor = asyncio.create_task(heartbeat())
+        result = await OrionDispatcher.dispatch(host, "file_controller", {"path": "x"})
+        await monitor
+        return result, beats
+    result, beats = asyncio.run(run())
+    assert result.ok and len(beats) == 5
+
+
+def test_a_cancelled_file_operation_reports_no_success(tmp_path, monkeypatch):
+    import asyncio
+
+    from orion_core.dispatcher import OrionDispatcher
+    host, logged = _file_host(tmp_path, monkeypatch, _SlowFiles(0.2))
+
+    async def run():
+        task = asyncio.create_task(
+            OrionDispatcher.dispatch(host, "file_controller", {"path": "x"}))
+        await asyncio.sleep(0.03)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return "cancelled"
+        return task.result()
+    assert asyncio.run(run()) == "cancelled"
+    assert any("may still finish" in line for line in logged)
+
+
+# Mark XXXV: the chain boundary is used by Live, the gateway and background jobs.
+def _xxxv_chain(results):
+    host = _bare_dispatcher()
+    calls = []
+
+    async def dispatch(name, args):
+        calls.append((name, dict(args)))
+        return results[name]
+
+    host.dispatch = dispatch
+    host._derive_chain = lambda *_args: []
+    return host, calls
+
+
+def _xxxv_receipts(value):
+    """Locate original typed receipts without prescribing a chain envelope."""
+    if isinstance(value, dict):
+        if value.get("type") == "mcp":
+            return [value]
+        return [receipt for child in value.values() for receipt in _xxxv_receipts(child)]
+    if isinstance(value, list):
+        return [receipt for child in value for receipt in _xxxv_receipts(child)]
+    return []
+
+
+def test_xxxv_chain_preserves_two_typed_sources_and_human_evidence():
+    receipts = [{"type": "mcp", "structuredContent": {"rows": [n]},
+                 "provenance": {"server": f"fixture{n}", "tool": "read"},
+                 "untrusted": True} for n in (1, 2)]
+    evidence = [{"source": f"fixture{n}", "observations": [n]} for n in (1, 2)]
+    media = {"data": b"fixture", "mime_type": "image/png"}
+    first = ToolResult("one", receipt=receipts[0], evidence=[evidence[0]],
+                       media=media, chain=[("second", {})])
+    second = ToolResult("two", receipt=receipts[1], evidence=[evidence[1]])
+    host, calls = _xxxv_chain({"first": first, "second": second})
+    result = asyncio.run(host.dispatch_chain("first", {}))
+    assert result.ok and calls == [("first", {}), ("second", {})]
+    assert _xxxv_receipts(result.response_payload()) == receipts
+    assert result.evidence == evidence and result.media is media
+    first.receipt["structuredContent"]["rows"].append(99)
+    first.evidence[0]["observations"].append(99)
+    assert _xxxv_receipts(result.response_payload()) == receipts
+    assert result.evidence[0]["observations"] == [1]
+    payload = result.response_payload()
+    _xxxv_receipts(payload)[0]["provenance"]["server"] = "mutated"
+    assert _xxxv_receipts(result.response_payload())[0]["provenance"]["server"] == "fixture1"
+
+
+def test_xxxv_chain_depth_limit_reports_unfinished_work():
+    results = {f"step{n}": ToolResult(str(n), chain=[(f"step{n + 1}", {})])
+               for n in range(5)}
+    results["step5"] = ToolResult("last")
+    host, calls = _xxxv_chain(results)
+    result = asyncio.run(host.dispatch_chain("step0", {}, max_depth=4))
+    assert len(calls) == 4
+    assert not result.ok
+    assert "unfinished" in result.text.lower() or "not run" in result.text.lower()
+    assert "step4" in result.text
+
+
+def test_xxxv_chain_duplicate_reports_skipped_work_without_repeating_it():
+    host, calls = _xxxv_chain({"repeat": ToolResult("completed once", chain=[("repeat", {})])})
+    result = asyncio.run(host.dispatch_chain("repeat", {}))
+    assert calls == [("repeat", {})]
+    assert not result.ok
+    assert "repeat" in result.text and ("skipped" in result.text.lower()
+                                        or "not run" in result.text.lower())
+
+
+def test_xxxv_chain_exact_bound_with_no_pending_work_remains_successful():
+    results = {f"step{n}": ToolResult(str(n), chain=[(f"step{n + 1}", {})])
+               for n in range(3)}
+    results["step3"] = ToolResult("last")
+    host, calls = _xxxv_chain(results)
+    result = asyncio.run(host.dispatch_chain("step0", {}, max_depth=4))
+    assert result.ok and len(calls) == 4
+    assert result.receipt is None and result.evidence is None
+
+
+@pytest.mark.parametrize("mode", ["coroutine", "offloop"])
+def test_xxxv_cancelled_dispatch_is_not_a_success_in_learning_or_telemetry(monkeypatch, mode):
+    from types import SimpleNamespace
+    import threading
+    import orion_core.dispatcher as dispatcher_module
+    entered, release = threading.Event(), threading.Event()
+    pattern, telemetry, latency = [], [], []
+    monkeypatch.setattr(dispatcher_module, "_gap_ledger",
+                        lambda: SimpleNamespace(note_tool_call=lambda: None))
+    monkeypatch.setattr(dispatcher_module, "_action_guard_on", lambda: False)
+    from orion_core import latency as latency_module
+    monkeypatch.setattr(latency_module, "TRACKER", SimpleNamespace(
+        record=lambda *args: latency.append(args)))
+    host = _bare_dispatcher()
+    host.pattern_detector = SimpleNamespace(record=lambda *args: pattern.append(args))
+    host.telemetry = SimpleNamespace(
+        metrics=SimpleNamespace(observe=lambda *_args: None),
+        record_tool_call=lambda *args: telemetry.append(args))
+
+    async def coroutine(_args):
+        entered.set()
+        await asyncio.Event().wait()
+
+    def offloop(_args):
+        entered.set()
+        assert release.wait(2)
+        return ToolResult("the worker completed")
+
+    name = "file_controller" if mode == "offloop" else "test_wait"
+    host.handler_table = lambda: {name: offloop if mode == "offloop" else coroutine}
+
+    async def run():
+        task = asyncio.create_task(host.dispatch(name, {}))
+        try:
+            for _ in range(100):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.002)
+            assert entered.is_set()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert host.active_tools == 0
+    assert host.recent_tools[-1]["ok"] is False
+    assert pattern == [(name, {}, False)] and telemetry == [(name, False)]
+    assert latency[-1][-1] == "cancelled"
+
+
+def test_xxxv_slow_skill_lifecycle_leaves_the_loop_free(monkeypatch):
+    from types import SimpleNamespace
+    import threading
+    import time
+    import orion_core.dispatcher as dispatcher_module
+    entered, release = threading.Event(), threading.Event()
+    monkeypatch.setattr(dispatcher_module, "_gap_ledger",
+                        lambda: SimpleNamespace(note_tool_call=lambda: None))
+    monkeypatch.setattr(dispatcher_module, "_action_guard_on", lambda: False)
+    host = _bare_dispatcher()
+    loop_thread = threading.get_ident()
+    worker_threads = []
+
+    def slow_install(source):
+        worker_threads.append(threading.get_ident())
+        entered.set()
+        # In the broken path this executes on the loop, so the release timeout
+        # is finite and the regression fails without trapping the test process.
+        assert release.wait(0.25) or threading.get_ident() == loop_thread
+        return ToolResult(f"installed {source}")
+
+    host.skills = SimpleNamespace(install=slow_install)
+    host.handler_table = lambda: {"skill": host.skill_tool}
+
+    async def run():
+        beats = []
+
+        async def heartbeat():
+            for _ in range(100):
+                await asyncio.sleep(0.002)
+                if entered.is_set():
+                    beats.append(time.monotonic())
+                    release.set()
+                    return
+            raise AssertionError("skill installer did not start")
+
+        monitor = asyncio.create_task(heartbeat())
+        try:
+            result = await host.dispatch("skill", {"action": "install", "source": "fixture"})
+            await monitor
+            return result, beats
+        finally:
+            release.set()
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+    result, beats = asyncio.run(run())
+    assert result.ok and beats
+    assert worker_threads and worker_threads[0] != loop_thread
+
+
+
+@pytest.mark.parametrize("said, answer", [
+    ("= 2x to the power of 3 - 2", "2x^3 - 2 is already as simple as it goes; factorised, "
+                                    "2(x - 1)(x^2 + x + 1). It is zero when x = 1 (plus 2 complex solutions)."),
+    ("solve 2x + 3 = 7", "x = 2."),
+    ("x^2 - 5x + 6 = 0", "x = 2 or x = 3."),
+    ("factorise x^2 - 4", "x^2 - 4 factorises to (x - 2)(x + 2)."),
+    ("differentiate x^3 + 2x", "d/dx of x^3 + 2x = 3x^2 + 2"),
+    ("x^3 - 2 = 2x^3 - 2", "x = 0."),
+])
+def test_the_calculator_works_algebra_exactly(said, answer):
+    """27 Oct 2026: "2x to the power of 3 - 2" was refused as not a calculation."""
+    from orion_core.calculator import calculate
+    result = calculate(said)
+    assert result.ok and result.text == answer
+
+
+def test_algebra_is_never_evaluated_as_code_and_stays_bounded():
+    from orion_core.calculator import algebra, calculate
+    assert not calculate("__import__('os').system('dir')").ok
+    assert algebra("x^7 + x = 1").startswith("I can solve equations in x up to the power of 6")
+    assert calculate("3 x 4").text == "3 x 4 = 12"          # arithmetic is unchanged

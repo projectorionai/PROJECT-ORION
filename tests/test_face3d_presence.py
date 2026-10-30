@@ -59,3 +59,23 @@ def test_presence_still_preserves_the_existing_signals():
     assert "exState.headX" in _HTML and "exState.headZ" in _HTML   # emotional posture
     assert "listen*0.04" in _HTML                # listening roll tilt
     assert "torsoRig.rotation" in _HTML          # torso lag
+
+
+def test_face_health_quotes_the_worst_stutter_of_each_reading_not_of_the_session():
+    # 16 Oct 2026: every FACE line of a 28-minute session said "(longest
+    # 1017 ms)" - the lifetime maximum, one boot-time gap repeated 20 times.
+    # The page now keeps a per-reading worst that the reader resets.
+    assert "winHitch=Math.max(orionHealth.winHitch,g)" in _HTML
+    assert "winGap=Math.max(orionHealth.winGap,g)" in _HTML
+    from orion_core.gui.face3d import HEALTH_READ_JS, health_change
+    assert "h.winHitch=0" in HEALTH_READ_JS and "h.winGap=0" in HEALTH_READ_JS
+    assert "JSON.stringify(h)" in HEALTH_READ_JS and "'null'" in HEALTH_READ_JS
+    seen: dict = {}
+    first = health_change(seen, '{"hitches":1,"maxHitch":1017,"winHitch":1017,'
+                                '"gaps":1,"maxGap":1017,"winGap":1017}')
+    assert first == "stuttered x1 (longest 1017 ms); renderer stalled x1 (longest 1017 ms)"
+    later = health_change(seen, '{"hitches":3,"maxHitch":1017,"winHitch":80,'
+                                '"gaps":1,"maxGap":1017,"winGap":0}')
+    assert later == "stuttered x2 (longest 80 ms)"
+    # A page without the window counters (an older cached page) still reads.
+    assert health_change({}, '{"hitches":4,"maxHitch":210}') == "stuttered x4 (longest 210 ms)"

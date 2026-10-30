@@ -242,3 +242,78 @@ def test_catch_up_surfaces_due_cards_and_an_overrun_focus_block(tmp_path):
     result = KnowledgeDispatchMixin.catch_up_tool(bag, {})
     assert "flashcard" in result.text
     assert "break" in result.text
+
+
+# ── the Focus page: a task in small steps, a dial, a gentle stop (30 Oct 2026) ──
+
+def test_a_task_written_as_one_line_becomes_its_steps():
+    from orion_core.focus import chunk_task
+    assert chunk_task("outline the essay, write the intro then add two sources") == [
+        "Outline the essay", "Write the intro", "Add two sources"]
+    assert chunk_task("1. read chapter 3\n2. make notes and test myself on them") == [
+        "Read chapter 3", "Make notes", "Test myself on them"]
+    # "and" inside one thing is not two steps, and nothing is made up.
+    assert chunk_task("buy salt and pepper") == ["Buy salt and pepper"]
+    assert chunk_task("  ") == []
+    assert len(chunk_task(", ".join(f"step {i}" for i in range(20)))) == 8
+
+
+def test_the_steps_are_still_there_after_a_restart(tmp_path):
+    path = tmp_path / "focus.db"
+    store = FocusStore(path)
+    store.save_plan("Lab report", [("Outline the method", True), ("Write the results", False),
+                                   ("  ", False)])
+    store.close()
+    again = FocusStore(path)
+    assert again.load_plan() == ("Lab report", [("Outline the method", True),
+                                                ("Write the results", False)])
+    again.save_plan("Revise", [])             # a task with no steps yet is kept too
+    assert again.load_plan() == ("Revise", [])
+
+
+def test_the_dial_reads_idle_running_due_and_break(engine):
+    from orion_core.gui.focus_deck import clock_text, dial_state, gentle_stop_counts
+    assert clock_text(65.4) == "01:05" and clock_text(-3) == "00:00"
+    idle = dial_state(None, T0, idle_minutes=25)
+    assert idle["mode"] == "idle" and idle["text"] == "25:00"
+    session = engine.start("write up", minutes=20, now=T0)
+    running = dial_state(session, T0 + timedelta(minutes=5), idle_minutes=25)
+    assert running["mode"] == "running" and running["text"] == "15:00"
+    assert running["progress"] == pytest.approx(0.25)
+    assert dial_state(session, T0 + timedelta(minutes=21), idle_minutes=25)["mode"] == "due"
+    on_break = dial_state(None, T0, idle_minutes=25, break_until=T0 + timedelta(minutes=2),
+                          break_seconds=300)
+    assert on_break["mode"] == "break" and on_break["text"] == "02:00"
+    # Stopping past halfway still counts the block; before it, it does not.
+    assert gentle_stop_counts(session, T0 + timedelta(minutes=11))
+    assert not gentle_stop_counts(session, T0 + timedelta(minutes=4))
+    assert not gentle_stop_counts(None, T0)
+
+
+def test_the_focus_page_starts_a_block_with_its_break_nudge(engine):
+    from types import SimpleNamespace
+
+    from PyQt6.QtWidgets import QApplication
+    globals().setdefault("_QT_APP", QApplication.instance() or QApplication([]))
+    from orion_core.gui.focus_deck import BREAK_TEXT, HALFWAY_TEXT, MODES, FocusDeckView
+
+    added: list[tuple[str, float]] = []
+    reminders = SimpleNamespace(
+        add=lambda text, minutes: added.append((text, minutes)) or SimpleNamespace(ok=True),
+        active=lambda: [], cancel=lambda rid: None)
+    page = FocusDeckView(SimpleNamespace(), engine, reminders=reminders)
+    page.step_input.setText("outline the method, write the results")
+    page.add_steps()
+    assert [text for text, _done in page.steps] == ["Outline the method", "Write the results"]
+    assert engine.store.load_plan()[1] == [("Outline the method", False),
+                                           ("Write the results", False)]
+    page.choose(next(m for m in MODES if m.body_double))
+    page.start()
+    session = engine.active()
+    assert session is not None and session.label == "Outline the method"
+    assert session.kind == "body double" and session.planned_minutes == 25
+    assert added == [(BREAK_TEXT, 25), (HALFWAY_TEXT, 12.5)]
+    assert page.dial.state()["mode"] == "running"
+    page.stop()                                  # straight away: not counted
+    assert engine.active() is None and "Stopped after" in page.status.text()
+    page.deleteLater()

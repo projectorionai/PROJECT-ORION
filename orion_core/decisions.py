@@ -30,6 +30,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from .constants import CONFIG_DIR
@@ -47,11 +48,12 @@ _SCORE = {"right": 1.0, "wrong": 0.0, "mixed": 0.5}
 DEFAULT_REVIEW_DAYS = 30
 
 #: Confidence bins for the calibration curve.
-BINS = ((50, 60), (60, 70), (70, 80), (80, 90), (90, 101))
+BINS = tuple((low, low + 10) for low in range(0, 90, 10)) + ((90, 101),)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    from .time_service import TIME
+    return TIME.now()
 
 
 def _iso(dt: datetime) -> str:
@@ -132,12 +134,12 @@ def calibration_bins(pairs: list[tuple[float, float]]) -> list[dict[str, Any]]:
     """
     out: list[dict[str, Any]] = []
     for low, high in BINS:
-        band = [actual for confidence, actual in pairs
+        band = [(confidence, actual) for confidence, actual in pairs
                 if low <= confidence * 100 < high]
         if not band:
             continue
-        actual_rate = sum(band) / len(band)
-        stated = (low + min(high, 100)) / 2 / 100.0
+        actual_rate = sum(actual for _, actual in band) / len(band)
+        stated = sum(confidence for confidence, _ in band) / len(band)
         out.append({
             "band": f"{low}-{min(high, 100)}%",
             "n": len(band),
@@ -153,8 +155,9 @@ def describe_calibration(bins: list[dict[str, Any]]) -> str:
     scored = [b for b in bins if b["n"] >= 2]
     if not scored:
         return "Not enough resolved decisions yet to judge calibration."
-    gaps = [b["gap"] for b in scored]
-    average = sum(gaps) / len(gaps)
+    samples = sum(b["n"] for b in scored)
+    average = sum(b["gap"] * b["n"] for b in scored) / samples
+    absolute_error = sum(abs(b["gap"]) * b["n"] for b in scored) / samples
     if average <= -12:
         return ("Consistently OVERCONFIDENT — outcomes land well below the stated "
                 "confidence. Try shading estimates down, or widening what counts "
@@ -162,6 +165,9 @@ def describe_calibration(bins: list[dict[str, Any]]) -> str:
     if average >= 12:
         return ("Consistently UNDERCONFIDENT — things work out more often than "
                 "predicted. The judgement is better than it feels.")
+    if absolute_error >= 12:
+        return ("Calibration varies across confidence bands — overconfidence and "
+                "underconfidence offset each other. Review the individual bands.")
     return "Well calibrated — stated confidence broadly matches what happens."
 
 
@@ -172,6 +178,7 @@ class DecisionStore:
         self.path = Path(path) if path is not None else (CONFIG_DIR / "decisions.db")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._lock = RLock()
         # Mark XXVI: WAL + relaxed fsync - a committed write costs
         # 0.03 ms instead of 2.81 ms, and that time is paid on the
         # qasync/GUI thread. See orion_core/db.py.
@@ -199,40 +206,46 @@ class DecisionStore:
             lesson=row["lesson"] or "", resolved_at=row["resolved_at"] or "")
 
     def add(self, decision: Decision) -> Decision:
-        cur = self._db.execute(
-            "INSERT INTO decisions (question, choice, confidence, prediction, "
-            "rationale, tags, made_at, review_at) VALUES (?,?,?,?,?,?,?,?)",
-            (decision.question, decision.choice, decision.confidence,
-             decision.prediction, decision.rationale, ",".join(decision.tags),
-             decision.made_at, decision.review_at))
-        self._db.commit()
-        decision.id = int(cur.lastrowid)
+        tags = ",".join(decision.tags)
+        with self._lock:
+            with self._db:
+                cur = self._db.execute(
+                    "INSERT INTO decisions (question, choice, confidence, prediction, "
+                    "rationale, tags, made_at, review_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (decision.question, decision.choice, decision.confidence,
+                     decision.prediction, decision.rationale, tags,
+                     decision.made_at, decision.review_at))
+                row_id = int(cur.lastrowid)
+            decision.id = row_id
         return decision
 
     def update(self, decision: Decision) -> None:
         if decision.id is None:
             return
-        self._db.execute(
-            "UPDATE decisions SET outcome=?, actual=?, lesson=?, resolved_at=?, "
-            "review_at=? WHERE id=?",
-            (decision.outcome, decision.actual, decision.lesson,
-             decision.resolved_at, decision.review_at, decision.id))
-        self._db.commit()
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE decisions SET outcome=?, actual=?, lesson=?, resolved_at=?, "
+                "review_at=? WHERE id=?",
+                (decision.outcome, decision.actual, decision.lesson,
+                 decision.resolved_at, decision.review_at, decision.id))
 
     def get(self, decision_id: int) -> Decision | None:
-        row = self._db.execute("SELECT * FROM decisions WHERE id=?",
-                               (decision_id,)).fetchone()
+        with self._lock:
+            row = self._db.execute("SELECT * FROM decisions WHERE id=?",
+                                   (decision_id,)).fetchone()
         return self._row(row) if row else None
 
     def all(self) -> list[Decision]:
-        return [self._row(r) for r in self._db.execute(
-            "SELECT * FROM decisions ORDER BY id").fetchall()]
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM decisions ORDER BY id").fetchall()
+        return [self._row(row) for row in rows]
 
     def close(self) -> None:
-        try:
-            self._db.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self._db.close()
+            except Exception:
+                pass
 
 
 # ── the journal ──────────────────────────────────────────────────────────────

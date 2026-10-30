@@ -357,7 +357,7 @@ def test_the_tool_exposes_export():
     assert "export" in tool["description"] and "orionplugin" in tool["description"]
     src = (Path(__file__).resolve().parents[1] / "orion_core"
            / "dispatch_productivity.py").read_text(encoding="utf-8")
-    assert "export_bundle(" in src
+    assert "self.plugins.export_bundle" in src
 
 
 # ── describe + call accounting (improvement #13) ────────────────────────────
@@ -375,15 +375,42 @@ def test_describe_of_an_unknown_plugin_is_graceful(registry):
     assert registry.describe("nope").ok is False
 
 
-def test_plugin_calls_and_failures_are_recorded_by_the_dispatcher():
+@pytest.mark.parametrize("raises", [False, True], ids=["failure_result", "handler_exception"])
+def test_plugin_calls_and_failures_are_recorded_by_the_dispatcher(registry, monkeypatch, raises):
     """The dispatcher must count plugin invocations and record failures against
     the plugin's health — otherwise 'calls' in doctor/describe is always zero."""
-    src = (Path(__file__).resolve().parents[1] / "orion_core"
-           / "dispatcher.py").read_text(encoding="utf-8")
-    forged_at = src.index("_tool_handlers")
-    window = src[forged_at:forged_at + 2000]
-    assert "registry.record_call(name)" in window
-    assert "mark_loaded" in window, "a failing plugin call must be recorded too"
+    import asyncio
+    from types import SimpleNamespace
+    from orion_core import dispatcher
+    from orion_core.data import ToolResult
+
+    assert registry.create("demo", "Temporary call-accounting fixture.", "allow").ok
+    before = registry.get("demo")
+    assert before is not None
+    calls = []
+
+    def handler():
+        calls.append("demo")
+        if raises:
+            raise RuntimeError("synthetic plugin failure")
+        return ToolResult("synthetic plugin failure", ok=False)
+
+    # The synthetic activated handler represents the temporary registry source;
+    # no real extension is imported or executed by this witness.
+    handler._orion_plugin_source_sha256 = before.source_sha256
+    host = SimpleNamespace(handler_table=lambda: {}, _tool_handlers={"demo": handler},
+                           plugins=registry, TOOL_DECLARATIONS=[])
+    monkeypatch.setattr(dispatcher, "_note_gap", lambda *_: None)
+    result = asyncio.run(dispatcher.OrionDispatcher.dispatch(host, "demo", {}))
+
+    after = registry.get("demo")
+    assert after is not None
+    assert not result.ok and calls == ["demo"]
+    assert after.calls == before.calls + 1
+    assert after.loaded is True
+    assert after.last_error == "synthetic plugin failure"
+    assert result.execution["state"] == "returned"
+    assert result.execution["executor_ok"] is False
 
 
 # ── the contract the LOADER enforces (regression) ───────────────────────────
@@ -404,10 +431,130 @@ def test_a_gemini_style_uppercase_schema_is_caught_statically(registry):
 def test_a_lowercase_schema_is_accepted(registry):
     good = _write(registry, "lower_tool.py",
                   "def get_tool_schema():\n"
-                  "    return {'name': 'x', 'parameters': {'type': 'object',\n"
+                  "    return {'name': 'x', 'description': 'A useful tool.',\n"
+                  "            'parameters': {'type': 'object',\n"
                   "            'properties': {}}}\n"
                   "def run(**k):\n    return 'ok'\n")
     assert pr.validate_module(good) == []
+
+
+@pytest.mark.parametrize("schema, error", [
+    ({"name": "demo", "parameters": {}}, "description"),
+    ({"name": "demo", "description": "   ", "parameters": {}}, "description"),
+    ({"name": "demo", "description": "Describe a file."}, "parameters"),
+    ({"name": "demo", "description": "Describe a file.",
+      "parameters": {"required": ["path"]}}, "not in properties"),
+    ({"name": "demo", "description": "Describe a file.",
+      "parameters": {"properties": []}}, "properties"),
+    ({"name": "demo", "description": "Describe a file.",
+      "parameters": {"required": [{}]}}, "entries must be strings"),
+])
+def test_literal_plugin_schema_problems_are_visible_before_loading(registry, schema, error):
+    path = _write(registry, "demo_tool.py",
+                  "def get_tool_schema():\n    return " + repr(schema) + "\n"
+                  "def run(**kwargs):\n    return 'ok'\n")
+    problems = pr.validate_module(path)
+    assert any(error in problem for problem in problems), problems
+    record = registry.get("demo")
+    assert record is not None and not record.healthy
+    assert error in registry.describe("demo").text
+
+
+@pytest.mark.parametrize("run, properties, error", [
+    ("def run(path):\n    return path\n", {}, "requires argument 'path'"),
+    ("def run(path):\n    return path\n", {"path": {"type": "string"}},
+     "does not mark it as required"),
+    ("def run(*, path):\n    return path\n", {"path": {"type": "string"}},
+     "does not mark it as required"),
+    ("def run():\n    return 'ok'\n", {"path": {"type": "string"}},
+     "does not accept it"),
+    ("def run(path, /):\n    return path\n", {"path": {"type": "string"}},
+     "positional-only"),
+    ("async def run(*, path):\n    return path\n", {}, "requires argument 'path'"),
+])
+def test_literal_plugin_arguments_match_the_handler_before_loading(
+        registry, run, properties, error):
+    schema = {"name": "demo", "description": "Describe a file.",
+              "parameters": {"type": "object", "properties": properties}}
+    path = _write(registry, "demo_tool.py",
+                  "def get_tool_schema():\n    return " + repr(schema) + "\n" + run)
+    assert any(error in problem for problem in pr.validate_module(path))
+
+
+@pytest.mark.parametrize("required, handler", [
+    (["path"], "def run(path):\n    return path\n"),
+    ([], "def run(path='local'):\n    return path\n"),
+])
+def test_literal_plugin_schema_requiredness_accepts_callable_controls(
+        registry, required, handler):
+    schema = {"name": "demo", "description": "Describe a file.",
+              "parameters": {"type": "object", "properties": {
+                  "path": {"type": "string"}}, "required": required}}
+    path = _write(registry, "demo_tool.py",
+                  "def get_tool_schema():\n    return " + repr(schema) + "\n" + handler)
+    assert pr.validate_module(path) == []
+
+
+def test_literal_plugin_contract_inspection_does_not_evaluate_defaults(registry, tmp_path):
+    marker = tmp_path / "DEFAULT_WAS_EXECUTED"
+    path = _write(registry, "defaults_tool.py",
+                  "from pathlib import Path\n" + _CONTRACT.replace(
+                      "def run(**kwargs):",
+                      "def run(query=Path(" + repr(str(marker)) + ").write_text('bad')):"))
+    assert pr.validate_module(path) == []
+    assert not marker.exists()
+
+
+def test_non_schema_object_literals_do_not_make_a_plugin_unhealthy(registry):
+    path = _write(registry, "data_tool.py", "DATA = {'type': 'OBJECT'}\n" + _CONTRACT)
+    assert pr.validate_module(path) == []
+
+
+def test_computed_plugin_schema_is_left_to_the_runtime_contract(registry):
+    path = _write(registry, "computed_tool.py",
+                  "def get_tool_schema():\n    return build_schema()\n"
+                  "def run(**kwargs):\n    return 'ok'\n")
+    assert pr.validate_module(path) == []
+
+
+@pytest.mark.parametrize("replacement", [
+    "if enabled:\n    get_tool_schema = build_schema\n",
+    "from unavailable_schema_provider import get_tool_schema\n",
+    "import unavailable_schema_provider as get_tool_schema\n",
+    "if enabled:\n    def get_tool_schema():\n        return build_schema()\n",
+    "class get_tool_schema:\n    pass\n",
+    "if enabled:\n    from unavailable_handler_provider import run\n",
+])
+def test_rebound_plugin_exports_are_left_to_the_runtime_contract(registry, replacement):
+    invalid_stub = _CONTRACT.replace("'description': 'd', ", "")
+    path = _write(registry, "rebound_tool.py", invalid_stub + replacement)
+    assert pr.validate_module(path) == []
+
+
+@pytest.mark.parametrize("local_scope", [
+    "def helper():\n    get_tool_schema = build_schema\n",
+    "class Helper:\n    def run(self):\n        return 'local method'\n",
+])
+def test_local_names_do_not_bypass_literal_plugin_validation(registry, local_scope):
+    invalid_stub = _CONTRACT.replace("'description': 'd', ", "")
+    path = _write(registry, "local_tool.py", invalid_stub + local_scope)
+    assert any("description" in problem for problem in pr.validate_module(path))
+
+
+def test_a_literal_contract_failure_cannot_replace_an_installed_plugin(registry, tmp_path):
+    assert registry.create("demo", "Describe local files.", "confirm").ok
+    original = {path.name: path.read_bytes() for path in registry.directory.iterdir()}
+    state = pr.PLUGIN_STATE_PATH.read_bytes()
+    external = tmp_path / "external"
+    external.mkdir()
+    candidate = external / "demo_tool.py"
+    candidate.write_text(
+        "def get_tool_schema():\n    return {'name': 'demo', 'parameters': {}}\n"
+        "def run(**kwargs):\n    return 'replacement'\n", encoding="utf-8")
+    result = registry.install(str(candidate))
+    assert not result.ok and "description" in result.text
+    assert {path.name: path.read_bytes() for path in registry.directory.iterdir()} == original
+    assert pr.PLUGIN_STATE_PATH.read_bytes() == state
 
 
 def test_a_scaffolded_plugin_passes_the_real_loader_contract(registry):
@@ -421,6 +568,25 @@ def test_a_scaffolded_plugin_passes_the_real_loader_contract(registry):
     schema = namespace["get_tool_schema"]()
     problems, _properties = schema_problems(schema)
     assert problems == [], f"a scaffolded plugin would not load: {problems}"
+
+
+@pytest.mark.parametrize("kind", ["tool", "event"])
+def test_scaffold_preserves_a_detailed_purpose_as_text(registry, kind):
+    import json
+
+    purpose = ('Inspect "quoted" files beneath C:\\Users\\Example.\n'
+               'Report findings and do not change files.\n'
+               'Literal docstring delimiter: """; control: \x00; symbol: \u03a9.')
+    result = registry.create("purposeful", purpose, "confirm", kind=kind)
+    assert result.ok, result.text
+    module = registry.directory / "purposeful_tool.py"
+    assert pr.validate_module(module) == []
+    namespace = {}
+    exec(compile(module.read_text(encoding="utf-8"), str(module), "exec"), namespace)
+    assert namespace["get_tool_schema"]()["description"] == purpose
+    assert namespace["__doc__"].strip().startswith(purpose)
+    manifest = json.loads((registry.directory / "purposeful.plugin.json").read_text(encoding="utf-8"))
+    assert manifest["description"] == purpose
 
 
 def test_a_reactive_scaffold_also_passes_the_loader_contract(registry):
@@ -490,3 +656,27 @@ def test_a_quarantined_plugin_gets_a_newly_shipped_fix(tmp_path):
 def test_seeding_is_a_no_op_without_a_bundle(tmp_path):
     assert pr.seed_shipped(tmp_path / "live", tmp_path / "absent") == []
     assert pr.seed_shipped(tmp_path / "live") == []
+
+
+def test_static_audits_are_cached_by_content_and_redone_on_any_edit(tmp_path, monkeypatch):
+    """28 Oct 2026: the Plugins page rescans every few seconds; re-parsing
+    every unchanged plugin held the interpreter lock for 50-370 ms."""
+    module = tmp_path / "probe_tool.py"
+    module.write_text("def get_tool_schema():\n    return {}\n\ndef run(args):\n    return 1\n",
+                      encoding="utf-8")
+    calls: list[str] = []
+    real = pr.validate_module_uncached
+    monkeypatch.setattr(pr, "validate_module_uncached",
+                        lambda path: calls.append(path.name) or real(path))
+    pr._AUDITS.clear()
+    first = pr.validate_module(module)
+    assert pr.validate_module(module) == first
+    assert calls == ["probe_tool.py"]                         # parsed once
+    module.write_text("def run(args):\n    return 1\n", encoding="utf-8")
+    assert "missing a top-level get_tool_schema() function" in pr.validate_module(module)
+    assert len(calls) == 2                                    # an edit is audited afresh
+    problems = pr.validate_module(module)
+    problems.append("caller's own note")
+    assert "caller's own note" not in pr.validate_module(module)   # callers get a copy
+    assert pr.validate_module(tmp_path / "missing_tool.py")
+

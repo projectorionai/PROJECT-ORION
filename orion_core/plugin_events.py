@@ -34,6 +34,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from PyQt6.QtCore import QObject, Qt, pyqtBoundSignal, pyqtSignal, pyqtSlot
+
 #: Signals a plugin may subscribe to. Deliberately a WHITELIST of observational,
 #: non-destructive events — a plugin can watch what ORION is doing, but this is
 #: not a hook into command execution or confirmation.
@@ -53,12 +55,39 @@ SUBSCRIBABLE: frozenset[str] = frozenset({
 #: Consecutive faults before a plugin's handler is muted for the session.
 MAX_FAULTS = 3
 
-#: A hook runs on the SIGNAL's thread — under qasync that is the GUI/event loop
+#: A Qt hook runs on the BUS's thread — under qasync that is the GUI/event loop
 #: thread, so a slow handler stalls rendering AND the audio deadline. Anything
 #: above this is reported; a plugin that keeps doing it is muted, because a
 #: third-party plugin must never be able to make ORION stutter.
 SLOW_MS = 50.0
 MAX_SLOW = 5
+
+
+class _QueuedHook(QObject):
+    """Only the trusted eligibility check runs inside a bus signal emitter.
+
+    Plugin code may pump Windows messages. Deliver it on the bus's event loop,
+    outside the emitting asyncio task's step, including worker subscriptions.
+    """
+
+    pending = pyqtSignal(object)
+
+    def __init__(self, bus: QObject, eligible: Callable[[], bool], deliver: Callable):
+        super().__init__()
+        self._eligible = eligible
+        self._deliver = deliver
+        self.pending.connect(self.deliver, Qt.ConnectionType.QueuedConnection)
+        self.moveToThread(bus.thread())
+
+    def post(self, *args: Any) -> None:
+        # Check now as well as at delivery: a disabled event must not be replayed
+        # merely because the owner re-enabled the plugin before Qt dispatched it.
+        if self._eligible():
+            self.pending.emit(args)
+
+    @pyqtSlot(object)
+    def deliver(self, args: tuple) -> None:
+        self._deliver(*args)
 
 
 @dataclass
@@ -91,10 +120,12 @@ class PluginEventBridge:
     #: The live (signal, slot) pairs per plugin, so a hot-reload can DISCONNECT
     #: the previous binding instead of stacking a second one on top of it.
     _connections: dict[str, list[tuple[Any, Any]]] = field(default_factory=dict)
+    _receivers: dict[str, list[_QueuedHook]] = field(default_factory=dict)
     #: Bumped on every (re)subscribe. A slot captures the generation it was made
     #: in and goes inert when superseded — so even a signal whose disconnect does
     #: not take (a stub, an exotic signal object) can never deliver twice.
     _generation: dict[str, int] = field(default_factory=dict)
+    registry: Any = None
 
     # ── wiring ────────────────────────────────────────────────────────────────
 
@@ -127,7 +158,21 @@ class PluginEventBridge:
                 continue
             try:
                 slot = self._make_slot(name, event, generation)
-                signal.connect(slot)
+                if isinstance(signal, pyqtBoundSignal):
+                    receiver = _QueuedHook(
+                        self.bus, lambda: self._eligible(name, generation), slot)
+                    try:
+                        # Direct only to the trusted forwarding adapter; its
+                        # receiver queues all arbitrary plugin execution.
+                        signal.connect(receiver.post, Qt.ConnectionType.DirectConnection)
+                    except Exception:
+                        receiver.deleteLater()
+                        raise
+                    slot = receiver.post
+                    self._receivers.setdefault(name, []).append(receiver)
+                else:
+                    # Preserve injectable non-Qt buses, which own their delivery.
+                    signal.connect(slot)
                 self._connections.setdefault(name, []).append((signal, slot))
             except Exception as exc:
                 self._emit(f"PLUGIN: could not bind '{name}' to '{event}' - {exc}")
@@ -142,16 +187,32 @@ class PluginEventBridge:
 
     def _make_slot(self, name: str, event: str, generation: int):
         def _slot(*args: Any) -> None:
-            if self._generation.get(name) != generation:
+            if not self._eligible(name, generation):
                 return          # superseded by a later subscribe (hot-reload)
             payload = args[0] if len(args) == 1 else (args or None)
             self.dispatch(name, event, payload)
         return _slot
 
+    def _eligible(self, name: str, generation: int) -> bool:
+        if self._generation.get(name) != generation:
+            return False
+        if self.registry is not None:
+            try:
+                return bool(self.registry.is_enabled(name))
+            except Exception:
+                return False
+        return True
+
     # ── delivery ──────────────────────────────────────────────────────────────
 
     def dispatch(self, name: str, event: str, payload: Any = None) -> bool:
         """Deliver one event to one plugin. Never raises. Returns delivered?"""
+        if self.registry is not None:
+            try:
+                if not self.registry.is_enabled(name):
+                    return False
+            except Exception:
+                return False
         stats = self.stats.setdefault(name, HookStats())
         if stats.muted:
             return False
@@ -160,7 +221,9 @@ class PluginEventBridge:
             return False
         started = time.perf_counter()
         try:
-            handler(event, payload)
+            from .execution_policy import background_scope
+            with background_scope("plugin_event", run_id=name):
+                handler(event, payload)
         except Exception as exc:
             stats.faults += 1
             stats.last_error = f"{type(exc).__name__}: {exc}"[:160]
@@ -193,16 +256,29 @@ class PluginEventBridge:
 
     def forget(self, name: str) -> bool:
         """Disconnect a plugin's hooks (used on hot-reload and on disable)."""
+        from .plugin_manifest import plugin_identity
+
+        identity = plugin_identity(name)
+        names = {name, *self._handlers, *self._connections, *self._bound, *self._generation}
+        matched = [key for key in names if plugin_identity(key) == identity]
+        had = False
+        for key in matched:
+            had = self._forget_exact(key) or had
+        return had
+
+    def _forget_exact(self, name: str) -> bool:
         pairs = self._connections.pop(name, [])
         for signal, slot in pairs:
             try:
                 signal.disconnect(slot)
             except Exception:
                 pass            # already gone, or a stub signal in a test
-        had = bool(pairs) or name in self._bound
+        had = bool(pairs) or name in self._bound or name in self._handlers
         # Invalidate any slot still connected somewhere we could not reach.
         if name in self._generation:
             self._generation[name] += 1
+        for receiver in self._receivers.pop(name, []):
+            receiver.deleteLater()
         self._bound.pop(name, None)
         self._handlers.pop(name, None)
         return had

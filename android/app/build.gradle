@@ -3,6 +3,28 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// The release key never lives in the repository. Gradle reads it from
+// ORION_SIGNING_PROPERTIES (or ~/.orion/android/keystore.properties), and
+// ORION_KEYSTORE_FILE / ORION_KEYSTORE_PASSWORD / ORION_KEY_ALIAS /
+// ORION_KEY_PASSWORD override single values. With neither present the release
+// APK is built unsigned, so CI and fresh checkouts still build.
+def signingFile = new File(System.getenv('ORION_SIGNING_PROPERTIES')
+        ?: "${System.getProperty('user.home')}/.orion/android/keystore.properties")
+def signingProps = new Properties()
+if (signingFile.isFile()) signingFile.withInputStream { signingProps.load(it) }
+def signingValue = { String env, String key -> System.getenv(env) ?: signingProps.getProperty(key) }
+def releaseStorePath = signingValue('ORION_KEYSTORE_FILE', 'storeFile')
+def releaseStore = releaseStorePath == null ? null
+        : (new File(releaseStorePath).isAbsolute() ? new File(releaseStorePath)
+            : new File(signingFile.parentFile, releaseStorePath))
+def releaseStorePassword = signingValue('ORION_KEYSTORE_PASSWORD', 'storePassword')
+def releaseKeyAlias = signingValue('ORION_KEY_ALIAS', 'keyAlias')
+def releaseKeyPassword = signingValue('ORION_KEY_PASSWORD', 'keyPassword')
+def hasReleaseKey = releaseStore?.isFile() && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+if (!hasReleaseKey) {
+    logger.lifecycle('ORION: no release key found; the release APK will be unsigned.')
+}
+
 android {
     namespace 'com.orion.companion'
     compileSdk 34
@@ -11,15 +33,37 @@ android {
         applicationId "com.orion.companion"
         minSdk 26
         targetSdk 34
-        versionCode 3
-        versionName "1.2"
+        versionCode 39
+        versionName "3.17"
+    }
+
+    signingConfigs {
+        if (hasReleaseKey) {
+            release {
+                storeFile releaseStore
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
         release {
-            minifyEnabled false
+            // R8 plus resource shrinking: the app ships a small slice of
+            // AppCompat, Material and OkHttp, and without this every class and
+            // drawable of all three went into the APK.
+            minifyEnabled true
+            shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (hasReleaseKey) signingConfig signingConfigs.release
         }
+    }
+
+    // The interface is English only; the libraries' translations of their
+    // own few strings are dead weight here.
+    androidResources {
+        localeFilters += ['en']
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -30,7 +74,10 @@ android {
     }
     buildFeatures {
         viewBinding true
+        aidl true
     }
+    // The face is the PC's Screen Face as a Canvas 2-D page
+    // (assets/orion_face.html, tools/export_phone_avatar.py): no Three.js.
 }
 
 dependencies {
@@ -39,4 +86,10 @@ dependencies {
     implementation 'com.google.android.material:material:1.12.0'
     implementation 'androidx.webkit:webkit:1.11.0'
     implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'org.mapsforge:mapsforge-map-android:0.25.0'
+    implementation 'org.mapsforge:mapsforge-map-reader:0.25.0'
+    implementation 'org.mapsforge:mapsforge-themes:0.25.0'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
 }

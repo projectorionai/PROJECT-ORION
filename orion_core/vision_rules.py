@@ -9,8 +9,8 @@ can do:
     object      a cup appears    announce   say it (or your own message)
     object_gone the keys leave   workflow   start one of your workflows,
     count       2+ people        log        just record it
-    pose        a hand is raised
-    colour      red fills a zone
+    pose        a hand is raised photo      save the moment it fired to
+    colour      red fills a zone            Pictures/ORION/Watch and say so
     motion      movement (in a zone)
     scene_change the view changes
     dark        the lights go off
@@ -65,7 +65,7 @@ TRIGGER_ALIASES = {"color": "colour", "gone": "object_gone", "leaves": "object_g
                    "movement": "motion", "moves": "motion", "lights_off": "dark",
                    "darkness": "dark", "blocked": "covered", "scene": "scene_change",
                    "people": "count", "sees": "object", "see": "object"}
-ACTIONS = ("announce", "workflow", "log")
+ACTIONS = ("announce", "workflow", "log", "photo")
 
 RELEASE_S = 3.0          # a condition must be false this long before the rule re-arms
 MIN_COOLDOWN_S = 5.0
@@ -120,6 +120,7 @@ class VisionRule:
         where = f" ({self.zone})" if self.zone else ""
         then = (f"run workflow '{self.workflow}'" if self.action == "workflow"
                 else "log it" if self.action == "log"
+                else "take a photo and tell you" if self.action == "photo"
                 else f"say \"{self.message}\"" if self.message else "tell you")
         state = "" if self.enabled else " [off]"
         fired = f", fired {self.fired}×" if self.fired else ""
@@ -208,9 +209,12 @@ class VisionRules:
         zone_name = normalise_zone(zone)
         verb = str(action or "announce").strip().lower()
         verb = {"say": "announce", "speak": "announce", "tell": "announce",
-                "run": "workflow", "run_workflow": "workflow"}.get(verb, verb)
+                "run": "workflow", "run_workflow": "workflow",
+                "snapshot": "photo", "picture": "photo", "take_photo": "photo",
+                "take_a_photo": "photo", "capture": "photo"}.get(verb.replace(" ", "_"), verb)
         if verb not in ACTIONS:
-            raise ValueError(f"'{action}' is not an action — use announce, workflow or log")
+            raise ValueError(f"'{action}' is not an action — use announce, workflow, "
+                             "log or photo")
         if verb == "workflow" and not str(workflow or "").strip():
             raise ValueError("a workflow rule needs the name of the workflow to run")
         rule = VisionRule(
@@ -373,9 +377,26 @@ class VisionRules:
 
 
 def act(firing: Firing, *, say: Callable[[str], Any], log: Callable[[str], Any],
-        run_workflow: Callable[[str, str], Any] | None) -> str:
-    """Carry out a fired rule. Returns what was done, for the event log."""
+        run_workflow: Callable[[str, str], Any] | None,
+        snapshot: Callable[[], Any] | None = None) -> str:
+    """Carry out a fired rule. Returns what was done, for the event log.
+    *snapshot* saves the frame that fired the rule and returns its path (or
+    None) — only a photo rule calls it."""
     rule = firing.rule
+    if rule.action == "photo":
+        path = None
+        if snapshot is not None:
+            try:
+                path = snapshot()
+            except Exception as exc:
+                log(f"VISION RULE: {rule.name} could not save its photo - {exc}")
+        heads_up = rule.message or f"Heads up — {firing.detail}"
+        if path:
+            log(f"VISION RULE: {rule.name} — {firing.detail}; photo saved to {path}")
+            say(f"{heads_up.rstrip('.')}. I've taken a photo.")
+            return f"photo saved ({path})"
+        say(f"{heads_up.rstrip('.')}, but I couldn't save a photo.")
+        return "photo failed"
     if rule.action == "announce":
         say(rule.message or f"Heads up — {firing.detail}.")
         return f"said it ({firing.detail})"

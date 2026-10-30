@@ -29,6 +29,16 @@ from .security import SecuritySanitiser, SecurityViolation
 from .utils import first_line
 
 
+def _number(value: Any) -> float:
+    """A number from a tool argument: 1200, "1,200", "£12.50", "40%" -> float; else 0."""
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+    return float(match.group(0)) if match else 0.0
+
+
 class CommerceDispatchMixin:
     """Commerce research and entrepreneurial advisory tools."""
 
@@ -151,6 +161,40 @@ class CommerceDispatchMixin:
         )
 
     async def brand_growth_tool(self, args: dict[str, Any]) -> ToolResult:
+        # Mark XXXX.2: paid campaigns on Meta and TikTok Shop (ad_campaigns.py) -
+        # exact arithmetic, a launch plan and a policy check; no engine needed.
+        requested = str(args.get("action") or "").lower().strip().replace(" ", "_")
+        if requested in {"ad_plan", "meta_plan", "tiktok_plan", "campaign_plan", "launch_plan"}:
+            from . import ad_campaigns
+            platform = "tiktok" if requested == "tiktok_plan" else str(args.get("platform") or "meta")
+            return ToolResult(ad_campaigns.plan(
+                platform=platform, product=str(args.get("product") or ""),
+                price=_number(args.get("price")), margin=_number(args.get("margin")) or 0.4,
+                daily_budget=_number(args.get("daily_budget") or args.get("budget")),
+                audience=str(args.get("audience") or "")))
+        if requested in {"ad_metrics", "analyse_ads", "analyze_ads", "ad_results", "roas"}:
+            from . import ad_campaigns
+            if not _number(args.get("spend")):
+                return ToolResult("Give me at least the spend, and ideally impressions, clicks, "
+                                  "purchases, revenue and your margin.", ok=False)
+            margin = _number(args.get("margin"))
+            return ToolResult(ad_campaigns.analyse(
+                spend=_number(args.get("spend")), impressions=_number(args.get("impressions")),
+                clicks=_number(args.get("clicks")), purchases=_number(args.get("purchases")),
+                revenue=_number(args.get("revenue")), margin=margin or None,
+                reach=_number(args.get("reach")), platform=str(args.get("platform") or "meta")).text())
+        if requested in {"ad_report", "ad_account", "live_ads", "my_ads", "campaign_report"}:
+            # Mark XXXX.3: the live results of the connected ad accounts, read-only.
+            from . import ad_accounts
+            margin = _number(args.get("margin"))
+            return ToolResult(await asyncio.to_thread(
+                ad_accounts.report, str(args.get("platform") or ""),
+                int(_number(args.get("days")) or 7), margin or None))
+        if requested in {"ad_copy_check", "check_ad", "ad_policy"}:
+            from . import ad_campaigns
+            issues = ad_campaigns.copy_issues(str(args.get("text") or args.get("copy") or ""))
+            return ToolResult("Nothing in that copy that ad review usually rejects." if not issues
+                              else "Ad review may reject this: " + " ".join(issues))
         if self.commerce is None or getattr(self.commerce, "growth", None) is None:
             return ToolResult("The brand growth agent is not available.", ok=False)
         action = str(args.get("action") or "strategy").lower().strip()

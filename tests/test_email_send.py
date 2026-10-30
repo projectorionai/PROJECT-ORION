@@ -15,6 +15,7 @@ Offline: no mail is sent and no browser opens.
 from __future__ import annotations
 
 import sys
+import asyncio
 import urllib.parse
 from pathlib import Path
 
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 import orion_core.messaging as messaging  # noqa: E402
 from orion_core.messaging import MessagingGateway  # noqa: E402
+from orion_core.execution_policy import foreground_scope  # noqa: E402
 
 
 class _Log:
@@ -51,9 +53,17 @@ def gateway(monkeypatch):
     return gate
 
 
-def test_an_unconfigured_send_opens_a_prefilled_draft(gateway):
+def test_an_unconfigured_background_send_requires_attention_without_opening(gateway):
     result = gateway.send_email("friend@example.com", "Lunch?", "Free at 1?")
+    assert not result.ok and result.receipt["status"] == "requires_foreground"
+    assert gateway._opened == []
+
+
+def test_explicit_foreground_unconfigured_send_opens_a_prefilled_draft(gateway):
+    with foreground_scope("email-compose-test:user-authorized"):
+        result = gateway.send_email("friend@example.com", "Lunch?", "Free at 1?")
     assert result.ok
+    assert result.receipt["status"] == "draft" and result.receipt["sent"] is False
     assert gateway._opened, "nothing was opened"
     query = urllib.parse.parse_qs(urllib.parse.urlparse(gateway._opened[0]).query)
     assert query["to"] == ["friend@example.com"]
@@ -64,13 +74,28 @@ def test_an_unconfigured_send_opens_a_prefilled_draft(gateway):
 
 def test_a_draft_is_never_described_as_sent(gateway):
     """Somebody who is told it was sent will walk away from the computer."""
-    text = gateway.send_email("a@b.com", "Subject", "Body").text.lower()
+    with foreground_scope("email-compose-test:user-authorized"):
+        text = gateway.send_email("a@b.com", "Subject", "Body").text.lower()
     assert "waiting for you" in text or "press send" in text
     assert "email sent" not in text
 
 
+@pytest.mark.parametrize("raises", [False, True])
+def test_failed_draft_launch_does_not_claim_a_draft_exists(gateway, monkeypatch, raises):
+    def failed_open(url):
+        if raises:
+            raise OSError("Synthetic browser launch failure")
+        return False
+    monkeypatch.setattr(messaging, "open_url", failed_open)
+    with foreground_scope("email-compose-test:user-authorized"):
+        result = gateway.send_email("friend@example.com", "Lunch?", "Free at 1?")
+    assert not result.ok and result.receipt["status"] == "failed"
+    assert "No message was sent" in result.text
+
+
 def test_a_multiline_body_survives_the_url(gateway):
-    gateway.send_email("a@b.com", "s", "line one\nline two")
+    with foreground_scope("email-compose-test:user-authorized"):
+        gateway.send_email("a@b.com", "s", "line one\nline two")
     query = urllib.parse.parse_qs(urllib.parse.urlparse(gateway._opened[0]).query)
     assert query["body"] == ["line one\nline two"]
 
@@ -156,10 +181,11 @@ def test_the_tool_routes_email(monkeypatch):
     dispatcher = _D()
     for args in ({"action": "email", "to": "a@b.com", "subject": "s", "body": "b"},
                  {"action": "send", "platform": "gmail", "to": "a@b.com", "message": "b"}):
-        result = dispatcher.messaging_tool(args)
+        result = asyncio.run(dispatcher.messaging_tool(args))
         assert result.ok and "a@b.com" in result.text
 
 
 def test_the_model_is_told_not_to_overclaim():
     schema = (ROOT / "orion_core" / "dispatch_schema.py").read_text(encoding="utf-8")
-    assert "do not claim the mail was sent" in schema
+    assert "Report submitted separately from delivered/read" in schema
+    assert "no compose window opens automatically" in schema

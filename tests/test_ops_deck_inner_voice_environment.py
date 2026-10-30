@@ -1,7 +1,6 @@
 """
-Tests for InnerVoicePanel and EnvironmentPanel (ops_deck.py) — the thought
-stream and calendar/geo panel that used to live directly on the Core Window
-and were lifted onto the OPS deck page when the Core Window became face-only.
+Tests for the Operations environment panel. Reflections have their own useful
+home in Cognition; Operations must not mount a duplicate notes panel.
 
 Headless (offscreen Qt) — no display required.  Network calls are mocked;
 these never touch a real geolocation/weather provider.
@@ -26,7 +25,6 @@ from PyQt6.QtWidgets import QApplication  # noqa: E402
 from orion_core.gui import ops_deck  # noqa: E402
 from orion_core.gui.ops_deck import (  # noqa: E402
     EnvironmentPanel,
-    InnerVoicePanel,
     OperationsDeckView,
 )
 
@@ -56,64 +54,6 @@ class _StubBus:
 
     def __getattr__(self, name):
         return _Signal()
-
-
-def _tick(panel: InnerVoicePanel, n: int) -> None:
-    for _ in range(n):
-        panel._thought_type_tick()
-
-
-# ── InnerVoicePanel ─────────────────────────────────────────────────────────
-
-def test_full_thought_types_out_incrementally(_app):
-    panel = InnerVoicePanel(_StubBus())
-    # Shown on purpose: the typewriter only animates when the panel is on
-    # screen, because doing it hidden costs ~64 ms of every second on the
-    # event loop for pixels nobody sees.
-    panel.show()
-    panel._on_thought_full({"at": "09:00:00", "kind": "reflection", "text": "Watching the queue."})
-    _tick(panel, 4)
-    mid = panel.thought_box.toPlainText()
-    assert "▌" in mid
-    assert mid.replace("▌", "") != "09:00:00 ◈ Watching the queue."
-    _tick(panel, 60)
-    done = panel.thought_box.toPlainText()
-    assert "Watching the queue." in done
-    assert "▌" not in done
-
-
-def test_decision_marker_used_for_decision_kind(_app):
-    panel = InnerVoicePanel(_StubBus())
-    panel._on_thought_full({"at": "09:00:00", "kind": "decision", "text": "Act now."})
-    _tick(panel, 40)
-    assert "⚙" in panel.thought_box.toPlainText()
-
-
-def test_streaming_delta_renders_live(_app):
-    panel = InnerVoicePanel(_StubBus())
-    panel._on_thought_delta({"phase": "start", "id": 1, "kind": "reflection", "at": "09:00:00"})
-    panel._on_thought_delta({"phase": "delta", "id": 1, "text": "partial thought"})
-    assert "partial thought" in panel.thought_box.toPlainText()
-    panel._on_thought_delta({"phase": "end", "id": 1})
-    assert 1 in panel._streamed_ids
-
-
-def test_streaming_abort_removes_the_partial_line(_app):
-    panel = InnerVoicePanel(_StubBus())
-    panel._on_thought_delta({"phase": "start", "id": 2, "kind": "reflection", "at": "09:00:00"})
-    panel._on_thought_delta({"phase": "delta", "id": 2, "text": "will be dropped"})
-    assert "will be dropped" in panel.thought_box.toPlainText()
-    panel._on_thought_delta({"phase": "abort", "id": 2})
-    assert "will be dropped" not in panel.thought_box.toPlainText()
-    assert panel._stream_active is False
-
-
-def test_full_thought_already_streamed_is_not_replayed(_app):
-    panel = InnerVoicePanel(_StubBus())
-    panel._on_thought_delta({"phase": "start", "id": 3, "kind": "reflection", "at": "09:00:00"})
-    panel._on_thought_delta({"phase": "end", "id": 3})
-    panel._on_thought_full({"at": "09:00:00", "kind": "reflection", "text": "already shown", "id": 3})
-    assert panel._thought_queue == []
 
 
 # ── EnvironmentPanel ─────────────────────────────────────────────────────────
@@ -232,23 +172,8 @@ def test_refresh_environment_widgets_reports_failure_when_all_providers_fail(_ap
 
 # ── OperationsDeckView wiring ────────────────────────────────────────────────
 
-def test_operations_deck_view_wires_both_new_panels(_app):
+def test_operations_keeps_environment_without_duplicate_reflections(_app):
     view = OperationsDeckView(_StubBus())
-    assert hasattr(view, "inner_voice_panel")
-    assert isinstance(view.inner_voice_panel, InnerVoicePanel)
+    assert not hasattr(view, "inner_voice_panel")
     assert hasattr(view, "environment_panel")
     assert isinstance(view.environment_panel, EnvironmentPanel)
-
-
-def test_a_hidden_inner_voice_panel_does_not_animate(_app):
-    """The thought still arrives in full — it just stops being revealed one
-    character at a time into something nobody is looking at."""
-    panel = InnerVoicePanel(_StubBus())
-    panel.hide()
-    panel._on_thought_full(
-        {"at": "09:00:00", "kind": "reflection", "text": "Unseen thought."})
-    panel._thought_type_tick()
-    text = panel.thought_box.toPlainText()
-    assert "Unseen thought." in text
-    assert "▌" not in text
-    assert not panel._type_timer.isActive()

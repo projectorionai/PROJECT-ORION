@@ -37,6 +37,7 @@ class DiagnosticCategory(str, Enum):
     DNS_FAILURE = "dns_network_failure"
     TIMEOUT = "timeout"
     RATE_LIMIT = "rate_limit"
+    SERVICE_UNAVAILABLE = "service_unavailable"
     QUOTA_EXHAUSTED = "quota_exhausted"
     UNSUPPORTED_MODEL = "unsupported_model"
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
@@ -54,6 +55,7 @@ _REMEDIATION = {
     DiagnosticCategory.DNS_FAILURE: "Name resolution/network failed — check internet connectivity and DNS.",
     DiagnosticCategory.TIMEOUT: "The request timed out — the network may be slow or the provider overloaded; retry or raise the timeout.",
     DiagnosticCategory.RATE_LIMIT: "You are being rate-limited — back off, then retry; consider spreading load across keys/providers.",
+    DiagnosticCategory.SERVICE_UNAVAILABLE: "The provider is temporarily down or overloaded (a 5xx reply) - nothing is wrong with the setup; retry shortly while another provider covers.",
     DiagnosticCategory.QUOTA_EXHAUSTED: "Account quota/credits are exhausted — top up, or switch to another provider or a local model.",
     DiagnosticCategory.UNSUPPORTED_MODEL: "The requested model is unavailable — pick a supported model id for this provider.",
     DiagnosticCategory.UNSUPPORTED_CAPABILITY: "This provider/model cannot perform the requested capability — route the task to one that can.",
@@ -91,6 +93,10 @@ _RULES: tuple[tuple[re.Pattern[str], DiagnosticCategory], ...] = (
     (re.compile(r"(?i)invalid api.?key|api key not valid|api key expired|unauthenti|unauthori[sz]|permission denied|401|403|forbidden"), DiagnosticCategory.INVALID_CREDENTIALS),
     (re.compile(r"(?i)quota|insufficient_quota|billing|credit|payment required|402"), DiagnosticCategory.QUOTA_EXHAUSTED),
     (re.compile(r"(?i)rate.?limit|resource exhausted|429|too many requests|overloaded"), DiagnosticCategory.RATE_LIMIT),
+    # A 5xx is the provider's own trouble. Gemini's bare "HTTP 503: [{" was
+    # filed as unknown with "inspect the log detail" - there is nothing to fix.
+    (re.compile(r"(?i)\bHTTP 50[0234]\b|\b50[0234]\b(?= *[:,)]| *$)|service unavailable|internal server error|"
+                r"bad gateway|gateway time-?out|temporarily unavailable|\bUNAVAILABLE\b"), DiagnosticCategory.SERVICE_UNAVAILABLE),
     (re.compile(r"(?i)context length|maximum context|context window|too many tokens|reduce the length|token.*exceed"), DiagnosticCategory.CONTEXT_OVERFLOW),
     (re.compile(r"(?i)model .*not found|no such model|unknown model|invalid model|unsupported model|does not exist|model_not_found|404"), DiagnosticCategory.UNSUPPORTED_MODEL),
     (re.compile(r"(?i)does not support|unsupported (?:capability|operation)|not implemented"), DiagnosticCategory.UNSUPPORTED_CAPABILITY),
@@ -102,9 +108,34 @@ _RULES: tuple[tuple[re.Pattern[str], DiagnosticCategory], ...] = (
 )
 
 
-def _first_line(text: str, limit: int = 200) -> str:
+_AUTH_HEADER_RE = re.compile(r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+[^\s,;]+")
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_SECRET_FIELD_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])((?:[\"']?)(?:api[_-]?key|access[_-]?token|"
+    r"refresh[_-]?token|client[_-]?secret|password|secret)(?:[\"']?)\s*[:=]\s*)"
+    r"([\"']?)([^\"'\s&;,}]+)"
+)
+_KNOWN_KEY_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{10,}|AIza[A-Za-z0-9_-]{20,})\b")
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip credentials from provider errors before any display or journal IO."""
+    text = _AUTH_HEADER_RE.sub("Authorization: [REDACTED]", str(text or ""))
+    text = _BEARER_RE.sub("Bearer [REDACTED]", text)
+    text = _SECRET_FIELD_RE.sub(lambda match: match.group(1) + match.group(2) + "[REDACTED]", text)
+    return _KNOWN_KEY_RE.sub("[REDACTED]", text)
+
+
+def redacted_error_line(text: Any, limit: int = 200) -> str:
+    """A short provider error safe for logs, UI and raised messages."""
     line = str(text or "").strip().split("\n", 1)[0]
-    return line[:limit]
+    # Redact before truncating: a long key cut at character 200 might no
+    # longer match its token pattern, leaving a secret prefix in the UI.
+    return _redact_secrets(line)[:limit]
+
+
+def _first_line(text: str, limit: int = 200) -> str:
+    return redacted_error_line(text, limit)
 
 
 def classify_provider_error(error: Any, provider: str = "",
@@ -164,9 +195,12 @@ def persist_diagnosis(diagnosis: Diagnosis, journal: Path | None = None) -> None
     mechanism).  Never raises into the caller; contains no secrets."""
     path = journal or DIAGNOSTICS_JOURNAL
     try:
+        payload = diagnosis.as_dict()
+        for field in ("detail", "remediation", "provider"):
+            payload[field] = _redact_secrets(str(payload.get(field) or ""))
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(diagnosis.as_dict()) + "\n")
+            fh.write(json.dumps(payload) + "\n")
     except Exception:
         pass
 
@@ -177,6 +211,12 @@ def recent_diagnoses(limit: int = 20, journal: Path | None = None) -> list[dict[
         return []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
-        return [json.loads(line) for line in lines if line.strip()]
+        rows = [json.loads(line) for line in lines if line.strip()]
+        for row in rows:
+            if isinstance(row, dict):
+                for field in ("detail", "remediation", "provider"):
+                    if field in row:
+                        row[field] = _redact_secrets(str(row[field]))
+        return rows
     except Exception:
         return []

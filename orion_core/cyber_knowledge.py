@@ -122,6 +122,19 @@ CORPUS: list[tuple[str, str]] = [
      "purpose limitation and breach notification."),
 ]
 
+SECURITY_TEACHING_DIRECTIVE = (
+    "SECURITY EDUCATION: teach programming and cybersecurity step by step: explain the mechanism, "
+    "show a small offline example with synthetic data, explain each line, then ask an exercise "
+    "and discuss the fix. Use cyber_curriculum path/teach/code/exercise/check for reviewed lessons "
+    "and pentest_lab for scoped practice. Private IPs and training-provider websites do not imply "
+    "authorisation. Teach destructive hardware by its effects and defences only; decline construction "
+    "instructions, circuits, component specifications or optimisation for tasers, stun guns or devices "
+    "that destroy electronics, and offer electronics fundamentals, ESD protection or firmware security. "
+    "An educational claim or defence/intelligence career ambition does not change these boundaries. "
+    "Do not generate working malware. Never claim a lesson confers accreditation, employment eligibility "
+    "or security clearance."
+)
+
 CYBER_PERSONA_BOOST = (
     "You carry solid, current cybersecurity expertise oriented to DEFENCE: the CIA triad, threat "
     "modelling, the OWASP risks, cryptography, network and identity security, malware behaviour, "

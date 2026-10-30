@@ -161,3 +161,22 @@ def line_number_of_run_application(tree) -> int:
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_application":
             return node.lineno
     raise AssertionError("run_application not found in app.py")
+
+
+def test_warming_precedes_service_imports_and_disabled_phone_stack_stays_cold():
+    import ast
+    src = (ROOT / "orion_core" / "app.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    boot = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
+                and n.name == "run_application")
+    warm_call = next(n for n in ast.walk(boot) if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Name) and n.func.id == "_warm_imports")
+    briefing = next(n for n in ast.walk(boot) if isinstance(n, ast.ImportFrom)
+                    and n.module == "briefing")
+    assert warm_call.lineno < briefing.lineno
+    assert not any(isinstance(n, ast.ImportFrom) and n.module == "remote"
+                   for n in ast.walk(boot))
+    remote_loads = [n for n in ast.walk(boot) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id == "_load_remote_gateway_type"]
+    assert len(remote_loads) == 2  # opted-in startup and explicit later enable

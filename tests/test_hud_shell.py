@@ -46,6 +46,18 @@ out = {{}}
 face = QLabel("FACE")
 before = (face.styleSheet(), face.objectName())
 shell = HudShell(face)
+class RecorderProbe:
+    def snapshot(self):
+        return {{"active": False, "state": "off"}}
+recording_stops = []
+shell.attach_recorder(RecorderProbe(), lambda: recording_stops.append(True))
+out["recording_off"] = shell.chips.chips["recording"].text()
+out["recording_stop_disabled"] = not shell.controls.button("stop_recording").isEnabled()
+shell._recorder.snapshot = lambda: {{"active": True, "audio_seconds": 65.0}}
+shell._refresh_recording()
+out["recording_active"] = shell.chips.chips["recording"].text()
+shell.controls.button("stop_recording").click()
+out["recording_stop_fired"] = recording_stops
 out["face_is_the_same_object"] = shell.centre is face
 out["face_stylesheet_untouched"] = face.styleSheet() == before[0]
 out["face_objectname_untouched"] = face.objectName() == before[1]
@@ -97,7 +109,8 @@ out["tmp_when_known"] = rail.meters["tmp"].value_label.text()
 rail.apply_sample("not a sample")
 rail.apply_sample(None)
 out["rubbish_survived"] = True
-rail.set_facts("07:14", 427, "WIN")
+out["facts_start"] = rail.facts.text()
+rail.set_active("3 h 14 min")
 out["facts"] = rail.facts.text()
 out["rail_width"] = rail.width()
 
@@ -121,6 +134,8 @@ out["blank_lines_ignored"] = log.line_count
 
 # ── the command bar ──────────────────────────────────────────────────────────
 bar = CommandBar()
+# Owner, 30 Oct 2026: "get rid of this 'Talk to ORION' heading".
+out["bar_captions"] = [label.text() for label in bar.findChildren(QLabel)]
 sent = []
 bar.submitted.connect(sent.append)
 bar.input.setText("  what is the weather  ")
@@ -270,9 +285,9 @@ def test_a_malformed_sample_does_not_raise(hud):
     assert hud["rubbish_survived"] is True
 
 
-def test_the_machine_facts_are_shown(hud):
-    assert "07:14" in hud["facts"] and "427" in hud["facts"]
-    assert "WIN" in hud["facts"]
+def test_the_rail_says_how_long_orion_has_been_active_and_nothing_else(hud):
+    assert hud["facts"] == "ORION has been active for 3 h 14 min"
+    assert hud["facts_start"] == "ORION has just started"
 
 
 def test_the_rail_keeps_its_width(hud):
@@ -303,6 +318,10 @@ def test_typing_sends_what_was_typed(hud):
     assert hud["input_cleared"] == ""
 
 
+def test_the_command_bar_has_no_talk_to_orion_caption(hud):
+    assert "Talk to ORION" not in hud["bar_captions"]
+
+
 def test_an_empty_line_is_not_sent(hud):
     assert hud["blank_not_submitted"] == 1
 
@@ -316,8 +335,9 @@ def test_the_microphone_button_toggles_and_says_which(hud):
     assert hud["mic_starts_on"] is True
     assert hud["mic_after_toggle"] is False
     assert hud["mic_emitted"] == [False]
-    assert "MUTED" in hud["mic_label_muted"]
-    assert "ACTIVE" in hud["mic_label_active"]
+    # Said plainly since Mark XXXV ("Mic off" / "Mic on - I'm listening").
+    assert "Mic off" in hud["mic_label_muted"]
+    assert "Mic on" in hud["mic_label_active"]
 
 
 def test_following_the_real_mic_state_does_not_re_emit(hud):
@@ -462,3 +482,106 @@ def test_the_controls_have_somewhere_to_be_opened_from():
     source = _window_source()
     assert "def open_controls" in source
     assert "self.controls_btn" in source
+
+
+def test_status_text_never_resizes_the_face():
+    """A resize clears the face's WebGL canvas - a black flash. A chip given a
+    longer label used to widen the left column and resize the face beside it
+    (942 -> 894 -> 876 px, never shrinking back)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtCore import QEvent, QObject
+    from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget
+    app = QApplication.instance() or QApplication([])
+    from orion_core.gui.hud_shell import HudShell, hud_stylesheet
+
+    resizes = []
+
+    class _Watch(QObject):
+        def eventFilter(self, _obj, event):
+            if event.type() == QEvent.Type.Resize:
+                resizes.append(event.size())
+            return False
+
+    centre = QWidget()
+    shell = HudShell(centre)
+    shell.setStyleSheet(hud_stylesheet())
+    window = QMainWindow()
+    window.setCentralWidget(shell)
+    window.resize(1400, 860)
+    window.show()
+    for _ in range(5):
+        app.processEvents()
+    watch = _Watch()
+    centre.installEventFilter(watch)
+    try:
+        shell.chips.set_chip("protocol", "PROTOCOL\nHOUSE PARTY ACTIVE", "warn")
+        shell.chips.set_chip("security", "SEC\nTHREAT REVIEW NEEDED", "bad")
+        shell.rail.apply_sample({"cpu": 100.0, "ram": 99.9, "gpu": 100.0})
+        shell.rail.set_active("123 days 23 h")
+        for i in range(30):
+            shell.log.append(f"NET: a long activity line {i} " + "x" * 120)
+        for _ in range(5):
+            app.processEvents()
+        assert resizes == [], f"the face was resized {len(resizes)}x by status text"
+    finally:
+        window.close()
+
+
+# ── Mark XXXV: the window speaks like a person (gui/humane.py) ───────────────
+
+def test_the_feed_tells_the_conversation_and_leaves_engineering_out():
+    from orion_core.gui.humane import humanise
+    assert humanise("YOU: what's the weather tomorrow?").kind == "you"
+    assert humanise("ORION: Mild, with showers.").text == "Mild, with showers."
+    assert humanise("YOU (voice): [wake]") is None
+    for noise in ("PERF: event loop blocked 250 ms by close() at sounddevice.py:1168",
+                  "DEBUG: Live channel exception trace: Traceback",
+                  "NET: initialising gemini live channel (gemini-2.5-flash).",
+                  "DECK: LOG", "BOOT: window visible at 0.42s.",
+                  "MCP[orion_world]: handshake failed - server closed the connection"):
+        assert humanise(noise) is None, noise
+    assert humanise("NET: gemini live channel synchronised.").text == "Connected - ready to talk."
+    dropped = humanise("NET: live channel dropped (code 1006); resuming the conversation.")
+    assert dropped.kind == "trouble" and "reconnecting" in dropped.text
+    mic = humanise("AUDIO: microphone pipeline initialised — listening on [1] "
+                   "Microphone (2- HD Pro Webcam C9.")
+    assert mic.text == "Listening through HD Pro Webcam C9…"
+    assert humanise("TOOL: geo requested.").text == "Checking the map and the weather…"
+    failed = humanise("TOOL: open_app failed - Spotify is not installed")
+    assert failed.kind == "trouble" and "Spotify is not installed" in failed.text
+    assert humanise("MEM: synchronised personal/commute").text == "Noted something about your commute."
+
+
+def test_headings_are_said_in_sentence_case_keeping_acronyms():
+    from orion_core.gui.humane import sentence_case
+    assert sentence_case("WAITING FOR YOUR APPROVAL") == "Waiting for your approval"
+    assert sentence_case("WHAT ORION IS DOING") == "What ORION is doing"
+    assert sentence_case("CPU & GPU") == "CPU & GPU"
+    assert sentence_case("Already in sentence case") == "Already in sentence case"
+
+
+def test_the_details_switch_shows_the_full_log_and_back():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    from orion_core.gui.hud_shell import ActivityLog
+    log = ActivityLog()
+    log._build_view()
+    for line in ("PERF: event loop blocked 250 ms", "YOU: hello", "ORION: Hi there."):
+        log.append(line)
+    app.processEvents()
+    human = log.view.toPlainText()
+    assert "PERF" not in human and "You" in human and "Hi there." in human
+    log.set_details(True)
+    assert "PERF: event loop blocked 250 ms" in log.view.toPlainText()
+    log.set_details(False)
+    assert log.view.toPlainText() == human
+
+
+def test_recording_chip_and_stop_use_the_recorder_state(hud):
+    assert hud["recording_off"] == "Recording\noff"
+    assert hud["recording_stop_disabled"]
+    assert "1:05 saved" in hud["recording_active"]
+    assert hud["recording_stop_fired"] == [True]

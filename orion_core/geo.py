@@ -53,6 +53,8 @@ from .constants import CONFIG_DIR
 from .data import ToolResult
 from .utils import first_line
 from .db import apply_pragmas
+from .globe_locations import valid_coordinates
+from .globe_coordinates import parse_coordinates
 
 GEO_CACHE_PATH = CONFIG_DIR / "geo_cache.db"
 _USER_AGENT = "ORION-AI-OS/10.x (personal assistant; contact via desktop app)"
@@ -67,8 +69,8 @@ _SETTLEMENT_KINDS = ("city", "town", "village", "hamlet", "suburb",
 # them coarsely (or to a nearby administrative centroid), and the Open-Meteo
 # fallback doesn't understand postcodes at all — so a coastal postcode can
 # land the globe camera out at sea.  ``postcodes.io`` is a free, keyless
-# service that returns the EXACT centroid for any live UK postcode, so a
-# postcode-shaped query is routed there first for pinpoint accuracy.
+# service that returns a representative point for a live UK postcode. This is
+# a postcode area reference, not the position of an individual house or car.
 _POSTCODES_IO = "https://api.postcodes.io"
 _UK_POSTCODE_RE = re.compile(
     r"^(GIR\s*0AA|[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})$", re.IGNORECASE)
@@ -99,6 +101,7 @@ class Place:
     admin: dict[str, str] = field(default_factory=dict)   # region/county/…
     population: int | None = None
     display: str = ""
+    source: str = ""
 
     def summary(self) -> str:
         bits = [self.name]
@@ -117,7 +120,7 @@ class Place:
         return {"name": self.name, "lat": self.lat, "lon": self.lon,
                 "kind": self.kind, "country": self.country,
                 "admin": self.admin, "population": self.population,
-                "display": self.display}
+                "display": self.display, "source": self.source}
 
 
 class GeoIntelligenceEngine:
@@ -203,11 +206,12 @@ class GeoIntelligenceEngine:
             return []
         cache_key = f"geocode::{query}::{limit}"
         cached = self._cache_get(cache_key)
-        if cached is not None:
-            return [self._place_from_dict(d) for d in cached]
-        # Pinpoint path: a UK postcode resolves through postcodes.io to its
-        # exact centroid, so the globe flies to the real location rather than a
-        # coarse administrative point (or, via the old fallback, open water).
+        if isinstance(cached, list):
+            places = [p for d in cached if (p := self._place_from_dict(d)) is not None]
+            if places or not cached:
+                return places
+        # Prefer the provider's postcode point over a settlement centre. Neither
+        # establishes a surveyed address position or the location of a vehicle.
         if looks_like_uk_postcode(query):
             place = await self._geocode_uk_postcode(query)
             if place is not None:
@@ -221,7 +225,7 @@ class GeoIntelligenceEngine:
         url = (f"{_NOMINATIM}/search?format=jsonv2&addressdetails=1&extratags=1"
                f"&accept-language=en{gb}&limit={max(1, min(10, limit))}&q={quote_plus(query)}")
         data = await self._get_json(url)
-        if not data:
+        if not isinstance(data, list):
             return []
         places = [self._place_from_nominatim(item) for item in data]
         places = [p for p in places if p is not None]
@@ -232,7 +236,7 @@ class GeoIntelligenceEngine:
         return places
 
     async def _geocode_uk_postcode(self, query: str) -> Place | None:
-        """Resolve a UK postcode to its exact centroid via postcodes.io.
+        """Resolve a UK postcode to its provider reference via postcodes.io.
 
         Returns ``None`` (so the caller can fall back to Nominatim) when the
         postcode is unknown/terminated or the service is unreachable.
@@ -242,9 +246,11 @@ class GeoIntelligenceEngine:
         data = await self._get_json(url)
         if not isinstance(data, dict) or data.get("status") != 200:
             return None
-        r = data.get("result") or {}
+        r = data.get("result")
+        if not isinstance(r, dict):
+            return None
         lat, lon = r.get("latitude"), r.get("longitude")
-        if lat is None or lon is None:
+        if not valid_coordinates(lat, lon):
             return None
         name = r.get("postcode") or pc
         admin = {
@@ -263,13 +269,22 @@ class GeoIntelligenceEngine:
         return Place(
             name=str(name), lat=float(lat), lon=float(lon), kind="postcode",
             country=str(r.get("country") or ""), admin=admin,
-            display=display or str(name))
+            display=display or str(name), source="postcodes.io")
 
     async def reverse(self, lat: float, lon: float) -> Place | None:
-        cache_key = f"reverse::{lat:.4f}::{lon:.4f}"
+        if not valid_coordinates(lat, lon):
+            return None
+        lat, lon = float(lat), float(lon)
+        # Match request precision; four decimals made neighbouring points
+        # about eleven metres apart share a cached address.
+        cache_key = f"reverse::{lat:.6f}::{lon:.6f}"
         cached = self._cache_get(cache_key)
+        if cached == {}:
+            return None
         if cached is not None:
-            return self._place_from_dict(cached) if cached else None
+            place = self._place_from_dict(cached)
+            if place is not None:
+                return place
         url = (f"{_NOMINATIM}/reverse?format=jsonv2&addressdetails=1"
                f"&accept-language=en&lat={lat:.6f}&lon={lon:.6f}")
         data = await self._get_json(url)
@@ -288,8 +303,10 @@ class GeoIntelligenceEngine:
         radius_m = int(max(1.0, min(200.0, radius_km)) * 1000)
         cache_key = f"nearby::{anchor.lat:.3f}::{anchor.lon:.3f}::{radius_m}::{limit}"
         cached = self._cache_get(cache_key)
-        if cached is not None:
-            return (anchor, [self._place_from_dict(d) for d in cached])
+        if isinstance(cached, list):
+            places = [p for d in cached if (p := self._place_from_dict(d)) is not None]
+            if places or not cached:
+                return (anchor, places)
         place_filter = "|".join(kinds)
         oql = (f"[out:json][timeout:25];"
                f"(node[\"place\"~\"^({place_filter})$\"]"
@@ -309,7 +326,7 @@ class GeoIntelligenceEngine:
                 name=str(name), lat=float(el["lat"]), lon=float(el["lon"]),
                 kind=str(tags.get("place") or ""), country=anchor.country,
                 population=int(pop) if str(pop or "").isdigit() else None,
-                display=str(name)))
+                display=str(name), source="OpenStreetMap Overpass"))
         # Order by distance from the anchor, nearest first.
         found.sort(key=lambda p: self._haversine(anchor.lat, anchor.lon, p.lat, p.lon))
         self._cache_put(cache_key, [p.to_dict() for p in found])
@@ -321,16 +338,26 @@ class GeoIntelligenceEngine:
 
     async def locate(self, query: str) -> ToolResult:
         """Spoken-friendly 'locate X' — resolves and flies the globe there."""
-        places = await self.geocode(query, limit=1)
+        try:
+            coordinates = parse_coordinates(query)
+        except ValueError as exc:
+            return ToolResult(str(exc), ok=False)
+        if coordinates is not None:
+            self.bus.globe_request.emit(query)
+            return ToolResult(f"Globe position: {coordinates[0]:.6f}, {coordinates[1]:.6f} "
+                              "(supplied WGS84 coordinate).")
+        places = await self.geocode(query, limit=6)
         if not places:
             return ToolResult(f"I couldn't locate '{query}' — unknown or offline.",
                               ok=False)
-        p = places[0]
         try:
             self.bus.globe_request.emit(query)   # fly the on-screen globe there
         except Exception:
             pass
-        return ToolResult(f"Located {p.summary()}")
+        if len(places) > 1:
+            return ToolResult("Several locations match. Choose the full address in the Globe:\n"
+                              + "\n".join(f"- {p.display or p.summary()}" for p in places[:6]))
+        return ToolResult(f"Located {places[0].summary()}")
 
     async def towns_near(self, query: str, radius_km: float = 50.0) -> ToolResult:
         anchor, found = await self.nearby(query, radius_km)
@@ -366,10 +393,12 @@ class GeoIntelligenceEngine:
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _place_from_nominatim(self, item: Any) -> Place | None:
-        if not isinstance(item, dict) or item.get("lat") is None:
+        if not isinstance(item, dict) or not valid_coordinates(item.get("lat"), item.get("lon")):
             return None
         addr = item.get("address") or {}
         extra = item.get("extratags") or {}
+        if not isinstance(addr, dict) or not isinstance(extra, dict):
+            return None
         postcode = addr.get("postcode") or ""
         # For a postcode/ZIP query Nominatim often returns an empty ``name`` but
         # carries the code in the address; surface it (with the settlement it
@@ -397,14 +426,20 @@ class GeoIntelligenceEngine:
             country=str(addr.get("country") or ""),
             admin={k: v for k, v in admin.items() if v},
             population=int(pop) if str(pop or "").isdigit() else None,
-            display=str(item.get("display_name") or name))
+            display=str(item.get("display_name") or name), source="OpenStreetMap Nominatim")
 
     @staticmethod
-    def _place_from_dict(d: dict[str, Any]) -> Place:
-        return Place(name=d.get("name", ""), lat=d.get("lat", 0.0),
-                     lon=d.get("lon", 0.0), kind=d.get("kind", ""),
-                     country=d.get("country", ""), admin=d.get("admin", {}),
-                     population=d.get("population"), display=d.get("display", ""))
+    def _place_from_dict(d: Any) -> Place | None:
+        # Missing coordinates must never become a plausible marker at (0, 0).
+        if not isinstance(d, dict) or not valid_coordinates(d.get("lat"), d.get("lon")):
+            return None
+        if not isinstance(d.get("admin", {}), dict):
+            return None
+        return Place(name=str(d.get("name") or ""), lat=float(d["lat"]),
+                     lon=float(d["lon"]), kind=str(d.get("kind") or ""),
+                     country=str(d.get("country") or ""), admin=d.get("admin", {}),
+                     population=d.get("population"), display=str(d.get("display") or ""),
+                     source=str(d.get("source") or ""))
 
     @staticmethod
     def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

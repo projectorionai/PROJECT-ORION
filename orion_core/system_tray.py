@@ -24,8 +24,17 @@ from .constants import APP_NAME
 
 # Menu labels — named once so the tests and the menu agree.
 LABEL_SHOW = "Show ORION"
-LABEL_OVERLAY = "Overlay mode"
+LABEL_SHOW_DOCK = "Show Dock"        # becomes LABEL_HIDE_DOCK while the dock is up
+LABEL_HIDE_DOCK = "Hide Dock"
+LABEL_OVERLAY = "Overlay Mode"
 LABEL_QUIT = "Quit ORION"
+
+
+def dock_menu_label(dock_visible: bool) -> str:
+    """The dock entry's text: ORION does not put his docked face on the screen
+    edge by himself (windows_settings "dock_on_startup"); this is how he is
+    asked for it, and asked to go again."""
+    return LABEL_HIDE_DOCK if dock_visible else LABEL_SHOW_DOCK
 
 
 def tooltip_for_state(state: str) -> str:
@@ -97,12 +106,15 @@ class OrionTray:
         self._actions: dict[str, Any] = {}
         for label, slot in (
             (LABEL_SHOW, self.show_window),
+            (LABEL_SHOW_DOCK, self.toggle_dock),
             (LABEL_OVERLAY, self.overlay),
         ):
             action = QAction(label, menu)
             action.triggered.connect(slot)
             menu.addAction(action)
             self._actions[label] = action
+        # "Show Dock" / "Hide Dock" follows whether the dock is on screen.
+        menu.aboutToShow.connect(self._refresh_dock_entry)
         menu.addSeparator()
         quit_action = QAction(LABEL_QUIT, menu)
         quit_action.triggered.connect(self.quit)
@@ -146,6 +158,10 @@ class OrionTray:
 
     def show_window(self) -> None:
         window = self.window
+        summon = getattr(window, "_summon", None)
+        if callable(summon):         # Windows integration: lays out a --tray start too
+            summon()
+            return
         try:
             if window.isMinimized():
                 window.showNormal()
@@ -153,6 +169,34 @@ class OrionTray:
                 window.show()
             window.raise_()
             window.activateWindow()
+        except Exception:
+            pass
+
+    def dock_visible(self) -> bool:
+        """Whether the docked Screen Face is wanted on screen right now."""
+        try:
+            visible = getattr(self.window, "_dock_visible", None)
+            return bool(visible()) if callable(visible) else False
+        except Exception:
+            return False
+
+    def toggle_dock(self) -> None:
+        """Tray: Show Dock / Hide Dock. The dock is not on screen at start, so
+        this is how it is asked for (window._dock_control, set by
+        app._start_windows_integration)."""
+        try:
+            control = getattr(self.window, "_dock_control", None)
+            if callable(control):
+                control(None)
+        except Exception:
+            pass
+
+    def _refresh_dock_entry(self) -> None:
+        try:
+            action = self._actions.get(LABEL_SHOW_DOCK)
+            if action is not None:
+                action.setText(dock_menu_label(self.dock_visible()))
+                action.setEnabled(callable(getattr(self.window, "_dock_control", None)))
         except Exception:
             pass
 
@@ -165,6 +209,23 @@ class OrionTray:
                 self.show_window()
         except Exception:
             pass
+
+    def notify(self, title: str, message: str, *, warning: bool = False,
+               timeout_ms: int = 8000) -> bool:
+        """A plain tray balloon (no buttons). True when it was handed to the
+        tray - the fallback for ToastCenter when Windows toasts are unavailable.
+        Must be called on the Qt thread."""
+        if self._tray is None:
+            return False
+        try:
+            from PyQt6.QtWidgets import QSystemTrayIcon
+            icon = (QSystemTrayIcon.MessageIcon.Warning if warning
+                    else QSystemTrayIcon.MessageIcon.Information)
+            self._tray.showMessage(str(title or APP_NAME)[:80], str(message or "")[:220],
+                                   icon, int(timeout_ms))
+            return True
+        except Exception:
+            return False
 
     def quit(self) -> None:
         try:
@@ -208,5 +269,6 @@ class OrionTray:
             pass
 
 
-__all__ = ["OrionTray", "tooltip_for_state", "tray_available",
-           "LABEL_SHOW", "LABEL_OVERLAY", "LABEL_QUIT"]
+__all__ = ["OrionTray", "dock_menu_label", "tooltip_for_state", "tray_available",
+           "LABEL_SHOW", "LABEL_SHOW_DOCK", "LABEL_HIDE_DOCK", "LABEL_OVERLAY",
+           "LABEL_QUIT"]

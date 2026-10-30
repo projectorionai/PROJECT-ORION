@@ -11,6 +11,8 @@
 Description=O.R.I.O.N. headless AI node (remote uplink)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -19,18 +21,24 @@ Group=orion
 WorkingDirectory=/opt/orion
 Environment=ORION_HEADLESS=1
 Environment=QT_QPA_PLATFORM=offscreen
+Environment=ORION_CONFIG_DIR=/opt/orion/config
 Environment=ORION_REMOTE_HOST=127.0.0.1
 Environment=ORION_REMOTE_PORT=8765
-# Put provider keys in /opt/orion/config/api_keys.json, or add them here:
-# Environment=ORION_MODE=auto
+Environment=ORION_REMOTE_EXPOSURE=reverse-proxy
+EnvironmentFile=/opt/orion/config/orion-cloud.env
+# Keep provider keys in /opt/orion/config/api_keys.json, owned by orion.
 ExecStart=/opt/orion/.venv/bin/python /opt/orion/orion.py --headless
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=10
 # Hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/opt/orion/config
+ReadWritePaths=/opt/orion/research
+ReadWritePaths=/opt/orion/reports
+ReadWritePaths=/opt/orion/logs
+ReadWritePaths=/opt/orion/conversations
 ProtectHome=true
 
 [Install]

@@ -29,6 +29,7 @@ from orion_core.telephony import (  # noqa: E402
     MAX_SPOKEN_CHARS,
     Channel,
     ContactBook,
+    Dispatch,
     TelephonyGateway,
     normalise_number,
     screen,
@@ -398,11 +399,19 @@ def test_a_voice_reminder_is_handed_to_telephony_when_there_is_some():
     class _Gateway:
         async def call(self, who, message, **kwargs):
             handed.append((who, message))
+            return Dispatch(True, Channel.VOICE_CALL, "placed")
 
     service.telephony = _Gateway()
     service.add(phrase="in 1 minute about the news and call me",
                 recipient="me")
-    service._fire(service._reminders[-1])
+    async def deliver():
+        service._fire(service._reminders[-1])
+        tasks = [task for task in asyncio.all_tasks()
+                 if task.get_name() == "orion-reminder-dispatch"]
+        await asyncio.gather(*tasks)
+
+    asyncio.run(deliver())
+    assert handed == [("me", "This is ORION with a reminder. about the news.")]
     assert not bus.speak_request.sent, "it should not also have been spoken"
 
 

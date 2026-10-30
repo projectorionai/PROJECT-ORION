@@ -1,7 +1,7 @@
 """
 Vision subsystem.
 
-    VolatileScreenGrabber   — in-memory JPEG capture of the primary monitor
+    VolatileScreenGrabber   — in-memory JPEG capture of the desktop or a monitor
     LocalFileIntelligence   — non-blocking file inspection pipeline (Mark VII)
     VisionAgent             — Mark VIII: image analysis, OCR, screenshot
                               understanding, desktop error detection and
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import mimetypes
@@ -28,12 +29,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-import mss
 from PIL import Image, ImageStat
+
+from .lazy_import import LazyModule
+
+# Desktop capture is initialized by its physical worker, after startup.
+mss = LazyModule("mss")
 
 from .bus import OrionBus
 from .constants import is_protected_path
 from .data import ToolResult
+from .display import physical_pixels
 from .security import SecuritySanitiser, SecurityViolation
 from .utils import PIL_RESAMPLE, fold_control_label, fold_title, open_camera_capture
 
@@ -86,6 +92,7 @@ class VolatileScreenGrabber:
     def __init__(self, bus: OrionBus) -> None:
         self.bus = bus
         self._local = threading.local()
+        self._dxgi_lock = threading.Lock()
 
     def _grabber(self) -> Any:
         grabber = getattr(self._local, "mss", None)
@@ -109,29 +116,55 @@ class VolatileScreenGrabber:
         for.
         """
         monitors = capture.monitors
-        if index is not None and 1 <= index < len(monitors):
+        if index is None or (type(index) is int and index == 0):
+            return monitors[0]
+        if isinstance(index, int) and not isinstance(index, bool) and 1 <= index < len(monitors):
             return monitors[index]
-        return monitors[0]
+        raise ValueError("That monitor is not connected. Use display_info to list the displays.")
 
-    def capture_jpeg(self, max_side: int = 1024, quality: int = 78,
-                     monitor: int | None = None) -> bytes:
+    @physical_pixels
+    def monitor_index_for_bounds(self, bounds: tuple[int, int, int, int]) -> int:
+        """Resolve display_info geometry to mss's independent monitor order.
+
+        Called on the capture worker immediately before the requested grab.
+        Refresh that worker's backend so cached pre-hotplug monitor indexes
+        cannot silently select a different display.
+        """
+        previous = getattr(self._local, "mss", None)
+        if previous is not None:
+            previous.close()
+            self._local.mss = None
         capture = self._grabber()
-        raw   = capture.grab(self._monitor(capture, monitor))
-        image = Image.frombytes("RGB", raw.size, raw.rgb)
-        image.thumbnail((max_side, max_side), PIL_RESAMPLE)
+        for index, monitor in enumerate(capture.monitors[1:], 1):
+            if tuple(int(monitor[key]) for key in ("left", "top", "width", "height")) == bounds:
+                return index
+        raise ValueError("That monitor is not connected. Use display_info to list the displays.")
+
+    @physical_pixels
+    def capture_jpeg(self, max_side: int = 2560, quality: int = 90,
+                     monitor: int | None = None) -> bytes:
+        image = self.capture_image(max_side=max_side, monitor=monitor)
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=max(45, min(95, int(quality))), optimize=True)
         return buffer.getvalue()
 
     def capture_image(self, max_side: int = 1600, monitor: int | None = None) -> Image.Image:
         """Full-quality PIL frame for local analysis (OCR, error detection)."""
+        return self.capture_image_with_bounds(max_side, monitor)[0]
+
+    @physical_pixels
+    def capture_image_with_bounds(self, max_side: int = 0,
+                                 monitor: int | None = None) -> tuple[Image.Image, tuple[int, int, int, int]]:
+        """Capture pixels and their physical desktop origin in one operation."""
         capture = self._grabber()
-        raw   = capture.grab(self._monitor(capture, monitor))
+        selected = self._monitor(capture, monitor)
+        bounds = tuple(int(selected[key]) for key in ("left", "top", "width", "height"))
+        raw = capture.grab(selected)
         image = Image.frombytes("RGB", raw.size, raw.rgb)
         image = self._unless_blank(image, monitor)
         if max_side:
             image.thumbnail((max_side, max_side), PIL_RESAMPLE)
-        return image
+        return image, bounds
 
     # ── games: what a screenshot cannot see ────────────────────────────────
 
@@ -156,33 +189,66 @@ class VolatileScreenGrabber:
         """
         if not self._looks_blank(image):
             return image
+        # A DXGI output is one screen, not the virtual-desktop panorama. Do
+        # not substitute it while retaining a different origin/size map.
+        if monitor in (None, 0) and len(self._grabber().monitors) > 2:
+            return image
         frame = self.capture_dxgi(0 if monitor in (None, 0, 1) else int(monitor) - 1)
-        return frame if frame is not None else image
+        return frame if frame is not None and frame.size == image.size else image
 
     def capture_dxgi(self, output: int = 0) -> Image.Image | None:
-        """One frame of *output* via DXGI desktop duplication, or None."""
+        """One frame of the requested mss output through DXGI, or None.
+
+        Adapter/output numbering differs from mss's global display order.
+        Match physical geometry before accepting pixels, including when two
+        screens have identical resolutions.
+        """
         try:
             import dxcam  # type: ignore
         except Exception:
             return None
-        cameras = getattr(self, "_dxgi", None)
-        if cameras is None:
-            cameras = self._dxgi = {}
         try:
-            camera = cameras.get(output)
-            if camera is None:
-                camera = cameras[output] = dxcam.create(output_idx=output, output_color="RGB")
-            frame = camera.grab()
-            if frame is None:
-                # grab() returns None when nothing changed since the last one.
-                time.sleep(0.05)
-                frame = camera.grab()
-            if frame is None:
-                frame = getattr(self, "_dxgi_last", {}).get(output)
-            if frame is None:
+            monitors = self._grabber().monitors
+            selected = monitors[output + 1]
+            wanted = tuple(int(selected[key]) for key in ("left", "top", "width", "height"))
+            info = getattr(dxcam, "output_info", None)
+            candidates = ([(int(device), int(index)) for device, index in
+                           re.findall(r"Device\[(\d+)\]\s+Output\[(\d+)\]", str(info()))]
+                          if callable(info) else [])
+            if not candidates:
+                candidates = [(0, output)]
+            with self._dxgi_lock:
+                cameras = self.__dict__.setdefault("_dxgi", {})
+                for key in candidates:
+                    try:
+                        camera = cameras.get(key)
+                        if camera is None:
+                            camera = cameras[key] = dxcam.create(
+                                device_idx=key[0], output_idx=key[1], output_color="RGB")
+                        descriptor = getattr(getattr(camera, "_output", None), "desc", None)
+                        rect = getattr(descriptor, "DesktopCoordinates", None)
+                        if rect is not None:
+                            actual = (int(rect.left), int(rect.top),
+                                      int(rect.right - rect.left), int(rect.bottom - rect.top))
+                            if actual != wanted:
+                                continue
+                        elif len(monitors) > 2:
+                            # Without geometry, a same-sized primary frame
+                            # cannot be claimed as a requested secondary one.
+                            continue
+                        frame = camera.grab()
+                        if frame is None:
+                            time.sleep(0.05)
+                            frame = camera.grab()
+                        if frame is None:
+                            frame = getattr(self, "_dxgi_last", {}).get(key)
+                        if frame is None:
+                            return None
+                        self.__dict__.setdefault("_dxgi_last", {})[key] = frame
+                        return Image.fromarray(frame)
+                    except Exception:
+                        continue
                 return None
-            self.__dict__.setdefault("_dxgi_last", {})[output] = frame
-            return Image.fromarray(frame)
         except Exception:
             return None
 
@@ -195,6 +261,7 @@ class VolatileScreenGrabber:
         mon = self._monitor(capture, monitor)
         return (int(mon["left"]), int(mon["top"]), int(mon["width"]), int(mon["height"]))
 
+    @physical_pixels
     def capture_region(self, region: tuple[int, int, int, int]) -> Image.Image:
         """Capture a virtual-desktop rectangle (x, y, width, height)."""
         x, y, w, h = (int(v) for v in region)
@@ -203,6 +270,7 @@ class VolatileScreenGrabber:
         raw = capture.grab(bbox)
         return Image.frombytes("RGB", raw.size, raw.rgb)
 
+    @physical_pixels
     def capture_array(self, region: tuple[int, int, int, int] | None = None,
                       monitor: int | None = None) -> Any:
         """Capture as an (H, W, 3) uint8 numpy array — used for visual diffing."""
@@ -581,9 +649,9 @@ class VisionAgent:
 
     # ── public async API (all heavy work off-thread) ─────────────────────────
 
-    async def analyse_screen(self, prompt: str = "") -> ToolResult:
+    async def analyse_screen(self, prompt: str = "", monitor: int | None = None) -> ToolResult:
         """Capture the screen, analyse structure, extract text, attach the frame."""
-        return await asyncio.to_thread(self._analyse_screen_sync, prompt)
+        return await asyncio.to_thread(self._analyse_screen_sync, prompt, monitor)
 
     async def ocr(self, path: str = "") -> ToolResult:
         """OCR the screen (no path) or a specific image file."""
@@ -610,7 +678,8 @@ class VisionAgent:
             camera_index = cd.resolve()
         return await asyncio.to_thread(self._capture_live_frame_sync, camera_index, max_side)
 
-    async def analyse_camera(self, prompt: str = "", camera_index: int | None = None) -> ToolResult:
+    async def analyse_camera(self, prompt: str = "", camera_index: int | None = None, *,
+                             place: str = "") -> ToolResult:
         """Capture a webcam frame and direct the model to describe it forensically.
 
         The user wants fine detail — not just the obvious objects — so the frame
@@ -619,6 +688,27 @@ class VisionAgent:
         person, the room, small/partly-hidden objects, any readable text, and
         the spatial layout.  The multimodal channel reads the pixels directly.
         """
+        recorder = getattr(self, "scene_recorder", None)
+        if recorder is not None and recorder.enabled:
+            # Grab the original frame once: detail crops need camera pixels,
+            # not the smaller JPEG prepared for the live voice channel.
+            frame, outcome = await self.grab_frame(camera_index)
+            if frame is None:
+                return outcome if not outcome.ok else ToolResult("The camera gave no frame.", ok=False)
+            analysis = await recorder.look(frame, source="camera", prompt=prompt, place=place)
+            result = await asyncio.to_thread(self._encode_frame, frame, 1280, "detailed camera look")
+            if analysis is not None and analysis.ok:
+                result.text = (WEBCAM_FRAME_NOTE + "\n" + analysis.summary + "\n"
+                               + analysis.report())
+                if analysis.limitations:
+                    result.text += "\nLimits: " + "; ".join(analysis.limitations)
+                result.text += (f"\nRemembered as text (camera memory {analysis.record_id})."
+                                if analysis.record_id is not None else
+                                "\nThis view could not be written to camera memory.")
+                result.evidence = [analysis.to_record()]
+            else:
+                result.text += "\nDetailed scene analysis could not finish; describe this frame directly."
+            return result
         # 1280px (was 768) keeps book spines, labels and background objects
         # legible enough for the model to read and enumerate them.
         result = await self.capture_live_frame(camera_index, max_side=1280)
@@ -682,9 +772,19 @@ class VisionAgent:
             reader = getattr(engine, "image_to_result", None)
             if not callable(reader):
                 reader = self._ocr_image_text
-            return await inspect_frame(
+            result = await inspect_frame(
                 frame, prompt, router=router or getattr(self, "electronics_router", None),
                 ocr_reader=reader, mode=mode, grid=grid)
+            recorder = getattr(self, "scene_recorder", None)
+            if result.ok and recorder is not None and recorder.enabled:
+                # Keep the completed scan plus local background detail. Reuse
+                # its exact frame and text; never pay for a second model look.
+                try:
+                    await recorder.look(frame, source="camera_inspection", prompt=prompt,
+                                        allow_cloud=False, description=result.text)
+                except Exception:
+                    pass  # Memory must not discard a successful inspection.
+            return result
 
     # ── synchronous workers ───────────────────────────────────────────────────
 
@@ -722,7 +822,25 @@ class VisionAgent:
         """Open the webcam, preferring DirectShow (see utils.open_camera_capture)."""
         return open_camera_capture(index)
 
-    def _capture_live_frame_sync(self, camera_index: int, max_side: int) -> ToolResult:
+    async def grab_frame(self, camera_index: int | None = None) -> tuple[Any, ToolResult]:
+        """(the camera frame as a BGR array, or None; the outcome). The same
+        borrow-the-tracker-first path as capture_live_frame, full size."""
+        if camera_index is None:
+            from . import camera_devices as cd
+            camera_index = cd.resolve()
+        result = await asyncio.to_thread(self._capture_live_frame_sync, camera_index, 0, True)
+        frame = (result.evidence or [{}])[0].get("frame") if result.ok else None
+        return frame, result
+
+    def _frame_result(self, frame: Any, max_side: int, label: str, raw: bool) -> ToolResult:
+        if raw:
+            # evidence never reaches the model (see ToolResult).
+            return ToolResult(f"Camera frame captured ({label}).",
+                              evidence=[{"frame": frame.copy(), "source": label}])
+        return self._encode_frame(frame, max_side, label)
+
+    def _capture_live_frame_sync(self, camera_index: int, max_side: int,
+                                 raw: bool = False) -> ToolResult:
         try:
             import cv2  # noqa: F401 — presence check; the workers below import it themselves
         except Exception:
@@ -748,7 +866,7 @@ class VisionAgent:
                 for _ in range(8):                    # the tracker may be warming up
                     frame = source()
                     if frame is not None:
-                        return self._encode_frame(frame, max_side, "borrowed from face tracker")
+                        return self._frame_result(frame, max_side, "borrowed from face tracker", raw)
                     time.sleep(0.15)
             except Exception as exc:
                 self.bus.log.emit(f"VISION: could not borrow a tracker frame - {exc}")
@@ -778,7 +896,7 @@ class VisionAgent:
                     "The camera opened but returned no frame — it may be held by "
                     "another app or still warming up. Close other camera apps and "
                     "ask me again.", ok=False)
-            return self._encode_frame(frame, max_side, f"camera {camera_index} via {backend}")
+            return self._frame_result(frame, max_side, f"camera {camera_index} via {backend}", raw)
         except Exception as exc:
             self.bus.log.emit(f"VISION: camera capture failed - {exc}")
             return ToolResult(f"Camera capture failed: {exc}", ok=False)
@@ -788,12 +906,23 @@ class VisionAgent:
             except Exception:
                 pass
 
-    def _analyse_screen_sync(self, prompt: str) -> ToolResult:
+    def _analyse_screen_sync(self, prompt: str, monitor: int | None = None) -> ToolResult:
         # Native resolution for reading, a bounded copy for sending. Across two
         # screens a 1600 px cap scales the desktop to 42%, which is where small
         # labels stop being legible to the recogniser; the frame that goes to
         # the model still gets scaled below, so nothing grows on the wire.
-        image = self.grabber.capture_image(max_side=0)
+        if hasattr(self.grabber, "capture_image_with_bounds"):
+            kwargs = {"max_side": 0}
+            if monitor is not None:
+                kwargs["monitor"] = monitor
+            image, bounds = self.grabber.capture_image_with_bounds(**kwargs)
+        else:
+            if monitor is None:
+                image = self.grabber.capture_image(max_side=0)
+                bounds = self.grabber.monitor_bounds()
+            else:
+                image = self.grabber.capture_image(max_side=0, monitor=monitor)
+                bounds = self.grabber.monitor_bounds(monitor)
         width, height = image.size
         stat = ImageStat.Stat(image)
         brightness = sum(stat.mean[:3]) / (3 * 255)
@@ -801,10 +930,12 @@ class VisionAgent:
         dominant = tuple(int(v) for v in stat.mean[:3])
         # Outbound review frame for the multimodal channel.
         outbound = image.copy()
-        outbound.thumbnail((1024, 1024), PIL_RESAMPLE)
+        outbound.thumbnail((2560, 2560), PIL_RESAMPLE)
         buffer = io.BytesIO()
         outbound.save(buffer, format="JPEG", quality=80, optimize=True)
-        exact = self._exact_window_text(max_chars=12000)
+        # An explicit screen may not contain the foreground window. Its pixels
+        # are authoritative; do not splice in text from another monitor.
+        exact = self._exact_window_text(max_chars=12000) if monitor is None else ""
         ocr_text = self._ocr_image_text(image)
         windows = self._visible_window_titles()
         lines = [
@@ -812,6 +943,12 @@ class VisionAgent:
             f"Resolution (captured): {width}x{height}; brightness index {brightness:.2f}; "
             f"visual entropy {entropy:.2f}; mean RGB {dominant}.",
         ]
+        lines.append(
+            f"Attached image: {outbound.width}x{outbound.height}; physical desktop "
+            f"origin ({bounds[0]},{bounds[1]}). Image pixels are scaled: "
+            f"desktop_x = {bounds[0]} + image_x * {width}/{outbound.width}; "
+            f"desktop_y = {bounds[1]} + image_y * {height}/{outbound.height}. "
+            "Prefer a named control or automation ID over estimated pixels.")
         if windows:
             lines.append("Foreground window inventory: " + "; ".join(windows[:10]) + ".")
         if exact:
@@ -832,7 +969,10 @@ class VisionAgent:
         lines.append(SCREEN_FRAME_NOTE)
         return ToolResult(
             "\n".join(lines),
-            media={"data": buffer.getvalue(), "mime_type": "image/jpeg"},
+            media={"data": buffer.getvalue(), "mime_type": "image/jpeg",
+                   "coordinates": {"space": "screenshot", "origin": [bounds[0], bounds[1]],
+                                   "native_size": [width, height],
+                                   "image_size": [outbound.width, outbound.height]}},
         )
 
     def _exact_window_text(self, window: str = "", max_chars: int = 60000) -> str:
@@ -1026,6 +1166,7 @@ class VisionAgent:
             lines.append(
                 f"- [{el['role']}] '{el['name'][:60]}'{state} "
                 f"@ ({el['center'][0]},{el['center'][1]})"
+                + (f"; automation_id={el['automation_id']!r}" if el.get("automation_id") else "")
             )
         return ToolResult("\n".join(lines))
 
@@ -1042,6 +1183,11 @@ class VisionAgent:
     async def find_element(self, query: str, kinds: str = "all") -> dict[str, Any] | None:
         """Locate the best-matching control; returns its rect + centre or None."""
         return await asyncio.to_thread(self._find_element_sync, query, kinds)
+
+    async def resolve_element(self, query: str, kinds: str = "all",
+                              automation_id: str = "") -> dict[str, Any]:
+        """Resolve once, retaining ambiguity rather than guessing a click."""
+        return await asyncio.to_thread(self._resolve_element_sync, query, kinds, automation_id)
 
     async def find_element_via_ocr(self, query: str, monitor: int | None = None) -> dict[str, Any] | None:
         """OCR-based fallback for when the accessibility tree comes back
@@ -1121,22 +1267,38 @@ class VisionAgent:
         # spends rapidocr's 2.4 s on the first screen for nothing. MEASURED
         # end to end: finding "Terminal" on the right-hand monitor went
         # 7.55 s -> 5.12 s.
-        for reader in self._sweep_readers():
+        # Exact and whole-word matches on every screen with every reader
+        # first; only then a near miss of small text ("Fitter" for "Filter",
+        # ocr_engine.find_near_text_box), from the words already read off the
+        # same captures - so a misread label on one screen never wins over
+        # the real label read correctly on another.
+        near = getattr(self.ocr_engine, "find_near_text_box", None)
+        sweeps = [("find_text_box", reader) for reader in self._sweep_readers()]
+        if callable(near):
+            sweeps += [("find_near_text_box", reader) for reader in self._sweep_readers()]
+        for method, reader in sweeps:
+            find = getattr(self.ocr_engine, method)
             for screen in screens:
                 shot = capture(screen)
                 if shot is None:
                     continue
                 left, top, image = shot
                 try:
-                    box = (self.ocr_engine.find_text_box(image, query)
-                           if reader is None else
-                           self.ocr_engine.find_text_box(image, query,
-                                                         readers=(reader,)))
+                    box = (find(image, query) if reader is None
+                           else find(image, query, readers=(reader,)))
                 except Exception:
                     continue
                 if box is None:
                     continue
                 x, y, w, h = box
+                if w <= 0 or h <= 0 or x < 0 or y < 0:
+                    continue
+                token = None
+                if isinstance(image, Image.Image):
+                    if x + w > image.width or y + h > image.height:
+                        continue
+                    token = hashlib.sha256(image.crop((x, y, x + w, y + h))
+                                           .convert("RGB").tobytes()).hexdigest()
                 # Back into virtual-desktop pixels, which is the only
                 # coordinate space a click is meaningful in once there is
                 # more than one screen.
@@ -1148,6 +1310,9 @@ class VisionAgent:
                     "center": (x + w // 2, y + h // 2),
                     "enabled": True,
                     "monitor": screen,
+                    "visual_token": token,
+                    "source_hwnd": self._foreground_hwnd(),
+                    "observed_at": time.monotonic(),
                 }
         return None
 
@@ -1195,6 +1360,7 @@ class VisionAgent:
         }
         return mapping.get(kinds)
 
+    @physical_pixels
     def _detect_elements_sync(self, kinds: str, max_elements: int) -> list[dict[str, Any]]:
         if not self._uia_available():
             return []
@@ -1212,13 +1378,14 @@ class VisionAgent:
                 if len(collected) >= max_elements:
                     break
                 info = self._element_dict(ctrl)
-                if info is None:
+                if info is None or not info.get("visible", True):
                     continue
                 if roles is not None and info["role"] not in roles:
                     continue
                 # Skip zero-area and unnamed non-input controls (noise).
                 if info["rect"][2] <= 0 or info["rect"][3] <= 0:
                     continue
+                info["source_hwnd"] = hwnd
                 collected.append(info)
             return collected
         except Exception as exc:
@@ -1227,6 +1394,7 @@ class VisionAgent:
         finally:
             pythoncom.CoUninitialize()
 
+    @physical_pixels
     def _detect_dialogs_sync(self) -> list[dict[str, Any]]:
         if not self._uia_available():
             return []
@@ -1262,17 +1430,101 @@ class VisionAgent:
         # invisible Unicode, non-breaking spaces, and an inconsistently
         # punctuated "..." convention — all of which defeat naive
         # substring matching (Mark XXI, Track D1).
+        return self._resolve_element_sync(query, kinds)["element"]
+
+    def _resolve_element_sync(self, query: str, kinds: str = "all",
+                              automation_id: str = "") -> dict[str, Any]:
         query = fold_control_label(query)
-        if not query:
-            return None
+        missing = {"status": "missing", "element": None, "candidates": [],
+                   "detail": "No matching visible, enabled control was found."}
+        if not query and not automation_id:
+            return missing
         elements = self._detect_elements_sync(kinds, max_elements=400)
         if not elements:
-            return None
-        candidates = [e for e in elements if query in fold_control_label(e["name"])
-                      or set(query.split()) & set(fold_control_label(e["name"]).split())]
+            return missing
+        query_words = set(re.findall(r"\w+", query))
+        candidates = [e for e in elements
+                      if e.get("enabled", True) and e.get("visible", True)
+                      and (not automation_id or e.get("automation_id") == automation_id)
+                      and (not query or fold_control_label(e["name"]) == query
+                           or (query_words and query_words <=
+                               set(re.findall(r"\w+", fold_control_label(e["name"])))))]
         if not candidates:
-            return None
-        return sorted(candidates, key=lambda el: self._element_score(el, query))[0]
+            return missing
+
+        def rank(element: dict[str, Any]) -> tuple[int, int]:
+            # Prefer a button/link/menu to a decorative text label with the
+            # same name; compare matching tier without a shortest-name guess.
+            score = self._element_score(element, query)[0] if query else 0
+            role = element.get("role")
+            priority = (0 if role in self.BUTTON_ROLES else
+                        1 if role in self.LINK_ROLES else
+                        2 if role in self.MENU_ROLES else 3)
+            return score, priority
+
+        best_rank = min(map(rank, candidates))
+        best = [e for e in candidates if rank(e) == best_rank]
+        # The same UIA wrapper can appear twice; distinct runtime IDs or
+        # rectangles remain distinct targets even when their labels match.
+        unique: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for element in best:
+            key = (tuple(element.get("runtime_id") or ()),
+                   tuple(element["rect"]), element["role"], element["name"])
+            unique.setdefault(key, element)
+        best = list(unique.values())
+        if len(best) != 1:
+            choices = [f"{e['name']} [{e['role']}] at {tuple(e['center'])}" +
+                       (f"; automation_id={e['automation_id']}" if e.get("automation_id") else "")
+                       for e in best[:8]]
+            return {"status": "ambiguous", "element": None, "candidates": best[:8],
+                    "detail": "Several controls match. Choose an automation ID or a precise visible target: " +
+                              "; ".join(choices)}
+        return {"status": "found", "element": best[0], "candidates": best,
+                "detail": "One visible, enabled control matched."}
+
+    @physical_pixels
+    def validate_element_sync(self, element: dict[str, Any]) -> bool:
+        """Confirm the same target is still exposed at its intended centre.
+
+        This runs on the input worker immediately before a click. Native
+        hit-testing catches occlusion, window changes and moving controls;
+        child text nodes may be walked up to their button's identity.
+        """
+        if element.get("role") == "OCR":
+            token = element.get("visual_token")
+            if not token:
+                return False
+            try:
+                if self._foreground_hwnd() != element.get("source_hwnd"):
+                    return False
+                image = self.grabber.capture_region(element["rect"]).convert("RGB")
+                return hashlib.sha256(image.tobytes()).hexdigest() == token
+            except Exception:
+                return False
+        if not self._uia_available() or not element.get("runtime_id"):
+            return False
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            from pywinauto import Desktop
+            if self._foreground_hwnd() != element.get("source_hwnd"):
+                return False
+            control = Desktop(backend="uia").from_point(*element["center"])
+            for _ in range(12):
+                if control is None:
+                    return False
+                current = self._element_dict(control)
+                if current and current.get("runtime_id") == element["runtime_id"]:
+                    return (current.get("enabled", False) and current.get("visible", False)
+                            and current["rect"] == element["rect"]
+                            and current["role"] == element["role"]
+                            and current["name"] == element["name"])
+                control = control.parent()
+            return False
+        except Exception:
+            return False
+        finally:
+            pythoncom.CoUninitialize()
 
     @staticmethod
     def _element_score(el: dict[str, Any], query: str) -> tuple[int, int]:
@@ -1328,12 +1580,20 @@ class VisionAgent:
             rect = ctrl.rectangle()
             x, y = rect.left, rect.top
             w, h = rect.width(), rect.height()
-            return {
+            result = {
                 "role": str(info.control_type or ""),
                 "name": str(info.name or ""),
                 "rect": (x, y, w, h),
                 "center": (x + w // 2, y + h // 2),
                 "enabled": bool(getattr(info, "enabled", True)),
+                "visible": bool(getattr(info, "visible", True)),
             }
+            for key in ("runtime_id", "automation_id", "process_id"):
+                try:
+                    value = getattr(info, key)
+                    result[key] = list(value) if key == "runtime_id" else value
+                except Exception:
+                    pass
+            return result
         except Exception:
             return None

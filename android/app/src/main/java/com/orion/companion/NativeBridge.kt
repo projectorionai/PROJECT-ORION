@@ -1,11 +1,8 @@
 package com.orion.companion
 
 import android.app.Activity
-import android.content.ActivityNotFoundException
-import android.content.Intent
-import android.net.Uri
 import android.webkit.JavascriptInterface
-import android.widget.Toast
+import org.json.JSONObject
 
 /**
  * Native phone actions exposed to ORION's web UI as `window.OrionNative`.
@@ -15,121 +12,154 @@ import android.widget.Toast
  * turn-by-turn navigation, or share — using the phone's own apps, from
  * anywhere he's reachable.
  *
- * SAFETY: every action opens the relevant app *pre-filled* and lets the USER
- * confirm the final tap. We use ACTION_DIAL (never ACTION_CALL) and
- * ACTION_SENDTO (never a silent SMS/e-mail send), so nothing is dialled or
- * sent without a human. No CALL_PHONE / SEND_SMS permission is requested,
- * which also keeps the app off the Play Store's sensitive-permission list.
+ * Calls and texts are proposed to the native authorisation deck. A resolved
+ * application or offline map may open directly in local phone mode.
  *
  * The page feature-detects this object: `if (window.OrionNative) { … }`.
  */
 class NativeBridge(
     private val activity: Activity,
+    /** Must be safe to call from a JavaScript bridge thread. The page is
+     *  checked again on the UI thread before any native side effect. */
+    private val isTrustedPage: () -> Boolean = { false },
     /** Runs on the UI thread after the page reports its endpoints — which it
      *  does straight after pairing and on every token refresh. */
     private val onEndpointsSaved: () -> Unit = {},
+    private val onAction: (JSONObject) -> Unit = {},
+    private val onTelemetry: (String, Boolean?) -> Unit = { _, _ -> },
+    private val onSpeaking: (Boolean) -> Unit = {},
+    private val onSpeak: (String) -> Unit = {},
+    private val onStopSpeaking: () -> Unit = {},
+    private val onPrepareDictation: () -> Unit = {},
+    private val onStartDictation: () -> Unit = {},
+    private val onFinishDictation: () -> Unit = {},
 ) {
 
-    private fun launch(intent: Intent, failMsg: String) {
-        activity.runOnUiThread {
-            try {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                activity.startActivity(intent)
-            } catch (_: ActivityNotFoundException) {
-                Toast.makeText(activity, failMsg, Toast.LENGTH_LONG).show()
-            } catch (_: Exception) {
-                Toast.makeText(activity, failMsg, Toast.LENGTH_LONG).show()
-            }
-        }
+    private fun trusted(): Boolean = runCatching { isTrustedPage() }.getOrDefault(false)
+
+    private fun onTrustedPage(action: () -> Unit) {
+        if (!trusted()) return
+        activity.runOnUiThread { if (trusted()) action() }
     }
 
-    /** Open the dialer pre-filled with [number]; the user presses call. */
+    private fun propose(action: JSONObject) = onTrustedPage { onAction(action) }
+
+    /** Propose a call to the native authorisation deck. */
     @JavascriptInterface
     fun call(number: String) {
-        launch(
-            Intent(Intent.ACTION_DIAL, Uri.parse("tel:${number.trim()}")),
-            "No dialer app available.",
-        )
+        propose(JSONObject().put("kind", "make_call").put("number", number))
     }
 
-    /** Open the SMS composer to [number] with an optional [body]. */
+    /** Propose an SMS to the native authorisation deck. */
     @JavascriptInterface
     fun sms(number: String, body: String) {
-        val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${number.trim()}"))
-        if (body.isNotEmpty()) intent.putExtra("sms_body", body)
-        launch(intent, "No messaging app available.")
+        propose(JSONObject().put("kind", "send_sms")
+            .put("number", number).put("body", body))
+    }
+
+    @JavascriptInterface
+    fun openApp(packageName: String) {
+        propose(JSONObject().put("kind", "open_app").put("package", packageName))
     }
 
     /** Open the e-mail composer to [to] with an optional [subject]/[body]. */
     @JavascriptInterface
     fun email(to: String, subject: String, body: String) {
-        val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:"))
-        if (to.isNotEmpty()) intent.putExtra(Intent.EXTRA_EMAIL, arrayOf(to))
-        if (subject.isNotEmpty()) intent.putExtra(Intent.EXTRA_SUBJECT, subject)
-        if (body.isNotEmpty()) intent.putExtra(Intent.EXTRA_TEXT, body)
-        launch(intent, "No e-mail app available.")
+        propose(JSONObject().put("kind", "compose_email").put("to", to)
+            .put("subject", subject).put("body", body))
     }
+
+    @JavascriptInterface
+    fun sendEmail(to: String, subject: String, body: String) =
+        propose(JSONObject().put("kind", "send_email").put("to", to)
+            .put("subject", subject).put("body", body))
 
     /** Open turn-by-turn navigation for a free-text [query] (address / place). */
     @JavascriptInterface
     fun navigate(query: String) {
-        val q = Uri.encode(query.trim())
-        val nav = Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$q"))
-            .setPackage("com.google.android.apps.maps")
-        activity.runOnUiThread {
-            try {
-                nav.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                activity.startActivity(nav)
-            } catch (_: Exception) {
-                // Fall back to a generic geo query any maps app can handle.
-                launch(
-                    Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=$q")),
-                    "No maps app available.",
-                )
-            }
-        }
+        propose(JSONObject().put("kind", "navigate").put("query", query))
     }
 
     /** Show a place / map for a free-text [query] without starting navigation. */
     @JavascriptInterface
     fun map(query: String) {
-        launch(
-            Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${Uri.encode(query.trim())}")),
-            "No maps app available.",
-        )
+        propose(JSONObject().put("kind", "map").put("query", query))
     }
 
     /** Open an external URL in the phone's browser / relevant app. */
     @JavascriptInterface
     fun openUrl(url: String) {
-        launch(Intent(Intent.ACTION_VIEW, Uri.parse(url.trim())), "Can't open that link.")
+        propose(JSONObject().put("kind", "open_url").put("url", url))
     }
 
     /** Offer [text] to the Android share sheet. */
     @JavascriptInterface
     fun share(text: String) {
-        val send = Intent(Intent.ACTION_SEND)
-            .setType("text/plain")
-            .putExtra(Intent.EXTRA_TEXT, text)
-        launch(Intent.createChooser(send, "Share via"), "Nothing to share with.")
+        propose(JSONObject().put("kind", "share").put("text", text))
     }
 
-    /**
-     * Store the endpoint list ORION reports at pairing time, so the app can
-     * auto-connect (Tailscale name home + away) with no IP ever typed again.
-     * Called by the uplink page after a successful pair / token refresh.
-     */
+    /** New phone controls use the same reviewed native boundary as command RPC. */
     @JavascriptInterface
-    fun saveEndpoints(json: String) {
-        try {
-            Prefs.saveEndpoints(activity, json)
-        } catch (_: Exception) {
-        }
-        // JavaScript-interface calls arrive on a background thread.
-        activity.runOnUiThread { onEndpointsSaved() }
+    fun action(json: String) {
+        if (json.length > 32_000) return
+        runCatching { JSONObject(json) }.getOrNull()?.let(::propose)
     }
+
+    /** Signal a pairing change; endpoint data from JavaScript is never trusted. */
+    @JavascriptInterface
+    fun endpointsChanged() {
+        onTrustedPage { onEndpointsSaved() }
+    }
+
+    @JavascriptInterface
+    fun deviceStatus(): String = if (!trusted()) "{}" else JSONObject()
+        .put("microphone", androidx.core.content.ContextCompat.checkSelfPermission(activity,
+            android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+        .put("background_audio", OrionAudioService.running)
+        .put("capture_active", OrionAudioService.captureActive)
+        .put("accessibility", OrionAccessibilityService.isConnected())
+        .put("watching", OrionProjectionService.isCapturing)
+        .put("sentinel", OrionSentinelService.running)
+        .toString()
+
+    @JavascriptInterface
+    fun reportModel(model: String) {
+        onTrustedPage { onTelemetry(model.take(48), null) }
+    }
+
+    @JavascriptInterface
+    fun reportMic(active: Boolean) {
+        onTrustedPage { onTelemetry("", active) }
+    }
+
+    @JavascriptInterface
+    fun reportSpeaking(active: Boolean) {
+        onTrustedPage { onSpeaking(active) }
+    }
+
+    @JavascriptInterface
+    fun speak(text: String) {
+        onTrustedPage { onSpeak(text) }
+    }
+
+    @JavascriptInterface
+    fun stopSpeaking() {
+        onTrustedPage { onStopSpeaking() }
+    }
+
+    @JavascriptInterface
+    fun prepareDictation() {
+        onTrustedPage { onPrepareDictation() }
+    }
+
+    @JavascriptInterface
+    fun startDictation() { onTrustedPage { onStartDictation() } }
+
+    @JavascriptInterface
+    fun finishDictation() { onTrustedPage { onFinishDictation() } }
 
     /** Lets the page confirm it is inside the native app and what it can do. */
     @JavascriptInterface
-    fun capabilities(): String = "call,sms,email,navigate,map,openUrl,share,saveEndpoints"
+    fun capabilities(): String = if (!trusted()) "" else
+        "call,sms,openApp,email,sendEmail,navigate,map,openUrl,share,action,endpointsChanged,deviceStatus,speak,stopSpeaking"
 }

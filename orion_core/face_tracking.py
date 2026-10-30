@@ -187,7 +187,7 @@ class FaceTracker:
 
     def status(self) -> ToolResult:
         if not self.available:
-            return ToolResult("Face tracking unavailable: OpenCV not installed.")
+            return ToolResult("Face tracking unavailable: OpenCV not installed.", ok=False)
         if not self.running:
             return ToolResult("Face tracking is off. Say the word and I'll watch.")
         s = self.last_sample

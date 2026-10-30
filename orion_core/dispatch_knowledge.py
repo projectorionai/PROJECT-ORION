@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 import webbrowser
 from collections import deque
 from pathlib import Path
@@ -44,8 +45,302 @@ def _flatten_strings(value: Any) -> list[str]:
     return out
 
 
+#: Research modes that start a second, independent run of their own.
+_SECOND_RESEARCH_ACTIONS = frozenset({
+    "dossier", "investigate", "unattended", "background", "paper", "write_paper", "deep",
+    "deep_research", "study", "thesis", "report", "browse", "live", "read", "properly", "human"})
+_TOPIC_FILLER = frozenset({"about", "with", "from", "into", "that", "this", "what", "which",
+                           "practical", "information", "research", "topic"})
+
+
+def _topic_words(topic: str) -> set[str]:
+    return {word for word in re.findall(r"[a-z]{4,}", str(topic or "").lower())
+            if word not in _TOPIC_FILLER}
+
+
+def _overlapping_research(research: Any, topic: str) -> str:
+    """What to say instead of starting another run while the timed research
+    already covers *topic*, or "". 30 Oct 2026: a dossier on "circadian rhythm
+    and sleep strategies" started 90 s into a run on "circadian rhythm phase
+    delay and practical strategies for severe sleep schedule disruption" -
+    two runs on one question, the second one spending the quota."""
+    active = getattr(research, "_active", None) or {}
+    task = active.get("task")
+    if task is None or task.done():
+        return ""
+    asked, running = _topic_words(topic), _topic_words(str(active.get("topic") or ""))
+    shorter = min(len(asked), len(running))
+    if shorter < 2 or len(asked & running) / shorter < 0.6:
+        return ""
+    status = research.status().text
+    return (f"That is already being researched. {status} I'll tell you when it is ready; "
+            "say 'stop research' to cancel it.")
+
+
+def _research_receipt(dispatcher: Any, topic: str, paths: list[Any], *,
+                      state: str = "completed", allow_folders: bool = False) -> dict[str, Any]:
+    """Publish actual saved locations, never a proposed or missing path."""
+    verified: list[str] = []
+    for value in paths:
+        if value is None:
+            continue
+        try:
+            path = Path(value).resolve()
+            if (path.is_file() or (allow_folders and path.is_dir())) and str(path) not in verified:
+                verified.append(str(path))
+        except (OSError, ValueError, RuntimeError):
+            continue
+    selected = verified[0] if verified else None
+    refs = getattr(dispatcher, "_file_references", None)
+    if selected and callable(refs):
+        refs().remember(verified, selected=selected)
+    return {"file_paths": verified, "selected_path": selected,
+            "research_state": state, "topic": topic}
+
+
+async def _track_research_task(dispatcher: Any, topic: str, action: str,
+                               task: asyncio.Task, inputs: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A real background task owns a running receipt and one final result.
+
+    Optional callbacks let the Live channel put the actual lifecycle into its
+    continuity ledger even though the original tool turn has already ended.
+    """
+    receipt = {"file_paths": [], "selected_path": None, "research_state": "running",
+               "topic": topic, "action": action, "run_id": uuid.uuid4().hex}
+    from . import research_runs
+    store = getattr(dispatcher, "_research_run_store", None)
+    if store is None:
+        store = dispatcher._research_run_store = await asyncio.to_thread(research_runs.default_store)
+    from . import background
+    admission = background.spawn(asyncio.to_thread(
+        store.start, topic, action, run_id=receipt["run_id"], inputs=inputs,
+        owner=getattr(dispatcher, "research_owner", "local_session"),
+        request_id=getattr(dispatcher, "research_request_id", None)), name="orion-research-admission")
+    if admission is None:
+        raise OSError("Research could not be recorded and was not started: the event loop is closing")
+    try:
+        await asyncio.shield(admission)
+        research_runs.bind_publication_run(task, store, receipt["run_id"])
+        receipt["durable"] = True
+    except asyncio.CancelledError:
+        # Cancelling an await cannot stop an atomic write already in a thread.
+        # Keep an observer until admission settles, then close the accepted
+        # record without ever releasing the research operation's start gate.
+        async def settle_admission() -> None:
+            try:
+                await admission
+                await asyncio.to_thread(store.update, receipt["run_id"],
+                    {"research_state": "cancelled", "error_category": "admission_cancelled"},
+                    "Research was cancelled before its operation started.")
+            except (OSError, ValueError):
+                pass  # A failed admission has no accepted operation to replay.
+
+        settlement = background.spawn(settle_admission(), name="orion-research-admission-settle")
+        if settlement is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(settlement), research_runs.PUBLICATION_SETTLE_S)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass  # The owned observer continues if the disk is still busy.
+        raise
+    except (OSError, ValueError) as exc:
+        raise OSError(f"Research could not be recorded and was not started: {first_line(exc, 240)}") from exc
+    runs = getattr(dispatcher, "_background_research_runs", None)
+    if runs is None:
+        runs = dispatcher._background_research_runs = []
+    record = {"topic": topic, "action": action, "task": task,
+              "receipt": receipt, "result": None, "started": time.monotonic()}
+    runs.append(record)
+
+    def trim_history() -> None:
+        while len(runs) > 16:
+            old = next((item for item in runs if (item.get("receipt") or {}).get(
+                "research_state") not in research_runs.ACTIVE), None)
+            if old is None:
+                break  # durable admission caps active records, never discard their control handles
+            runs.remove(old)
+
+    trim_history()
+
+    def notify(name: str, payload: Any) -> bool:
+        callback = getattr(dispatcher, name, None)
+        if callable(callback):
+            try:
+                callback(topic, payload)
+                return True
+            except Exception:
+                pass  # Continuity reporting must not cancel the research.
+        return False
+
+    notify("research_started", dict(receipt))
+
+    def persist(result: ToolResult) -> None:
+        previous = record.get("save_task")
+        payload, message = dict(result.receipt or {}), result.text
+
+        async def save() -> None:
+            if previous is not None:
+                await previous
+            if receipt.get("durable"):
+                try:
+                    await asyncio.to_thread(store.update, receipt["run_id"], payload, message)
+                except (OSError, ValueError) as exc:
+                    record["receipt"].update(durable=False, persistence_error=first_line(exc, 240))
+        from . import background
+        record["save_task"] = background.spawn(save(), name="orion-research-receipt-save")
+
+    def publish_result(result: ToolResult, *, terminal: bool = True) -> None:
+        record["result"], record["task"] = result, None
+        record["receipt"] = result.receipt
+        trim_history()
+        persist(result)
+        if terminal and callable(getattr(dispatcher, "research_completion", None)):
+            if not notify("research_completion", result):
+                try:
+                    dispatcher.bus.speak_request.emit(result.text[:600])
+                except Exception:
+                    pass
+
+    def finished(done: asyncio.Task) -> None:
+        if done.cancelled():
+            result = ToolResult(f"Research on {topic} was cancelled before completion.", ok=False,
+                                receipt={"research_state": "cancelled"})
+        else:
+            try:
+                result = done.result()
+                if not isinstance(result, ToolResult):
+                    result = ToolResult(f"Research on {topic} ended without a recorded result.", ok=False)
+            except Exception as exc:
+                result = ToolResult(f"Research on {topic} failed: {first_line(exc, 160)}", ok=False)
+        state = "cancelled" if done.cancelled() else "completed" if result.ok else "failed"
+        paths, pending = research_runs.publication_paths(done)
+        final = dict(receipt)
+        final.update(result.receipt or {})
+        final.update(_research_receipt(dispatcher, topic, [*(final.get("file_paths") or []), *paths],
+                                       state=state, allow_folders=True))
+        final.update(run_id=receipt["run_id"], action=action, topic=topic)
+        result.receipt = final
+        if done.cancelled() and paths:
+            result.text += " Published artifact retained: " + "; ".join(paths)
+        if done.cancelled() and pending:
+            final["research_state"] = "cancel_requested"
+            result.text = f"Cancellation was requested for {topic}; a file publication is still settling."
+            publish_result(result, terminal=False)
+
+            async def settle_publication() -> None:
+                await asyncio.gather(*pending, return_exceptions=True)
+                actual_paths, _ = research_runs.publication_paths(done)
+                settled = dict(final, **_research_receipt(dispatcher, topic, actual_paths,
+                                  state="cancelled", allow_folders=True))
+                message = f"Research on {topic} was cancelled."
+                if actual_paths:
+                    message += " Published artifact retained: " + "; ".join(actual_paths)
+                publish_result(ToolResult(message, ok=False, receipt=settled))
+
+            from . import background
+            record["publication_task"] = background.spawn(settle_publication(), name="orion-research-publication-settle")
+        else:
+            publish_result(result)
+
+    task.add_done_callback(finished)
+    if task.done():
+        await asyncio.sleep(0)
+    return dict(receipt)
+
+
+async def _spawn_research_task(dispatcher: Any, topic: str, action: str, work: Any,
+                                inputs: dict[str, Any] | None = None) -> tuple[Any, dict[str, Any]]:
+    """Register intent durably before the coroutine can start its operation."""
+    from . import background
+    accepted = asyncio.Event()
+
+    async def run() -> ToolResult:
+        started = False
+        try:
+            await accepted.wait()
+            started = True
+            return await work
+        finally:
+            if not started:
+                work.close()
+
+    task = background.spawn(run(), name=f"orion-{action}-research")
+    if task is None:
+        work.close()
+        return None, {}
+    try:
+        receipt = await _track_research_task(dispatcher, topic, action, task, inputs)
+    except BaseException:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+    accepted.set()
+    return task, receipt
+
+
+async def _await_research_task(dispatcher: Any, topic: str, action: str, work: Any) -> ToolResult:
+    """Waiting for the result does not remove its running/status/stop lifecycle."""
+    from . import background
+
+    started = False
+
+    async def finished() -> ToolResult:
+        nonlocal started
+        started = True
+        try:
+            return await work
+        except Exception as exc:
+            return ToolResult(f"The research on {topic} failed: {first_line(exc, 160)}", ok=False,
+                              receipt=_research_receipt(dispatcher, topic, [], state="failed"))
+
+    try:
+        task, _receipt = await _spawn_research_task(dispatcher, topic, action, finished())
+    except BaseException:
+        if not started:
+            work.close()
+        raise
+    if task is None:
+        work.close()
+        return ToolResult("Research could not start because the event loop is closing.", ok=False)
+    return await task
+
+
 class KnowledgeDispatchMixin:
     """Memory, research, knowledge bases, documents and reporting."""
+
+    async def antigravity_research(self, args: dict[str, Any]) -> ToolResult:
+        """Research an explicit public topic in a fresh, isolated agent sandbox."""
+        from .antigravity_research import AntigravityError, AntigravityResearch
+        from .providers import read_api_key
+
+        service = getattr(self, "_antigravity_service", None)
+        if service is None:
+            service = AntigravityResearch()
+            self._antigravity_service = service
+        try:
+            result = await service.run(args.get("topic"), api_key=read_api_key())
+        except AntigravityError as exc:
+            return ToolResult(str(exc), ok=False)
+        return ToolResult(result.text, ok=result.status == "completed")
+
+    async def semantic_compare(self, args: dict[str, Any]) -> ToolResult:
+        """Compare only text supplied in this call; cloud use is per-call opt in."""
+        from .gemini_embeddings import rank_texts
+
+        try:
+            ranking = await rank_texts(
+                args.get("query", ""), args.get("candidates", []),
+                cloud=args.get("cloud") is True,
+                consent=args.get("confirm_cloud") is True,
+                model=args.get("model"),
+            )
+        except (ValueError, PermissionError) as exc:
+            return ToolResult(str(exc), ok=False)
+        lines = [f"Compared with {ranking.source} embeddings."]
+        if ranking.detail:
+            lines.append(ranking.detail)
+        lines.extend(f"{row.position}. {row.score:.4f} — {row.text}"
+                     for row in ranking.rows)
+        return ToolResult("\n".join(lines))
 
     def save_memory(self, args: dict[str, Any]) -> ToolResult:
         category = str(args.get("category") or "notes")
@@ -54,13 +349,39 @@ class KnowledgeDispatchMixin:
         result   = self.memory.save(category, key, value)
         return ToolResult(result)
 
-    def query_intelligence(self, args: dict[str, Any]) -> ToolResult:
+    #: The user's own past statements added to a recall answer, at most.
+    SAID_LIMIT = 4
+
+    def _recall_with_statements(self, query: str, limit: int
+                                ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        """Stored facts for *query*, and what the user said about it himself.
+
+        Measured 17 Oct 2026 on a copy of the owner's store: half of the small
+        details he gave ORION (his course, his work days, his budget, a trip)
+        were never turned into a fact and lived only in his own turns, which
+        this tool did not search although the system prompt says it does.
+        Blocking SQLite and encoder work: called on a worker thread.
+        """
+        rows = self.memory.query(query, limit=limit)
+        recall_said = getattr(self.memory, "recall_said", None)
+        said: list[dict[str, str]] = []
+        if callable(recall_said):
+            try:
+                said = list(recall_said(query, limit=min(self.SAID_LIMIT, max(1, limit))) or [])
+            except SecurityViolation:
+                raise
+            except Exception:
+                said = []           # extra evidence only; a fault here must not lose the facts
+        return rows, said
+
+    async def query_intelligence(self, args: dict[str, Any]) -> ToolResult:
         query = str(args.get("query") or args.get("text") or "").strip()
         limit = int(args.get("limit") or 8)
         category = str(args.get("category") or "").strip().lower()
         learned = bool(args.get("learned"))
+        said: list[dict[str, str]] = []
         if query and not (category or learned):
-            rows = self.memory.query(query, limit=limit)
+            rows, said = await asyncio.to_thread(self._recall_with_statements, query, limit)
         else:
             # The schema promised "an empty query returns the most recent
             # entries" — but query("") returns nothing, so an empty lookup
@@ -73,12 +394,19 @@ class KnowledgeDispatchMixin:
                 # Facts ORION kept from conversation on his own (fact_memory).
                 rows = [r for r in rows if str(r.get("key_ref", "")).startswith("learned_")]
             rows = rows[:limit]
-        if not rows:
+        if not rows and not said:
             return ToolResult("No matching intelligence records.")
         lines = [
             f"{row['category']}/{row['key_ref']}: {row['value']} ({row['updated_at']})"
             for row in rows
         ]
+        if said:
+            lines.append("What the user said about this, in their own words (dated, best match first):")
+            for turn in said:
+                words = " ".join(str(turn.get("content") or "").split())
+                if len(words) > 300:
+                    words = words[:300].rstrip() + " [...]"
+                lines.append(f"- [{str(turn.get('created_at') or '')[:10]}] {words}")
         return ToolResult("\n".join(lines))
 
     def recall_conversation(self, args: dict[str, Any]) -> ToolResult:
@@ -116,27 +444,36 @@ class KnowledgeDispatchMixin:
             # aloud (speak_request) when it lands.
             from . import background
 
-            async def _run() -> None:
+            async def _run() -> ToolResult:
                 try:
-                    await self._finish_paper(engine, topic, style, depth)
+                    result = await self._finish_paper(
+                        engine, topic, style, depth,
+                        announce=not callable(getattr(self, "research_completion", None)))
                 except Exception as exc:
+                    result = ToolResult(f"The research on {topic} failed: {first_line(exc, 120)}", ok=False)
+                if not result.ok and not callable(getattr(self, "research_completion", None)):
                     try:
-                        self.bus.speak_request.emit(
-                            f"The research on {topic} failed: {first_line(exc, 120)}")
+                        self.bus.speak_request.emit(result.text[:600])
                     except Exception:
                         pass
+                return result
 
-            if background.spawn(_run(), name="orion-deep-research") is not None:
+            task, receipt = await _spawn_research_task(self, topic, "paper", _run(), args)
+            if task is not None:
                 from .deep_research import DEPTHS
                 pages = DEPTHS[depth][0]
                 return ToolResult(
                     f"Research on '{topic}' is underway — about {pages} pages. I'm "
                     "searching and reading real sources now; every step is on the "
                     "Research console, and I'll tell you the moment the paper is "
-                    "written. We can carry on meanwhile.")
-        return await self._finish_paper(engine, topic, style, depth)
+                    "written. We can carry on meanwhile.", receipt=receipt)
+        return await _await_research_task(
+            self, topic, "paper", self._finish_paper(
+                engine, topic, style, depth,
+                announce=not callable(getattr(self, "research_completion", None))))
 
-    async def _finish_paper(self, engine: Any, topic: str, style: Any, depth: Any) -> ToolResult:
+    async def _finish_paper(self, engine: Any, topic: str, style: Any, depth: Any, *,
+                            announce: bool = True) -> ToolResult:
         """Write the paper, save it as Word, file it into memory, announce it."""
         from . import research_docx
 
@@ -144,15 +481,38 @@ class KnowledgeDispatchMixin:
             paper = await engine.write(topic, style=style, depth=depth)
         except Exception as exc:
             return ToolResult(f"The research run failed: {first_line(exc, 160)}",
-                              ok=False)
+                              ok=False, receipt=_research_receipt(self, topic, [], state="failed"))
 
-        path, note = await asyncio.to_thread(research_docx.write_paper, paper)
-        paper.docx_path = path
+        try:
+            from .research_runs import publish
+            path, note = await publish(research_docx.write_paper, paper,
+                                       artifact_paths=lambda result: [result[0]] if result[0] else [])
+        except Exception as exc:
+            path, note = None, first_line(exc, 160)
+        receipt = await asyncio.to_thread(_research_receipt, self, topic, [path])
+        paper.docx_path = Path(receipt["selected_path"]) if receipt["selected_path"] else None
+        if paper.docx_path is None:
+            receipt["research_state"] = "failed"
+            return ToolResult(f"The research on {topic} was written, but no paper was saved. "
+                              + (note or "The output file is missing."), ok=False, receipt=receipt)
 
-        # Into memory, so "everything he writes he must be able to remember".
-        filed = self._file_research(paper)
-
-        announcement = paper.announcement()
+        sections = list(getattr(paper, "sections", ()) or ())
+        incomplete = [section for section in sections if getattr(section, "error", "")
+                      or not str(getattr(section, "body", "") or "").strip()]
+        sourced = bool(getattr(paper, "sources", ()))
+        complete = sourced and bool(sections) and not incomplete
+        # Only a fully generated paper is filed as completed knowledge. The
+        # saved partial artifact remains selected and available in the receipt.
+        filed = self._file_research(paper) if complete else ""
+        if incomplete or not sections:
+            problem = (f"{len(incomplete)} section(s) failed or were empty." if sections
+                       else "No completed sections were returned.")
+            announcement = f"I saved an incomplete paper on {topic}. {problem} The research is not complete."
+        elif not sourced:
+            announcement = (f"I saved an unverified draft on {topic}. No external sources were retrieved, "
+                            "so the research is not complete.")
+        else:
+            announcement = paper.announcement()
         if note:
             announcement += f" ({note})"
         if filed:
@@ -160,7 +520,8 @@ class KnowledgeDispatchMixin:
         # Spoken as well as returned: a fifty-page document that appears
         # silently in a folder may as well not exist.
         try:
-            self.bus.speak_request.emit(announcement)
+            if announce and complete:
+                self.bus.speak_request.emit(announcement)
         except Exception:
             pass
         # The path goes in the TEXT. `media` is the live channel's typed frame
@@ -169,7 +530,10 @@ class KnowledgeDispatchMixin:
         # and the voice session was benched straight after every paper.
         if path:
             announcement += f" Location: {path}"
-        return ToolResult(announcement)
+        receipt.update(research_state="completed" if complete else "failed",
+                       source_count=len(getattr(paper, "sources", ())),
+                       failed_section_count=len(incomplete), section_count=len(sections))
+        return ToolResult(announcement, ok=complete, receipt=receipt)
 
     def _file_research(self, paper: Any) -> str:
         """Put the finished paper where ORION will find it again.
@@ -195,7 +559,10 @@ class KnowledgeDispatchMixin:
                     pass
             if memory is not None and hasattr(memory, "remember"):
                 try:
-                    memory.remember(summary)
+                    topic_key = re.sub(r"[^a-z0-9]+", "_", paper.topic.lower()).strip("_")[:48]
+                    section_key = re.sub(r"[^a-z0-9]+", "_", section.title.lower()).strip("_")[:48]
+                    location = f" (source: {paper.docx_path})" if paper.docx_path else ""
+                    memory.remember("knowledge", f"research_{topic_key}_{section_key}", summary + location)
                     stored += 1
                 except Exception:
                     pass
@@ -248,13 +615,28 @@ class KnowledgeDispatchMixin:
                 f"{len(run.failed)} page(s) would not open or carried no text.",
                 ok=False)
 
-        summary = await researcher.summarise(run)
-        folder = researcher.write_folder(run, summary)
-        where = f" Notes are in research/{folder.name}." if folder else ""
+        summary_error = ""
+        try:
+            summary = str(await researcher.summarise(run) or "").strip()
+        except Exception as exc:
+            summary, summary_error = "", first_line(exc, 200)
+        from .research_runs import publish
+        folder = await publish(researcher.write_folder, run, summary,
+                               artifact_paths=lambda folder: [folder / "SUMMARY.md", folder] if folder else [])
+        receipt = await asyncio.to_thread(_research_receipt, self, topic,
+                                          [folder / "SUMMARY.md", folder] if folder else [],
+                                          allow_folders=True)
+        saved = bool(receipt["file_paths"])
+        complete = saved and bool(summary) and (folder / "SUMMARY.md").is_file()
+        if not complete:
+            receipt["research_state"] = "failed"
+        if not summary:
+            summary = "The investigation is incomplete: no usable summary was generated. " + summary_error
+        where = f"\nLocation: {receipt['selected_path']}" if saved else "\nThe research notes could not be saved."
         return ToolResult(
             f"{summary}\n\n_Read {len(run.read)} page(s) and took "
             f"{len(run.notes)} note(s) over {run.seconds / 60:.1f} minutes._"
-            f"{where}")
+            f"{where}", ok=complete, receipt=receipt)
 
     def _show_research_console(self) -> None:
         """Put the research console on screen as a run starts.
@@ -264,6 +646,11 @@ class KnowledgeDispatchMixin:
         open. The console is the deck's RESEARCH page; asking for it is a GUI
         navigation, so it is emitted rather than called.
         """
+        # His own deck page: shown when the owner asked for the research,
+        # never when research runs on its own (require_own_window).
+        from .execution_policy import require_own_window
+        if require_own_window("gui_research_navigation") is not None:
+            return
         bus = getattr(self, "bus", None)
         if bus is None:
             return
@@ -274,41 +661,180 @@ class KnowledgeDispatchMixin:
             pass
 
     async def research_tool(self, args: dict[str, Any]) -> ToolResult:
+        action = str(args.get("action") or "start").lower().strip()
+        topic = str(args.get("topic") or args.get("query") or "").strip()
+        run_id = str(args.get("run_id") or "").strip()
+        runs = [*(getattr(self, "_background_research_runs", ()) or ()),
+                *(getattr(getattr(self, "research_director", None), "_background_research_runs", ()) or ())]
+        if action in {"status", "progress", "runs", "history", "open"}:
+            for run in runs:
+                saving = run.get("save_task")
+                if saving is not None:
+                    await asyncio.shield(saving)
+            from . import research_runs
+            store = getattr(self, "_research_run_store", None)
+            if store is None:
+                store = self._research_run_store = await asyncio.to_thread(research_runs.default_store)
+            if action in {"runs", "history", "open"} or (action in {"status", "progress"} and not runs) or (run_id and not any(
+                    (run.get("receipt") or {}).get("run_id") == run_id for run in runs)):
+                if store.storage_error:
+                    return ToolResult(f"Research history could not be read: {store.storage_error}", ok=False)
+                rows = await asyncio.to_thread(store.list, run_id=run_id, topic=topic,
+                                               limit=20 if action in {"runs", "history"} else 1)
+                if not rows:
+                    return ToolResult("No matching recorded research was found.", ok=False,
+                                      receipt={"research_state": "not_found", "run_id": run_id, "file_paths": []})
+                if action in {"runs", "history"}:
+                    return ToolResult("Recorded research (newest first):\n" + "\n".join(
+                        f"- {row['run_id']} [{row['research_state']}] {row['topic']}" for row in rows),
+                        receipt={"research_runs": rows})
+                row = rows[0]
+                available = await asyncio.to_thread(research_runs.verified_paths, row.get("file_paths"))
+                receipt = dict(row, recorded_file_paths=row.get("file_paths", []), file_paths=available,
+                               selected_path=available[0] if available else None)
+                if action == "open":
+                    if not available:
+                        return ToolResult("The recorded research artifact is no longer available at its saved path.",
+                                          ok=False, receipt=receipt)
+                    from . import file_search
+                    problem = await asyncio.to_thread(file_search.open_path, available[0])
+                    if problem:
+                        return ToolResult(f"Could not open the recorded artifact: {problem}", ok=False, receipt=receipt)
+                    refs = getattr(self, "_file_references", None)
+                    if callable(refs):
+                        refs().select(available[0])
+                    return ToolResult(f"Opened {available[0]}.", receipt=receipt)
+                return ToolResult(row.get("result") or f"Research is {row['research_state']}.",
+                                  ok=row["research_state"] == "completed", receipt=receipt)
+        matching = [run for run in reversed(runs)
+                    if (not topic or str(run["topic"]).casefold() == topic.casefold())
+                    and (not run_id or (run.get("receipt") or {}).get("run_id") == run_id)]
+        recent = next((run for run in matching if (run["task"] is not None
+                       and not run["task"].done()) or (run.get("receipt") or {}).get(
+                       "research_state") == "cancel_requested"), matching[0] if matching else None)
+        active = getattr(getattr(self, "research", None), "_active", {})
+        active_task = active.get("task")
+        if (recent is not None and active_task is not None and not active_task.done()
+                and active_task is not recent["task"]
+                and not run_id and (not topic or str(active.get("topic") or "").casefold() == topic.casefold())
+                and float(active.get("started") or 0.0) > recent["started"]):
+            recent = None
+        if recent is not None and action in {"status", "progress", "stop", "cancel"}:
+            task = recent["task"]
+            if (recent.get("receipt") or {}).get("research_state") == "cancel_requested":
+                return recent["result"]
+            if task is not None and task.done() and recent["result"] is None:
+                await asyncio.sleep(0)  # let the registered outcome callback publish it
+            if task is not None and not task.done():
+                if action in {"stop", "cancel"}:
+                    receipt = dict(recent["receipt"], research_state="cancel_requested")
+                    task.cancel()
+                    return ToolResult(f"Stopping research on {recent['topic']}.",
+                                      receipt=dict(receipt, research_state="cancelling"))
+                return ToolResult(f"Research on {recent['topic']} is still running; no finished "
+                                  "report has been recorded yet.", receipt=dict(recent["receipt"]))
+            if recent["result"] is not None and action in {"status", "progress"}:
+                result = recent["result"]
+                return ToolResult(result.text, ok=result.ok, receipt=result.receipt)
+        if run_id and action in {"status", "progress", "stop", "cancel"}:
+            return ToolResult("No active research matches that run ID; completed or interrupted work cannot be cancelled.",
+                              ok=False, receipt={"run_id": run_id, "research_state": "not_found", "file_paths": []})
+        if (topic and action in {"status", "progress", "stop", "cancel"}
+                and str(active.get("topic") or "").casefold() != topic.casefold()):
+            return ToolResult(f"No matching active research was found for '{topic}'.", ok=False,
+                              receipt={"topic": topic, "research_state": "not_found", "file_paths": []})
+        if action == "neuroscience_pilot":
+            # A fixed, reviewed source snapshot. Reading the mission record is
+            # optional; this path never changes mission, memory or research state.
+            from .neuroscience_research import pilot_evidence, pilot_report
+
+            try:
+                report = pilot_report(
+                    missions=getattr(self, "missions", None),
+                    topic=str(args.get("topic") or args.get("query") or ""),
+                )
+            except ValueError as exc:
+                return ToolResult(str(exc), ok=False)
+            return ToolResult(report, evidence=pilot_evidence())
         if self.research is None:
             return ToolResult("Research agent is not available.", ok=False)
-        action = str(args.get("action") or "start").lower().strip()
-        topic = str(args.get("topic") or args.get("query") or "")
+        if action in _SECOND_RESEARCH_ACTIONS:
+            running = _overlapping_research(self.research, topic)
+            if running:
+                return ToolResult(running)
         if action in {"start", "conduct", "research"}:
-            return self.research.start_research(topic, minutes=float(args.get("minutes", 30)))
+            from .research import ResearchAgent
+            accepted = asyncio.Event() if isinstance(self.research, ResearchAgent) else None
+            options = {"_accepted": accepted} if accepted is not None else {}
+            result = self.research.start_research(topic, minutes=float(args.get("minutes", 30)), **options)
+            task = getattr(self.research, "_active", {}).get("task")
+            if result.ok and isinstance(task, asyncio.Task):
+                try:
+                    result.receipt = await _track_research_task(self, topic, "start", task, args)
+                except BaseException:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise
+                if accepted is not None:
+                    accepted.set()
+            return result
         if action in {"paper", "write_paper", "deep", "deep_research", "study",
                       "thesis", "report"}:
             return await self._deep_research(args, topic)
         if action in {"dossier", "investigate", "unattended", "background"}:
-            return await self._dossier(topic, args)
+            if not topic.strip():
+                return ToolResult("What should I look into?", ok=False)
+            from . import background
+
+            async def _finish_dossier() -> ToolResult:
+                callback_handles_announcement = callable(getattr(self, "research_completion", None))
+                try:
+                    return await self._dossier(topic, args, announce=not callback_handles_announcement)
+                except Exception as exc:
+                    result = ToolResult(
+                        f"The research on {topic} failed: {first_line(exc, 160)}", ok=False,
+                        receipt=_research_receipt(self, topic, [], state="failed"))
+                    if not callback_handles_announcement:
+                        try:
+                            self.bus.speak_request.emit(result.text)
+                        except Exception:
+                            pass
+                    return result
+
+            task, _receipt = await _spawn_research_task(self, topic, "dossier", _finish_dossier(), args)
+            if task is None:
+                return ToolResult("Research could not start because the event loop is closing.", ok=False)
+            # Dossiers retain their awaited tool contract. Their independent
+            # owned task is also visible to status/stop and Live continuity.
+            return await task
         if action in {"browse", "live", "read", "properly", "human"}:
             if not topic:
                 return ToolResult("What should I look into?", ok=False)
             if args.get("wait"):
-                return await self._browse_research(topic, args)
+                return await _await_research_task(self, topic, "browse", self._browse_research(topic, args))
             # Reading several rounds of pages can outlive a Live WebSocket.
             # Return to the voice turn now; finish independently and announce
             # the requested result when it is ready.
             from . import background
 
-            async def _finish_browse() -> None:
+            async def _finish_browse() -> ToolResult:
                 try:
                     result = await self._browse_research(topic, args)
-                    if getattr(self, "bus", None) is not None:
+                    if (getattr(self, "bus", None) is not None
+                            and not callable(getattr(self, "research_completion", None))):
                         self.bus.speak_request.emit(str(result.text)[:600])
                 except Exception as exc:
-                    if getattr(self, "bus", None) is not None:
-                        self.bus.speak_request.emit(
-                            f"The research on {topic} failed: {first_line(exc, 120)}")
+                    result = ToolResult(f"The research on {topic} failed: {first_line(exc, 120)}", ok=False)
+                    if (getattr(self, "bus", None) is not None
+                            and not callable(getattr(self, "research_completion", None))):
+                        self.bus.speak_request.emit(result.text)
+                return result
 
-            if background.spawn(_finish_browse(), name="orion-browse-research") is not None:
+            task, receipt = await _spawn_research_task(self, topic, "browse", _finish_browse(), args)
+            if task is not None:
                 return ToolResult(
                     f"I'm researching {topic} now. Follow the Research console; "
-                    "I'll tell you what I found when the reading is done.")
+                    "I'll tell you what I found when the reading is done.", receipt=receipt)
             return ToolResult("Research could not start because the event loop is closing.",
                               ok=False)
         if action in {"stop", "cancel"}:
@@ -336,7 +862,7 @@ class KnowledgeDispatchMixin:
             "queue, agenda, findings, reviewed, validate, or opportunities.",
             ok=False)
 
-    async def _dossier(self, topic: str, args: dict[str, Any]) -> ToolResult:
+    async def _dossier(self, topic: str, args: dict[str, Any], *, announce: bool = True) -> ToolResult:
         """An unattended investigation, filed as a dossier with its citations.
 
         Distinct from `start` (a timed background crawl that reports on
@@ -358,21 +884,39 @@ class KnowledgeDispatchMixin:
             mcp=getattr(self, "mcp", None),
             bus=getattr(self, "bus", None),
             reminders=getattr(self, "reminders", None),
+            announce_results=announce,
         )
         dossier = await worker.investigate(topic, questions=questions)
-        where = str(dossier.path) if dossier.path else "nowhere (it could not be filed)"
+        receipt = await asyncio.to_thread(_research_receipt, self, topic, [dossier.path])
+        saved = bool(receipt["file_paths"])
+        sourced = bool(dossier.sources)
+        complete = saved and sourced and not dossier.generation_errors
+        receipt.update(research_state="completed" if complete else "failed",
+                       source_count=len(dossier.sources),
+                       evidence_level=getattr(dossier, "evidence_level", "") or "unknown")
+        where = receipt["selected_path"] if saved else "nowhere (it could not be filed)"
         lines = [
             f"Dossier on {dossier.topic} — {len(dossier.sources)} source"
             f"{'s' if len(dossier.sources) != 1 else ''} via "
             f"{dossier.gatherer or 'the built-in lookup'}.",
             f"Filed: {where}",
         ]
+        if dossier.filing_error:
+            lines.append(dossier.filing_error)
+        elif not saved:
+            lines.append("No saved dossier file could be verified.")
+        if not sourced:
+            lines.append("No external sources were retrieved. This is an unverified draft from "
+                         "the model's own knowledge; the research request has not been completed.")
+        if dossier.generation_errors:
+            lines += ["The investigation is incomplete; generation failed:"]
+            lines.extend(f"- {error}" for error in dossier.generation_errors[:8])
         if dossier.summary:
             lines += ["", dossier.summary.strip()]
         if dossier.takeaways:
             lines += [""] + [f"  {n}. {point}"
                              for n, point in enumerate(dossier.takeaways, 1)]
-        return ToolResult("\n".join(lines))
+        return ToolResult("\n".join(lines), ok=complete, receipt=receipt)
 
     def neuro_knowledge(self, args: dict[str, Any]) -> ToolResult:
         """Authoritative neuroscience / neural-engineering facts from the local corpus."""
@@ -602,9 +1146,21 @@ class KnowledgeDispatchMixin:
                           "databases, security, testing or a language.")
 
     def cyber_knowledge_tool(self, args: dict[str, Any]) -> ToolResult:
+        from . import electronics_teaching
+        query = str(args.get("query") or args.get("topic") or "")
+        boundary = electronics_teaching.construction_boundary(query)
+        if boundary:
+            return ToolResult(boundary, ok=False)
+        if str(args.get("format") or "short").lower() != "full":
+            from .learning_steps import resolve_plan
+            reviewed_topic = electronics_teaching.resolve_topic(query) or query
+            if resolve_plan(reviewed_topic):
+                return KnowledgeDispatchMixin.cyber_curriculum_tool(
+                    self, {**args, "action": "coach_start", "topic": reviewed_topic})
+        if electronics_teaching.resolve_topic(query):
+            return ToolResult(electronics_teaching.teach(query))
         if self.cyber is None:
             return ToolResult("The cybersecurity knowledge base is not available.", ok=False)
-        query = str(args.get("query") or args.get("topic") or "")
         answer = self.cyber.answer(query)
         if answer:
             return ToolResult(answer)
@@ -624,20 +1180,69 @@ class KnowledgeDispatchMixin:
         authorisation requirements."""
         from .cyber_curriculum import (
             CyberCurriculum, CERTIFICATION_TIMELINE, training_capability_note,
-            validate_target_scope,
         )
         cur = getattr(self, "_cyber_curriculum", None)
         if cur is None:
             cur = CyberCurriculum()
             self._cyber_curriculum = cur
         action = str(args.get("action") or "outline").lower().strip()
+        topic = str(args.get("topic") or args.get("query") or "").strip()
+        from . import cyber_exercises, electronics_teaching
+        boundary = electronics_teaching.construction_boundary(topic)
+        if boundary:
+            return ToolResult(boundary, ok=False)
+        # Short, learner-controlled teaching is the default. Full reference
+        # lessons remain an explicit choice rather than a lecture on every turn.
+        from .learning_coach import LearningCoach
+        coach_action = action.removeprefix("coach_")
+        coach_controls = {"start", "next", "answer", "simpler", "repeat", "pause",
+                          "resume", "status", "settings"}
+        if ((action.startswith("coach_") and coach_action in coach_controls)
+                or action in {"next", "simpler", "repeat", "pause", "resume"}):
+            coach = getattr(self, "_learning_coach", None)
+            if coach is None:
+                coach = self._learning_coach = LearningCoach()
+            return coach.handle(
+                coach_action, user=str(args.get("user") or "default"), topic=topic,
+                answer=str(args.get("answer") or ""), pace_minutes=args.get("pace_minutes"),
+                steps_per_session=args.get("steps_per_session"), restart=args.get("restart", False))
+        short_actions = {"path", "learning_path", "beginner", "start", "teach", "lesson",
+                         "explain", "learn", "code", "example", "secure_code", "exercise",
+                         "practice", "practise", "quiz"}
+        if action in short_actions and str(args.get("format") or "short").lower() != "full":
+            return KnowledgeDispatchMixin.cyber_curriculum_tool(
+                self, {**args, "action": "coach_start", "topic": topic})
+        if action in {"path", "learning_path", "beginner", "start"}:
+            return ToolResult(cyber_exercises.learning_path())
+        if action in {"code", "example", "secure_code"}:
+            if electronics_teaching.resolve_topic(topic):
+                return ToolResult(electronics_teaching.teach(topic))
+            return ToolResult(cyber_exercises.code_lesson(topic),
+                              ok=cyber_exercises.resolve_topic(topic) is not None)
+        if action in {"exercise", "practice", "practise", "quiz"}:
+            return ToolResult(cyber_exercises.exercise(topic),
+                              ok=cyber_exercises.resolve_topic(topic) is not None)
+        if action in {"check", "answer", "check_answer"}:
+            return ToolResult(cyber_exercises.check_answer(topic, str(args.get("answer") or "")),
+                              ok=cyber_exercises.resolve_topic(topic) is not None)
         # ── teaching layer: recognition-first lessons + a code identifier ─────
         # The curriculum is the syllabus; this teaches a specific technique with
         # the KEY IDENTIFIERS that let a student recognise it in the wild.
         if action in {"teach", "lesson", "explain", "learn"}:
             from . import cyber_teaching
-            topic = str(args.get("topic") or args.get("query") or "").strip()
-            return ToolResult(cyber_teaching.teach(topic))
+            if electronics_teaching.resolve_topic(topic):
+                return ToolResult(electronics_teaching.teach(topic))
+            sections = []
+            if cyber_teaching.resolve_topic(topic):
+                sections.append(cyber_teaching.teach(topic))
+            if cyber_exercises.resolve_topic(topic):
+                sections.append(cyber_exercises.code_lesson(topic))
+            if sections:
+                return ToolResult("\n\n".join(sections))
+            return ToolResult(cyber_teaching.teach(topic)
+                              + "\nUse action='path' for a beginner sequence, 'lessons' "
+                              "for all topics including electronics defence, or 'code' "
+                              "for sql_injection, xss, access_control or log_analysis.")
         if action in {"identify", "recognise", "recognize", "what_is_this",
                       "analyse_code", "analyze_code"}:
             from . import cyber_teaching
@@ -654,7 +1259,14 @@ class KnowledgeDispatchMixin:
             return ToolResult(
                 "Techniques I teach (recognition-first):\n" + "\n".join(
                     f"  • {r['title']} ({r['category']}) — {r['demo_policy']}"
-                    for r in rows))
+                    for r in rows)
+                + "\n\nOffline code exercises (action='code' or 'exercise'):\n"
+                + "\n".join(f"  • {r['topic']} — {r['title']}"
+                            for r in cyber_exercises.catalogue())
+                + "\n\nElectronics and hardware defence (action='teach'):\n"
+                + "\n".join(f"  • {r['topic']} — {r['title']}"
+                            for r in electronics_teaching.catalogue())
+                + "\nUse action='path' for the beginner learning sequence.")
         if action in {"outline", "list", "modules"}:
             rows = cur.outline()
             lines = [f"Cybersecurity curriculum v{cur.version} — {len(rows)} modules "
@@ -696,13 +1308,18 @@ class KnowledgeDispatchMixin:
             lines = [f"{yr}: {', '.join(certs)}" for yr, certs in CERTIFICATION_TIMELINE.items()]
             return ToolResult("Recommended certification timeline:\n" + "\n".join(lines))
         if action in {"scope_check", "authorise", "authorize"}:
+            from .pentest_lab import target_allowed
             target = str(args.get("target") or "")
-            ok, reason = validate_target_scope(target)
+            ok, reason = target_allowed(target, allow_guidance=False)
             return ToolResult(f"Target '{target}': {'ALLOWED' if ok else 'DENIED'} — {reason}",
                               ok=ok)
         return ToolResult(
             "cyber_curriculum actions: outline, search, module, progress, "
-            "complete, certifications, scope_check.", ok=False)
+            "complete, certifications, scope_check, path, teach, lessons, identify, "
+            "code, exercise, check (topic + answer); coach_start, coach_next, "
+            "coach_answer, coach_simpler, coach_repeat, coach_pause, coach_resume, "
+            "coach_status, coach_settings. Teaching defaults to short; format='full' "
+            "requests a complete reference lesson.", ok=False)
 
     def language_tutor_tool(self, args: dict[str, Any]) -> ToolResult:
         """The immersion tutor (CAP-01) — teach a language, Spanish by default.
@@ -1173,7 +1790,8 @@ class KnowledgeDispatchMixin:
             from .constants import CONFIG_DIR
             path = CONFIG_DIR / "api_keys.json"
             if path.is_file():
-                data = json.loads(path.read_text(encoding="utf-8"))
+                from .key_seal import load_json
+                data = load_json(path)
                 for v in _flatten_strings(data):
                     if isinstance(v, str) and len(v) >= 12:
                         values.append(v)
@@ -1303,6 +1921,11 @@ class KnowledgeDispatchMixin:
             return recon.revoke_target(str(args.get("target") or ""))
         if action in {"list_authorized", "list"}:
             return recon.list_authorized()
+        if action in {"lan_devices", "devices", "network_devices"}:
+            # Passive (reads the neighbour table, sends nothing), so it needs
+            # no authorised target: "scan my network" from someone at home.
+            from .lan_devices import describe
+            return ToolResult(await asyncio.to_thread(describe))
         if action == "scan_host":
             return await recon.scan_host(
                 str(args.get("target") or ""), str(args.get("ports") or ""))
@@ -1318,6 +1941,10 @@ class KnowledgeDispatchMixin:
             description = str(args.get("description") or "").strip()
             if not description:
                 return ToolResult("Describe the security tool to write.", ok=False)
+            from .electronics_teaching import construction_boundary
+            boundary = construction_boundary(description)
+            if boundary:
+                return ToolResult(boundary, ok=False)
             return await self.forge_tool({
                 "action": "forge",
                 "tool_name": str(args.get("tool_name") or "security_tool"),
@@ -1328,7 +1955,7 @@ class KnowledgeDispatchMixin:
             })
         return ToolResult(
             "security_recon actions: authorize_target, revoke_target, "
-            "list_authorized, scan_host, packet_capture, craft_packet, "
+            "list_authorized, lan_devices, scan_host, packet_capture, craft_packet, "
             "cve_lookup, write_tool.", ok=False)
 
     def expand_mind(self, args: dict[str, Any]) -> ToolResult:
@@ -1368,7 +1995,7 @@ class KnowledgeDispatchMixin:
             rows = await asyncio.to_thread(
                 self.graph.entity_neighbourhood, str(args.get("name") or query))
             if not rows:
-                return ToolResult("No such entity (or it has no relationships yet).")
+                return ToolResult("No such entity (or it has no relationships yet).", ok=False)
             return ToolResult("Relationships:\n" + "\n".join(
                 f"- {r['source_name']} —{r['kind']}→ {r['target_name']}" for r in rows[:15]))
         if action in {"ingest", "remember", "record"}:
@@ -1393,11 +2020,28 @@ class KnowledgeDispatchMixin:
         )
 
     async def awareness_tool(self, args: dict[str, Any]) -> ToolResult:
+        # "I've done all those tasks" arrived as action=clear_completed, which
+        # no branch knew, so nothing was marked done (action_aliases).
+        from .action_aliases import normalise_args
+        args = normalise_args("awareness", args)
         action = str(args.get("action") or "situation").lower().strip()
         if action in {"situation", "report", "status"}:
             if self.cognitive_loop is None:
                 return ToolResult("The cognitive loop is not available.", ok=False)
-            return self.cognitive_loop.situation_report()
+            report = self.cognitive_loop.situation_report()
+            # The same task view the briefing reads (owner_tasks): the report
+            # alone knew only ORION's own list, so it could deny the overdue
+            # Notion tasks the briefing had just read out (25 Oct 2026).
+            view_fn = getattr(self, "owner_task_view", None)
+            if report.ok and callable(view_fn):
+                try:
+                    from dataclasses import replace
+                    # Bounded: a slow board must not hold up the whole report.
+                    view = await asyncio.wait_for(view_fn(), timeout=4.0)
+                    report = replace(report, text=report.text + "\n- " + view.summary_line())
+                except Exception:
+                    pass
+            return report
         if self.cognition is None:
             return ToolResult("Cognitive state is not available.", ok=False)
         if action in {"add_priority", "priority"}:
@@ -1416,22 +2060,33 @@ class KnowledgeDispatchMixin:
                     f"on {str(task.get('at', ''))[:10]}. Only add it back if the user asks for "
                     "that task back by name (restore=true).", ok=False)
             return ToolResult(f"Task tracked: {task.get('title', '?')}.")
-        if action in {"complete_task", "done"}:
-            ok = await asyncio.to_thread(self.cognition.complete_task, title)
-            return ToolResult("Task marked complete." if ok else "No matching open task.", ok=ok)
+        if action in {"complete_task", "done", "complete_tasks", "mark_done", "finish_tasks",
+                      "completed"}:
+            # One path for "I've done that/those": ORION's list AND the Notion
+            # board the briefing reads (17 Oct 2026: completing only here left
+            # the board's six tasks to be read out again next morning).
+            return await self.complete_owner_tasks(
+                [args.get("titles"), title], all_listed=bool(args.get("all_listed")))
         if action in {"list_tasks", "tasks"}:
+            # ORION's list AND the board the briefing reads, one overdue rule.
+            if callable(getattr(self, "list_owner_tasks", None)):
+                return await self.list_owner_tasks()
             tasks = await asyncio.to_thread(self.cognition.list_tasks)
             if not tasks:
                 return ToolResult("No open tasks.")
+            await asyncio.to_thread(self.cognition.note_mentioned_tasks,
+                                    [str(t.get("title") or "") for t in tasks[:30]], "awareness")
             return ToolResult("Open tasks:\n" + "\n".join(
                 f"- {t.get('title', '?')}"
                 + (f" (due {t['due']}{', OVERDUE' if t.get('overdue') else ''})" if t.get("due") else "")
                 for t in tasks[:30]))
         if action in {"remove_task", "delete_task", "dismiss_task", "drop_task"}:
-            removed = await asyncio.to_thread(self.cognition.remove_task, title)
+            removed = await asyncio.to_thread(self.cognition.dismiss_task, title)
             return (ToolResult(f"Removed '{removed}'. It will not come back unless you ask for it.")
                     if removed else ToolResult("No matching open task.", ok=False))
         if action in {"clear_overdue", "remove_overdue", "clear_overdue_tasks"}:
+            if callable(getattr(self, "clear_overdue_owner_tasks", None)):
+                return await self.clear_overdue_owner_tasks()
             removed = await asyncio.to_thread(self.cognition.clear_overdue)
             if not removed:
                 return ToolResult("Nothing is overdue.")
@@ -1667,6 +2322,181 @@ class KnowledgeDispatchMixin:
             f"Ingested {Path(path).name} [{result.category}] — {result.chunks} chunk(s), "
             f"v{result.version}, tags: {', '.join(result.tags[:6])}.{directive}{entities}")
 
+    def forget_engine(self) -> Any:
+        """The cross-store forget engine over ORION's live stores (forget.py)."""
+        from .forget import ForgetEngine
+        log = getattr(getattr(self, "bus", None), "log", None)
+        return ForgetEngine(
+            memory=getattr(self, "memory", None), companion=getattr(self, "companion", None),
+            graph=getattr(self, "graph", None), cognition=getattr(self, "cognition", None),
+            goals=getattr(self, "goal_tracker", None),
+            log=(log.emit if log is not None else None))
+
+    async def request_forget(self, topic: str) -> ToolResult:
+        """Survey what ORION holds about *topic* and raise the on-screen
+        confirmation. Nothing is removed here: only the owner's approval of
+        that prompt (confirm_system_action -> run_confirmed_forget) removes
+        exactly the records listed, so a mishearing cannot erase anything."""
+        if not str(topic or "").strip():
+            return ToolResult("What should I forget? Name the topic or the item.", ok=False)
+        from .execution_policy import require_foreground
+        blocked = require_foreground("forget_confirmation_dialog")
+        if blocked is not None:
+            return blocked
+        engine = self.forget_engine()
+        plan = await asyncio.to_thread(engine.survey, topic)
+        if not plan.patterns:
+            return ToolResult(f"'{topic}' is too vague to forget safely; name it more exactly.", ok=False)
+        if not plan.matches:
+            return ToolResult(plan.summary())
+        guard = getattr(self, "system_guard", None)
+        if guard is None:
+            return ToolResult("Forgetting needs the on-screen confirmation, which is not "
+                              "available right now; nothing was removed.", ok=False)
+        from .system_guard import ActionIntent
+        decision = guard.request_confirmation(
+            ActionIntent.MEMORY_FORGET, origin="forget",
+            payload={"topic": topic, "approved": plan.identities(), "summary": plan.summary()})
+        token = getattr(decision, "token", "") or ""
+        if not token:
+            return ToolResult("The confirmation could not be raised; nothing was removed.", ok=False)
+        self.bus.confirm_action.emit({
+            "token": token, "intent": "memory_forget",
+            "message": f"Forget everything about {plan.label}? {plan.summary()}",
+            "items": [m.preview for m in plan.matches[:20]],
+        })
+        return ToolResult(
+            f"{plan.summary()} Approve the on-screen confirmation to forget it; nothing has "
+            "been removed yet.", ok=False,
+            receipt={"pending_confirmation": True, "records": len(plan.matches),
+                     "stores": plan.counts()})
+
+    def run_confirmed_forget(self, payload: dict[str, Any]) -> ToolResult:
+        """Released ONLY by the owner's approval (the guard token). Re-surveys the
+        approved topic and removes the approved records - never more."""
+        topic = str((payload or {}).get("topic") or "")
+        approved = [tuple(str(x) for x in ident) for ident in (payload or {}).get("approved") or []]
+        if not topic or not approved:
+            return ToolResult("The approved forget request lost its details; nothing was removed.", ok=False)
+        engine = self.forget_engine()
+
+        def _work() -> ToolResult:
+            plan = engine.survey(topic)
+            receipt = engine.execute(plan, approved)
+            removed = sum(receipt["removed"].values())
+            redacted = sum(receipt["redacted"].values())
+            where = ", ".join(f"{name} ({n})" for name, n in
+                              {**receipt["removed"], **{f"{k} redacted": v
+                                                        for k, v in receipt["redacted"].items()}}.items())
+            text = (f"Forgotten: {removed} record(s) removed and {redacted} redacted"
+                    + (f" - {where}" if where else "") + ". No copy was kept.")
+            if receipt["problems"]:
+                text += " Could not finish: " + "; ".join(receipt["problems"]) + "."
+            return ToolResult(text, ok=not receipt["problems"], receipt=receipt)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return _work()
+
+        async def _release() -> None:
+            try:
+                result = await asyncio.to_thread(_work)
+                self.bus.log.emit(f"SYS: {result.text}")
+                self.bus.dashboard_event.emit("companion", {"forgotten": True})
+            except Exception as exc:
+                self.bus.log.emit(f"SYS: forgetting failed - {exc}")
+
+        from . import background
+        if background.spawn(_release(), name="orion-forget") is None:
+            return _work()
+        return ToolResult("Forgetting it now - I will confirm what was removed.")
+
+    def troubleshooting_guide_tool(self, args: dict[str, Any]) -> ToolResult:
+        """ORION's own manual (self_manual.py): how he works and how to fix it."""
+        from . import self_manual
+        question = str(args.get("question") or args.get("topic") or "").strip()
+        if not question:
+            return ToolResult(self_manual.contents())
+        found = self_manual.lookup(question)
+        if not found:
+            return ToolResult(f"The manual has nothing on that. {self_manual.contents()}", ok=False)
+        return ToolResult("\n\n".join(f"{title}: {answer}" for title, answer in found))
+
+    def away_mode_tool(self, args: dict[str, Any]) -> ToolResult:
+        """Keep the PC awake for the phone while the owner is out (away_mode.py)."""
+        from .away_mode import AwayMode
+        away = getattr(self, "_away", None)
+        if away is None:
+            log = getattr(getattr(self, "bus", None), "log", None)
+            away = self._away = AwayMode(log.emit if log is not None else None)
+        action = str(args.get("action") or "status").strip().lower()
+        if action in ("on", "start", "enable"):
+            return ToolResult(away.start())
+        if action in ("off", "stop", "disable"):
+            return ToolResult(away.stop())
+        return ToolResult(away.status())
+
+    async def erase_my_data_tool(self, args: dict[str, Any]) -> ToolResult:
+        """Erase what ORION keeps about the owner (erase_all.py): survey, then
+        the on-screen confirmation, then the erase at the next start."""
+        from . import erase_all
+        from .execution_policy import require_foreground
+        action = str(args.get("action") or "survey").strip().lower()
+        scope = str(args.get("scope") or "personal").strip().lower()
+        try:
+            if action == "status":
+                waiting = erase_all.pending()
+                return ToolResult(f"An erase ({waiting}) is waiting for the next start."
+                                  if waiting else "No erase is waiting.")
+            if action == "cancel":
+                return ToolResult("The waiting erase is cancelled." if erase_all.cancel()
+                                  else "No erase was waiting.")
+            plan = await asyncio.to_thread(erase_all.survey, scope)
+            if action == "survey":
+                return ToolResult(plan.summary(), receipt={"items": len(plan.paths),
+                                                           "bytes": plan.total_bytes, "scope": plan.scope})
+            if action != "erase":
+                return ToolResult(f"Unknown action '{action}' (survey, erase, cancel or status).", ok=False)
+        except ValueError as exc:
+            return ToolResult(str(exc), ok=False)
+        blocked = require_foreground("erase_confirmation_dialog")
+        if blocked is not None:
+            return blocked
+        guard = getattr(self, "system_guard", None)
+        if guard is None:
+            return ToolResult("Erasing needs the on-screen confirmation, which is not available "
+                              "right now; nothing was changed.", ok=False)
+        from .system_guard import ActionIntent
+        decision = guard.request_confirmation(ActionIntent.DATA_ERASE, origin="erase",
+                                              payload={"scope": plan.scope})
+        token = getattr(decision, "token", "") or ""
+        if not token:
+            return ToolResult("The confirmation could not be raised; nothing was changed.", ok=False)
+        self.bus.confirm_action.emit({
+            "token": token, "intent": "data_erase",
+            "message": f"Erase your data? {plan.summary()}",
+            "items": [p.name for p in plan.paths[:20]],
+        })
+        return ToolResult(f"{plan.summary()} Approve the on-screen confirmation to erase it; nothing "
+                          "has changed yet.", ok=False, receipt={"pending_confirmation": True})
+
+    def run_confirmed_erase(self, payload: dict[str, Any]) -> ToolResult:
+        """Released ONLY by the owner's approval: arms the erase and restarts,
+        so it runs before any store is opened."""
+        from . import erase_all
+        scope = str((payload or {}).get("scope") or "")
+        if scope not in erase_all.SCOPES:
+            return ToolResult("The approved erase lost its scope; nothing was changed.", ok=False)
+        plan = erase_all.schedule(scope)
+        self.bus.log.emit(f"PRIVACY: erase approved ({scope}, {len(plan.paths)} items); restarting to run it.")
+        try:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(1500, self.bus.request_restart.emit)
+        except Exception:
+            pass
+        return ToolResult(f"Erasing {len(plan.paths)} item(s) to the Recycle Bin; restarting now to finish.")
+
     async def companion_tool(self, args: dict[str, Any]) -> ToolResult:
         """Companion continuity: brief, goals, habits, achievements, activity log."""
         if self.companion is None:
@@ -1676,7 +2506,19 @@ class KnowledgeDispatchMixin:
 
         if action in {"brief", "continuity", "catchup", "catch_up"}:
             brief = await asyncio.to_thread(self.companion.continuity_brief)
-            return ToolResult(brief or "Nothing tracked yet — I will keep notes as you work.")
+            if brief:
+                return ToolResult(brief)
+            # Not "nothing tracked" while wins are on record (25 Oct 2026:
+            # the panel said so above three starred achievements).
+            wins = await asyncio.to_thread(self.companion.achievements, 3)
+            if wins:
+                return ToolResult("No recent activity is tracked. Recorded wins: "
+                                  + "; ".join(str(w.get("title") or "") for w in wins) + ".")
+            return ToolResult("Nothing tracked yet — I will keep notes as you work.")
+
+        if action in {"forget", "erase", "forget_topic", "remove", "delete", "forget_item"}:
+            topic = str(args.get("topic") or args.get("query") or title or "").strip()
+            return await self.request_forget(topic)
 
         if action in {"log", "activity", "log_activity"}:
             if not title:

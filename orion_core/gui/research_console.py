@@ -28,6 +28,7 @@ the research engine itself.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import time
 from typing import Any
@@ -70,10 +71,18 @@ MAX_FEED_ROWS = 600
 
 _DEPTHS = (("Brief · ~5 pages", "brief"), ("Standard · ~15 pages", "standard"),
            ("Thesis · ~35 pages", "thesis"), ("Exhaustive · ~50 pages", "exhaustive"))
-_STYLES = (("Literature review", "literature_review"), ("Technical deep-dive", "technical"),
-           ("Comparative", "comparative"), ("Critical appraisal", "critical"),
-           ("Systematic", "systematic"), ("Teaching primer", "primer"))
-_MODES = (("Write a paper (Word)", "paper"), ("Investigate & summarise", "browse"))
+_STYLES = (("Literature Review", "literature_review"), ("Technical Deep-Dive", "technical"),
+           ("Comparative", "comparative"), ("Critical Appraisal", "critical"),
+           ("Systematic", "systematic"), ("Teaching Primer", "primer"))
+_MODES = (("Write a Paper (Word)", "paper"), ("Investigate & Summarise", "browse"))
+
+
+def _count(value: Any) -> int:
+    """Progress values must fit Qt's signed integer range."""
+    try:
+        return min(2**31 - 1, max(0, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _panel(title: str) -> tuple[QFrame, QVBoxLayout]:
@@ -97,6 +106,7 @@ class ResearchConsole(QWidget):
         self.dispatcher = dispatcher
         self._sources: list[str] = []
         self._running = False
+        self._task: asyncio.Task | None = None
         self._build()
         try:
             bus.dashboard_event.connect(self._on_dashboard_event)
@@ -111,10 +121,10 @@ class ResearchConsole(QWidget):
         root.setSpacing(10)
 
         head = QHBoxLayout()
-        title = QLabel("Live research")
+        title = QLabel("Research Console")
         title.setObjectName("titleLabel")
         head.addWidget(title)
-        self.status = QLabel("Idle — ask ORION to research something, or start a run here.")
+        self.status = QLabel("Idle")
         self.status.setObjectName("mutedLabel")
         head.addWidget(self.status, 1)
         root.addLayout(head)
@@ -126,7 +136,7 @@ class ResearchConsole(QWidget):
         row.setContentsMargins(12, 8, 12, 8)
         row.setSpacing(8)
         self.topic = QLineEdit()
-        self.topic.setPlaceholderText("What should ORION research?  e.g. neural engineering")
+        self.topic.setPlaceholderText("Research topic")
         self.topic.setAccessibleName("Research topic")
         self.topic.returnPressed.connect(self._start)
         row.addWidget(self.topic, 3)
@@ -164,7 +174,7 @@ class ResearchConsole(QWidget):
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setChildrenCollapsible(False)
 
-        work, work_layout = _panel("THE WORK")
+        work, work_layout = _panel("The Work")
         self.feed = QListWidget()
         self.feed.setObjectName("researchFeed")
         self.feed.setWordWrap(True)
@@ -174,7 +184,7 @@ class ResearchConsole(QWidget):
         work_layout.addWidget(self.feed, 1)
         split.addWidget(work)
 
-        now, now_layout = _panel("NOW READING")
+        now, now_layout = _panel("Now Reading")
         self.page_title = QLabel("—")
         self.page_title.setObjectName("sectionTitle")
         self.page_title.setWordWrap(True)
@@ -188,28 +198,22 @@ class ResearchConsole(QWidget):
         self.page_text = QTextBrowser()
         self.page_text.setObjectName("logBox")
         self.page_text.setOpenExternalLinks(True)
-        self.page_text.setPlaceholderText("The text of the page ORION is reading appears here.")
         now_layout.addWidget(self.page_text, 3)
-        note_head = QLabel("HIS NOTE")
+        note_head = QLabel("His Note")
         note_head.setObjectName("panelHeading")
         now_layout.addWidget(note_head)
         self.note_text = QTextBrowser()
         self.note_text.setObjectName("logBox")
-        self.note_text.setPlaceholderText("What ORION wrote down from that page.")
         now_layout.addWidget(self.note_text, 2)
         split.addWidget(now)
 
-        read, read_layout = _panel("SOURCES READ")
+        read, read_layout = _panel("Sources Read")
         self.sources = QListWidget()
         self.sources.setObjectName("researchSources")
         self.sources.setWordWrap(True)
         self.sources.itemActivated.connect(self._open_item)
         self.sources.itemDoubleClicked.connect(self._open_item)
         read_layout.addWidget(self.sources, 1)
-        hint = QLabel("Double-click a source to open it in your browser.")
-        hint.setObjectName("mutedLabel")
-        hint.setWordWrap(True)
-        read_layout.addWidget(hint)
         split.addWidget(read)
 
         split.setStretchFactor(0, 4)
@@ -220,6 +224,9 @@ class ResearchConsole(QWidget):
     # ── starting a run ───────────────────────────────────────────────────────
 
     def _start(self) -> None:
+        # Return in the topic field still fires when the button is disabled.
+        if self._task is not None:
+            return
         topic = self.topic.text().strip()
         if not topic:
             self.status.setText("Type a topic first.")
@@ -234,22 +241,35 @@ class ResearchConsole(QWidget):
         self.status.setText(f"Starting research on “{topic}”…")
         self.start_btn.setEnabled(False)
 
-        async def _run() -> None:
+        async def _run() -> str:
             try:
                 result = await dispatcher.dispatch("research", args)
-                message = str(getattr(result, "text", "") or getattr(result, "message", "") or result)
+                return str(getattr(result, "text", "") or getattr(result, "message", "") or result)
             except Exception as exc:
-                message = f"The research run failed: {exc}"
+                return f"The research run failed: {exc}"
+
+        self._task = background.spawn(_run(), name="orion-research-console")
+        if self._task is None:
+            self.status.setText("Research not started - ORION is not ready yet.")
+            self.start_btn.setEnabled(True)
+            return
+
+        def finished(task: asyncio.Task) -> None:
+            # A done callback also handles cancellation before _run starts.
+            self._task = None
+            self._running = False
+            message = "Research cancelled." if task.cancelled() else task.result()
             try:
                 self.status.setText(message.splitlines()[0][:220] if message else "Done.")
                 self.start_btn.setEnabled(True)
             except RuntimeError:
                 pass    # the page was destroyed while the run was going
 
-        background.spawn(_run(), name="orion-research-console")
+        self._task.add_done_callback(finished)
 
     def reset(self) -> None:
         """Clear the page for a new run."""
+        self._running = False
         self.feed.clear()
         self.sources.clear()
         self._sources = []
@@ -282,7 +302,11 @@ class ResearchConsole(QWidget):
             self._running = True
         elif kind == "start" and not self._running:
             self.reset()
-        stamp = time.strftime("%H:%M:%S", time.localtime(float(step.get("at") or time.time())))
+        try:
+            when = time.localtime(float(step.get("at") or time.time()))
+        except (TypeError, ValueError, OverflowError, OSError):
+            when = time.localtime()
+        stamp = time.strftime("%H:%M:%S", when)
         item = QListWidgetItem(f"{stamp}  {_GLYPHS.get(kind, '·')}  {message}")
         url = str(step.get("url") or "")
         if url:
@@ -315,16 +339,16 @@ class ResearchConsole(QWidget):
         elif kind == "note":
             self.note_text.setPlainText(str(step.get("note") or ""))
         elif kind == "planned":
-            total = int(step.get("sections") or 0)
+            total = _count(step.get("sections"))
             if total:
                 self.progress.setRange(0, total)
                 self.progress.setValue(0)
                 self.progress.show()
         elif kind == "section_done":
-            total = int(step.get("total") or 0)
+            total = _count(step.get("total"))
             if total:
                 self.progress.setRange(0, total)
-                self.progress.setValue(int(step.get("done") or 0))
+                self.progress.setValue(min(total, _count(step.get("done"))))
                 self.progress.show()
         elif kind == "finished":
             self._running = False

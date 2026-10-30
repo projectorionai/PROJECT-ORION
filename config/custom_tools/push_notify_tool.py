@@ -36,6 +36,16 @@ import urllib.request
 from pathlib import Path
 
 TIMEOUT = 15
+
+
+MAX_RESPONSE_BYTES = 1_000_000
+
+
+def _bounded_http_body(response) -> bytes:
+    data = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise ValueError("Remote response exceeded its size limit; completion is unverified")
+    return data
 CONFIG_NAME = "messaging.json"
 NTFY_DEFAULT = "https://ntfy.sh"
 PUSHOVER_API = "https://api.pushover.net/1/messages.json"
@@ -110,7 +120,7 @@ def _post(url: str, data: bytes, headers: dict) -> tuple[bool, str]:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             if response.status not in (200, 201):
                 return False, f"the service answered {response.status}"
-            body = response.read()
+            body = _bounded_http_body(response)
             if body:
                 reply = json.loads(body)
                 if isinstance(reply, dict) and (reply.get("errors") or reply.get("status") == 0):

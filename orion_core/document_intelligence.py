@@ -18,7 +18,7 @@ encoder (semantic.py) once it is warm and the passages are embedded. No
 embedding service, no API call, nothing that can rate-limit halfway through. That keeps the "lightning-fast" promise and
 makes the retrieval something a test can pin down exactly.
 
-**It answers grounded, and cites.** ``ask`` pulls the passages that actually
+**It answers from passages, and cites.** ``ask`` pulls the passages that actually
 bear on the question and, if a model is available, has it answer *from those
 passages* with inline ``[1]``/``[2]`` markers that map to real file:line
 sources. With no model it still answers — extractively, by quoting the
@@ -97,11 +97,14 @@ class Answer:
     text: str
     sources: list[str]          # ordered citations referenced as [1], [2] ...
     passages: list[Passage]
-    grounded: bool              # True when a model synthesised it from passages
+    grounded: bool              # support verified, not merely model-generated
+    generated: bool = False
+    citations_valid: bool | None = None  # references exist; does not prove support
 
     def as_dict(self) -> dict[str, Any]:
         return {"text": self.text, "sources": self.sources,
-                "grounded": self.grounded}
+                "grounded": self.grounded, "generated": self.generated,
+                "citations_valid": self.citations_valid}
 
 
 @dataclass
@@ -136,7 +139,28 @@ def _read_pdf(path: Path) -> str:
 def _read_docx(path: Path) -> str:
     import docx                          # optional; lazily imported
     document = docx.Document(str(path))
-    return "\n".join(p.text for p in document.paragraphs)
+    blocks = getattr(document, "iter_inner_content", None)
+    if not callable(blocks):
+        return "\n".join(p.text for p in document.paragraphs)
+    # 30 Oct 2026: tables were never read - a dropped quote's prices lived
+    # only in one. Paragraphs and table rows, in the order the page has them.
+    lines: list[str] = []
+    for block in blocks():
+        rows = getattr(block, "rows", None)
+        if rows is None:
+            lines.append(block.text)
+            continue
+        for row in rows:
+            cells: list[str] = []
+            seen: list[Any] = []
+            for cell in row.cells:
+                if any(cell._tc is known for known in seen):
+                    continue                  # a merged cell repeats across its span
+                seen.append(cell._tc)
+                cells.append(" ".join(cell.text.split()))
+            if any(cells):
+                lines.append(" | ".join(cells))
+    return "\n".join(lines)
 
 
 def read_document(path: Path) -> str:
@@ -369,7 +393,15 @@ class DocumentIntelligence:
             try:
                 body = str(await generate(prompt) or "").strip()
                 if body:
-                    return Answer(body, sources, passages, grounded=True)
+                    cited = [int(number) for number in re.findall(r"\[(\d+)\]", body)]
+                    # 27 Sep audit reproduced conflicting prose with [99].
+                    # A real citation still cannot certify that its passage
+                    # entails every claim. Preserve provenance without a
+                    # false support badge; invalid/missing references quote
+                    # the retrieved text instead.
+                    if cited and all(1 <= number <= len(passages) for number in cited):
+                        return Answer(body, sources, passages, grounded=False,
+                                      generated=True, citations_valid=True)
             except Exception:
                 pass  # fall through to the extractive answer
         return Answer(self._extractive_answer(question, passages),

@@ -104,8 +104,12 @@ class ResearchDirector:
         self.validator = SourceValidator()
         self.missions = None            # attached after MissionEngine wiring
         self.auto_advance = True
+        self._advance_lock = asyncio.Lock()
         if research is not None:
-            research.on_complete = self._on_run_complete
+            if hasattr(research, "on_settled"):
+                research.on_settled = self._on_run_settled
+            else:
+                research.on_complete = self._on_run_complete  # legacy runner contract
         if telemetry is not None:
             telemetry.health.register("research_director")
 
@@ -153,13 +157,15 @@ class ResearchDirector:
 
     async def resume_pending(self) -> str:
         """Called at launch: restart the agenda where the last session left off."""
-        # A run that was 'running' when ORION shut down never finished — requeue it.
+        # A coroutine cannot resume after process death. Preserve the run as
+        # interrupted; only already queued topics are eligible to start.
         sessions = await self._sessions()
         for s in sessions.values():
             if str(s.get("status")) == "running":
                 await asyncio.to_thread(
                     self.cognition.upsert_research_session,
-                    str(s.get("topic") or ""), {"status": "queued"})
+                    str(s.get("topic") or ""), {"status": "interrupted",
+                    "error": "The process stopped before this research settled; it has not been replayed."})
         return await self._advance()
 
     # ── findings ──────────────────────────────────────────────────────────────
@@ -248,6 +254,10 @@ class ResearchDirector:
 
     async def _advance(self) -> str:
         """Start the next queued topic if the runner is idle. Returns its topic."""
+        async with self._advance_lock:
+            return await self._advance_locked()
+
+    async def _advance_locked(self) -> str:
         if not self.auto_advance or self.research is None:
             return ""
         active = getattr(self.research, "_active", {})
@@ -262,28 +272,63 @@ class ResearchDirector:
         nxt = queued[0]
         topic = str(nxt.get("topic") or "")
         minutes = float(nxt.get("minutes") or 20.0)
-        result = self.research.start_research(topic, minutes=minutes)
+        from .research import ResearchAgent
+        accepted = asyncio.Event() if isinstance(self.research, ResearchAgent) else None
+        result = self.research.start_research(topic, minutes=minutes,
+                                             **({"_accepted": accepted} if accepted is not None else {}))
+        if result.ok and accepted is not None:
+            from .dispatch_knowledge import _track_research_task
+            task = self.research._active["task"]
+            try:
+                result.receipt = await _track_research_task(self, topic, "queue", task, {"minutes": minutes})
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            accepted.set()
         if getattr(result, "ok", False):
             await asyncio.to_thread(
                 self.cognition.upsert_research_session, topic, {"status": "running"})
             self.bus.log.emit(f"DIRECTOR: research advanced to '{topic}'.")
             return topic
+        await asyncio.to_thread(self.cognition.upsert_research_session, topic,
+                                {"status": "failed", "error": str(result.text)[:300]})
         return ""
+
+    async def _on_run_settled(self, topic: str, folder: Path, result: ToolResult) -> None:
+        """The caller's task is done before an outcome can advance the queue."""
+        if result.ok:
+            await self._on_run_complete(topic, folder)
+            return
+        state = str((result.receipt or {}).get("research_state") or "failed")
+        if state not in {"cancelled", "interrupted"}:
+            state = "failed"
+        async with self._advance_lock:
+            await asyncio.to_thread(self.cognition.upsert_research_session, topic,
+                                    {"status": state, "folder": str(folder),
+                                     "error": str(result.text)[:500]})
+            self.bus.dashboard_event.emit("research_director", {"topic": topic, "status": state})
+        # An explicit cancellation stops the programme; it must not launch
+        # another investigation immediately after the user asked to stop.
+        if state != "cancelled":
+            await self._advance()
 
     async def _on_run_complete(self, topic: str, folder: Path) -> None:
         """ResearchAgent completion hook: harvest, record, advance."""
-        try:
-            harvested = await asyncio.to_thread(self.harvest_folder, topic, folder)
-            await asyncio.to_thread(
-                self.cognition.upsert_research_session, topic,
-                {"status": "complete", "folder": str(folder), "claims": harvested})
-            self.bus.dashboard_event.emit(
-                "research_director",
-                {"topic": topic, "status": "complete", "claims": harvested})
-            if self.telemetry is not None:
-                self.telemetry.metrics.incr("research.director.completed")
-        except Exception as exc:
-            self.bus.log.emit(f"DIRECTOR: harvest fault - {first_line(exc)}")
+        async with self._advance_lock:
+            try:
+                harvested = await asyncio.to_thread(self.harvest_folder, topic, folder)
+                await asyncio.to_thread(
+                    self.cognition.upsert_research_session, topic,
+                    {"status": "complete", "folder": str(folder), "claims": harvested})
+                self.bus.dashboard_event.emit(
+                    "research_director", {"topic": topic, "status": "complete", "claims": harvested})
+                if self.telemetry is not None:
+                    self.telemetry.metrics.incr("research.director.completed")
+            except Exception as exc:
+                self.bus.log.emit(f"DIRECTOR: harvest fault - {first_line(exc)}")
+                await asyncio.to_thread(self.cognition.upsert_research_session, topic,
+                                        {"status": "failed", "error": first_line(exc, 300)})
         await self._advance()
 
     # ── knowledge acquisition ─────────────────────────────────────────────────
@@ -326,7 +371,9 @@ class ResearchDirector:
             sentence = re.sub(r"[#*_`>\[\]]+", "", raw).strip()
             if len(sentence) < _FACT_MIN_LEN or sentence.startswith(("_", "-")):
                 continue
-            if "[Model unavailable" in sentence or not _FACT_MARKERS.search(sentence):
+            # A claim research marked as unsourced is not evidence.
+            if ("[Model unavailable" in sentence or "[unsourced]" in raw
+                    or not _FACT_MARKERS.search(sentence)):
                 continue
             if self.evidence.record_claim(
                     topic, sentence, source,

@@ -132,3 +132,24 @@ def test_desktop_entry_passes_its_launch_clock_to_the_startup_report():
     """)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
+
+
+def test_offline_launch_flag_reaches_boot_before_any_provider_is_created():
+    result = _run("""
+        import os, runpy, sys, types
+        import orion_core.single_instance as si
+        si.MUTEX_NAME += '-offline-test-%d' % os.getpid()
+        si.SOCKET_NAME += '-offline-test-%d' % os.getpid()
+        si.LOCK_FILENAME = 'orion-offline-test-%d.lock' % os.getpid()
+        os.environ.pop('ORION_MODE', None)
+        sys.argv = ['orion.py', '--offline']
+        captured = []
+        app = types.ModuleType('orion_core.app')
+        app.main = lambda **kwargs: captured.append(os.environ.get('ORION_MODE'))
+        sys.modules['orion_core.app'] = app
+        runpy.run_path('orion.py', run_name='__main__')
+        assert captured == ['offline']
+        print('ok')
+    """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"

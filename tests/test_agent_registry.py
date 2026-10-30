@@ -13,6 +13,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from orion_core import agent_registry as ar
@@ -186,3 +188,69 @@ def test_load_all_ignores_non_json_files(tmp_path, monkeypatch):
     (tmp_path / "readme.md").write_text("not a manifest", encoding="utf-8")
     manifests = ar.load_all()
     assert [m["name"] for m in manifests] == ["legal"]
+
+
+def _work_contract() -> dict:
+    return {
+        "purpose": "Identify contract risks using the supplied clauses.",
+        "inputs": ["User question", "Contract clauses and stated jurisdiction"],
+        "deliverable": "A prioritised risk review with unresolved questions.",
+        "acceptance": ["Every risk cites a supplied clause", "Unknowns are explicit"],
+        "owner": "legal-review",
+        "cancellation": "propagate",
+        "limits": {"max_steps": 2, "max_readings": 1},
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("title", 12), ("expertise", ["contracts"]), ("persona", True),
+    ("primary", [42]), ("keywords", [None]),
+])
+def test_work_contract_manifest_rejects_coerced_field_types(tmp_path, field, value):
+    data = _valid_manifest()
+    data[field] = value
+    manifest, errors = ar.load_manifest(_write(tmp_path, "legal", data))
+    assert manifest is None
+    assert any(field in error for error in errors)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("purpose", " "), ("purpose", True), ("inputs", "a question"),
+    ("inputs", []), ("inputs", ["question", 2]), ("deliverable", {}),
+    ("acceptance", []), ("acceptance", [False]), ("owner", ""),
+    ("cancellation", "ignore"), ("limits", []),
+    ("limits", {"max_steps": False}), ("limits", {"max_steps": 0}),
+    ("limits", {"max_readings": -1}), ("limits", {"max_readings": 1.5}),
+    ("limits", {"permissions": ["write"]}),
+])
+def test_work_contract_manifest_rejects_malformed_contract(tmp_path, field, value):
+    data = _valid_manifest()
+    data["work_contract"] = {**_work_contract(), field: value}
+    manifest, errors = ar.load_manifest(_write(tmp_path, "legal", data))
+    assert manifest is None
+    assert any(field in error for error in errors)
+
+
+@pytest.mark.parametrize("value", [None, [], "contract"])
+def test_work_contract_manifest_requires_object_when_present(tmp_path, value):
+    data = {**_valid_manifest(), "work_contract": value}
+    manifest, errors = ar.load_manifest(_write(tmp_path, "legal", data))
+    assert manifest is None
+    assert any("work_contract" in error for error in errors)
+
+
+def test_work_contract_manifest_is_optional_but_complete_when_supplied(tmp_path):
+    data = {**_valid_manifest(), "work_contract": _work_contract()}
+    accepted, errors = ar.load_manifest(_write(tmp_path, "legal", data))
+    assert errors == []
+    assert accepted["work_contract"] == data["work_contract"]
+    del data["work_contract"]["deliverable"]
+    manifest, errors = ar.load_manifest(_write(tmp_path, "legal", data))
+    assert manifest is None
+    assert any("deliverable" in error for error in errors)
+
+
+def test_work_contract_build_agent_rejects_direct_invalid_manifest():
+    data = {**_valid_manifest(), "work_contract": {"purpose": 22}}
+    with pytest.raises(ValueError, match="work_contract"):
+        ar.build_agent(data, _StubRouter(), _StubBus())

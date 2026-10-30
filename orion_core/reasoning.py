@@ -374,6 +374,8 @@ class ReasoningOutcome:
     verification: VerificationReport = field(default_factory=VerificationReport)
     elapsed_s: float = 0.0
     ok: bool = True
+    #: What the arithmetic self-check found and fixed ("" when nothing).
+    self_check: str = ""
 
     @property
     def lookups(self) -> int:
@@ -389,6 +391,8 @@ class ReasoningOutcome:
             parts.append("red-team critique applied")
         if self.verification.ran:
             parts.append(f"verification: {self.verification.summary()}")
+        if self.self_check:
+            parts.append(self.self_check)
         parts.append(f"{self.elapsed_s:.1f}s")
         return "— reasoning: " + " · ".join(parts)
 
@@ -442,6 +446,114 @@ def extract_claims(text: str, limit: int = 10) -> list[str]:
             if len(claims) >= max(1, limit):
                 return claims
     return claims
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SELF-CHECK: THE ARITHMETIC IN AN ANSWER, RE-DONE EXACTLY
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# A language model reasons well and multiplies badly: "17 x 23 = 381" reads as
+# confidently as the right answer and every step after it inherits the slip.
+# A deliberate answer's written-out sums are re-done here, locally and exactly,
+# and a wrong one is sent back to be fixed - a check that costs nothing unless
+# it finds something, and that a model cannot talk its way past.
+
+SELF_CHECK_INSTRUCTION = (
+    "A calculator re-did the arithmetic in this answer and found the calculations "
+    "listed under WRONG CALCULATIONS are wrong. Rewrite the answer with each of them "
+    "corrected, and carry any result that depended on them through. Change nothing "
+    "else. Return only the corrected answer - no commentary, no mention of the check."
+)
+
+_NUMBER = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"
+# No en dash: "pages 10–12" is a range, not a subtraction.
+_OPERATOR = r"[-+*/×x÷−]"
+_EQUATION = re.compile(
+    rf"(?<![\w.,/:^−–-])((?:{_NUMBER})(?:\s*{_OPERATOR}\s*(?:{_NUMBER}))+)"
+    rf"\s*=\s*([-−]?(?:{_NUMBER}))(?![\d.]*\d)(?!\s*{_OPERATOR}\s*\d)(?!\s*%)")
+_TOKEN = re.compile(rf"{_NUMBER}|{_OPERATOR}")
+
+
+@dataclass(frozen=True)
+class ArithmeticSlip:
+    expression: str
+    claimed: str
+    correct: str
+    start: int = 0
+    end: int = 0
+
+    def line(self) -> str:
+        return f"{self.expression} = {self.correct}, not {self.claimed}"
+
+
+def _evaluate(expression: str) -> float | None:
+    """+ - x / with the usual precedence, nothing else. None if malformed."""
+    tokens = _TOKEN.findall(expression)
+    if len(tokens) < 3 or len(tokens) % 2 == 0:
+        return None
+    try:
+        values = [float(tokens[0].replace(",", ""))]
+        adds: list[str] = []
+        for op, raw in zip(tokens[1::2], tokens[2::2]):
+            number = float(raw.replace(",", ""))
+            if op in "*×x":
+                values[-1] *= number
+            elif op in "/÷":
+                if number == 0:
+                    return None
+                values[-1] /= number
+            else:
+                adds.append("-" if op in "-−" else "+")
+                values.append(number)
+    except ValueError:
+        return None
+    total = values[0]
+    for op, number in zip(adds, values[1:]):
+        total = total - number if op == "-" else total + number
+    return total
+
+
+def _format_like(value: float, claimed: str) -> str:
+    decimals = len(claimed.split(".", 1)[1]) if "." in claimed else 0
+    if decimals == 0 and abs(value - round(value)) < 1e-9:
+        text = f"{int(round(value)):,}" if "," in claimed else str(int(round(value)))
+        return text
+    shown = f"{value:,.{max(decimals, 2)}f}" if "," in claimed else f"{value:.{max(decimals, 2)}f}"
+    return shown.rstrip("0").rstrip(".") if decimals == 0 else shown
+
+
+def arithmetic_slips(text: str) -> list[ArithmeticSlip]:
+    """Every written-out calculation ("a op b = c") whose result is wrong.
+
+    Rounding is allowed to the claimed precision (22/7 = 3.14 is right); only
+    flat + - x / sums are checked, so anything this cannot parse is left alone
+    rather than guessed at."""
+    slips: list[ArithmeticSlip] = []
+    for match in _EQUATION.finditer(str(text or "")):
+        expression, claimed = match.group(1).strip(), match.group(2)
+        actual = _evaluate(expression)
+        if actual is None:
+            continue
+        try:
+            stated = float(claimed.replace(",", "").replace("−", "-"))
+        except ValueError:
+            continue
+        decimals = len(claimed.split(".", 1)[1]) if "." in claimed else 0
+        tolerance = max(0.5 * 10 ** -decimals, 1e-9 * abs(actual))
+        if abs(actual - stated) <= tolerance + 1e-12:
+            continue
+        slips.append(ArithmeticSlip(expression, claimed, _format_like(actual, claimed),
+                                    match.start(2), match.end(2)))
+    return slips
+
+
+def correct_arithmetic(text: str, slips: Sequence[ArithmeticSlip]) -> str:
+    """Put each slip's right result where its wrong one was (last first)."""
+    out = str(text or "")
+    for slip in sorted(slips, key=lambda s: -s.start):
+        if out[slip.start:slip.end] == slip.claimed:
+            out = out[:slip.start] + slip.correct + out[slip.end:]
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -518,6 +630,9 @@ class ReasoningEngine:
         answer = await self._synthesise(question, findings, critique, budget)
         if budget.critiques >= 2 and answer.strip():
             answer = await self._audit(question, answer)
+        self_check = ""
+        if budget.verify and answer.strip():
+            answer, self_check = await self._self_check(question, answer)
 
         verification = VerificationReport()
         if budget.verify and self.evidence is not None:
@@ -529,7 +644,9 @@ class ReasoningEngine:
             question=question, answer=answer or "I could not form an answer.",
             budget=budget, rationale=rationale, findings=findings,
             critique=critique, verification=verification,
-            elapsed_s=time.perf_counter() - started, ok=bool(answer.strip()),
+            elapsed_s=time.perf_counter() - started,
+            ok=bool(answer.strip()) and any(f.ok and f.answer.strip() for f in findings),
+            self_check=self_check,
         )
         self.last = outcome
         self._publish(outcome)
@@ -575,7 +692,7 @@ class ReasoningEngine:
             bus=self.bus,
         )
 
-    def _instruments(self) -> dict[str, tuple[str, Callable[[dict[str, Any]], Awaitable[str]]]]:
+    def _instruments(self) -> dict[str, tuple[str, Callable[[dict[str, Any]], Awaitable[Any]]]]:
         """Purpose-shaped instruments over tools that also have write actions.
 
         ``second_brain`` can ingest, ``find_files`` can open what it finds,
@@ -584,24 +701,50 @@ class ReasoningEngine:
         here pins the action and exposes exactly one argument, so the unsafe
         branches are unreachable rather than merely discouraged.
         """
-        instruments: dict[str, tuple[str, Callable[[dict[str, Any]], Awaitable[str]]]] = {}
+        instruments: dict[str, tuple[str, Callable[[dict[str, Any]], Awaitable[Any]]]] = {}
+
+        async def _scholarly_search(args: dict[str, Any]) -> Any:
+            from . import scholarly
+            return await scholarly.search({
+                "query": str(args.get("query") or args.get("topic") or "")[:500],
+                "source": str(args.get("source") or "all"),
+                "limit": args.get("limit", 5),
+            })
+
+        instruments["scholarly_search"] = (
+            'Discover bibliographic metadata from Crossref and Europe PMC APIs; '
+            'metadata discovery, not full text read or verified claims. '
+            'ARGS: {"query": "topic", "source": "all|crossref|europepmc", "limit": 5}',
+            _scholarly_search)
 
         if self.dispatch is not None:
-            async def _find_files(args: dict[str, Any]) -> str:
-                result = await self.dispatch(
+            async def _find_files(args: dict[str, Any]) -> Any:
+                return await self.dispatch(
                     "find_files", {"query": str(args.get("query") or args.get("name") or ""),
                                    "open": False})
-                return str(getattr(result, "text", result))
 
-            async def _knowledge_recall(args: dict[str, Any]) -> str:
-                result = await self.dispatch(
+            async def _knowledge_recall(args: dict[str, Any]) -> Any:
+                return await self.dispatch(
                     "second_brain", {"action": "recall",
                                      "query": str(args.get("query") or args.get("topic") or "")})
-                return str(getattr(result, "text", result))
 
-            async def _situation(_args: dict[str, Any]) -> str:
-                result = await self.dispatch("awareness", {"action": "situation"})
-                return str(getattr(result, "text", result))
+            async def _situation(_args: dict[str, Any]) -> Any:
+                return await self.dispatch("awareness", {"action": "situation"})
+
+            async def _incident_lookup(args: dict[str, Any]) -> Any:
+                return await self.dispatch("diagnostics", {
+                    "action": "incident",
+                    "question": str(args.get("question") or args.get("query") or "")[:2000],
+                    "when": str(args.get("when") or args.get("time") or "")[:100],
+                })
+
+            async def _latency_report(_args: dict[str, Any]) -> Any:
+                return await self.dispatch("diagnostics", {"action": "latency"})
+
+            async def _capability_status(args: dict[str, Any]) -> Any:
+                return await self.dispatch("capabilities", {
+                    "query": str(args.get("query") or "")[:200],
+                })
 
             instruments["find_files"] = (
                 'Find files and folders on the user\'s machine by name (it only '
@@ -613,6 +756,14 @@ class ReasoningEngine:
             instruments["situation"] = (
                 'The current situation: active projects, priorities, deadlines and '
                 'focus. ARGS: {}', _situation)
+            instruments["incident_lookup"] = (
+                'Read recorded incidents from ORION\'s bounded diagnostic log tails. '
+                'ARGS: {"question": "what failed", "when": "23:41"}', _incident_lookup)
+            instruments["latency_report"] = (
+                'Read measured event loop stalls and operation timings. ARGS: {}', _latency_report)
+            instruments["capability_status"] = (
+                'Read current available capabilities and API/MCP connection state. '
+                'ARGS: {"query": "optional capability"}', _capability_status)
 
         if self.evidence is not None:
             async def _evidence_lookup(args: dict[str, Any]) -> str:
@@ -788,6 +939,30 @@ class ReasoningEngine:
         # unaudited answer is better than a truncated one.
         return repaired if len(repaired) >= len(answer) * 0.5 else answer
 
+    async def _self_check(self, question: str, answer: str) -> tuple[str, str]:
+        """Re-do the answer's written-out arithmetic; send a wrong sum back to
+        be fixed (one call), or correct it in place if the rewrite is no
+        better. Returns (answer, footer note). No slips: no call, no note."""
+        slips = arithmetic_slips(answer)
+        if not slips:
+            return answer, ""
+        listing = "\n".join(f"- {slip.line()}" for slip in slips[:8])
+        count = f"{len(slips)} arithmetic slip{'s' if len(slips) != 1 else ''}"
+        self.bus.log.emit(f"REASON: self-check caught {count} - "
+                          + "; ".join(s.line() for s in slips[:3]))
+        repaired = ""
+        try:
+            _profile, text = await self.router.generate_text(
+                f"QUESTION:\n{question}\n\nANSWER:\n{answer[:6000]}\n\n"
+                f"WRONG CALCULATIONS:\n{listing}",
+                instruction=SELF_CHECK_INSTRUCTION, task="reason.self_check")
+            repaired = str(text or "").strip()
+        except Exception as exc:
+            self.bus.log.emit(f"REASON: self-check rewrite skipped - {first_line(exc, 120)}")
+        if repaired and len(repaired) >= len(answer) * 0.5 and not arithmetic_slips(repaired):
+            return repaired, f"self-check: {count} corrected"
+        return correct_arithmetic(answer, slips), f"self-check: {count} corrected in place"
+
     # ── stage 4: verification against the evidence store ──────────────────────
 
     def _verify(self, question: str, answer: str) -> VerificationReport:
@@ -867,7 +1042,11 @@ def _topic_of(question: str) -> str:
 
 __all__ = [
     "AUDIT_INSTRUCTION",
+    "ArithmeticSlip",
     "BUDGETS",
+    "SELF_CHECK_INSTRUCTION",
+    "arithmetic_slips",
+    "correct_arithmetic",
     "CHAIR_INSTRUCTION",
     "CRITIC_INSTRUCTION",
     "Critique",

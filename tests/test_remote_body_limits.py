@@ -61,7 +61,8 @@ def _oversized_json() -> bytes:
 
 
 @pytest.mark.parametrize("path", [
-    "/v1/auth/pair", "/v1/auth/token", "/api/chat", "/api/confirm", "/v1/agent/tasks",
+    "/v1/auth/pair", "/v1/auth/token", "/api/chat", "/api/chat/stream", "/api/chat/cancel",
+    "/api/confirm", "/v1/agent/tasks",
 ])
 def test_oversized_json_body_is_refused_with_413(tmp_path, path):
     async def flow():
@@ -163,6 +164,8 @@ def test_pairing_still_works_with_a_normal_body(tmp_path):
     ("/v1/auth/token", {"device_id": "d", "refresh_token": "x" * 300},
      "'refresh_token' is too long"),
     ("/api/chat", {"message": {"text": "hi"}}, "'message' must be a string"),
+    ("/api/chat/stream", {"message": ["hi"]}, "'message' must be a string"),
+    ("/api/chat/cancel", {"request_id": "x" * 65}, "'request_id' is too long"),
     ("/api/confirm", {"id": "c", "token": "t", "decision": ["yes"]},
      "'decision' must be a string or true or false"),
     ("/v1/agent/tasks", {"tool": "web_search", "args": ["q"]}, "'args' must be an object"),

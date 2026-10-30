@@ -105,9 +105,19 @@ class FrameBuffer:
             self._generation += 1
 
     def take(self) -> tuple[QImage | None, int]:
-        """The newest finished frame, and its generation. Called by the GUI."""
+        """The newest finished frame, and its generation. Called by the GUI.
+
+        A shallow COPY of the front image, not the front image itself. The
+        object handed out used to be the very one that becomes the back buffer
+        at the next swap, so a frame the GUI still held was painted over by
+        later, unpublished work (audit 6 Oct 2026, A08). QImage is implicitly
+        shared with atomic reference counts: the copy costs nothing, and the
+        worker's next paint detaches onto fresh pixels only if the GUI is
+        still holding that frame - paintEvent lets go of it when it returns,
+        so the usual frame is still a pointer swap."""
         with self._lock:
-            return self._front, self._generation
+            front = self._front
+            return (None if front is None else QImage(front)), self._generation
 
     @property
     def age(self) -> float:
@@ -148,6 +158,10 @@ class FaceRenderPipeline:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        #: Guards the worker's decision to exit against start() resuming it,
+        #: so "resumed" can never be said of a worker already on its way out.
+        self._life = threading.Lock()
+        self._exiting = False
 
         #: Frames the worker finished, and frames the loop never had to paint.
         self.rendered = 0
@@ -156,16 +170,34 @@ class FaceRenderPipeline:
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
+        """Start the worker - or, if a stop is still finishing, keep the worker
+        that is there. The head has ONE owner: a second worker stepping and
+        painting the same vertex arrays is the torn-face race this module
+        exists to prevent."""
+        with self._life:
+            thread = self._thread
+            if thread is not None and thread.is_alive() and not self._exiting:
+                self._stop.clear()          # running, or stopping: carry on
+                self._wake.set()
+                return
+        if thread is not None and thread.is_alive():
+            # Past its last frame; only returning from _run is left.
+            thread.join(1.0)
+            if thread.is_alive():
+                return                      # never two owners
+        self._exiting = False
         self._stop.clear()
         thread = threading.Thread(target=self._run, name="orion-face-render",
                                   daemon=True)
         self._thread = thread
         thread.start()
 
-    def stop(self, timeout: float = 1.5) -> None:
-        """Ask the worker to finish and wait briefly for it.
+    def stop(self, timeout: float = 1.5) -> bool:
+        """Ask the worker to finish and wait briefly for it. True once it has
+        exited; False if it is still finishing, in which case this pipeline
+        KEEPS it (running stays True) - it used to drop the handle on a
+        timed-out join, report itself stopped, and let a later start() add a
+        second worker over the same head (audit 6 Oct 2026, A09).
 
         Joined rather than abandoned: a daemon thread holding a QImage while
         Qt tears down its graphics stack is how "destroyed but pending"
@@ -173,14 +205,24 @@ class FaceRenderPipeline:
         """
         self._stop.set()
         self._wake.set()
-        thread, self._thread = self._thread, None
+        thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout)
+        if thread is not None and thread.is_alive():
+            return False
+        self._thread = None
+        return True
 
     @property
     def running(self) -> bool:
+        """A worker is alive (it may be finishing a stop - see stopping)."""
         thread = self._thread
         return thread is not None and thread.is_alive()
+
+    @property
+    def stopping(self) -> bool:
+        """Asked to stop, and the worker has not exited yet."""
+        return self.running and self._stop.is_set()
 
     # ── the GUI thread's side ────────────────────────────────────────────────
 
@@ -234,7 +276,11 @@ class FaceRenderPipeline:
 
     def _run(self) -> None:
         last = time.monotonic()
-        while not self._stop.is_set():
+        while True:
+            with self._life:
+                if self._stop.is_set():
+                    self._exiting = True
+                    return
             frame_started = time.monotonic()
             dt = max(0.0, min(0.25, frame_started - last))
             last = frame_started

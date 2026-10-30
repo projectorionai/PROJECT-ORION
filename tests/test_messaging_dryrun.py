@@ -39,7 +39,7 @@ def test_dry_run_under_pytest_does_not_open_browser(monkeypatch):
     assert opened == [], "no browser window may open during a test"
 
 
-def test_real_send_opens_browser_when_not_suppressed(monkeypatch):
+def test_unsuppressed_background_send_never_opens_default_browser(monkeypatch):
     """The seam is ``open_url``, not ``webbrowser.open``.
 
     Every link ORION opens now goes through orion_core.browser so that one
@@ -52,11 +52,25 @@ def test_real_send_opens_browser_when_not_suppressed(monkeypatch):
     monkeypatch.setattr(m, "open_url", lambda url: opened.append(url) or True)
     monkeypatch.setattr(m.MessagingGateway, "delivery_suppressed", staticmethod(lambda: False))
     gw = m.MessagingGateway(_Bus())
+    monkeypatch.setattr(gw, "_bot_token", lambda *_: "")
     res = gw.send_text("telegram", "example_contact", "hello there friend")
-    assert res.ok
-    assert len(opened) == 1
-    assert opened[0].startswith("https://t.me/example_contact?text=")
-    assert "hello%20there%20friend" in opened[0]  # message is URL-encoded
+    assert not res.ok and res.receipt["status"] == "requires_foreground"
+    assert opened == []
+
+
+def test_explicit_foreground_draft_preserves_exact_encoded_body(monkeypatch):
+    from orion_core.execution_policy import foreground_scope
+    from urllib.parse import parse_qs, urlparse
+    opened = []
+    monkeypatch.setattr(m, "open_url", lambda url: opened.append(url) or True)
+    gate = m.MessagingGateway(_Bus())
+    monkeypatch.setattr(gate, "delivery_suppressed", lambda: False)
+    monkeypatch.setattr(gate, "_bot_token", lambda *_: "")
+    body = "  exact message\nUnicode 🙂  "
+    with foreground_scope("compose-test:user-authorized"):
+        result = gate.send_text("telegram", "example_contact", body)
+    assert result.ok and result.receipt["status"] == "draft" and result.receipt["sent"] is False
+    assert len(opened) == 1 and parse_qs(urlparse(opened[0]).query)["text"] == [body]
 
 
 def test_explicit_dryrun_env_forces_suppression(monkeypatch):

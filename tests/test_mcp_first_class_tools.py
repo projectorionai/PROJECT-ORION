@@ -306,3 +306,113 @@ def test_the_repo_config_holds_no_credential():
             is_path = ":\\" in value or value.startswith(("/", "~"))
             assert is_path or value.lower() in {"0", "1", "true", "false"}, \
                 f"{name}.{key} holds a value in a tracked file"
+
+
+# Structured MCP evidence must survive actual dispatcher-to-model serialization.
+import pytest as _receipt_pytest
+
+
+@_receipt_pytest.mark.parametrize("kind", ["", "tool", "protocol", "timeout", "unavailable"])
+def test_mcp_reply_retains_typed_receipt_through_first_class_dispatch(kind):
+    import asyncio
+    import json
+    from orion_core.mcp_host import MCPReply
+
+    content = [
+        {"type": "text", "text": "Measured result"},
+        {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+        {"type": "audio", "data": "YXVkaW8=", "mimeType": "audio/wav"},
+        {"type": "resource_link", "uri": "fixture://report", "name": "report"},
+    ]
+    reply = MCPReply("Measured result", kind, content=content,
+                     structured_content={"count": 3}, meta={"fixture": "metadata"},
+                     provenance={"server": "fixture", "tool": "read", "untrusted": True})
+    host = _StubMCPHost()
+    host._response = reply
+    dispatcher = _dispatcher()
+    dispatcher.mcp_host = host
+    dispatcher.TOOL_DECLARATIONS = list(TOOL_DECLARATIONS)
+    dispatcher.register_mcp_tools("fixture", [{"name": "read"}])
+    result = asyncio.run(dispatcher._dispatch_mcp("mcp__fixture__read", {}))
+    payload = json.loads(json.dumps(result.response_payload()))
+    assert payload["ok"] is (not bool(kind))
+    assert payload["result"] == "Measured result"
+    assert payload["receipt"] == {
+        "type": "mcp", "content": content, "structuredContent": {"count": 3},
+        "_meta": {"fixture": "metadata"},
+        "provenance": {"server": "fixture", "tool": "read", "untrusted": True},
+        "isError": bool(kind), "errorKind": kind, "untrusted": True,
+    }
+    assert result.media is None and result.evidence is None
+    assert host.calls == [("fixture", "read", {})]
+
+
+def test_mcp_receipt_is_snapshot_at_result_creation_and_each_payload():
+    from orion_core.mcp_host import MCPReply
+    reply = MCPReply("summary", content=[{"type": "text", "text": "original"}],
+                     structured_content={"rows": [{"value": 1}]}, provenance={"server": "fixture"})
+    result = ToolResult(reply)
+    reply.content[0]["text"] = "caller mutation"
+    reply.structured_content["rows"][0]["value"] = 99
+    payload = result.response_payload()
+    assert payload["receipt"]["content"][0]["text"] == "original"
+    assert payload["receipt"]["structuredContent"]["rows"][0]["value"] == 1
+    payload["receipt"]["provenance"]["server"] = "changed returned payload"
+    assert result.response_payload()["receipt"]["provenance"]["server"] == "fixture"
+
+
+def test_explicit_receipt_does_not_replace_gemini_media_or_human_evidence():
+    receipt = {"type": "fixture", "rows": [{"value": 1}]}
+    media = {"data": b"raw", "mime_type": "audio/wav"}
+    evidence = [{"source": "human-facing evidence"}]
+    result = ToolResult("plain", media=media, evidence=evidence, receipt=receipt)
+    receipt["rows"][0]["value"] = 99
+    assert result.response_payload()["receipt"]["rows"][0]["value"] == 1
+    assert result.media is media and result.evidence is evidence
+    assert "media" not in result.response_payload() and "evidence" not in result.response_payload()
+
+
+@_receipt_pytest.mark.parametrize("path", ["chain", "gateway"])
+@_receipt_pytest.mark.parametrize("kind", ["", "tool", "protocol", "timeout", "unavailable"])
+def test_xxxv_typed_mcp_receipt_survives_real_chain_and_gateway(monkeypatch, path, kind):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from orion_core.mcp_host import MCPReply
+    import orion_core.dispatcher as dispatcher_module
+    from orion_core.tool_gateway import use_tool
+
+    monkeypatch.setattr(dispatcher_module, "_action_guard_on", lambda: False)
+    monkeypatch.setattr(dispatcher_module, "_note_gap", lambda *_args: None)
+    reply = MCPReply("measured", kind,
+        content=[{"type": "text", "text": "measured"},
+                 {"type": "resource_link", "uri": "fixture://report", "name": "report"}],
+        structured_content={"rows": [1]}, meta={"version": 1},
+        provenance={"server": "fixture", "tool": "read", "untrusted": True})
+    host = _StubMCPHost()
+    host._response = reply
+    dispatcher = _dispatcher()
+    dispatcher.bus = SimpleNamespace(log=SimpleNamespace(emit=lambda *_args: None))
+    dispatcher.mcp_host = host
+    dispatcher._mcp_spend_gate = lambda *_args, **_kwargs: None
+    dispatcher.telemetry = None
+    dispatcher.TOOL_DECLARATIONS = list(TOOL_DECLARATIONS)
+    dispatcher.register_mcp_tools("fixture", [{"name": "read"}])
+    name = "mcp__fixture__read"
+    if path == "gateway":
+        result = asyncio.run(use_tool(dispatcher, {"name": name, "arguments": "{}"}))
+    else:
+        result = asyncio.run(dispatcher.dispatch_chain(name, {}))
+    payload = json.loads(json.dumps(result.response_payload()))
+    assert payload["ok"] is (not bool(kind))
+    assert payload["receipt"] == reply.as_tool_receipt()
+    assert result.evidence is None and result.media is None
+    reply.structured_content["rows"].append(99)
+    assert result.response_payload()["receipt"]["structuredContent"]["rows"] == [1]
+    payload["receipt"]["provenance"]["server"] = "changed"
+    assert result.response_payload()["receipt"]["provenance"]["server"] == "fixture"
+    assert host.calls == [("fixture", "read", {})]
+
+
+def test_ordinary_tool_result_keeps_existing_response_contract():
+    assert ToolResult("ordinary", ok=False).response_payload() == {"ok": False, "result": "ordinary"}

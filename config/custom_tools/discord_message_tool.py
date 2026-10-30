@@ -10,10 +10,18 @@ from pathlib import Path
 
 API = "https://discord.com/api/v10"
 TIMEOUT = 15
+MAX_RESPONSE_BYTES = 1_000_000
 
 #: Where credentials and contacts live. NEVER in this file: a plugin that ships
 #: with a token in its source leaks it to anyone the plugin is shared with.
 CONFIG_NAME = "messaging.json"
+
+
+def _read_response(response) -> bytes:
+    body = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise ValueError("Discord response exceeded the permitted size")
+    return body
 
 
 def _config() -> dict:
@@ -35,10 +43,15 @@ def _config() -> dict:
                 data = loaded.get("discord") or {}
     except Exception:
         data = {}
+    if not isinstance(data, dict):
+        data = {}
     for key, env in (("bot_token", "DISCORD_BOT_TOKEN"),
                      ("webhook_url", "DISCORD_WEBHOOK_URL"),
                      ("default_channel_id", "DISCORD_CHANNEL_ID")):
         value = os.getenv(env, "").strip()
+        if key in {"bot_token", "webhook_url"}:
+            from orion_core.jv_plugins.runtime import secret
+            value = secret("discord_message", env).strip() or value
         if value:
             data[key] = value
     return data if isinstance(data, dict) else {}
@@ -58,7 +71,9 @@ def _post(url: str, payload: dict, token: str = "") -> tuple[bool, str]:
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            detail = exc.read().decode("utf-8", "replace")[:200]
+            detail = _read_response(exc).decode("utf-8", "replace")[:200]
+        except ValueError:
+            return False, "Discord returned an oversized error response; no automatic retry was attempted."
         except Exception:
             pass
         if exc.code == 401:
@@ -86,7 +101,7 @@ def _open_dm(user_id: str, token: str) -> tuple[str, str]:
     request.add_header("Authorization", f"Bot {token}")
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            channel = json.loads(response.read().decode("utf-8"))
+            channel = json.loads(_read_response(response).decode("utf-8"))
             return str(channel.get("id") or ""), ""
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
@@ -179,11 +194,11 @@ def run(**kwargs) -> str:
             lines.append(f"  {name} ({kind})")
         return "Discord contacts:\n" + "\n".join(lines)
 
-    message = str(kwargs.get("message") or kwargs.get("text") or "").strip()
-    if not message:
+    message = str(kwargs.get("message") or kwargs.get("text") or "")
+    if not message.strip():
         return "What would you like me to say?"
     if len(message) > 2000:
-        message = message[:1997] + "…"          # Discord's hard limit
+        return "Could not send: Discord messages are limited to 2000 characters. Shorten the message before sending."
 
     target = str(kwargs.get("to") or kwargs.get("contact") or "").strip()
     token = str(config.get("bot_token") or "").strip()
@@ -192,14 +207,26 @@ def run(**kwargs) -> str:
     # A webhook posts to one fixed channel and needs no bot — use it when there
     # is no token, or when the user did not name anybody in particular.
     if webhook and (not token or not target):
+        if target:
+            # A webhook always posts to one fixed channel. It cannot DM a
+            # named user; accepting an arbitrary 'to' silently misdelivers it.
+            bound_name = str(config.get("webhook_contact") or "").strip()
+            bound_channel = str(config.get("default_channel_id") or "").strip()
+            kind, identifier, _error = _resolve(target, config)
+            bound = (bool(bound_name) and target.casefold() == bound_name.casefold()) or (
+                bool(bound_channel) and kind == "channel" and identifier == bound_channel)
+            if not bound:
+                return ("Could not send: the Discord webhook is bound to one channel, "
+                        "not this recipient. Set webhook_contact/default_channel_id "
+                        "for that channel, or configure a bot to reach this contact.")
         ok, detail = _post(webhook, {"content": message})
         return ("Sent on Discord." if ok
                 else f"I could not send that on Discord. {detail}")
 
     if not token:
-        return ("Discord is not configured. Add a bot token (to message people "
-                "and channels) or a webhook URL (to post to one channel) under "
-                "\"discord\" in config/messaging.json.")
+        from orion_core.data import ToolResult
+        return ToolResult("Discord is not configured. Connect a bot or webhook account before API delivery.", ok=False,
+            receipt={"kind": "messaging", "platform": "discord", "status": "not_configured", "sent": False, "attempted": False})
 
     kind, identifier, error = _resolve(target, config)
     if error:

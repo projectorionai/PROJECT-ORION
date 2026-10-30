@@ -133,10 +133,17 @@ def test_a_running_focus_block_boosts_study_and_focus():
 
 
 def test_the_foreground_page_boosts_its_domain():
-    out = tr.resolve("help", tr.ResolverState(active_page="COGNITION"),
-                     DECLS, max_tools=8)
-    names = {d["name"] for d in out}
-    assert "study" in names or "focus" in names
+    # Asserted as the property itself. This used to check for study or focus
+    # by name, which held only because every learning tool tied on the boost
+    # and "focus" came early in the alphabet — once "helps" folded to "help",
+    # pentest_lab outscored it and took the slot, with the boost unchanged.
+    def learning_tools(state):
+        out = tr.resolve("help", state, DECLS, max_tools=8)
+        return sum(tr.classify_tool(d["name"]) == "learning" for d in out)
+
+    boosted = learning_tools(tr.ResolverState(active_page="COGNITION"))
+    assert boosted >= 3
+    assert boosted > learning_tools(tr.ResolverState())
 
 
 def test_recently_used_tools_are_boosted():
@@ -189,3 +196,42 @@ def test_dispatcher_accessor_filters_when_enabled(monkeypatch):
     out = OrionDispatcher.resolve_tool_declarations(stub, "play chess")
     assert len(out) <= tr.MAX_TOOLS
     assert "chess" in {d["name"] for d in out}
+
+
+# ── typing slips (spelling.py) ───────────────────────────────────────────────
+
+def _speller():
+    from orion_core.spelling import Speller
+    asked = {"close": 9, "music": 9, "pause": 6, "weather": 3, "spotify": 4, "inbox": 2}
+    described = {"whether": 21, "weather": 6, "check": 5}
+    english = {"the": 1996, "check": 2000, "whether": 3251, "music": 2189, "paris": 3000,
+               "oven": 17428, "bike": 7997, "alert": 9000}
+    return Speller(asked, described, english)
+
+
+def test_a_slip_one_edit_from_a_tool_word_is_put_right():
+    sp = _speller()
+    assert sp.correct("colse spotfy") == "close spotify"          # swap, drop
+    assert sp.correct("pasue the musci") == "pause the music"
+    assert sp.correct("chekc my inbx") == "check my inbox"
+
+
+def test_asking_outranks_describing():
+    # "wether" is one edit from both; the tools are ASKED about the weather.
+    assert _speller().correct("whats the wether") == "whats the weather"
+
+
+def test_real_words_names_and_literals_are_never_touched():
+    sp = _speller()
+    for text in ("preheat the oven", "fly to paris", "fix my bike", "alerts please",
+                 "open main.py", "go to https://exampel.com/pasue", "parse_confgi", "it's"):
+        assert sp.correct(text) == text
+
+
+def test_no_dictionary_means_no_guessing(monkeypatch):
+    from orion_core import spelling
+    monkeypatch.setattr(spelling, "_english_words", lambda: {})
+    monkeypatch.setattr(spelling, "_ENGLISH", None)
+    cached = spelling.CachedSpeller("test", lambda: ({"close": 1, "spotify": 1}, {}), lambda: 1)
+    assert cached.get() is None
+    assert cached.correct("colse spotfy") == "colse spotfy"

@@ -1,0 +1,22 @@
+# ── O.R.I.O.N. requirements: integrations ──────────────────────────────────
+# Opt-in by nature: real-browser automation, security tooling for the user's
+# own authorised targets, and the repair-prediction plugin.
+
+scikit-learn>=1.5,<2                     # optional-on-use repair prediction plugin
+openpyxl>=3.1.5,<4                      # reviewed JV spreadsheet creation and verification
+sgp4>=2.25,<3                          # CelesTrak OMM satellite predictions in the World view
+pyserial>=3.5,<4                       # a robot on a USB serial port (robot_link 'serial:COM5')
+
+# Social automation (real TikTok/Instagram account, opt-in — accepts ban/ToS risk)
+playwright>=1.40,<2                      # channel="chrome" drives the user's real installed Chrome via a
+                          # dedicated persistent profile (orion_core/social_automation.py),
+                          # never the OS-default profile (Chrome refuses CDP attach on that
+                          # since ~M136/March 2025). Run once after installing:
+                          # `playwright install chrome`
+
+# Cybersecurity / pentesting (opt-in — for the user's own authorized targets/labs/CTFs only)
+scapy>=2.5,<3                            # packet crafting/analysis/capture — on Windows needs the Npcap driver
+                          # (npcap.com) for raw sockets; degrades to an actionable message without it.
+python-nmap>=0.7,<1                      # wraps the `nmap` CLI for port/service scans — needs nmap itself
+                          # installed separately (nmap.org); degrades to an actionable message
+                          # without it (checked via shutil.which("nmap")).

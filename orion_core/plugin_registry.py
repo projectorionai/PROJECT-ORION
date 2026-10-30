@@ -33,6 +33,7 @@ This module supplies that layer.  Its rules follow the rest of ORION:
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import os
 import tempfile
@@ -40,8 +41,9 @@ import shutil
 import zipfile
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PureWindowsPath
+from threading import RLock
+from typing import Any, Callable
 
 from .constants import CONFIG_DIR
 from .data import ToolResult
@@ -50,14 +52,67 @@ from .plugin_manifest import (
     MANIFEST_SUFFIX,
     PluginManifest,
     discover_manifests,
+    load_manifest,
+    plugin_identity,
     unmet_requirements,
 )
-from .atomic_io import atomic_write_text
+from .atomic_io import atomic_write_text, atomic_write_bytes, _replace
 
 PLUGIN_STATE_PATH = CONFIG_DIR / "plugins.json"
 CUSTOM_TOOLS_DIR = CONFIG_DIR / "custom_tools"
 _DEFAULT_TIER = "confirm"          # safest tier for anything undeclared
 _TOOL_SUFFIX = "_tool.py"
+MAX_PLUGIN_FILE_BYTES = 8 * 1024 * 1024
+MAX_PLUGIN_BUNDLE_BYTES = 32 * 1024 * 1024
+
+
+class _InstallRecoveryRequired(RuntimeError):
+    """Publication failed and its staging backups must be retained."""
+
+
+def detach_runtime(dispatcher: Any, name: str) -> None:
+    """Retire future registrations after a successful removal receipt.
+
+    Python objects held by in-flight calls may outlive their registration.
+    The registry's saved disabled tombstone also holds those cached calls.
+    """
+    safe = _safe_name(name)
+    retired = {name, safe}
+    handlers = getattr(dispatcher, "_tool_handlers", {})
+    if isinstance(handlers, dict):
+        retired.update(key for key in handlers if _safe_name(key) == safe)
+    scheduler = getattr(dispatcher, "plugin_scheduler", None)
+    if scheduler is not None:
+        entries = getattr(scheduler, "entries", {})
+        if isinstance(entries, dict):
+            retired.update(key for key in entries if _safe_name(key) == safe)
+        for key in retired:
+            try:
+                scheduler.remove(key)
+            except Exception:
+                pass
+    removed_handlers = set()
+    if isinstance(handlers, dict):
+        for key in retired:
+            if handlers.pop(key, None) is not None:
+                removed_handlers.add(key)
+    rollbacks = getattr(dispatcher, "_forge_rollbacks", {})
+    if isinstance(rollbacks, dict):
+        for key in list(rollbacks):
+            if _safe_name(key) == safe:
+                rollbacks.pop(key, None)
+    declarations = getattr(dispatcher, "TOOL_DECLARATIONS", None)
+    if removed_handlers and isinstance(declarations, list):
+        # A native name collision must not remove the built-in declaration.
+        table = getattr(dispatcher, "handler_table", None)
+        try:
+            native = table() if callable(table) else {}
+        except Exception:
+            return  # Keep declarations if native ownership cannot be checked.
+        connected = getattr(dispatcher, "_mcp_routes", {})
+        declarations[:] = [item for item in declarations
+                           if item.get("name") not in removed_handlers
+                           or item.get("name") in native or item.get("name") in connected]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -90,6 +145,16 @@ class PluginRecord:
     loaded: bool = False
     last_error: str = ""
     calls: int = 0
+    manifest_file: str = ""
+    secrets: tuple[str, ...] = ()
+    source_sha256: str = ""
+    #: Why its module sits in custom_tools/_quarantine (the loader moved it
+    #: there); the manifest alone stays active. 25 Oct 2026: this showed red
+    #: as "module file not found", as if the plugin had been lost.
+    quarantined: str = ""
+    #: The built-in tool this plugin duplicates. Held back on purpose, so it
+    #: is a neutral state, not a load error (it showed red as one).
+    superseded_by: str = ""
 
     @property
     def healthy(self) -> bool:
@@ -97,6 +162,10 @@ class PluginRecord:
                 and not self.problems and not self.last_error)
 
     def status(self) -> str:
+        if self.superseded_by:
+            return "superseded"
+        if self.quarantined:
+            return "quarantined"
         if not self.enabled:
             return "disabled"
         if not self.module_exists:
@@ -119,6 +188,10 @@ class PluginRecord:
             bits.append("needs: " + ", ".join(self.permissions))
         if self.undeclared:
             bits.append("UNDECLARED: " + ", ".join(self.undeclared))
+        if self.superseded_by:
+            bits.append(f"superseded by built-in {self.superseded_by}")
+        if self.quarantined:
+            bits.append(f"quarantined: {self.quarantined[:80]} (restore or remove it)")
         if self.missing_deps:
             bits.append(f"missing: {', '.join(self.missing_deps)}")
         if self.problems:
@@ -143,6 +216,10 @@ class PluginRecord:
             "last_error": self.last_error, "calls": self.calls,
             "version": self.version, "permissions": list(self.permissions),
             "undeclared": list(self.undeclared),
+            "secrets": list(self.secrets),
+            "source_sha256": self.source_sha256,
+            "quarantined": self.quarantined,
+            "superseded_by": self.superseded_by,
         }
 
 
@@ -241,7 +318,34 @@ def _module_roots(tree: "ast.AST") -> set[str]:
     return roots
 
 
+#: Static audits by content: (kind, file name, sha256) -> result. The Plugins
+#: page rescans every few seconds, and re-parsing two dozen unchanged plugins
+#: each time held the interpreter lock for 50-370 ms (28 Oct 2026). Keyed by
+#: the content's hash, re-read on every call, so any edit is audited afresh.
+_AUDITS: dict[tuple[str, str, str], Any] = {}
+
+
+def _audited(kind: str, path: Path, compute: Callable[[Path], Any]) -> Any:
+    import hashlib
+    path = Path(path)
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return compute(path)
+    key = (kind, path.name, digest)
+    if key not in _AUDITS:
+        if len(_AUDITS) > 512:
+            _AUDITS.clear()
+        _AUDITS[key] = compute(path)
+    return _AUDITS[key]
+
+
 def detect_capabilities(path: Path) -> set[str]:
+    """detect_capabilities_uncached, once per version of the file."""
+    return set(_audited("capabilities", path, detect_capabilities_uncached))
+
+
+def detect_capabilities_uncached(path: Path) -> set[str]:
     """Statically infer which PERMISSIONS a plugin module actually exercises.
 
     Pure ``ast`` — the module is never imported, so auditing an untrusted plugin
@@ -312,6 +416,11 @@ def compare_versions(left: str, right: str) -> int:
 
 
 def validate_module(path: Path) -> list[str]:
+    """validate_module_uncached, once per version of the file."""
+    return list(_audited("contract", path, validate_module_uncached))
+
+
+def validate_module_uncached(path: Path) -> list[str]:
     """Statically check that *path* satisfies ORION's plugin contract.
 
     Returns a list of human-readable problems — empty means it conforms.  This
@@ -344,30 +453,96 @@ def validate_module(path: Path) -> list[str]:
 
 
 def _schema_literal_problems(tree: "ast.AST") -> list[str]:
-    """Catch the schema mistakes the LOADER would reject, statically.
+    """Apply the loader's shared contract to a plain, literal schema.
 
-    The loader's contract requires ``parameters.type`` to be lowercase
-    ``'object'`` (forge_contract). A plugin declaring Gemini-style ``'OBJECT'``
-    passes every other check, is reported healthy, and then silently refuses to
-    activate — so the registry must see it here rather than promise a plugin
-    that will not load. Only literal dicts are inspected; a schema built
-    dynamically is left to the loader.
+    Only a direct literal return is inspected: computed or decorated exports
+    remain the runtime loader's responsibility. Ordinary data dictionaries are
+    not tool declarations. Defaults and annotations are represented by inert
+    placeholders, so validating a candidate never executes its code.
     """
-    problems: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Dict):
+    from .forge_contract import contract_problems, schema_problems
+
+    functions = {node.name: node for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    # Conditional definitions, imports and other module-scope bindings can
+    # replace a literal stub. Their resulting contract belongs to the loader.
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        for key, value in zip(node.keys, node.values):
-            if (isinstance(key, ast.Constant) and key.value == "type"
-                    and isinstance(value, ast.Constant)
-                    and isinstance(value.value, str)
-                    and value.value.lower() == "object"
-                    and value.value != "object"):
-                problems.append(
-                    "schema parameters 'type' must be lowercase 'object' "
-                    f"(found {value.value!r}) — the loader will refuse it")
-                return problems
-    return problems
+        if _module_scope_rebinds_export(node):
+            return []
+    schema_fn = functions.get("get_tool_schema")
+    if schema_fn is None or schema_fn.decorator_list:
+        return []
+    body = schema_fn.body[1:] if ast.get_docstring(schema_fn) is not None else schema_fn.body
+    if len(body) != 1 or not isinstance(body[0], ast.Return):
+        return []
+    try:
+        schema = ast.literal_eval(body[0].value)
+    except (ValueError, TypeError, SyntaxError, RecursionError):
+        return []
+
+    try:
+        problems, _properties = schema_problems(schema)
+    except (TypeError, ValueError) as exc:
+        return [f"CONTRACT: invalid literal tool schema: {exc}"]
+    run_fn = functions.get("run")
+    if run_fn is not None and not run_fn.decorator_list:
+        def placeholder():
+            pass
+
+        try:
+            placeholder.__signature__ = _static_function_signature(run_fn)
+        except ValueError as exc:
+            problems.append(f"run() has an invalid signature: {exc}")
+        else:
+            problems = contract_problems(schema, placeholder)
+    return [f"CONTRACT: {problem}" for problem in problems]
+
+
+def _module_scope_rebinds_export(node: ast.AST) -> bool:
+    """Conservatively identify export bindings without entering local scopes."""
+    exports = {"get_tool_schema", "run"}
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name in exports  # the body has its own scope
+    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return node.id in exports
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return any((alias.asname or alias.name.split(".")[0]) in exports
+                   or alias.name == "*" for alias in node.names)
+    if isinstance(node, ast.ExceptHandler) and node.name in exports:
+        return True
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in exports:
+        return True
+    if isinstance(node, ast.MatchMapping) and node.rest in exports:
+        return True
+    return any(_module_scope_rebinds_export(child) for child in ast.iter_child_nodes(node))
+
+
+def _static_function_signature(function: Any) -> inspect.Signature:
+    """Mirror an AST signature without evaluating defaults or annotations."""
+    arguments = function.args
+    positional = [*arguments.posonlyargs, *arguments.args]
+    defaults_start = len(positional) - len(arguments.defaults)
+    parameters = [
+        inspect.Parameter(
+            argument.arg,
+            inspect.Parameter.POSITIONAL_ONLY if index < len(arguments.posonlyargs)
+            else inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=inspect.Parameter.empty if index < defaults_start else None,
+        )
+        for index, argument in enumerate(positional)
+    ]
+    if arguments.vararg is not None:
+        parameters.append(inspect.Parameter(arguments.vararg.arg, inspect.Parameter.VAR_POSITIONAL))
+    parameters.extend(
+        inspect.Parameter(argument.arg, inspect.Parameter.KEYWORD_ONLY,
+                          default=inspect.Parameter.empty if default is None else None)
+        for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults)
+    )
+    if arguments.kwarg is not None:
+        parameters.append(inspect.Parameter(arguments.kwarg.arg, inspect.Parameter.VAR_KEYWORD))
+    return inspect.Signature(parameters)
 
 
 def extract_description(path: Path) -> str:
@@ -529,16 +704,19 @@ def scaffold(name: str, description: str = "", tier: str = _DEFAULT_TIER,
     directory = Path(directory or CUSTOM_TOOLS_DIR)
     directory.mkdir(parents=True, exist_ok=True)
     safe = _safe_name(name)
-    description = (description or f"The {safe.replace('_', ' ')} plugin.").strip()
+    description = str(description or "").strip() or f"The {safe.replace('_', ' ')} plugin."
     tier = tier if tier in CAPABILITY_TIERS else _DEFAULT_TIER
 
     module_path = directory / f"{safe}{_TOOL_SUFFIX}"
     manifest_path = directory / f"{safe}{MANIFEST_SUFFIX}"
-    # Escape quotes so a description containing " cannot break the template.
+    # The same escaped content is valid inside the module docstring and schema
+    # string. Preserve detailed purposes, including newlines and Windows paths,
+    # without turning their quotes/backslashes into executable Python syntax.
+    escaped_description = json.dumps(description, ensure_ascii=False)[1:-1]
     reactive = str(kind or "tool").strip().lower() in {
         "event", "events", "listener", "reactive", "watcher"}
     template = _TEMPLATE_LISTENER if reactive else _TEMPLATE
-    body = template.format(name=safe, description=description.replace('"', "'"))
+    body = template.format(name=safe, description=escaped_description)
     module_path.write_text(body, encoding="utf-8")
     # A new plugin is born WITH a version and an honest capability declaration:
     # if none is supplied we audit the freshly-written module and declare what it
@@ -576,12 +754,7 @@ def scaffold(name: str, description: str = "", tier: str = _DEFAULT_TIER,
 
 def _safe_name(name: str) -> str:
     """A filesystem/identifier-safe plugin name."""
-    cleaned = "".join(
-        c if (c.isalnum() or c == "_") else "_" for c in str(name or "").strip().lower()
-    ).strip("_")
-    while "__" in cleaned:
-        cleaned = cleaned.replace("__", "_")
-    return cleaned or "plugin"
+    return plugin_identity(name)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -599,6 +772,34 @@ def _digest(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         return ""
+
+
+def _forget_quarantined(target: Path, module_name: str) -> None:
+    """Remove a quarantined copy a delivered version has replaced. If the new
+    one fails to load, the loader quarantines it again with a fresh reason."""
+    qdir = target / "_quarantine"
+    broken = qdir / f"{module_name}.broken"
+    try:
+        broken.unlink(missing_ok=True)
+        index_path = qdir / "index.json"
+        if index_path.is_file():
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            if isinstance(index, dict) and index.pop(broken.name, None) is not None:
+                atomic_write_text(index_path, json.dumps(index, indent=2), encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+
+
+def _drop_quarantine_entry(qdir: Path, broken_name: str) -> None:
+    """Remove *broken_name*'s line from the quarantine index (the file itself
+    has already been restored or archived)."""
+    index_path = qdir / "index.json"
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(index, dict) and index.pop(broken_name, None) is not None:
+        atomic_write_text(index_path, json.dumps(index, indent=2), encoding="utf-8")
 
 
 def seed_shipped(target: Path, source: Path | None = None) -> list[str]:
@@ -663,6 +864,8 @@ def seed_shipped(target: Path, source: Path | None = None) -> list[str]:
                     shutil.copy2(target / f, backup / f"{f}.{stamp}")
             for f in files:
                 shutil.copy2(f, target / f.name)
+            if quarantined:
+                _forget_quarantined(target, module.name)
             ledger[name] = shipped
             delivered.append(name)
         atomic_write_text(ledger_path, json.dumps(ledger, indent=2, sort_keys=True),
@@ -686,6 +889,12 @@ class PluginRegistry:
         self.telemetry = telemetry
         self.directory = Path(directory or CUSTOM_TOOLS_DIR)
         self._state: dict[str, Any] = {"disabled": [], "meta": {}}
+        self._committed_disabled: frozenset[str] = frozenset()
+        self._runtime_holds: dict[str, str] = {}
+        self._ambiguous_identities: frozenset[str] = frozenset()
+        self._state_error = ""
+        self._file_lock = RLock()
+        self._state_lock = RLock()
         self._health: dict[str, dict[str, Any]] = {}
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
@@ -706,22 +915,64 @@ class PluginRegistry:
 
     def _load_state(self) -> None:
         try:
-            if PLUGIN_STATE_PATH.is_file():
-                data = json.loads(PLUGIN_STATE_PATH.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    disabled = data.get("disabled")
-                    meta = data.get("meta")
-                    self._state = {
-                        "disabled": list(disabled) if isinstance(disabled, list) else [],
-                        "meta": dict(meta) if isinstance(meta, dict) else {},
-                    }
+            data = json.loads(PLUGIN_STATE_PATH.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("saved plugin state must be an object")
+            disabled = data.get("disabled", [])
+            meta = data.get("meta", {})
+            if (not isinstance(disabled, list)
+                    or any(not isinstance(name, str) or not name.strip() for name in disabled)):
+                raise ValueError("disabled plugins must be a list of non-empty names")
+            if not isinstance(meta, dict):
+                raise ValueError("plugin metadata must be an object")
+            self._state = {"disabled": list(disabled), "meta": dict(meta)}
+            self._committed_disabled = frozenset(_safe_name(name) for name in disabled)
+            self._state_error = ""
+        except FileNotFoundError:
+            # A missing file is the supported first-run state. An unreadable
+            # existing file is not permission to forget saved disable choices.
+            self._state = {"disabled": [], "meta": {}}
+            self._committed_disabled = frozenset()
+            self._state_error = ""
         except Exception as exc:
-            self._log(f"PLUGIN: state unreadable, starting fresh - {exc}")
+            reason = str(exc) or type(exc).__name__
+            if reason != self._state_error:
+                self._log(f"PLUGIN: saved state unavailable; plugins held - {reason}")
+            self._state_error = reason
+
+    @property
+    def state_error(self) -> str:
+        return self._state_error
+
+    def _unavailable_state(self) -> ToolResult:
+        return ToolResult(
+            f"Saved plugin preferences are unavailable: {self._state_error}. "
+            f"Plugins are held and {PLUGIN_STATE_PATH} has been preserved. "
+            "Restore or repair that file, then restart ORION.", ok=False)
 
     def _save_state(self) -> bool:
-        temporary = None
+        with self._state_lock:
+            return self._save_state_locked()
+
+    def _save_state_locked(self) -> bool:
+        if self._state_error:
+            return False
+        temporary = backup = None
+        previous = None
+        published = keep_backup = False
         try:
             PLUGIN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                previous = PLUGIN_STATE_PATH.read_bytes()
+            except FileNotFoundError:
+                pass
+            if previous is not None:
+                with tempfile.NamedTemporaryFile(mode="wb", dir=PLUGIN_STATE_PATH.parent,
+                        suffix=".recovery.tmp", delete=False) as stream:
+                    backup = Path(stream.name)
+                    stream.write(previous)
+                    stream.flush()
+                    os.fsync(stream.fileno())
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
                     dir=PLUGIN_STATE_PATH.parent, suffix=".tmp", delete=False) as stream:
                 temporary = Path(stream.name)
@@ -729,27 +980,58 @@ class PluginRegistry:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, PLUGIN_STATE_PATH)
-            return json.loads(PLUGIN_STATE_PATH.read_text(encoding="utf-8")) == self._state
+            published = True
+            if json.loads(PLUGIN_STATE_PATH.read_text(encoding="utf-8")) != self._state:
+                raise ValueError("saved preferences did not match the requested state")
+            return True
         except Exception as exc:
+            if published:
+                try:
+                    if backup is None:
+                        PLUGIN_STATE_PATH.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(PLUGIN_STATE_PATH, previous)
+                        if PLUGIN_STATE_PATH.read_bytes() != previous:
+                            raise OSError("previous preferences could not be verified")
+                except Exception as recovery:
+                    keep_backup = True
+                    self._state_error = (
+                        f"saved preference recovery failed: {recovery}; "
+                        f"previous bytes retained at {backup}" if backup is not None
+                        else f"first-run preference recovery failed: {recovery}")
             self._log(f"PLUGIN: could not save state - {exc}")
             return False
         finally:
-            if temporary is not None:
+            for path in (temporary, None if keep_backup else backup):
+                if path is None:
+                    continue
                 try:
-                    temporary.unlink(missing_ok=True)
+                    path.unlink(missing_ok=True)
                 except OSError:
                     pass
 
     def is_enabled(self, name: str) -> bool:
-        return _safe_name(name) not in set(self._state.get("disabled") or [])
+        safe = _safe_name(name)
+        return (not self._state_error and safe not in self._committed_disabled
+                and safe not in self._runtime_holds and safe not in self._ambiguous_identities)
 
     def set_enabled(self, name: str, enabled: bool) -> ToolResult:
+        with self._state_lock:
+            return self._set_enabled_locked(name, enabled)
+
+    def _set_enabled_locked(self, name: str, enabled: bool) -> ToolResult:
+        if self._state_error:
+            return self._unavailable_state()
         safe = _safe_name(name)
-        known = {record.name for record in self.scan()}
+        if safe in self._runtime_holds:
+            return ToolResult(self._runtime_holds[safe] + " Restore the retained files and restart ORION.", ok=False)
+        known = {_safe_name(record.name) for record in self.scan()}
+        if safe in self._ambiguous_identities:
+            return ToolResult(f"Plugin '{name}' has ambiguous identities; resolve the metadata files first.", ok=False)
         if safe not in known:
             return ToolResult(f"No plugin named '{name}'.", ok=False)
         previous = list(self._state.get("disabled") or [])
-        disabled = set(previous)
+        disabled = {_safe_name(item) for item in previous}
         if enabled:
             disabled.discard(safe)
         else:
@@ -757,12 +1039,13 @@ class PluginRegistry:
         self._state["disabled"] = sorted(disabled)
         if not self._save_state():
             self._state["disabled"] = previous
-            return ToolResult(f"Could not verify the saved setting for plugin '{safe}'.", ok=False)
+            detail = f" {self._state_error}" if self._state_error else ""
+            return ToolResult(f"Could not verify the saved setting for plugin '{safe}'.{detail}", ok=False)
+        self._committed_disabled = frozenset(disabled)
         word = "enabled" if enabled else "disabled"
         self._log(f"PLUGIN: '{safe}' {word}.")
         note = "" if enabled else " It stays off until you enable it again."
-        restart = "" if enabled else " (already-loaded tools clear on restart)"
-        return ToolResult(f"Plugin '{safe}' {word}.{note}{restart}")
+        return ToolResult(f"Plugin '{safe}' {word}.{note}")
 
     # ── discovery ────────────────────────────────────────────────────────────
 
@@ -771,17 +1054,25 @@ class PluginRegistry:
         orphan ``*_tool.py`` that has no manifest yet (the forged tools)."""
         records: dict[str, PluginRecord] = {}
         manifests, errors = discover_manifests(self.directory)
+        owned_modules = {manifest.module for manifest in manifests}
 
         for manifest in manifests:
             record = self._record_from_manifest(manifest)
-            records[record.name] = record
+            identity = _safe_name(record.name)
+            if identity in records:
+                record.problems += ("Duplicate manifest identity; resolve the metadata files before loading or removal",)
+            records[identity] = record
 
         # Orphans: a *_tool.py with no manifest beside it still loads through
         # the forge path, so it must be visible here — that is exactly the set
         # that currently carries no declared capability tier.
         for module_path in sorted(self.directory.glob(f"*{_TOOL_SUFFIX}")):
             name = module_path.name[: -len(_TOOL_SUFFIX)]
-            if name in records:
+            if module_path.name in owned_modules:
+                continue
+            identity = _safe_name(name)
+            if identity in records:
+                records[identity].problems += ("Duplicate manifest identity; an orphan module has the same management name",)
                 continue
             record = PluginRecord(
                 name=name,
@@ -792,21 +1083,37 @@ class PluginRegistry:
                 has_manifest=False,
                 module_exists=True,
                 problems=tuple(validate_module(module_path)),
+                undeclared=tuple(sorted(detect_capabilities(module_path))),
+                source_sha256=_digest(module_path),
             )
-            records[name] = record
+            records[identity] = record
 
         for manifest_name, reason in errors.items():
             stem = manifest_name.replace(MANIFEST_SUFFIX, "")
-            records[stem] = PluginRecord(
+            identity = _safe_name(stem)
+            problem = (reason,)
+            if identity in records:
+                records[identity].problems += ("Duplicate manifest identity; invalid metadata has the same management name",)
+                continue
+            records[identity] = PluginRecord(
                 name=stem, enabled=self.is_enabled(stem),
-                has_manifest=True, problems=(reason,))
+                has_manifest=True, problems=problem, manifest_file=manifest_name)
 
+        self._ambiguous_identities = frozenset(
+            identity for identity, record in records.items()
+            if any("Duplicate manifest identity" in problem for problem in record.problems))
         for record in records.values():
-            health = self._health.get(record.name)
+            record.enabled = self.is_enabled(record.name)
+            health = self._health.get(_safe_name(record.name))
             if health:
                 record.loaded = bool(health.get("loaded"))
                 record.last_error = str(health.get("error") or "")
                 record.calls = int(health.get("calls") or 0)
+                record.superseded_by = str(health.get("superseded_by") or "")
+            if record.quarantined and record.last_error.startswith("module file"):
+                record.last_error = ""      # the quarantine IS the explanation
+            if _safe_name(record.name) in self._runtime_holds:
+                record.last_error = self._runtime_holds[_safe_name(record.name)]
         return sorted(records.values(), key=lambda r: r.name)
 
     def _record_from_manifest(self, manifest: PluginManifest) -> PluginRecord:
@@ -829,12 +1136,16 @@ class PluginRegistry:
             undeclared=tuple(
                 audit_permissions(module_path, manifest.permissions)["undeclared"]
             ) if exists and module_path else (),
+            manifest_file=manifest.source_path.name if manifest.source_path else "",
+            secrets=tuple(manifest.secrets),
+            source_sha256=_digest(module_path) if exists and module_path else "",
+            quarantined="" if exists else self.quarantine_reason_for_module(manifest.module),
         )
 
     def get(self, name: str) -> PluginRecord | None:
         safe = _safe_name(name)
         for record in self.scan():
-            if record.name == safe:
+            if _safe_name(record.name) == safe:
                 return record
         return None
 
@@ -856,6 +1167,186 @@ class PluginRegistry:
         entry = self._health.setdefault(_safe_name(name), {})
         entry["calls"] = int(entry.get("calls") or 0) + 1
 
+    # ── quarantined and superseded plugins (25 Oct 2026, owner report) ───────
+    #
+    # The Plugins page showed three gesture plugins in red as load ERRORS
+    # ("held back: it duplicates ORION's built-in tool 'gesture_control'") and
+    # jv_telegram_remote in red as "module file not found". Both are deliberate
+    # states, not faults: a duplicate is superseded by the built-in, and the
+    # Telegram module had been quarantined by the loader, its manifest left
+    # behind. They are now shown for what they are, a duplicate is archived
+    # out of the active set (a timestamped copy in _superseded/, never
+    # deleted), and a quarantined plugin can be restored or removed.
+
+    SUPERSEDED_DIR = "_superseded"
+    SUPERSEDED_INDEX = "index.json"
+
+    def quarantine_reason_for_module(self, module: str) -> str:
+        """Why *module* sits in _quarantine, or '' when it does not."""
+        module = str(module or "").strip()
+        if not module or Path(module).name != module:
+            return ""
+        qdir = self.directory / "_quarantine"
+        broken = qdir / f"{module}.broken"
+        try:
+            if not broken.is_file():
+                return ""
+        except OSError:
+            return ""
+        reason = ""
+        try:
+            index = json.loads((qdir / "index.json").read_text(encoding="utf-8"))
+            if isinstance(index, dict) and isinstance(index.get(broken.name), dict):
+                reason = str(index[broken.name].get("reason") or "")
+        except (OSError, ValueError):
+            pass
+        return reason or "it failed to load and was set aside"
+
+    def quarantine_reason(self, name: str) -> str:
+        """The quarantine reason for the plugin *name* (by its manifest)."""
+        safe = _safe_name(name)
+        manifests, _errors = discover_manifests(self.directory)
+        for manifest in manifests:
+            if _safe_name(manifest.name) == safe:
+                module_path = manifest.module_path
+                if module_path is not None and module_path.is_file():
+                    return ""
+                return self.quarantine_reason_for_module(manifest.module)
+        return ""
+
+    def _archive_files(self, paths: list[Path], receipt: dict[str, Any]) -> list[str]:
+        """Move *paths* into _superseded/ as ``<name>.<stamp>`` copies and log
+        a receipt in its index. Each copy is verified byte-for-byte before the
+        original is removed, so nothing is ever lost. Returns archived names."""
+        archive = self.directory / self.SUPERSEDED_DIR
+        archive.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        moved: list[str] = []
+        for path in paths:
+            data = path.read_bytes()
+            target = archive / f"{path.name}.{stamp}"
+            serial = 1
+            while target.exists():
+                target = archive / f"{path.name}.{stamp}-{serial}"
+                serial += 1
+            shutil.copy2(path, target)
+            if target.read_bytes() != data:
+                raise OSError(f"the archived copy of {path.name} did not verify")
+            path.unlink()
+            moved.append(target.name)
+        index_path = archive / self.SUPERSEDED_INDEX
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            if not isinstance(index, list):
+                index = []
+        except (OSError, ValueError):
+            index = []
+        index.append({**receipt, "files": moved,
+                      "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        atomic_write_text(index_path, json.dumps(index[-200:], indent=2), encoding="utf-8")
+        return moved
+
+    def _plugin_files(self, record: "PluginRecord") -> list[Path]:
+        root = self.directory.resolve()
+        names = [record.module] if record.module else []
+        if record.has_manifest:
+            names.append(record.manifest_file or f"{_safe_name(record.name)}{MANIFEST_SUFFIX}")
+        files: list[Path] = []
+        for filename in names:
+            if (not filename or Path(filename).name != filename
+                    or PureWindowsPath(filename).name != filename or ":" in filename):
+                raise ValueError("plugin files must be plain sibling filenames")
+            path = root / filename
+            if path.is_symlink():
+                raise ValueError(f"refusing to move {filename} through a link")
+            if path.is_file():
+                files.append(path)
+        return files
+
+    def supersede(self, name: str, builtin: str, reason: str = "") -> ToolResult:
+        """A plugin held back because it duplicates the built-in *builtin*:
+        recorded as superseded (neutral, not an error) and archived out of the
+        active set. Only the loader's exact-duplicate verdict calls this."""
+        with self._file_lock:
+            safe = _safe_name(name)
+            entry = self._health.setdefault(safe, {})
+            entry.update({"loaded": False, "error": "", "superseded_by": str(builtin)})
+            record = self.get(safe)
+            if record is None:
+                return ToolResult(f"No plugin named '{name}'.", ok=False)
+            try:
+                files = self._plugin_files(record)
+                if not files:
+                    return ToolResult(f"'{safe}' has no files left to archive.")
+                moved = self._archive_files(files, {
+                    "name": record.name, "superseded_by": str(builtin),
+                    "reason": reason or f"duplicates the built-in tool '{builtin}'"})
+            except Exception as exc:
+                self._log(f"PLUGIN: '{safe}' is superseded by the built-in '{builtin}' "
+                          f"(left in place: {exc}).")
+                return ToolResult(f"'{safe}' is superseded by '{builtin}' but could not be "
+                                  f"archived: {exc}", ok=False)
+            self._log(f"PLUGIN: '{safe}' is superseded by the built-in '{builtin}' - archived "
+                      f"to custom_tools/{self.SUPERSEDED_DIR}/ ({', '.join(moved)}).")
+            return ToolResult(f"Archived '{safe}' (superseded by the built-in {builtin}).",
+                              receipt={"archived": moved, "superseded_by": str(builtin)})
+
+    def superseded_archive(self) -> list[dict[str, Any]]:
+        """Receipts of plugins archived as superseded, newest first."""
+        try:
+            index = json.loads((self.directory / self.SUPERSEDED_DIR / self.SUPERSEDED_INDEX)
+                               .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(index, list):
+            return []
+        return [dict(item) for item in reversed(index)
+                if isinstance(item, dict) and item.get("superseded_by")]
+
+    def restore_quarantined(self, name: str) -> ToolResult:
+        """Put a quarantined plugin's module back, if it would pass the forge's
+        safety gate today. The quarantined copy is archived, not deleted; a
+        module that still fails to load is quarantined again on the next load."""
+        with self._file_lock:
+            if self._state_error:
+                return self._unavailable_state()
+            record = self.get(name)
+            if record is None:
+                return ToolResult(f"No plugin named '{name}'.", ok=False)
+            if not record.quarantined:
+                return ToolResult(f"Plugin '{record.name}' is not quarantined.", ok=False)
+            qdir = self.directory / "_quarantine"
+            broken = qdir / f"{record.module}.broken"
+            target = self.directory / record.module
+            try:
+                source = broken.read_text(encoding="utf-8", errors="replace")
+                from .security import SecuritySanitiser, SecurityViolation
+                trial = record.module[: -len(_TOOL_SUFFIX)] if record.module.endswith(_TOOL_SUFFIX) else record.name
+                try:
+                    SecuritySanitiser.guard_forged_source(source, f"restore.{broken.name}",
+                                                          trial_name=trial)
+                except SecurityViolation as exc:
+                    return ToolResult(
+                        f"'{record.name}' cannot be restored as it is: {exc}. Remove it, or ask the "
+                        "forge to rebuild it.", ok=False, receipt={"restored": False})
+                if target.exists():
+                    return ToolResult(f"A live '{record.module}' already exists; nothing restored.", ok=False)
+                shutil.copy2(broken, target)
+                if target.read_bytes() != broken.read_bytes():
+                    target.unlink(missing_ok=True)
+                    raise OSError("the restored copy did not verify")
+                self._archive_files([broken], {"name": record.name, "restored_from_quarantine": True,
+                                               "reason": record.quarantined})
+                _drop_quarantine_entry(qdir, broken.name)
+            except Exception as exc:
+                return ToolResult(f"Could not restore '{record.name}': {exc}", ok=False)
+            self._health.pop(_safe_name(record.name), None)
+            self._log(f"PLUGIN: restored '{record.name}' from quarantine - it loads on the next reload.")
+            return ToolResult(
+                f"Restored '{record.name}'. Say 'reload plugins' (or restart) to load it; if it "
+                f"still fails ({record.quarantined}) the loader sets it aside again.",
+                receipt={"restored": True, "module": record.module})
+
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def create(self, name: str, description: str = "",
@@ -864,10 +1355,17 @@ class PluginRegistry:
                kind: str = "tool",
                events: "tuple[str, ...] | list[str] | None" = None) -> ToolResult:
         """Scaffold a new, immediately-working plugin."""
+        with self._file_lock:
+            return self._create_locked(name, description, tier, version, permissions, kind, events)
+
+    def _create_locked(self, name: str, description: str, tier: str, version: str,
+                       permissions: Any, kind: str, events: Any) -> ToolResult:
+        if self._state_error:
+            return self._unavailable_state()
         safe = _safe_name(name)
         if not safe or safe == "plugin":
             return ToolResult("Give the plugin a name, sir.", ok=False)
-        if (self.directory / f"{safe}{_TOOL_SUFFIX}").exists():
+        if self.get(safe) is not None or (self.directory / f"{safe}{_TOOL_SUFFIX}").exists():
             return ToolResult(
                 f"A plugin called '{safe}' already exists. Pick another name, "
                 "or remove it first.", ok=False)
@@ -878,9 +1376,7 @@ class PluginRegistry:
                 kind=kind, events=events)
         except Exception as exc:
             return ToolResult(f"Could not create the plugin: {exc}", ok=False)
-        self._state.setdefault("meta", {})[safe] = {
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"), "source": "scaffold"}
-        self._save_state()
+        self._record_install(safe, "scaffold")
         self._log(f"PLUGIN: scaffolded '{safe}' → {module_path.name}")
         return ToolResult(
             f"Created plugin '{safe}' (tier={tier}).\n"
@@ -892,6 +1388,12 @@ class PluginRegistry:
     def install(self, source: str) -> ToolResult:
         """Install a plugin from a path to a ``*_tool.py`` (its manifest is
         copied too when one sits beside it, and generated when it does not)."""
+        with self._file_lock:
+            return self._install_locked(source)
+
+    def _install_locked(self, source: str) -> ToolResult:
+        if self._state_error:
+            return self._unavailable_state()
         raw = str(source or "").strip().strip('"').strip("'")
         if not raw:
             return ToolResult("Give me a path to the plugin file, sir.", ok=False)
@@ -905,75 +1407,271 @@ class PluginRegistry:
         if src.suffix != ".py":
             return ToolResult("A plugin module must be a .py file.", ok=False)
 
-        problems = validate_module(src)
-        if problems:
-            return ToolResult(
-                f"'{src.name}' does not satisfy the plugin contract:\n  - "
-                + "\n  - ".join(problems)
-                + "\nIt needs top-level get_tool_schema() and run() functions.",
-                ok=False)
-
         stem = src.name[: -len(_TOOL_SUFFIX)] if src.name.endswith(_TOOL_SUFFIX) \
             else src.stem
         safe = _safe_name(stem)
-        target = self.directory / f"{safe}{_TOOL_SUFFIX}"
         try:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, target)
+            files = {f"{safe}{_TOOL_SUFFIX}": self._candidate_bytes(src)}
+            sibling = src.parent / f"{stem}{MANIFEST_SUFFIX}"
+            if sibling.exists():
+                payload = json.loads(self._candidate_bytes(sibling).decode("utf-8"))
+                manifest = PluginManifest.from_dict(payload, source_path=sibling)
+                if manifest.module != src.name:
+                    raise ValueError("The manifest must describe the selected module")
+                payload["module"] = f"{safe}{_TOOL_SUFFIX}"
+                files[f"{safe}{MANIFEST_SUFFIX}"] = json.dumps(payload, indent=2).encode("utf-8")
+            installed = self._install_candidates(files)
         except Exception as exc:
-            return ToolResult(f"Could not copy the plugin in: {exc}", ok=False)
-
-        # Bring its manifest along, or synthesise one so it gains a tier.
-        sibling = src.parent / f"{stem}{MANIFEST_SUFFIX}"
-        manifest_target = self.directory / f"{safe}{MANIFEST_SUFFIX}"
-        if sibling.is_file():
-            try:
-                shutil.copy2(sibling, manifest_target)
-            except Exception:
-                self._write_manifest(safe, target)
-        else:
-            self._write_manifest(safe, target)
-
-        self._state.setdefault("meta", {})[safe] = {
-            "installed_at": time.strftime("%Y-%m-%d %H:%M:%S"), "source": str(src)}
-        self._save_state()
+            return ToolResult(f"Could not install the plugin: {exc}", ok=False)
+        saved = self._record_installs(installed, str(src))
         self._log(f"PLUGIN: installed '{safe}' from {src}")
         return ToolResult(
             f"Installed plugin '{safe}' (validated against the contract). "
-            "Run 'plugin reload' to bring it live.")
+            "Run 'plugin reload' to bring it live."
+            + ("" if saved else " Install metadata could not be saved."))
+
+    @staticmethod
+    def _candidate_bytes(path: Path) -> bytes:
+        with path.open("rb") as stream:
+            data = stream.read(MAX_PLUGIN_FILE_BYTES + 1)
+        if len(data) > MAX_PLUGIN_FILE_BYTES:
+            raise ValueError(f"{path.name} exceeds the plugin file budget")
+        return data
+
+    def _record_install(self, name: str, source: str) -> bool:
+        return self._record_installs([name], source)
+
+    def _record_installs(self, names: list[str], source: str) -> bool:
+        with self._state_lock:
+            for name in names:
+                self._state.setdefault("meta", {})[_safe_name(name)] = {
+                    "installed_at": time.strftime("%Y-%m-%d %H:%M:%S"), "source": source}
+            return self._save_state()
+
+    def _install_candidates(self, files: dict[str, bytes]) -> list[str]:
+        """Validate a complete batch, then publish with rollback on IO failure.
+
+        Each replacement is atomic, but this is not a multi-file transaction
+        across a process crash or an unrelated concurrent filesystem reader.
+        """
+        modules = [name for name in files if name.endswith(".py")]
+        if len({name.casefold() for name in files}) != len(files):
+            raise ValueError("Plugin filenames collide on a case-insensitive filesystem")
+        if not modules:
+            raise ValueError("The candidate contains no plugin module")
+        if sum(map(len, files.values())) > MAX_PLUGIN_BUNDLE_BYTES:
+            raise ValueError("The candidate exceeds the expanded plugin bundle budget")
+        self.directory.mkdir(parents=True, exist_ok=True)
+        root = self.directory.resolve()
+        staging = Path(tempfile.mkdtemp(prefix=".install-stage-", dir=root))
+        keep_recovery = False
+        try:
+            for name, data in files.items():
+                if (Path(name).name != name or PureWindowsPath(name).name != name
+                        or ":" in name or any(ord(char) < 32 for char in name)):
+                    raise ValueError("Plugin members must be plain sibling filenames")
+                if len(data) > MAX_PLUGIN_FILE_BYTES:
+                    raise ValueError(f"{name} exceeds the plugin file budget")
+                (staging / name).write_bytes(data)
+            supplied, errors = discover_manifests(staging)
+            if errors:
+                raise ValueError("; ".join(errors.values()))
+            owned_modules = {manifest.module for manifest in supplied}
+            for name in modules:
+                path = staging / name
+                problems = validate_module(path)
+                if problems:
+                    raise ValueError(f"{name}: " + "; ".join(problems))
+                if name not in owned_modules:
+                    if not name.endswith(_TOOL_SUFFIX):
+                        raise ValueError(f"{name} must have an explicit plugin manifest")
+                    if self._write_manifest(name[:-len(_TOOL_SUFFIX)], path, directory=staging) is None:
+                        raise OSError("Could not prepare the plugin manifest")
+            prepared = []
+            for manifest_path in staging.glob(f"*{MANIFEST_SUFFIX}"):
+                manifest = load_manifest(manifest_path)
+                module_path = manifest.module_path
+                if module_path is None or not module_path.is_file():
+                    raise ValueError(f"{manifest_path.name} refers to a module outside this candidate")
+                prepared.append(manifest)
+            identities = [_safe_name(manifest.name) for manifest in prepared]
+            if len(set(identities)) != len(identities):
+                raise ValueError("Duplicate manifest identity in the plugin candidate")
+            if len({manifest.module.casefold() for manifest in prepared}) != len(prepared):
+                raise ValueError("Each plugin module must have exactly one manifest owner")
+            for record in self.scan():
+                for manifest in prepared:
+                    if _safe_name(record.name) != _safe_name(manifest.name):
+                        continue
+                    replacing_owner = record.manifest_file == manifest.source_path.name
+                    replacing_orphan = not record.has_manifest and record.module in modules
+                    if not replacing_owner and not replacing_orphan:
+                        raise ValueError(f"Plugin identity '{manifest.name}' conflicts with existing '{record.name}'")
+            candidates = sorted(path for path in staging.iterdir() if path.is_file())
+            previous = staging / ".previous"
+            previous.mkdir()
+            backups: dict[Path, Path | None] = {}
+            for path in candidates:
+                target = root / path.name
+                if target.is_symlink() or target.resolve().parent != root:
+                    raise ValueError(f"Refusing an installation through {target.name}")
+                if target.exists():
+                    if not target.is_file():
+                        raise ValueError(f"{target.name} is not a regular file")
+                    old = previous / target.name
+                    shutil.copy2(target, old)
+                    backups[target] = old
+                else:
+                    backups[target] = None
+            published = []
+            try:
+                for path in sorted(candidates, key=lambda item: (not item.name.endswith(_TOOL_SUFFIX), item.name)):
+                    target = root / path.name
+                    _replace(str(path), target)
+                    published.append(target)
+            except Exception as exc:
+                recovery_errors = []
+                for target in reversed(published):
+                    try:
+                        old = backups[target]
+                        if old is None:
+                            target.unlink(missing_ok=True)
+                        else:
+                            _replace(str(old), target)
+                    except OSError as recovery:
+                        recovery_errors.append(str(recovery))
+                if recovery_errors:
+                    keep_recovery = True
+                    raise _InstallRecoveryRequired(
+                        f"Installation failed ({exc}); rollback could not finish. "
+                        f"Previous files are retained in {previous}: {'; '.join(recovery_errors)}") from exc
+                raise
+            return sorted(manifest.name for manifest in prepared)
+        finally:
+            # This exact directory was created within the configured plugin
+            # root. Preserve it if rollback needs manual recovery.
+            if not keep_recovery and staging.resolve().is_relative_to(root):
+                shutil.rmtree(staging, ignore_errors=True)
 
     def remove(self, name: str) -> ToolResult:
+        with self._file_lock, self._state_lock:
+            return self._remove_locked(name)
+
+    def _remove_locked(self, name: str) -> ToolResult:
+        if self._state_error:
+            return self._unavailable_state()
         safe = _safe_name(name)
         record = self.get(safe)
         if record is None:
             return ToolResult(f"No plugin named '{name}'.", ok=False)
-        removed: list[str] = []
-        for path in (self.directory / f"{safe}{_TOOL_SUFFIX}",
-                     self.directory / f"{safe}{MANIFEST_SUFFIX}"):
-            try:
-                if path.is_file():
-                    path.unlink()
-                    removed.append(path.name)
-            except Exception as exc:
-                return ToolResult(f"Could not remove {path.name}: {exc}", ok=False)
-        self._state.setdefault("meta", {}).pop(safe, None)
-        disabled = set(self._state.get("disabled") or [])
-        disabled.discard(safe)
-        self._state["disabled"] = sorted(disabled)
-        self._save_state()
+        if any("Duplicate manifest identity" in problem for problem in record.problems):
+            return ToolResult(f"Plugin '{safe}' has ambiguous manifests; resolve those files before removal.", ok=False)
+        if record.quarantined:
+            return self._remove_quarantined_locked(record)
+        staging = None
+        removed: list[Path] = []
+        previous_state = {"disabled": list(self._state.get("disabled") or []),
+                          "meta": dict(self._state.get("meta") or {})}
+        keep_recovery = False
+        root = self.directory.resolve()
+        try:
+            filenames = [record.module or f"{safe}{_TOOL_SUFFIX}"]
+            if record.has_manifest:
+                filenames.append(record.manifest_file or f"{safe}{MANIFEST_SUFFIX}")
+            paths = []
+            for filename in filenames:
+                if (Path(filename).name != filename or PureWindowsPath(filename).name != filename
+                        or ":" in filename or any(ord(char) < 32 for char in filename)):
+                    raise ValueError("Plugin removal requires plain sibling filenames")
+                path = root / filename
+                if path.is_symlink() or path.resolve().parent != root:
+                    raise ValueError(f"Refusing removal through {filename}")
+                if path.exists():
+                    if not path.is_file():
+                        raise ValueError(f"{filename} is not a regular file")
+                    paths.append(path)
+            if not paths:
+                return ToolResult(f"Nothing to remove for '{safe}'.", ok=False)
+            staging = Path(tempfile.mkdtemp(prefix=".remove-recovery-", dir=root))
+            for path in paths:
+                shutil.copy2(path, staging / path.name)
+            for path in paths:
+                path.unlink()
+                removed.append(path)
+            for key in list(self._state["meta"]):
+                if _safe_name(key) == safe:
+                    self._state["meta"].pop(key, None)
+            # Keep a saved tombstone: a cached handler or a later reinstall
+            # cannot silently revive the removed generation.
+            disabled = {_safe_name(item) for item in self._state.get("disabled") or []} | {safe}
+            self._state["disabled"] = sorted(disabled)
+            if not self._save_state():
+                raise OSError("Could not verify the saved removal preference" +
+                              (f": {self._state_error}" if self._state_error else ""))
+            self._committed_disabled = frozenset(disabled)
+        except Exception as exc:
+            self._state = previous_state
+            recovery_errors = []
+            for path in reversed(removed):
+                try:
+                    _replace(str(staging / path.name), path)
+                except OSError as recovery:
+                    recovery_errors.append(str(recovery))
+            if recovery_errors:
+                keep_recovery = True
+                reason = (f"Removal rollback could not finish; '{safe}' is held. "
+                          f"Previous files retained at {staging}: {'; '.join(recovery_errors)}")
+                self._runtime_holds[safe] = reason
+                return ToolResult(f"Could not remove '{safe}': {exc}. {reason}", ok=False)
+            return ToolResult(f"Could not remove '{safe}': {exc}", ok=False)
+        finally:
+            if staging is not None and not keep_recovery and staging.resolve().is_relative_to(root):
+                shutil.rmtree(staging, ignore_errors=True)
         self._health.pop(safe, None)
         self._log(f"PLUGIN: removed '{safe}'.")
-        if not removed:
-            return ToolResult(f"Nothing to remove for '{safe}'.", ok=False)
         return ToolResult(
-            f"Removed plugin '{safe}' ({', '.join(removed)}). "
-            "It stays registered until the next restart.")
+            f"Removed plugin '{safe}' ({', '.join(path.name for path in removed)}). "
+            "Cached calls are held. Reinstall and explicitly enable it to use it again.",
+            evidence=[{"kind": "plugin_removed", "name": record.name, "identity": safe}])
+
+    def _remove_quarantined_locked(self, record: "PluginRecord") -> ToolResult:
+        """Retire a quarantined plugin: its manifest and the quarantined module
+        are archived to _superseded/ (verified copies, nothing deleted), its
+        quarantine line is dropped and a saved tombstone keeps it from
+        reviving. The owner can still move the files back by hand."""
+        safe = _safe_name(record.name)
+        qdir = self.directory / "_quarantine"
+        broken = qdir / f"{record.module}.broken"
+        previous = list(self._state.get("disabled") or [])
+        try:
+            files = self._plugin_files(record) + ([broken] if broken.is_file() else [])
+            if not files:
+                return ToolResult(f"Nothing to remove for '{safe}'.", ok=False)
+            disabled = {_safe_name(item) for item in previous} | {safe}
+            self._state["disabled"] = sorted(disabled)
+            if not self._save_state():
+                self._state["disabled"] = previous
+                return ToolResult(f"Could not save the removal of '{safe}'; nothing was moved.", ok=False)
+            self._committed_disabled = frozenset(disabled)
+            moved = self._archive_files(files, {"name": record.name, "removed_quarantined": True,
+                                                "reason": record.quarantined})
+            _drop_quarantine_entry(qdir, broken.name)
+        except Exception as exc:
+            return ToolResult(f"Could not remove '{safe}': {exc}", ok=False)
+        self._health.pop(safe, None)
+        self._log(f"PLUGIN: removed quarantined '{safe}' - archived to custom_tools/"
+                  f"{self.SUPERSEDED_DIR}/ ({', '.join(moved)}).")
+        return ToolResult(
+            f"Removed the quarantined plugin '{safe}'. Its files are kept in custom_tools/"
+            f"{self.SUPERSEDED_DIR}/ in case you want them back.",
+            evidence=[{"kind": "plugin_removed", "name": record.name, "identity": safe}],
+            receipt={"archived": moved})
 
     def _write_manifest(self, name: str, module_path: Path,
-                        tier: str = _DEFAULT_TIER) -> Path | None:
+                        tier: str = _DEFAULT_TIER, *, directory: Path | None = None) -> Path | None:
         """Generate a manifest for a module that has none."""
         safe = _safe_name(name)
-        manifest_path = self.directory / f"{safe}{MANIFEST_SUFFIX}"
+        manifest_path = (directory or self.directory) / f"{safe}{MANIFEST_SUFFIX}"
         payload = {
             "name": safe,
             "description": extract_description(module_path)
@@ -1043,31 +1741,69 @@ class PluginRegistry:
         A plugin was previously only shareable by telling someone which two files
         to copy. A bundle is one file that install() accepts directly.
         """
+        with self._file_lock:
+            return self._export_bundle_locked(name, destination)
+
+    def _export_bundle_locked(self, name: str, destination: str) -> ToolResult:
+        try:
+            return self._write_export_bundle(name, destination)
+        except Exception as exc:
+            return ToolResult(f"Could not write the bundle: {exc}", ok=False)
+
+    def _write_export_bundle(self, name: str, destination: str) -> ToolResult:
         record = self.get(name)
         if record is None:
             return ToolResult(f"I have no plugin called '{name}', sir.", ok=False)
-        module_path = self.directory / (record.module or f"{record.name}{_TOOL_SUFFIX}")
-        if not module_path.is_file():
-            return ToolResult(f"'{name}' has no module file to export.", ok=False)
-        manifest_path = self.directory / f"{record.name}{MANIFEST_SUFFIX}"
+        if any("Duplicate manifest identity" in problem for problem in record.problems):
+            return ToolResult(f"Plugin '{name}' has ambiguous manifests; resolve them before export.", ok=False)
+        root = self.directory.resolve()
+        filenames = [record.module or f"{_safe_name(record.name)}{_TOOL_SUFFIX}"]
+        if record.has_manifest:
+            filenames.append(record.manifest_file or f"{_safe_name(record.name)}{MANIFEST_SUFFIX}")
+        sources = []
+        for filename in filenames:
+            if (Path(filename).name != filename or PureWindowsPath(filename).name != filename
+                    or ":" in filename or any(ord(char) < 32 for char in filename)):
+                raise ValueError("Plugin export requires plain sibling filenames")
+            path = root / filename
+            if path.is_symlink() or path.resolve().parent != root or not path.is_file():
+                raise ValueError(f"Cannot export unavailable or redirected plugin file '{filename}'")
+            sources.append(path)
+        bundle_name = f"{_safe_name(record.name)}.orionplugin"
         target = Path(destination).expanduser() if str(destination or "").strip() else (
-            self.directory / "bundles" / f"{record.name}.orionplugin")
+            self.directory / "bundles" / bundle_name)
         if target.is_dir():
-            target = target / f"{record.name}.orionplugin"
+            target = target / bundle_name
+        if target.is_symlink():
+            raise ValueError("Refusing to replace an export destination through a symbolic link")
+        # Protect this plugin's sources, including hard-link aliases, and the
+        # other plugin modules/metadata in the same registry.
+        protected = [*root.glob("*.py"), *root.glob(f"*{MANIFEST_SUFFIX}")]
+        for source in protected:
+            if (target.resolve() == source.resolve()
+                    or (target.exists() and source.exists() and target.samefile(source))):
+                raise ValueError("The export destination would overwrite a plugin source or manifest")
+        temporary = None
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as bundle:
-                bundle.write(module_path, module_path.name)
-                if manifest_path.is_file():
-                    bundle.write(manifest_path, manifest_path.name)
-                else:
-                    # Export is not a place to lose the capability tier - write a
-                    # manifest into the bundle rather than shipping a bare module.
-                    bundle.writestr(
-                        f"{record.name}{MANIFEST_SUFFIX}",
-                        json.dumps(self._manifest_dict(record), indent=2))
-        except Exception as exc:
-            return ToolResult(f"Could not write the bundle: {exc}", ok=False)
+            descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".export.tmp", dir=target.parent)
+            with os.fdopen(descriptor, "w+b") as stream:
+                with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as bundle:
+                    for source in sources:
+                        bundle.write(source, source.name)
+                    if not record.has_manifest:
+                        bundle.writestr(
+                            f"{_safe_name(record.name)}{MANIFEST_SUFFIX}",
+                            json.dumps(self._manifest_dict(record), indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
+            _replace(temporary, target)
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
         return ToolResult(
             f"Exported '{record.name}' (v{record.version}, tier={record.tier}) to\n"
             f"  {target}\n"
@@ -1083,15 +1819,22 @@ class PluginRegistry:
             "permissions": list(record.permissions),
             "events": [],
             "requires": list(record.requires),
+            "secrets": list(record.secrets),
         }
 
     def install_bundle(self, source: str) -> ToolResult:
         """Install a plugin from a .orionplugin/.zip bundle.
 
         Every member is checked before anything is written: only a plain
-        ``*_tool.py`` / ``*.plugin.json`` at the archive ROOT is accepted, so a
+        plugin ``*.py`` / ``*.plugin.json`` at the archive ROOT is accepted, so a
         malicious bundle cannot path-traverse out of the plugin directory.
         """
+        with self._file_lock:
+            return self._install_bundle_locked(source)
+
+    def _install_bundle_locked(self, source: str) -> ToolResult:
+        if self._state_error:
+            return self._unavailable_state()
         raw = str(source or "").strip().strip('"').strip("'")
         src = Path(raw).expanduser()
         if not src.is_file():
@@ -1103,36 +1846,45 @@ class PluginRegistry:
                     m for m in members
                     if not m.endswith("/")
                     and "/" not in m and "\\" not in m and not m.startswith("..")
-                    and (m.endswith(_TOOL_SUFFIX) or m.endswith(MANIFEST_SUFFIX))
+                    and ":" not in m and not any(ord(char) < 32 for char in m)
+                    and (m.endswith(".py") or m.endswith(MANIFEST_SUFFIX))
                 ]
                 if not safe:
                     return ToolResult(
                         "That bundle contains no plugin module - expected a "
                         f"*{_TOOL_SUFFIX} at the top level.", ok=False)
                 rejected = [m for m in members if m not in safe]
-                self.directory.mkdir(parents=True, exist_ok=True)
+                if len(safe) != len({name.casefold() for name in safe}):
+                    raise ValueError("Duplicate filenames in a plugin bundle")
+                files = {}
+                expanded = 0
                 for member in safe:
-                    bundle.extract(member, self.directory)
+                    info = bundle.getinfo(member)
+                    expanded += info.file_size
+                    if info.file_size > MAX_PLUGIN_FILE_BYTES or expanded > MAX_PLUGIN_BUNDLE_BYTES:
+                        raise ValueError("The candidate exceeds the expanded plugin bundle budget")
+                    with bundle.open(info) as stream:
+                        data = stream.read(MAX_PLUGIN_FILE_BYTES + 1)
+                    if len(data) > MAX_PLUGIN_FILE_BYTES:
+                        raise ValueError(f"{member} exceeds the plugin file budget")
+                    files[member] = data
+                installed = self._install_candidates(files)
         except zipfile.BadZipFile:
             return ToolResult("That file is not a readable plugin bundle.", ok=False)
         except Exception as exc:
             return ToolResult(f"Could not install the bundle: {exc}", ok=False)
-        installed = sorted({m[: -len(_TOOL_SUFFIX)] for m in safe
-                            if m.endswith(_TOOL_SUFFIX)})
         note = ""
         if rejected:
             note = (f"\n  (ignored {len(rejected)} unexpected file(s) in the bundle: "
                     + ", ".join(rejected[:3]) + ")")
-        for plugin_name in installed:
-            self._state.setdefault("meta", {})[plugin_name] = {
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"), "source": "bundle"}
-        self._save_state()
+        saved = self._record_installs(installed, "bundle")
         if not installed:
             return ToolResult("The bundle held a manifest but no module." + note,
                               ok=False)
         return ToolResult(
             f"Installed {', '.join(installed)} from the bundle.{note}\n"
-            "Run 'plugin audit' to see what it can touch, then 'plugin reload'.")
+            "Run 'plugin audit' to see what it can touch, then 'plugin reload'."
+            + ("" if saved else " Install metadata could not be saved."))
 
     # -- tier vs capability coherence -----------------------------------------
 
@@ -1173,6 +1925,10 @@ class PluginRegistry:
         safe default (``confirm``) means an unattended remote request must be
         confirmed rather than silently allowed.
         """
+        with self._file_lock:
+            return self._backfill_manifests_locked()
+
+    def _backfill_manifests_locked(self) -> list[str]:
         written: list[str] = []
         for module_path in sorted(self.directory.glob(f"*{_TOOL_SUFFIX}")):
             name = module_path.name[: -len(_TOOL_SUFFIX)]
@@ -1218,6 +1974,8 @@ class PluginRegistry:
     # ── reporting ────────────────────────────────────────────────────────────
 
     def list_plugins(self) -> ToolResult:
+        if self._state_error:
+            return self._unavailable_state()
         records = self.scan()
         if not records:
             return ToolResult(
@@ -1262,8 +2020,12 @@ class PluginRegistry:
 
     def doctor(self, events: Any = None) -> ToolResult:
         """One health pass over the whole plugin surface."""
+        if self._state_error:
+            return self._unavailable_state()
         records = self.scan()
         problems: list[str] = []
+        set_aside = [r for r in records if r.quarantined or r.superseded_by]
+        records = [r for r in records if not (r.quarantined or r.superseded_by)]
         for record in records:
             if not record.module_exists:
                 problems.append(f"{record.name}: module file missing")
@@ -1278,12 +2040,19 @@ class PluginRegistry:
         no_manifest = [r.name for r in records if not r.has_manifest]
         quarantined = self._quarantined()
 
-        lines = [f"PLUGIN DOCTOR — {len(records)} plugin(s) inspected.", ""]
+        lines = [f"PLUGIN DOCTOR — {len(records) + len(set_aside)} plugin(s) inspected.", ""]
         if problems:
             lines.append(f"{len(problems)} problem(s):")
             lines += [f"  ✗ {problem}" for problem in problems]
         else:
             lines.append("  ✓ No problems found.")
+        for record in set_aside:
+            if record.superseded_by:
+                lines.append(f"  · {record.name}: superseded by the built-in "
+                             f"{record.superseded_by} (held back on purpose)")
+            else:
+                lines.append(f"  · {record.name}: quarantined - {record.quarantined[:120]} "
+                             f"→ 'plugin restore {record.name}' or 'plugin remove {record.name}'")
         if no_manifest:
             lines.append("")
             lines.append(
@@ -1333,7 +2102,11 @@ class PluginRegistry:
             if not index.is_file():
                 return []
             data = json.loads(index.read_text(encoding="utf-8"))
-            return sorted(data.keys()) if isinstance(data, dict) else []
+            if not isinstance(data, dict):
+                return []
+            # An entry whose tool is live again is history, not a fault.
+            return sorted(name for name in data
+                          if not (self.directory / name[: -len(".broken")]).exists())
         except Exception:
             return []
 
@@ -1342,7 +2115,14 @@ class PluginRegistry:
         records = self.scan()
         return {
             "total": len(records),
+            "state_error": self._state_error,
             "enabled": sum(1 for r in records if r.enabled),
             "healthy": sum(1 for r in records if r.enabled and r.healthy),
+            "quarantined": sum(1 for r in records if r.quarantined),
+            "superseded": sum(1 for r in records if r.superseded_by),
+            "archived": [{"name": str(item.get("name") or ""),
+                          "superseded_by": str(item.get("superseded_by") or ""),
+                          "at": str(item.get("at") or "")}
+                         for item in self.superseded_archive()[:12]],
             "plugins": [r.to_dict() for r in records],
         }

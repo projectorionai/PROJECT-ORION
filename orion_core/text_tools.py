@@ -46,6 +46,8 @@ MAX_STEPS = 4
 MENU_SIZE = 10
 #: Characters of one tool result shown back to the model.
 RESULT_CHARS = 1800
+#: Structured observations have their own budget so prose cannot hide state/paths.
+OBSERVATION_CHARS = 7000
 
 _BLOCK = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.DOTALL | re.IGNORECASE)
 _XML_FUNCTION = re.compile(r"<function\s*=\s*([\w.\-]+)\s*>(.*?)(?:</function>|$)",
@@ -108,14 +110,34 @@ def render_menu(declarations: Sequence[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+#: The note the live worker appends to a typed request (memory.relevant_note):
+#: background for the model to read, not words to route by.
+_MEMORY_NOTE = re.compile(
+    r"\s*\[(?:Background from ORION's memory|From your past conversations with the user)\b.*\Z",
+    re.DOTALL)
+
+
+def routing_text(request: str) -> str:
+    """What the user actually asked, without any memory note after it.
+
+    The note is worded "[Background from ORION's memory — things already
+    known ...: <facts>]", and ranking tools on it pulled the memory tools and
+    whatever the facts mentioned into the menu in place of the tool the
+    request needed: with a three-fact note, the right tool was on the menu
+    for 66.5% of 376 everyday requests against 92.3% without one
+    (docs/ORION_TOOL_ROUTING.md)."""
+    return _MEMORY_NOTE.sub("", str(request or "")) or str(request or "")
+
+
 def choose_tools(query: str, declarations: Sequence[dict[str, Any]],
                  size: int = MENU_SIZE) -> list[dict[str, Any]]:
-    """The declarations most relevant to *query* (word + meaning ranking)."""
+    """The declarations most relevant to *query*: words, meaning and the
+    learned intent network (intent_brain.routing_scores)."""
     try:
         from . import tool_resolver as tr
-        scorer = getattr(tr, "hybrid_scores", None) or tr.lexical_scores
-        return tr.resolve(query, None, list(declarations), enabled=True,
-                          max_tools=size, scorer=scorer)
+        from .intent_brain import routing_scores
+        return tr.resolve(routing_text(query), None, list(declarations), enabled=True,
+                          max_tools=size, scorer=routing_scores)
     except Exception:
         return list(declarations)[:size]
 
@@ -128,7 +150,11 @@ PROTOCOL = (
     "When the request is done, or needs no tool, reply in plain spoken English "
     "with no tool markup at all. Never say something has been done unless a "
     "tool result in this conversation confirms it; if a tool failed, say so "
-    "plainly. Parameters marked * are required.\nTOOLS:\n"
+    "plainly. An execution state of returned only confirms the handler returned; "
+    "use the operation receipt to distinguish running, queued, draft, incomplete, "
+    "cancelled and completed work. Reuse recorded run IDs and exact paths for "
+    "follow-ups rather than guessing or starting duplicate research. "
+    "Parameters marked * are required.\nTOOLS:\n"
 )
 
 
@@ -234,12 +260,79 @@ Generate = Callable[[str, str], Awaitable[tuple[Any, str]]]
 Dispatch = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 
+def _observations(result: Any) -> dict[str, Any]:
+    """Small typed observations, never arbitrary receipt payloads or media."""
+    from .session_log import redact
+
+    def receipt_fields(raw: Any, *, include_paths: bool = True) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        fields = {}
+        for key in ("run_id", "research_state", "delivery_state", "action", "topic",
+                    "error_category", "message_id"):
+            value = raw.get(key)
+            if isinstance(value, str):
+                fields[key] = redact(value)[:240]
+        for key in ("source_count", "section_count", "failed_section_count"):
+            if type(raw.get(key)) is int:
+                fields[key] = raw[key]
+        if include_paths:
+            selected = raw.get("selected_path")
+            # An overlong/redacted path is omitted, never cut into a wrong target.
+            if isinstance(selected, str) and len(selected) <= 4096 and redact(selected) == selected:
+                fields["selected_path"] = selected
+            paths = raw.get("file_paths")
+            if isinstance(paths, (list, tuple)):
+                fields["file_paths"] = [p for p in paths[:3] if isinstance(p, str)
+                                        and len(p) <= 2048 and redact(p) == p]
+        return fields
+
+    raw = getattr(result, "receipt", None)
+    observations = receipt_fields(raw)
+    if isinstance(raw, dict) and isinstance(raw.get("research_runs"), list):
+        observations["research_runs"] = [receipt_fields(row, include_paths=False)
+                                          for row in raw["research_runs"][:3]]
+    execution = getattr(result, "execution", None)
+    if isinstance(execution, dict):
+        observations["execution"] = {key: value for key, value in execution.items()
+                                     if key in {"call_id", "tool", "state", "executor_ok"}
+                                     and (type(value) is bool or value is None
+                                          or isinstance(value, str) and len(value) <= 128)}
+    # Keep exact selected_path and states even if a multi-file list is too large.
+    if len(json.dumps(observations, ensure_ascii=False)) > OBSERVATION_CHARS:
+        observations.pop("file_paths", None)
+        observations.pop("research_runs", None)
+    return observations
+
+
 def _result_text(result: Any) -> tuple[bool, str]:
     ok = bool(getattr(result, "ok", True))
     text = str(getattr(result, "text", result) or "").strip() or "(no output)"
     if len(text) > RESULT_CHARS:
         text = text[:RESULT_CHARS] + " …[truncated]"
+    observations = _observations(result)
+    if observations:
+        text += "\nOPERATION OBSERVATIONS: " + json.dumps(observations, ensure_ascii=False)
     return ok, text
+
+
+def summarise_steps(steps: Sequence[ToolStep]) -> str:
+    """The turn's tools in plain words when the model said nothing after
+    them: what worked first, then what did not. It used to be the LAST tool
+    alone, raw - 30 Oct 2026, "That did not work: [notion_workspace]
+    Unsupported notion action: create. OPERATION OBSERVATIONS: {...}", while
+    the research it had just started was running fine."""
+    def plain(step: ToolStep) -> str:
+        line = step.result.split("\nOPERATION OBSERVATIONS", 1)[0].strip().splitlines()
+        text = re.sub(r"^\[[\w.]+\]\s*", "", line[0] if line else "").strip()
+        return text.rstrip(".") if text else step.name.replace("_", " ")
+    worked = [plain(step) for step in steps if step.ok]
+    failed = [f"{step.name.replace('_', ' ')}: {plain(step)}" for step in steps if not step.ok]
+    parts = [". ".join(dict.fromkeys(worked)) + "." if worked else ""]
+    if failed:
+        lead = "One part did not work - " if worked else "That did not work - "
+        parts.append(lead + "; ".join(dict.fromkeys(failed)) + ".")
+    return " ".join(part for part in parts if part)
 
 
 async def run(request: str, declarations: Sequence[dict[str, Any]],
@@ -269,8 +362,7 @@ async def run(request: str, declarations: Sequence[dict[str, Any]],
         if not calls or step == max_steps:
             final = strip_markup(reply)
             if not final and steps:
-                last = steps[-1]
-                final = (last.result if last.ok else f"That did not work: {last.result}")[:600]
+                final = summarise_steps(steps)[:600]
             return TextTurn(final or "I'm not sure how to help with that.", steps, provider)
         for name, args in calls[:3]:
             if name not in known:
@@ -292,4 +384,4 @@ async def run(request: str, declarations: Sequence[dict[str, Any]],
 
 
 __all__ = ["MAX_STEPS", "PROTOCOL", "TextTurn", "ToolStep", "choose_tools",
-           "parse_calls", "render_menu", "run", "strip_markup"]
+           "parse_calls", "render_menu", "routing_text", "run", "strip_markup"]

@@ -1,3 +1,13 @@
+# Agentic Android HUD execution plan — 25 September 2026
+
+1. Preserve the existing WebView pairing and certificate trust flow while adding a separate, authenticated native device channel to the current `aiohttp` gateway. The channel carries bounded JSON commands and binary JPEG frames; reconnect with exponential backoff. Device commands are refused unless the corresponding local capability has been enabled.
+2. Add Android services for user-consented MediaProjection capture, on-demand AccessibilityService snapshots and gestures, and a user-enabled floating sentinel. Capture is capped at two downsampled frames per second; stop actions and service teardown close readers, displays, and sockets.
+3. Route app launch, SMS, and calls through a native intent router. Communicative or destructive requests enter a local slide-to-confirm deck before execution, with runtime permissions requested only at execution time.
+4. Replace the phone page's 3D face with a crimson vector waveform, add a compact telemetry strip and structured trace nodes, and convert remote confirmation cards to deliberate slide approval. Keep the existing chat, pairing, and voice paths working.
+5. Register services and permissions in the manifest, harmonize app colors with the specified palette, then run the Android build and focused gateway tests. Commit each verified component by staging only task-owned paths or hunks because the worktree already contains unrelated changes.
+
+## Prior repository audit
+
 # ORION execution plan — 25 September 2026
 
 This plan records what an audit of the current source found, what has been

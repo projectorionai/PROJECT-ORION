@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar icon. Android draws notification icons from their alpha
+     alone, so the full-colour launcher icon showed as a blank disc.
+     Written by tools/make_brand_icons.py; edit the script, not this file. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M7.80,54.00 a46.20,46.20 0 1,0 92.40,0 a46.20,46.20 0 1,0 -92.40,0"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="9.24" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M72.26,38.12 A24.20,24.20 0 0,0 29.83,55.27 M35.74,69.88 A24.20,24.20 0 0,0 78.17,52.73"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="5.72" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M46.52,54.00 a7.48,7.48 0 1,0 14.96,0 a7.48,7.48 0 1,0 -14.96,0 M26.72,63.07 a4.84,4.84 0 1,0 9.68,0 a4.84,4.84 0 1,0 -9.68,0 M71.60,44.93 a4.84,4.84 0 1,0 9.68,0 a4.84,4.84 0 1,0 -9.68,0" />
+</vector>

@@ -60,8 +60,8 @@ jobs:
           chmod +x ./gradlew
           grep distributionUrl gradle/wrapper/gradle-wrapper.properties
 
-      - name: Build the debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: Lint and build the debug APK
+        run: ./gradlew lintDebug assembleDebug --no-daemon --stacktrace
 
       - name: Upload the APK
         uses: actions/upload-artifact@v4

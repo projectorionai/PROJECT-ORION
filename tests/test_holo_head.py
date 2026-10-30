@@ -33,7 +33,16 @@ ROOT = Path(__file__).resolve().parents[1]
 #: loop with QPainter before (an earlier face cost 441 ms per wall-clock
 #: second), so this is a real ceiling, not a formality. Measured ~6 ms; the
 #: headroom covers slower machines and CI.
+#:
+#: What is held to it is the STEADY cost of a frame - the median of five
+#: paints after one warm-up - because that is what the loop pays thirty
+#: times a second. It used to be one cold paint per fresh head, first-use
+#: allocation and caches included, and under a busy full-suite run that
+#: single sample landed at 22.6 ms and 24.1 ms and then passed on a repeat
+#: (audit 6 Oct 2026). The cold paint is still reported, not asserted: it
+#: happens once.
 PAINT_BUDGET_MS = 22.0
+PAINT_SAMPLES = 5
 
 _PROBE = r'''
 import json, os, sys
@@ -66,6 +75,27 @@ def draw(state, speaking, amp, viseme, steps, seed=11):
     head.paint(p, SIZE / 2, SIZE * 0.47, radius, PRI, ACC, BG)
     p.end()
     return img, head.last_paint_ms
+
+
+def paint_cost(state, speaking, amp, viseme, steps, samples={samples}):
+    """(cold ms, median warm ms) for painting one head in this state."""
+    import statistics
+    head = HoloHead()
+    for _ in range(steps):
+        if viseme:
+            head.set_viseme(*viseme)
+        head.step(1.0 / 30.0, amp, speaking=speaking, state=state)
+    times = []
+    for _ in range(samples + 1):
+        img = QImage(SIZE, SIZE, QImage.Format.Format_RGB32)
+        img.fill(BG)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        radius = min(SIZE * 0.42, SIZE / (head.SPAN + 0.15))
+        head.paint(p, SIZE / 2, SIZE * 0.47, radius, PRI, ACC, BG)
+        p.end()
+        times.append(head.last_paint_ms)
+    return times[0], statistics.median(times[1:])
 
 
 def stats(img):
@@ -118,7 +148,10 @@ sleeping, _ = draw("STANDBY", False, 0.0, None, 40)
 out["closed"] = stats(closed)
 out["wide"] = stats(wide)
 out["sleeping"] = stats(sleeping)
-out["paint_ms"] = max(ms_closed, ms_open)
+cold_closed, warm_closed = paint_cost("LISTENING", False, 0.0, None, 12)
+cold_open, warm_open = paint_cost("SPEAKING", True, 0.9, (1.0, -0.05, 0.0), 22)
+out["paint_ms"] = max(warm_closed, warm_open)
+out["cold_paint_ms"] = max(cold_closed, cold_open)
 out["dark_closed"] = dark_pixels_in_mouth_band(closed)
 out["dark_wide"] = dark_pixels_in_mouth_band(wide)
 out["dark_shut"] = dark_pixels_in_mouth_band(shut)
@@ -128,7 +161,7 @@ print("@@" + json.dumps(out))
 
 @pytest.fixture(scope="module")
 def frames() -> dict:
-    script = _PROBE.format(root=str(ROOT).replace("\\", "/"))
+    script = _PROBE.format(root=str(ROOT).replace("\\", "/"), samples=PAINT_SAMPLES)
     proc = subprocess.run([sys.executable, "-c", script], cwd=ROOT,
                           capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
@@ -181,7 +214,8 @@ def test_sleeping_lowers_the_lids_without_losing_the_head(frames):
 
 def test_paint_stays_within_the_frame_budget(frames):
     assert frames["paint_ms"] < PAINT_BUDGET_MS, (
-        f"paint took {frames['paint_ms']:.1f} ms (budget {PAINT_BUDGET_MS} ms). "
+        f"paint took {frames['paint_ms']:.1f} ms (median of {PAINT_SAMPLES} warm frames; "
+        f"budget {PAINT_BUDGET_MS} ms; cold first paint {frames['cold_paint_ms']:.1f} ms). "
         f"ORION has starved its own event loop with QPainter before."
     )
 

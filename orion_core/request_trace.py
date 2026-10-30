@@ -42,12 +42,15 @@ ask; ``TRACES.explain_last_silence()`` is the one a user gets when they say
 
 from __future__ import annotations
 
+import re
 import time
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 class Stage(str, Enum):
@@ -68,10 +71,16 @@ class Stage(str, Enum):
     PLAYBACK_START = "PLAYBACK_START"
     PLAYBACK_COMPLETE = "PLAYBACK_COMPLETE"
     LISTENING_RESTORED = "LISTENING_RESTORED"
+    #: The end of a request that never had a microphone to restore — a phone
+    #: or typed turn is complete when its reply is delivered (or its sender
+    #: gives up on it).
+    REPLY_DELIVERED = "REPLY_DELIVERED"
 
 
 #: Stage order for "how far did it get" comparisons.
 STAGE_ORDER: tuple[Stage, ...] = tuple(Stage)
+_COMPLETE_STAGES = frozenset({Stage.LISTENING_RESTORED.value,
+                              Stage.REPLY_DELIVERED.value})
 _STAGE_INDEX = {stage: i for i, stage in enumerate(STAGE_ORDER)}
 
 #: What the user actually experiences when a request dies at each stage, and
@@ -133,6 +142,32 @@ class TraceEvent:
     ok: bool = True
 
 
+#: Measurements hung off a trace are bounded so one runaway loop (a provider
+#: retried in a tight cycle) cannot grow a request without limit.
+MAX_MARKS = 64
+
+_LABEL_RE = re.compile(r"[^a-z0-9_.:-]+")
+
+
+def _label(value: Any, limit: int = 48) -> str:
+    """A metric label that cannot carry a secret or grow without bound.
+
+    Labels are for grouping (a provider name, a queue class), never for
+    payloads: lower-cased, restricted to a small alphabet, truncated.
+    """
+    return _LABEL_RE.sub("_", str(value).lower())[:limit]
+
+
+@dataclass
+class TraceMark:
+    """One measurement inside a request: a provider attempt, a queue wait,
+    the first token. Marks never change the stage logic that assigns blame."""
+
+    name: str
+    at: float                  # monotonic
+    fields: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class RequestTrace:
     """One request's journey through ORION."""
@@ -145,9 +180,41 @@ class RequestTrace:
     error: str = ""
     failed_stage: str = ""
     recovery: str = ""
+    marks: list[TraceMark] = field(default_factory=list)
     _bus: Any = field(default=None, repr=False)
 
     # ── recording ─────────────────────────────────────────────────────────────
+
+    def mark(self, name: str, **fields: Any) -> "RequestTrace":
+        """Record a measurement (``provider_attempt``, ``queue_wait``,
+        ``first_token``...) without moving the request's stage.
+
+        Field values are kept only when they are numbers, booleans or short
+        labels; anything else is reduced to a label, so a caller cannot put a
+        prompt, a token or a key into the trace by accident.
+        """
+        if len(self.marks) >= MAX_MARKS:
+            return self
+        clean: dict[str, Any] = {}
+        for key, value in list(fields.items())[:8]:
+            if isinstance(value, bool) or value is None:
+                clean[_label(key, 24)] = value
+            elif isinstance(value, (int, float)):
+                clean[_label(key, 24)] = round(float(value), 3)
+            else:
+                clean[_label(key, 24)] = _label(value)
+        self.marks.append(TraceMark(_label(name, 32), time.monotonic(), clean))
+        return self
+
+    def marks_named(self, name: str) -> list[TraceMark]:
+        wanted = _label(name, 32)
+        return [m for m in self.marks if m.name == wanted]
+
+    def since_start_ms(self, name: str) -> float | None:
+        """Milliseconds from the start of the request to the first ``name``
+        mark (``first_token``, ``first_audio``), or None if it never came."""
+        found = self.marks_named(name)
+        return (found[0].at - self.started) * 1000.0 if found else None
 
     def stage(self, stage: Stage | str, detail: str = "") -> "RequestTrace":
         name = stage.value if isinstance(stage, Stage) else str(stage)
@@ -193,7 +260,7 @@ class RequestTrace:
 
     @property
     def complete(self) -> bool:
-        return any(e.stage == Stage.LISTENING_RESTORED.value for e in self.events)
+        return any(e.stage in _COMPLETE_STAGES for e in self.events)
 
     @property
     def age_s(self) -> float:
@@ -244,6 +311,9 @@ class RequestTrace:
             "elapsed_ms": round(self.elapsed_ms(), 1),
             "age_s": round(self.age_s, 1),
             "stages": [e.stage for e in self.events],
+            "marks": [{**m.fields, "name": m.name,
+                       "at_ms": round((m.at - self.started) * 1000.0, 1)}
+                      for m in self.marks],
             "diagnosis": self.diagnosis(),
         }
 
@@ -292,7 +362,7 @@ class TraceStore:
         """Requests that never reached LISTENING_RESTORED and have gone quiet."""
         limit = self.STALL_AFTER_S if older_than is None else older_than
         return [t for t in self.all()
-                if not t.complete and t.age_s > limit]
+                if not t.complete and t.age_s >= limit]
 
     def explain_last_silence(self) -> str:
         """The answer to "why did you ignore me?" — in one sentence."""
@@ -352,4 +422,43 @@ class TraceStore:
 TRACES = TraceStore()
 
 
-__all__ = ["RequestTrace", "Stage", "TraceStore", "TRACES", "STAGE_ORDER"]
+# ── the request in flight ─────────────────────────────────────────────────────
+#
+# A remote chat, a queued job and the provider attempts made on its behalf run
+# in different coroutines, often several calls apart. Passing the trace down
+# every signature would touch dozens of functions that do not care about it; a
+# context variable follows the request through ``await``, ``create_task`` and
+# ``asyncio.to_thread`` (both copy the context) without any of them knowing.
+
+_CURRENT: ContextVar[RequestTrace | None] = ContextVar("orion_request_trace",
+                                                       default=None)
+
+
+def current() -> RequestTrace | None:
+    """The trace of the request this code is running for, if any."""
+    return _CURRENT.get()
+
+
+@contextmanager
+def bound(trace: RequestTrace | None) -> Iterator[RequestTrace | None]:
+    """Make ``trace`` the current request for the enclosed block."""
+    token = _CURRENT.set(trace)
+    try:
+        yield trace
+    finally:
+        _CURRENT.reset(token)
+
+
+def mark(name: str, **fields: Any) -> None:
+    """Mark the current request, if there is one. Never raises."""
+    trace = _CURRENT.get()
+    if trace is None:
+        return
+    try:
+        trace.mark(name, **fields)
+    except Exception:
+        pass
+
+
+__all__ = ["RequestTrace", "Stage", "TraceStore", "TRACES", "STAGE_ORDER",
+           "TraceMark", "current", "bound", "mark"]

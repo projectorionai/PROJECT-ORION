@@ -9,9 +9,9 @@ recent identity, relationship, project and note entries.
 
 Two fixes, and the second is the subtle one
 -------------------------------------------
-Categories are interleaved, with the ones describing the user going round twice
-before the bulk ones go round once. A thousand rows of one kind can no longer
-starve the one row of another.
+Categories are interleaved, with the ones describing the user going round until
+all of them are carried (or the budget is spent) before the bulk ones get a
+slot. A thousand rows of one kind can no longer starve the one row of another.
 
 And what did not fit is listed BY KEY, because a model cannot look something up
 if it does not know the thing exists. Without the index, "who is Sample Relative?" gets
@@ -124,6 +124,20 @@ def test_the_user_facing_categories_get_the_larger_share():
     is equal treatment of things that are not equal."""
     text = _matrix(_lopsided()).prompt_context(limit=18)
     assert _core_count(text) > len(_body(text)) / 2, "the prompt is still mostly bulk"
+
+
+def test_every_user_fact_that_fits_is_carried_before_any_bulk_row():
+    """Two passes measured badly on a copy of the owner's store (17 Oct 2026):
+    ~19 facts about him and 16 slots, and after two passes every bulk category
+    took one each, so his dog's name was only listed by key."""
+    rows = [("knowledge", f"pack_{i}", f"bulk {i}", f"2026-10-17T10:{i:02d}:00Z")
+            for i in range(40)]
+    rows += [("personal", f"detail_{i}", f"about the user {i}", "2026-01-01T00:00:00Z")
+             for i in range(19)]
+    text = _matrix(rows).prompt_context(limit=16)
+    categories = Counter(line[2:].split("/")[0] for line in _body(text))
+    assert categories == {"personal": 16}, categories
+    assert "knowledge" in _index_line(text), "the bulk is still named for lookup"
 
 
 def test_bulk_still_fills_the_budget_when_there_is_little_else():

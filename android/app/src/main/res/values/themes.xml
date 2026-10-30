@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Full-screen, dark, no action bar — the ORION orb owns the screen. -->
+    <!-- Full-screen tactical shell with no platform color accents. -->
     <style name="Theme.OrionCompanion" parent="Theme.Material3.Dark.NoActionBar">
         <item name="android:statusBarColor">@color/orion_bg</item>
         <item name="android:navigationBarColor">@color/orion_bg</item>
         <item name="android:windowBackground">@color/orion_bg</item>
         <item name="colorPrimary">@color/orion_accent</item>
+        <item name="colorSecondary">@color/crimson_muted</item>
+        <item name="colorTertiary">@color/crimson_accent</item>
+        <item name="colorSurface">@color/carbon_grey</item>
+        <item name="android:colorAccent">@color/crimson_accent</item>
         <item name="colorOnPrimary">@color/orion_on_accent</item>
         <!-- Keep Material 3's dialogs (the pairing prompt) on ORION's palette
              instead of its default purple-grey surfaces. -->

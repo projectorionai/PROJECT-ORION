@@ -164,10 +164,17 @@ class _Guarded(_FakeHost):
 
 
 def _guarded_dispatcher(reason="twilio.create_call spends real money"):
+    from collections import deque
     from orion_core.system_guard import SystemActionGuard
 
     host = _FakeHost(reason)
     d = _dispatcher(host)
+    # Match the constructor's bookkeeping for the public built-in dispatch path.
+    d.active_tools = 0
+    d.recent_tools = deque(maxlen=60)
+    d.telemetry = None
+    d.swarm_view = None
+    d.pattern_detector = None
     d.system_guard = SystemActionGuard()
 
     class _Signal:
@@ -231,15 +238,47 @@ async def test_without_a_guard_a_confirmed_mcp_call_is_refused():
 # reached by its own name skipped even the confirm flag.
 
 async def test_a_first_class_billable_tool_waits_for_a_human():
+    from orion_core.execution_policy import foreground_scope
+
     d, host = _guarded_dispatcher()
     d.register_mcp_tools("twilio", [{"name": "create_call", "description": "Call.",
                                      "inputSchema": {"type": "object", "properties": {
                                          "to": {"type": "string"}}}}])
-    refused = await d.dispatch("mcp__twilio__create_call", {"to": "+44"})
-    assert refused.ok is False and host.calls == []
-    armed = await d.dispatch("mcp__twilio__create_call", {"to": "+44", "confirm": True})
+    # A trusted host interaction may present the existing human approval UI;
+    # ordinary model/background dispatch must never acquire this scope.
+    with foreground_scope("test-explicit-host-mcp-control"):
+        refused = await d.dispatch("mcp__twilio__create_call", {"to": "+44"})
+        assert refused.ok is False and host.calls == []
+        armed = await d.dispatch("mcp__twilio__create_call", {"to": "+44", "confirm": True})
     assert armed.ok is False and "approve" in armed.text.lower()
     assert host.calls == [], "a first-class name bypassed the spend gate"
+    pending = list(d.system_guard._pending.values())
+    assert len(pending) == 1
+    assert pending[0].payload == {"server": "twilio", "tool": "create_call", "arguments": {"to": "+44"}}
+
+
+@pytest.mark.parametrize("first_class", [False, True])
+async def test_default_background_billable_dispatch_neither_requests_ui_nor_arms_a_token(first_class):
+    d, host = _guarded_dispatcher()
+    d.register_mcp_tools("twilio", [{"name": "create_call", "description": "Call.",
+                                     "inputSchema": {"type": "object", "properties": {
+                                         "to": {"type": "string"}}}}])
+    prompts = []
+    class RecordingPrompt:
+        def emit(self, payload):
+            prompts.append(payload)
+    d.bus.confirm_action = RecordingPrompt()
+    name, arguments = (("mcp__twilio__create_call", {"to": "+44", "confirm": True}) if first_class else
+                       ("mcp", {"action": "call", "server": "twilio", "tool": "create_call",
+                                "arguments": {"to": "+44"}, "confirm": True}))
+    result = await d.dispatch(name, arguments)
+    assert not result.ok
+    assert result.receipt["status"] == "requires_foreground"
+    assert result.receipt["effect"] == "mcp_confirmation_dialog"
+    assert result.receipt["desktop_mutated"] is False
+    assert prompts == []
+    assert d.system_guard.pending_count() == 0
+    assert host.calls == [], "default background dispatch executed a billable action"
 
 
 async def test_a_failed_mcp_call_is_not_reported_as_success():

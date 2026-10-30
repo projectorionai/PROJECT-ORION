@@ -17,11 +17,9 @@ Wall-clock, deliberately
 ------------------------
 Cron fields are matched against local wall-clock time, not against elapsed
 monotonic time, because "six in the morning" has to mean six in the morning
-after the clocks change. The consequence is that a missed minute is a missed
-run rather than a run fired late in a burst: if the machine was asleep at 06:00
-the 06:00 job does not go off at 09:14 when it wakes. A briefing delivered
-three hours late is worse than one not delivered, and the catch-up path is
-``catch_up``, which exists and is honest about the gap.
+after the clocks change. The supervisor keeps the next due minute and runs
+an overdue entry once when it wakes, then schedules its next occurrence from
+the current time. It never replays every occurrence missed during sleep.
 
 The one subtlety in cron
 ------------------------
@@ -34,10 +32,11 @@ expected and nobody notices for a month.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Iterable
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 #: Fields, in cron's order, with the values each may take.
 _FIELDS: tuple[tuple[str, int, int], ...] = (
@@ -45,7 +44,7 @@ _FIELDS: tuple[tuple[str, int, int], ...] = (
     ("hour", 0, 23),
     ("day", 1, 31),
     ("month", 1, 12),
-    ("weekday", 0, 6),          # 0 = Sunday, as crontab(5) has it
+    ("weekday", 0, 7),          # 0 and 7 = Sunday; normalise AFTER expanding
 )
 
 #: Names people write instead of numbers.
@@ -77,6 +76,11 @@ class ScheduleError(ValueError):
     """A schedule that cannot mean anything. Carries a sentence for the user."""
 
 
+def _instant(when: datetime) -> datetime:
+    """Compare aware clocks by their instant, including repeated local hours."""
+    return when.astimezone(timezone.utc) if when.utcoffset() is not None else when
+
+
 def _expand(spec: str, low: int, high: int, field: str) -> set[int]:
     """One cron field as the set of values it matches."""
     values: set[int] = set()
@@ -101,33 +105,39 @@ def _expand(spec: str, low: int, high: int, field: str) -> set[int]:
         else:
             start = end = _value(part, field)
 
-        if start > end:
-            # "fri-mon" and "22-2" wrap round the end of the range, which is
-            # what someone writing them means.
-            wrapped = list(range(start, high + 1)) + list(range(low, end + 1))
-            values.update(wrapped[::step])
-            continue
         if not (low <= start <= high and low <= end <= high):
             raise ScheduleError(
                 f"{field}: {part!r} is outside {low}-{high}")
+        if start > end:
+            # "fri-mon" and "22-2" wrap round the end of the range, which is
+            # what someone writing them means.
+            # Sunday 0/7 is one day, not two positions in a wrapped week.
+            wrap_high = 6 if field == "weekday" else high
+            wrapped = list(range(start, wrap_high + 1)) + list(range(low, end + 1))
+            values.update(wrapped[::step])
+            continue
         values.update(range(start, end + 1, step))
 
     if not values:
         raise ScheduleError(f"{field}: {spec!r} matches nothing")
-    return values
+    return {value % 7 for value in values} if field == "weekday" else values
 
 
 def _value(text: str, field: str) -> int:
     text = text.strip().lower()
     if text in _NAMES:
+        allowed = (field == "month" and text in {
+            "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"
+        }) or (field == "weekday" and text in {
+            "sun", "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat"
+        })
+        if not allowed:
+            raise ScheduleError(f"{field}: {text!r} is not a name for this field")
         return _NAMES[text]
     try:
         number = int(text)
     except ValueError:
         raise ScheduleError(f"{field}: {text!r} is not a number or a name")
-    # Both 0 and 7 mean Sunday in crontab(5).
-    if field == "weekday" and number == 7:
-        return 0
     return number
 
 
@@ -180,18 +190,49 @@ class Schedule:
     def next_due(self, after: datetime) -> datetime | None:
         """The next wall-clock minute this fires, strictly after *after*.
 
-        Searched minute by minute from the next whole minute. Four years is
-        enough for a 29-February-only schedule; past that the expression
-        matches nothing real, and returning None says so rather than looping.
+        Skip ineligible days before considering scheduled hours and minutes.
+        The search is bounded to four years; impossible dates do not make the
+        GUI thread scan over two million minutes. None also means that the
+        next occurrence is beyond datetime's representable range.
         """
         if self.is_interval:
-            return after + timedelta(seconds=self.interval_seconds)
-        moment = (after.replace(second=0, microsecond=0)
-                  + timedelta(minutes=1))
-        for _ in range(_SEARCH_LIMIT_MINUTES):
-            if self.matches(moment):
-                return moment
-            moment += timedelta(minutes=1)
+            try:
+                due = _instant(after) + timedelta(seconds=self.interval_seconds)
+                return due.astimezone(after.tzinfo) if after.utcoffset() is not None else due
+            except OverflowError:
+                return None
+        if not self.hours or not self.minutes:
+            return None
+        hours, minutes = sorted(self.hours), sorted(self.minutes)
+        day = after.replace(hour=0, minute=0, second=0, microsecond=0)
+        after_instant = _instant(after)
+        for _ in range(_SEARCH_LIMIT_MINUTES // (24 * 60) + 1):
+            if self.matches(day.replace(hour=hours[0], minute=minutes[0])):
+                future: dict[datetime, datetime] = {}
+                for hour in hours:
+                    for minute in minutes:
+                        candidate = day.replace(hour=hour, minute=minute)
+                        if after.utcoffset() is None:
+                            if candidate > after:
+                                return candidate
+                            continue
+                        for fold in (0, 1):
+                            try:
+                                instant = _instant(candidate.replace(fold=fold))
+                                local = instant.astimezone(after.tzinfo)
+                            except (OverflowError, ValueError):
+                                continue
+                            # Neither fold of a spring gap survives a round trip.
+                            # Both autumn folds may be valid and still in future.
+                            if (local.replace(tzinfo=None) == candidate.replace(tzinfo=None)
+                                    and instant > after_instant):
+                                future[instant] = local
+                if future:
+                    return future[min(future)]
+            try:
+                day += timedelta(days=1)
+            except OverflowError:
+                return None
         return None
 
 
@@ -256,8 +297,14 @@ def parse_schedule(schedule: Any = "", interval_seconds: Any = 0) -> Schedule | 
     text = str(schedule or "").strip()
     try:
         interval = float(interval_seconds or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ScheduleError("'interval_seconds' must be a number")
+    if not math.isfinite(interval) or interval < 0:
+        raise ScheduleError("'interval_seconds' must be finite and non-negative")
+    try:
+        timedelta(seconds=interval)
+    except OverflowError:
+        raise ScheduleError("'interval_seconds' is too large") from None
 
     if text and interval > 0:
         raise ScheduleError(

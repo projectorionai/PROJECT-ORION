@@ -62,17 +62,12 @@ def gateway(monkeypatch):
 def _stub_bot(monkeypatch, gateway, reply="Sent to Mum on Telegram.",
               token="a-token"):
     sent = []
-
-    def fake_send(self, platform, contact, message):
-        if not token:
-            return None
-        sent.append((platform, contact, message))
-        from orion_core.data import ToolResult
-
-        failed = "failed" in reply.lower()
-        return ToolResult(reply, ok=not failed)
-
-    monkeypatch.setattr(m.MessagingGateway, "_send_via_bot", fake_send)
+    monkeypatch.setattr(gateway, "_bot_token", lambda *_: token)
+    monkeypatch.setattr(gateway, "_discord_webhook", lambda: "")
+    def fake_send(name, arguments):
+        sent.append((name.removesuffix("_message"), arguments["to"], arguments["message"]))
+        return reply
+    gateway.bind_plugin_sender(fake_send, {"telegram_message": bool(token), "discord_message": bool(token)})
     return sent
 
 
@@ -87,12 +82,11 @@ def test_a_configured_bot_delivers_instead_of_opening_a_link(gateway,
     assert gateway.opened == [], "a browser tab was opened as well as sending"
 
 
-def test_without_a_token_the_compose_link_still_opens(gateway, monkeypatch):
+def test_without_a_token_background_defers_without_opening_compose(gateway, monkeypatch):
     _stub_bot(monkeypatch, gateway, token="")
     result = gateway.send_text("telegram", "Mum", "I'll be late")
-    assert result.ok
-    assert len(gateway.opened) == 1
-    assert "t.me" in gateway.opened[0]
+    assert not result.ok and result.receipt["status"] == "requires_foreground"
+    assert gateway.opened == []
 
 
 def test_a_delivery_failure_is_reported_not_papered_over(gateway, monkeypatch):
@@ -140,11 +134,11 @@ def test_a_bot_only_platform_with_no_token_says_what_is_missing(gateway,
     assert gateway.opened == []
 
 
-def test_whatsapp_is_deliberately_link_only():
-    """It has no free bot API for messaging arbitrary contacts, so the compose
-    link genuinely is the best available — not an oversight."""
+def test_whatsapp_has_owned_profile_route_separate_from_bot_plugins():
+    from orion_core.browser_messaging import OwnedBrowserMessagingRouter
     assert "whatsapp" in m.MessagingGateway._ENDPOINTS
     assert "whatsapp" not in m.MessagingGateway._BOT_PLUGINS
+    assert "whatsapp" in OwnedBrowserMessagingRouter.PLATFORMS
 
 
 def test_a_token_is_never_read_from_the_source(gateway):

@@ -1,0 +1,33 @@
+{
+  "name": "orion_dataset_compare",
+  "description": "Compare two supplied flat record snapshots by a unique key. Return exact added, removed, changed and unchanged row counts, field changes and up to 20 examples per category containing IDs and field names only. Read-only calculation; reads no files and calls no services.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "before": {
+        "type": "array",
+        "maxItems": 512,
+        "description": "Supplied flat JSON records; may also be a JSON-encoded array. No file paths. Up to 512 rows, 32 distinct fields across both snapshots and 256 KiB combined JSON.",
+        "items": {"type": "object", "maxProperties": 32, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}
+      },
+      "after": {
+        "type": "array",
+        "maxItems": 512,
+        "description": "Supplied flat JSON records; may also be a JSON-encoded array. No file paths. Up to 512 rows, 32 distinct fields across both snapshots and 256 KiB combined JSON.",
+        "items": {"type": "object", "maxProperties": 32, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}
+      },
+      "key": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 80,
+        "description": "Unique nonempty string or exact integer ID field in every row; defaults to id. String and integer IDs are distinct."
+      }
+    },
+    "required": ["before", "after"]
+  },
+  "module": "orion_dataset_compare_tool.py",
+  "tier": "allow",
+  "requires": [],
+  "permissions": [],
+  "version": "1.0.0"
+}

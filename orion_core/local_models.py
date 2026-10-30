@@ -2,7 +2,11 @@
 Local model management (Phase 1) — native Ollama discovery + registration.
 
 ORION reaches local models (Qwen, Llama, DeepSeek, Mistral, Gemma, …) through
-Ollama's OpenAI-compatible endpoint at ``/v1/chat/completions``.  This module:
+Ollama's native ``/api/chat`` (provider_transport.OllamaChatTransport), which
+is the only route on which its context and keep-alive settings take effect.
+The profile keeps its ``/v1`` base URL: the router finds the server root from
+it, and ``ORION_OLLAMA_NATIVE=0`` falls back to the compatible endpoint.
+This module:
 
     • detects a running Ollama server (default 127.0.0.1:11434);
     • lists the models the user has actually pulled;
@@ -110,6 +114,10 @@ class OllamaManager:
     #:
     #: Override with ORION_OLLAMA_KEEP_ALIVE if you would rather trade RAM for
     #: reload latency.
+    #:
+    #: This is only the SERVER's default, for requests that name no keep-alive.
+    #: ORION's own requests carry their own (ProviderRouter.LOCAL_KEEP_ALIVE_S,
+    #: shortened under memory pressure), which Ollama honours per request.
     KEEP_ALIVE = os.getenv("ORION_OLLAMA_KEEP_ALIVE", "30s")
 
     def keep_alive_env(self) -> dict[str, str]:
@@ -119,6 +127,16 @@ class OllamaManager:
         # One model resident at a time: ORION only ever needs the one, and the
         # default lets several accumulate.
         env.setdefault("OLLAMA_MAX_LOADED_MODELS", "1")
+        # The same context ORION asks for per request, as the server default,
+        # so anything reaching this server through /v1 (which cannot carry a
+        # context size) is held to it as well.
+        env.setdefault("OLLAMA_CONTEXT_LENGTH",
+                       os.getenv("ORION_LOCAL_NUM_CTX", "").strip() or "4096")
+        # Mark XXXX.4: flash attention, and the conversation cache held at 8-bit
+        # instead of 16 - about half the memory for the same context, so the
+        # model stays on the graphics card instead of spilling into RAM.
+        env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
+        env.setdefault("OLLAMA_KV_CACHE_TYPE", "q8_0")
         return env
 
     def autostart(self, wait: float = 6.0) -> bool:
@@ -136,6 +154,15 @@ class OllamaManager:
         if self.probe(0.35):
             return True
         binary = shutil.which("ollama")
+        if not binary:
+            # The Windows installer puts it under %LOCALAPPDATA%, which is
+            # often not on PATH for a process started from a shortcut.
+            try:
+                from .local_mind import ollama_binary
+                found = ollama_binary()
+                binary = str(found) if found else ""
+            except Exception:
+                binary = ""
         if not binary:
             return False
         try:
@@ -215,8 +242,21 @@ class OllamaManager:
         "is Ollama up?") can afford to wait longer and should pass its own.
         """
         if not self.probe(self.STARTUP_PROBE_TIMEOUT if timeout is None else timeout):
-            self._log("SYS: Ollama not detected; local LLM inference offline "
-                      "(install from ollama.com and `ollama pull qwen2.5` for MODE B).")
+            # 25 Oct 2026: this told the owner to "install from ollama.com"
+            # while the next line said a local model IS installed - Ollama was
+            # present, just not running. Say which it is.
+            try:
+                from .local_mind import ollama_binary
+                installed = ollama_binary() is not None
+            except Exception:
+                installed = False
+            if installed:
+                self._log("SYS: Ollama is installed but not running; local LLM inference "
+                          "is offline until it starts (choose Hybrid or Local in Preferences, "
+                          "or run `ollama serve`).")
+            else:
+                self._log("SYS: Ollama not detected; local LLM inference offline "
+                          "(install from ollama.com and `ollama pull qwen2.5` for MODE B).")
             return False
         model = self.best_model()
         if not model:
@@ -297,15 +337,49 @@ class AIModeInfo:
         self.ollama = ollama
         self.offline_stt = offline_stt
 
+    def brain_lines(self) -> list[str]:
+        """Which brain answers (brain_mode.py) and which local model it uses."""
+        from . import brain_mode
+        lines = [f"Brain mode: {brain_mode.describe()}"]
+        if brain_mode.forced_offline() and brain_mode.mode() != brain_mode.LOCAL:
+            lines[0] += " (this session was started with --offline)"
+        elif brain_mode.env_override_active():
+            lines[0] += " (set by ORION_BRAIN_MODE)"
+        model = str(brain_mode.get("local_model") or "")
+        if not model and self.ollama is not None:
+            try:
+                model = str(self.ollama.status().get("best_model") or "")
+            except Exception:
+                model = ""
+        if not model:
+            try:
+                profiles = self.router.local_text_profiles()
+                model = str(profiles[0].model) if profiles else ""
+            except Exception:
+                model = ""
+        lines.append("Local agent model (tool use without an AI API): "
+                     + (model or "none — start Ollama with a pulled model, e.g. llama3.1"))
+        return lines
+
     def report(self) -> Any:
         from .data import ToolResult
         snap = self.router.provider_snapshot()
+        try:
+            brain = self.brain_lines()
+        except Exception:
+            brain = []
         lines = [
             f"Intelligence mode: {snap.get('mode')}",
+            *brain,
             f"Internet: {'online' if snap.get('online') else 'OFFLINE'}",
             f"Cloud live voice: {', '.join(snap.get('available_live') or []) or 'none'}",
             f"Text models available: {', '.join(snap.get('available_text') or []) or 'none'}",
             f"Local models (offline-capable): {', '.join(snap.get('available_local') or []) or 'none'}",
+            "Local rule-based conversation and commands: available without an API key or language model",
+            "Local analysis tools: latency report, dependency batch planning and dataset comparison "
+            "use supplied data without a network",
+            "Local files: structured workbook export, document/data inspection and saved memory; "
+            "web searches and cloud integrations still require their services",
         ]
         if self.ollama is not None:
             st = self.ollama.status()
@@ -316,5 +390,9 @@ class AIModeInfo:
                 lines.append("Pull a model for a stronger offline brain: "
                              + ", ".join(t for t, _ in recs[:3]))
         if self.offline_stt is not None:
-            lines.append(f"Offline dictation: {self.offline_stt.status().get('engine', 'none')}")
+            status = self.offline_stt.status()
+            engine = status.get("engine", "none")
+            if engine in {"", "none"} and getattr(self.offline_stt, "cached_available", False):
+                engine = "cached model available; loads on first use"
+            lines.append(f"Offline dictation: {engine}")
         return ToolResult("\n".join(lines))

@@ -105,6 +105,22 @@ def test_an_embedding_is_a_unit_vector_of_the_right_size():
 
 
 @needs_encoder
+def test_the_encoder_runs_on_one_cpu_thread_even_with_a_gpu(monkeypatch):
+    """accelerator.POLICY keeps it on the CPU: 16.3 ms there against 13.7 ms
+    on the GPU, whose session build holds Python's lock ~300 ms beside live
+    audio. One thread, as before."""
+    from orion_core import accelerator
+    monkeypatch.setattr(voiceprint, "_SESSION", None)
+    monkeypatch.delenv("ORION_GPU", raising=False)
+    session = voiceprint._session()
+    assert isinstance(session, accelerator.AcceleratedSession)
+    assert session.model == "voiceprint" and session.device == "CPU"
+    assert session.get_providers() == ["CPUExecutionProvider"]
+    assert session.get_session_options().intra_op_num_threads == 1
+    assert voiceprint._embed_uncached(speak("owner"), SR).shape == (256,)
+
+
+@needs_encoder
 def test_the_same_voice_scores_far_above_a_different_one():
     """The property everything else rests on.
 
@@ -381,3 +397,343 @@ def test_describe_names_the_same_owner_the_gate_uses(prints):
         json.dumps({"SampleUser": {"embedding": [0.1] * 256}}), encoding="utf-8")
     assert "SampleUser" in prints.describe()
     assert prints.owner == "SampleUser"
+
+
+def test_guided_session_deadline_releases_model_without_another_utterance():
+    from orion_core import voice_enrolment as learning
+
+    clock = [0.0]
+    session = learning.EnrolmentSession("SampleUser", clock=lambda: clock[0], time_limit=5)
+    clock[0] = 6.0
+    assert not session.listening
+    assert session.progress().state == "failed"
+
+
+def test_guided_cancel_erases_samples(monkeypatch):
+    from orion_core import voice_enrolment as learning
+
+    monkeypatch.setattr(learning, "assess", lambda *a: learning.Assessment(True))
+    session = learning.EnrolmentSession("SampleUser")
+    assert session.offer(b"\x01\x00" * 24000, embedding=np.array([1., 0., 0.])).accepted
+    vector = session._embeddings[0]
+    session.cancel()
+    assert session._embeddings == [] and session._styles == []
+    assert not np.any(vector)
+
+
+def test_guided_forget_erases_a_completed_or_cancelled_registry(monkeypatch, prints):
+    from orion_core import voice_enrolment as learning
+
+    monkeypatch.setattr(learning, "assess", lambda *a: learning.Assessment(True))
+    monkeypatch.setattr(learning, "_SESSION", None)
+    session = learning.start("SampleUser", store=prints)
+    session.offer(b"\x01\x00" * 24000, embedding=np.array([1., 0., 0.]))
+    session.cancel()
+    learning.forget_my_voice(prints)
+    assert learning.current() is None
+    assert not session._embeddings
+
+
+def test_guided_minimum_applies_after_outliers(monkeypatch, prints):
+    from orion_core import voice_enrolment as learning
+
+    session = learning.EnrolmentSession("SampleUser", store=prints, minimum=12)
+    session._embeddings = [np.array([1., 0., 0.]) for _ in range(12)]
+    session._styles = ["normal"] * 12
+    monkeypatch.setattr(learning, "_drop_outliers", lambda e, s: (e[:9], s[:9], 3))
+    ok, message = session.finish()
+    assert not ok and "12" in message
+    assert prints.names() == []
+
+
+def test_guided_save_failure_never_reports_success(monkeypatch, prints):
+    from orion_core import voice_enrolment as learning
+
+    session = learning.EnrolmentSession("SampleUser", store=prints, minimum=3,
+                                       owner_only_after=False)
+    session._embeddings = [np.array([1., 0., 0.]) for _ in range(3)]
+    session._styles = ["normal"] * 3
+
+    def locked(*_args, **_kwargs):
+        raise PermissionError("locked voice profile")
+
+    monkeypatch.setattr(voiceprint, "_write_json", locked)
+    ok, message = session.finish()
+    assert not ok and "locked" in message
+    assert not session._embeddings
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_guided_nonfinite_audio_is_rejected(bad):
+    from orion_core import voice_enrolment as learning
+
+    result = learning.assess(np.full(40000, bad, dtype=np.float32))
+    assert not result.ok
+    assert voiceprint._unit([bad, 0., 0.]) is None
+
+
+def test_guided_complete_persists_only_embeddings_and_erases_working_samples(monkeypatch, prints):
+    from orion_core import voice_enrolment as learning
+
+    monkeypatch.setattr(learning, "assess", lambda *a: learning.Assessment(True))
+    session = learning.EnrolmentSession("SampleUser", store=prints, target=3, minimum=3,
+                                       owner_only_after=False)
+    for _ in range(3):
+        session.offer(b"\x01\x00" * 24000, embedding=np.array([1., 0., 0.]))
+    assert session.state == "complete"
+    assert not session._embeddings and not session._styles
+    assert session.progress().good == 3
+    assert prints.names() == ["SampleUser"]
+    assert prints._load()["profiles"]["SampleUser"]["method"] == "guided"
+
+
+def test_voice_turns_keep_names_and_reply_gates_distinct():
+    from orion_core import voice_enrolment as learning
+
+    clock = [0.0]
+    turns = learning.SpeakerTurns(clock=lambda: clock[0])
+    turns.record(voiceprint.Verdict(True, .9, "SampleUser", confident=True, kind="owner"))
+    assert turns.address_by_name()
+    turns.record(voiceprint.Verdict(False, .2, "Other", confident=True, kind="known"))
+    assert not turns.address_by_name() and not turns.reply_allowed(only_owner=True)
+    turns.note_unjudged(.2)
+    assert turns.reply_allowed(only_owner=True)
+    assert not turns.address_by_name()
+    clock[0] = 91.0
+    assert turns.listener_note() == ""
+
+
+# Explicit conversation recordings share identification, never authorisation.
+def _conversation_recording(tmp_path, **kwargs):
+    from orion_core.conversation_recorder import ConversationRecorder
+
+    defaults = {"clock": lambda: 100.0,
+                "transcribe": lambda audio, rate: "Synthetic recorded words",
+                "identify": lambda audio, rate: voiceprint.Verdict(
+                    True, .91, "SyntheticOwner", confident=True, kind="owner")}
+    defaults.update(kwargs)
+    return ConversationRecorder(tmp_path / "recordings", **defaults)
+
+
+@pytest.mark.parametrize("consent", [False, None, "true", 1])
+def test_room_recording_needs_explicit_consent_for_each_session(tmp_path, consent):
+    service = _conversation_recording(tmp_path)
+    assert not service.start(consent=consent).ok
+    assert not service.active and not service.root.exists()
+    assert not service.feed(pcm("owner", seconds=.1), captured_at=100.1)
+
+
+def test_room_recording_keeps_wav_and_named_local_transcript_without_guard_changes(tmp_path):
+    import json
+    import wave
+    from orion_core import speaker_gate, voice_enrolment
+
+    before = voice_enrolment.turns().history()
+    guarded_before = speaker_gate._last
+    service = _conversation_recording(tmp_path)
+    assert service.start(consent=True).ok
+    audio = pcm("owner", seconds=.5)
+    assert service.feed(audio, captured_at=100.5)
+    result = service.stop()
+    assert result.ok and not service.active and not service.record_only
+    assert result.receipt["state"] == "stopped"
+    assert result.receipt["audio_seconds"] == .5
+    path = service.root / result.receipt["id"]
+    with wave.open(str(path / "recording.wav"), "rb") as saved:
+        assert saved.getframerate() == SR and saved.getnchannels() == 1
+        assert saved.readframes(saved.getnframes()) == audio
+    row = json.loads((path / "transcript.jsonl").read_text(encoding="utf-8").strip())
+    assert row["speaker"] == "SyntheticOwner" and row["text"] == "Synthetic recorded words"
+    assert row["start"] == 0 and row["end"] == .5
+    assert voice_enrolment.turns().history() == before
+    assert speaker_gate._last == guarded_before
+    recalled = service.recall(query="recorded words")
+    assert recalled.ok and "SyntheticOwner" in recalled.text
+    assert "Synthetic recorded words" in recalled.text
+
+
+@pytest.mark.parametrize("verdict", [
+    voiceprint.Verdict(True, .9, "LooksLikeOwner", confident=False, kind="uncertain"),
+    voiceprint.Verdict(False, .2, "Unknown", confident=True, kind="unknown"),
+    voiceprint.Verdict(True, .0, "", confident=False, kind="nobody"),
+    voiceprint.Verdict(True, .0, "", confident=False, kind="unreadable"),
+])
+def test_room_recording_never_labels_uncertain_or_unknown_audio_as_a_person(tmp_path, verdict):
+    import json
+
+    service = _conversation_recording(tmp_path, identify=lambda *_: verdict)
+    assert service.start(consent=True).ok
+    service.feed(pcm("owner", seconds=.5), captured_at=100.5)
+    service.stop()
+    row = json.loads((service._session.path / "transcript.jsonl").read_text(encoding="utf-8").strip())
+    assert row["speaker"] == "Unknown speaker" and row["speaker_confidence"] == 0
+
+
+def test_room_recording_never_resumes_saved_consent_on_restart(tmp_path):
+    service = _conversation_recording(tmp_path)
+    assert service.start(consent=True).ok
+    service.stop()
+    restarted = _conversation_recording(tmp_path)
+    assert restarted.status().receipt["state"] == "off"
+    assert not restarted.active and not restarted.record_only
+    assert not restarted.start().ok
+    assert len(restarted.list_sessions().receipt["recordings"]) == 1
+
+
+def test_room_recording_retains_audio_when_local_transcription_is_unavailable(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from orion_core import speech_offline
+
+    service = _conversation_recording(tmp_path, transcribe=None)
+    monkeypatch.setattr(speech_offline, "shared", lambda: SimpleNamespace(available=False))
+    assert service.start(consent=True).ok
+    service.feed(pcm("owner", seconds=.5), captured_at=100.5)
+    result = service.stop()
+    assert result.receipt["audio_seconds"] == .5
+    assert result.receipt["transcribed_segments"] == 0
+    assert result.receipt["transcription_status"] == "unavailable"
+    assert "No local transcription engine" in result.text
+    assert "No transcript text" in service.recall().text
+
+
+def test_room_transcription_bypasses_interaction_gate_without_updating_it(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from orion_core import speech_offline
+
+    calls = []
+    fake = SimpleNamespace(available=True, transcribe_pcm=lambda *a, **kw: calls.append(kw) or "room words")
+    monkeypatch.setattr(speech_offline, "shared", lambda: fake)
+    service = _conversation_recording(tmp_path, transcribe=None)
+    assert service.start(consent=True).ok
+    service.feed(pcm("other", seconds=.5), captured_at=100.5)
+    service.stop()
+    assert calls == [{"identity_checked": True}]
+    assert "room words" in service.recall().text
+
+
+def test_room_recording_identity_failure_does_not_lose_available_words(tmp_path):
+    def unavailable(*_):
+        raise RuntimeError("synthetic identity outage")
+
+    service = _conversation_recording(tmp_path, identify=unavailable)
+    assert service.start(consent=True).ok
+    service.feed(pcm("owner", seconds=.5), captured_at=100.5)
+    service.stop()
+    result = service.recall()
+    assert "Unknown speaker" in result.text and "Synthetic recorded words" in result.text
+
+
+def test_room_recording_forget_refuses_when_recycle_bin_cannot_preserve_evidence(tmp_path, monkeypatch):
+    from orion_core import recycle_bin
+
+    service = _conversation_recording(tmp_path)
+    assert service.start(consent=True).ok
+    session_id = service.snapshot()["id"]
+    assert not service.forget(session_id).ok
+    service.stop()
+    monkeypatch.setattr(recycle_bin, "refusal", lambda path: "bin disabled")
+    monkeypatch.setattr(recycle_bin, "send_to_recycle_bin", lambda path: pytest.fail("refused recycle ran"))
+    result = service.forget(session_id)
+    assert not result.ok and "bin disabled" in result.text
+    assert (service.root / session_id / "recording.wav").exists()
+    assert not service.forget("../outside").ok
+
+
+def test_room_recording_forget_recycles_only_the_selected_finished_session(tmp_path, monkeypatch):
+    from orion_core import recycle_bin
+
+    service = _conversation_recording(tmp_path)
+    assert service.start(consent=True).ok
+    service.stop()
+    selected = service._session.path
+    assert service.start(consent=True).ok
+    service.stop()
+    kept = service._session.path
+    targets = []
+    monkeypatch.setattr(recycle_bin, "refusal", lambda path: None)
+    monkeypatch.setattr(recycle_bin, "send_to_recycle_bin", lambda path: targets.append(path) or True)
+    result = service.forget(selected.name)
+    assert result.ok and targets == [selected.resolve()]
+    assert kept.exists()
+
+
+def test_room_recording_anonymous_voice_numbers_are_tentative_and_session_only(tmp_path):
+    import json
+
+    vectors = iter([np.array([1., 0., 0.]), np.array([0., 1., 0.]),
+                    np.array([.99, .01, 0.]), np.array([.7, .7, 0.])])
+    service = _conversation_recording(tmp_path,
+        identify=lambda *_: voiceprint.Verdict(True, kind="nobody"),
+        embed=lambda *_: next(vectors))
+    assert service.start(consent=True).ok
+    at = 100.0
+    for _ in range(4):
+        for _ in range(3):
+            at += .4
+            assert service.feed(b"\x00\x10" * 6400, at)
+        at += .7
+        assert service.feed(b"\x00\x00" * 11200, at)
+    result = service.stop()
+    rows = [json.loads(line) for line in (service._session.path / "transcript.jsonl").read_text(
+        encoding="utf-8").splitlines()]
+    assert [row["speaker"] for row in rows] == ["Speaker 1", "Speaker 2", "Speaker 1", "Unknown speaker"]
+    assert rows[0]["speaker_source"] == "tentative session voice cluster"
+    assert result.receipt["anonymous_speakers"] == 2
+    assert not service._session.anonymous
+    assert "embedding" not in (service._session.path / "manifest.json").read_text(encoding="utf-8")
+    assert service.start(consent=True).ok
+    assert not service._session.anonymous
+    service.close()
+
+
+def test_room_recording_uncertain_enrolled_match_never_becomes_anonymous_person(tmp_path):
+    service = _conversation_recording(tmp_path,
+        identify=lambda *_: voiceprint.Verdict(True, .65, "PossibleOwner", kind="uncertain"),
+        embed=lambda *_: np.array([1., 0., 0.]))
+    assert service.start(consent=True).ok
+    for i in range(3):
+        assert service.feed(b"\x00\x10" * 6400, 100.4 + .4 * i)
+    service.stop()
+    assert service.snapshot()["anonymous_speakers"] == 0
+    assert "Unknown speaker" in service.recall().text
+
+
+def test_room_recording_mixed_long_segment_does_not_inherit_one_persons_name(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    service = _conversation_recording(tmp_path, identify=None)
+    vectors = iter([np.array([1., 1., 0.]), np.array([1., 0., 0.]), np.array([0., 1., 0.])])
+    monkeypatch.setattr(voiceprint, "embed", lambda *_: next(vectors))
+    monkeypatch.setattr(voiceprint, "store", lambda: SimpleNamespace(verdict_for=lambda *_:
+        voiceprint.Verdict(True, .91, "SyntheticOwner", confident=True, kind="owner")))
+    text, status, verdict, vector = service._read_audio(b"\x00\x10" * (SR * 3))
+    assert text == "Synthetic recorded words" and status == "local"
+    assert verdict is None and vector is None
+
+
+def test_room_recording_closed_shutdown_service_cannot_start_again(tmp_path):
+    service = _conversation_recording(tmp_path)
+    service.close()
+    assert not service.start(consent=True).ok
+    assert not service.root.exists()
+
+
+def test_room_recording_thread_start_failure_stays_closed_and_retains_failed_manifest(tmp_path, monkeypatch):
+    import json
+    import threading
+
+    service = _conversation_recording(tmp_path)
+    real_start = threading.Thread.start
+
+    def unavailable(thread):
+        if thread.name.startswith("orion-recording-"):
+            raise RuntimeError("synthetic thread-start fault")
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", unavailable)
+    assert not service.start(consent=True).ok
+    assert not service.active
+    assert service._session.analysed.is_set()
+    manifest = json.loads((service._session.path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["state"] == "failed" and manifest["errors"]
+    service.close()

@@ -204,7 +204,8 @@ class SecuritySanitiser:
         return ".".join(reversed(parts))
 
     @classmethod
-    def guard_forged_source(cls, source: str, context: str = "forge") -> str:
+    def guard_forged_source(cls, source: str, context: str = "forge", *,
+                            trial_name: str | None = None, trial_test: bool = False) -> str:
         """Narrow firewall for AI-GENERATED tool source (forge.py): forged
         tools are meant to be additive and standalone, so this rejects code
         that imports orion_core directly or references orion.py/orion_core
@@ -215,8 +216,13 @@ class SecuritySanitiser:
         ban os.remove/shutil.rmtree/subprocess wholesale, because a forged
         tool legitimately cleaning up its own scratch files is normal, not a
         core-mutation attempt. Only the orion_core self-reference is in
-        scope here.
+        scope here. Reserved ``trial_`` tools additionally use the fail-closed
+        analysis subset for both their module and acceptance tests. This is a
+        source admission filter, not an OS sandbox.
         """
+        if trial_name and trial_name.startswith("trial_"):
+            from .forge_trial_policy import guard_trial_source
+            guard_trial_source(source, trial_name, test=trial_test, context=context)
         if not isinstance(source, str) or not source.strip():
             return source
         if cls.CORE_MUTATION_RE.search(source):

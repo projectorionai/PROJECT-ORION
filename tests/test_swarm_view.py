@@ -28,7 +28,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 pytest.importorskip("PyQt6.QtWidgets")
-from PyQt6.QtWidgets import QApplication  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 import orion_core.gui.swarm_view as sv  # noqa: E402
 from orion_core.bus import OrionBus  # noqa: E402
@@ -308,6 +308,157 @@ def test_fallback_list_selection_drives_the_inspector(_app, monkeypatch):
     view._push_snapshot()
     view.list_view.setCurrentRow(1)   # first agent row (index 0 is core)
     assert "agent" in view.inspector_label.text().lower() or view.inspector_action.text()
+
+
+class _FakeLocalPage:
+    """A page-shaped object; importing this never starts Chromium."""
+
+    def __init__(self, *args, **kwargs):
+        self.scripts = []
+
+    def profile(self):
+        return self
+
+    def runJavaScript(self, code):
+        self.scripts.append(code)
+
+
+class _FakeLocalWebView(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.loadFinished = _Signal()
+        self._page = _FakeLocalPage()
+        self.urls = []
+        self.stopped = False
+
+    def setPage(self, page):
+        self._page = page
+
+    def page(self):
+        return self._page
+
+    def setUrl(self, url):
+        self.urls.append(url.toString())
+
+    def stop(self):
+        self.stopped = True
+        self.loadFinished.emit(False)       # exercise synchronous retirement
+
+
+def _fake_local_swarm(monkeypatch, tmp_path, *, controls=True, handler=True):
+    from types import ModuleType
+
+    root = tmp_path / "three"
+    if controls:
+        entry = root / "examples/jsm/controls/OrbitControls.js"
+        entry.parent.mkdir(parents=True)
+        entry.write_text("// supplied entry", encoding="utf-8")
+    face = ModuleType("orion_core.gui.face3d")
+    face.ORION_SCHEME = "orion"
+    face.local_three = lambda: root
+    face.ensure_asset_handler = lambda profile: handler
+    pages = []
+    face.register_page = lambda name, html: pages.append((name, html))
+    monkeypatch.setitem(sys.modules, "orion_core.gui.face3d", face)
+    web = ModuleType("PyQt6.QtWebEngineWidgets")
+    web.QWebEngineView = _FakeLocalWebView
+    monkeypatch.setitem(sys.modules, "PyQt6.QtWebEngineWidgets", web)
+    monkeypatch.setattr(sv, "_swarm_page_class", lambda: _FakeLocalPage)
+    return pages
+
+
+def test_legacy_swarm_uses_a_local_origin_and_waits_before_sending_js(_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("ORION_SWARM_GL", "0")
+    monkeypatch.setattr(sv, "WEBENGINE_OK", True)
+    pages = _fake_local_swarm(monkeypatch, tmp_path)
+    deck = SwarmDeckView(_StubBus(), agents=_StubAgents())
+    deck._ensure_built()
+    web = deck.view
+    assert web.urls == ["orion://three/swarm.html"]
+    assert pages[0][0] == "swarm.html" and "https://" not in pages[0][1]
+    assert web.page().scripts == []          # not safe to run JS before load
+    web.loadFinished.emit(True)
+    assert any("Coding Agent" in script for script in web.page().scripts)
+    deck._timer.stop()
+
+
+@pytest.mark.parametrize("controls, handler", [(False, True), (True, False)])
+def test_unavailable_local_swarm_cannot_fall_back_to_a_cdn(
+        _app, monkeypatch, tmp_path, controls, handler):
+    monkeypatch.setenv("ORION_SWARM_GL", "0")
+    monkeypatch.setattr(sv, "WEBENGINE_OK", True)
+    pages = _fake_local_swarm(monkeypatch, tmp_path, controls=controls, handler=handler)
+    deck = SwarmDeckView(_StubBus(), agents=_StubAgents())
+    deck._ensure_built()
+    assert pages == [] and deck.view is None
+    assert deck.list_view.count() == 3       # core and two real supplied agents
+    deck.list_view.setCurrentRow(1)
+    assert "Agent" in deck.inspector_label.text()
+    deck._timer.stop()
+
+
+def test_a_failed_local_page_retires_the_renderer_and_keeps_the_live_list(
+        _app, monkeypatch, tmp_path):
+    monkeypatch.setenv("ORION_SWARM_GL", "0")
+    monkeypatch.setattr(sv, "WEBENGINE_OK", True)
+    _fake_local_swarm(monkeypatch, tmp_path)
+    deck = SwarmDeckView(_StubBus(), agents=_StubAgents())
+    deck._ensure_built()
+    web = deck.view
+    web.loadFinished.emit(False)
+    assert deck.view is None and web.stopped
+    assert deck.list_view.count() == 3
+    deck.agents = None
+    deck._push_snapshot()
+    assert deck.list_view.count() == 1       # still refreshes with WebEngine installed
+    deck._timer.stop()
+
+
+def test_native_swarm_construction_failure_uses_the_offline_list(_app, monkeypatch):
+    from types import ModuleType
+
+    monkeypatch.setattr(sv, "gl_renderer_enabled", lambda: True)
+    monkeypatch.setattr(sv, "WEBENGINE_OK", True)
+    native = ModuleType("orion_core.swarm.render.gl_view")
+
+    def unavailable(_parent):
+        raise RuntimeError("no GL context")
+
+    native.SwarmGLView = unavailable
+    monkeypatch.setitem(sys.modules, "orion_core.swarm.render.gl_view", native)
+    deck = SwarmDeckView(_StubBus(), agents=_StubAgents())
+    deck._ensure_built()
+    assert not deck._gl_mode and deck.gl_view is None and deck.view is None
+    assert deck.list_view.count() == 3
+    deck._timer.stop()
+
+
+@pytest.mark.parametrize("message", [
+    "SWARM: OpenGL 4.1 core profile unavailable — using fallback view",
+    "SWARM: shader compilation failed: unsupported driver",
+])
+def test_native_swarm_initialisation_failure_defers_the_live_list_fallback(
+        _app, monkeypatch, message):
+    monkeypatch.setattr(sv, "gl_renderer_enabled", lambda: True)
+    deck = SwarmDeckView(_StubBus(), agents=_StubAgents())
+    deck.gl_view = QWidget()
+    callbacks = []
+    monkeypatch.setattr(sv.QTimer, "singleShot", lambda _ms, callback: callbacks.append(callback))
+    deck._on_gl_status(message)
+    assert deck.gl_view is not None and not hasattr(deck, "list_view")
+    callbacks.pop()()
+    assert deck.gl_view is None and deck.list_view.count() == 3
+    deck._timer.stop()
+
+
+def test_optional_swarm_shader_warning_does_not_retire_a_working_renderer(_app, monkeypatch):
+    monkeypatch.setattr(sv, "gl_renderer_enabled", lambda: True)
+    deck = SwarmDeckView(_StubBus())
+    callbacks = []
+    monkeypatch.setattr(sv.QTimer, "singleShot", lambda _ms, callback: callbacks.append(callback))
+    deck._on_gl_status("SWARM: edge shader failed, drawing nodes only: unsupported blend")
+    assert callbacks == [] and not hasattr(deck, "list_view")
+    deck._timer.stop()
 
 
 # ── console-message routing (_route_console_message) ────────────────────────

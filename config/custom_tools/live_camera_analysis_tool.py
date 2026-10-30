@@ -17,6 +17,8 @@ loader also bounds tool imports now, so a future tool doing this cannot stall
 startup again — but a tool should not need that safety net.
 """
 
+from orion_core.data import ToolResult
+
 class LiveCameraAnalysis:
     """Opens the camera only when actually asked to look at something."""
 
@@ -44,14 +46,16 @@ class LiveCameraAnalysis:
         return (f"Captured a {width}x{height} frame; it is {brightness} "
                 f"(mean intensity {mean:.0f} of 255).")
 
-    def run_analysis(self) -> str:
+    def run_analysis(self) -> ToolResult:
         if not self.open():
-            return (f"No camera available at index {self.index} — nothing was "
-                    "captured.")
+            return ToolResult(f"No camera available at index {self.index} — nothing was captured.", ok=False,
+                              receipt={"kind": "camera", "status": "unavailable", "captured": False})
         ret, frame = self.capture.read()
         if not ret or frame is None:
-            return "The camera opened but returned no frame."
-        return self.analyze_frame(frame)
+            return ToolResult("The camera opened but returned no frame.", ok=False,
+                              receipt={"kind": "camera", "status": "failed", "captured": False})
+        return ToolResult(self.analyze_frame(frame),
+                          receipt={"kind": "camera", "status": "captured", "captured": True})
 
     def release(self) -> None:
         if self.capture is not None:
@@ -75,13 +79,13 @@ def get_tool_schema():
     }
 
 
-def run():
+def run() -> ToolResult:
     # Constructed per call: nothing holds the camera open between uses, and
     # importing this module touches no hardware at all.
     analyser = LiveCameraAnalysis()
     try:
         return analyser.run_analysis()
     except Exception as exc:
-        return f"Error: {exc}"
+        return ToolResult(f"Camera analysis failed ({type(exc).__name__}); no analysis was verified.", ok=False)
     finally:
         analyser.release()

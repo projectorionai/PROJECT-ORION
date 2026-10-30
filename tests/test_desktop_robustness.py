@@ -144,8 +144,86 @@ def test_open_application_times_out_without_crashing_when_no_window_appears(monk
     layer = _layer(monkeypatch, desktop, fake_gw)
 
     result = layer.open_application("trayapp")
-    assert result.ok   # the launch itself succeeded — window just unconfirmed
+    # INTENTIONAL CHANGE (23 Oct 2026): this was ok=True, so a plan's next
+    # step typed into whatever had focus. The launch is reported, not success.
+    assert not result.ok
     assert "No new window was seen" in result.text
+    assert result.receipt["status"] == "started_no_window" and result.receipt["started"]
+
+
+def test_open_application_gives_a_started_but_windowless_launch_its_own_wait(monkeypatch):
+    fake_gw = _FakeGetWindow()
+    fake_gw.titles = ["Existing Window"]
+    desktop = _StubDesktopAgent(ToolResult(
+        "Started Slowapp, but no window has appeared yet.", ok=False,
+        receipt={"status": "started_no_window", "started": True, "window": False},
+        evidence=[{"app": "slowapp", "window": ""}]))
+    layer = _layer(monkeypatch, desktop, fake_gw)
+
+    def _late_window(app_name):
+        fake_gw.titles = ["Existing Window", "Slowapp - Home"]
+        return desktop._result
+    desktop.open_app = _late_window
+    result = layer.open_application("slowapp")
+    assert result.ok and "Window confirmed: 'Slowapp - Home'" in result.text
+
+
+def test_open_application_uses_the_window_the_agent_already_confirmed(monkeypatch):
+    fake_gw = _FakeGetWindow()
+    desktop = _StubDesktopAgent(ToolResult("Opened Notepad.",
+                                           evidence=[{"app": "notepad", "window": "Notes - Notepad"}]))
+    layer = _layer(monkeypatch, desktop, fake_gw)
+    polled = []
+    layer._wait_for_new_window = lambda *a: polled.append(a)
+    result = layer.open_application("notepad")
+    assert result.ok and "Window confirmed: 'Notes - Notepad'" in result.text and polled == []
+
+
+# ── DesktopAgent.open_app: "Opened X." only once X has a window ──────────────
+
+def _agent(monkeypatch, frames):
+    """A DesktopAgent whose launches are recorded, never run, and whose
+    window list advances one frame per poll."""
+    from orion_core import agents
+    agent = agents.DesktopAgent.__new__(agents.DesktopAgent)
+    agent.bus = _StubBus()
+    agent.OPEN_WINDOW_TIMEOUT_S = 0.3
+    agent.OPEN_WINDOW_POLL_S = 0.02
+    agent._note_launch = lambda *a, **k: ""
+    launched, polls = [], []
+    monkeypatch.setattr(agents.shutil, "which", lambda exe: f"C:\\Synthetic\\{exe}")
+    monkeypatch.setattr(agents.subprocess, "Popen", lambda argv, **_k: launched.append(argv))
+
+    def windows():
+        polls.append(1)
+        return frames[min(len(polls), len(frames)) - 1]
+    agent._top_windows = windows
+    return agent, launched, polls
+
+
+def test_open_app_waits_for_the_apps_own_window(monkeypatch):
+    agent, launched, polls = _agent(monkeypatch, [
+        [("explorer", "Downloads")], [("explorer", "Downloads")],
+        [("explorer", "Downloads"), ("notepad", "Untitled - Notepad")]])
+    result = agent.open_app("notepad")
+    assert result.ok and result.text.startswith("Opened Notepad")
+    assert launched == [["C:\\Synthetic\\notepad.exe"]] and len(polls) == 3
+    assert result.evidence[0]["window"] == "Untitled - Notepad"
+
+
+def test_open_app_matches_a_window_by_name_when_the_process_differs(monkeypatch):
+    agent, _launched, _polls = _agent(monkeypatch, [[("applicationframehost", "Notepad")]])
+    assert agent.open_app("notepad").ok
+
+
+def test_open_app_never_says_opened_when_no_window_appears(monkeypatch):
+    agent, launched, polls = _agent(monkeypatch, [[("explorer", "Downloads")]])
+    result = agent.open_app("notepad")
+    assert not result.ok and len(launched) == 1, "reported, never relaunched"
+    assert result.text.startswith("Started Notepad, but no window has appeared yet")
+    assert result.receipt == {"status": "started_no_window", "started": True,
+                              "window": False, "app": "notepad"}
+    assert len(polls) >= 2, "it waited, bounded, before saying so"
 
 
 def test_open_application_does_not_poll_when_the_launch_itself_failed(monkeypatch):

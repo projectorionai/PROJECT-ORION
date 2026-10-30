@@ -284,3 +284,146 @@ def test_the_reply_is_checked_before_anything_else_claims_it():
     resolve = source.index("_resolve_shutdown_confirmation(text)")
     power = source.index("_handle_power_command(lowered)")
     assert resolve < power
+
+
+# ── the Live model's own call asks too ───────────────────────────────────────
+
+def _live_call(h, said, *names, own_line=""):
+    """Run the Live tool handler for *names* after the user said *said*."""
+    ran = []
+    w = h.worker
+    w._turn_said = said
+    w._own_lines = live_worker_module.deque(maxlen=12)
+    if own_line:
+        w._remember_own_line(own_line)
+    w.session = None
+    w.mic = None
+    w._trace = None
+    w._turn_active = False
+    w._emit_state = lambda *_a: None
+    w._transport_ready = lambda: False
+    w.observe_for_reflex = lambda *_a, **_k: None
+    w.observe_resolver_shadow = lambda *_a: None
+    w.connected = False
+
+    async def run_tool(fc):
+        ran.append(fc.name)
+        return {"ok": True, "result": "done"}, None
+    w._run_tool_call = run_tool
+    w._farewell_spoken = False
+    calls = [types.SimpleNamespace(name=n, id=str(i), args={}) for i, n in enumerate(names)]
+    asyncio.run(w._handle_tool_call(types.SimpleNamespace(function_calls=calls)))
+    # An accepted power call is answered in place and leaves after the
+    # model's goodbye (_leave_after_model_goodbye), never dispatched directly.
+    assert not any(n in w.POWER_TOOLS for n in ran), "a power tool ran directly"
+    if w._farewell_spoken:
+        ran.extend(n for n in names if n in w.POWER_TOOLS)
+    return ran
+
+
+def test_one_goodbye_at_shutdown_in_his_own_voice(h):
+    """10 Oct: "when shutting down both of their voices activate at the same
+    time saying goodbye" - the Live model said goodbye AND app.py's local
+    farewell played, because the tool shut ORION down at once."""
+    w = h.worker
+    w._drop_live_output = False
+    waited = []
+
+    async def no_wait(*a, **k):
+        waited.append(1)
+    w._await_speech = no_wait
+
+    async def model_speaks():
+        started = asyncio.Event()
+        w._farewell_audio_started = started
+        go = asyncio.ensure_future(w._leave_after_model_goodbye(restart=False))
+        await asyncio.sleep(0.05)
+        started.set()                                  # the model's goodbye audio arrives
+        await go
+    asyncio.run(model_speaks())
+    assert h.fired == ["SHUTDOWN"] and h.said == [], "a second goodbye was spoken"
+
+    h.fired.clear()
+    w.MODEL_GOODBYE_START_S = 0.05
+
+    async def model_silent():
+        w._farewell_audio_started = asyncio.Event()
+        await w._leave_after_model_goodbye(restart=False)
+    asyncio.run(model_silent())
+    assert h.fired == ["SHUTDOWN"] and len(h.said) == 1, "silent model: exactly one local goodbye"
+    assert waited == [1, 1]
+
+
+def test_a_shutdown_nobody_asked_for_is_held_and_asked_about(h):
+    """The resolver's record has shutdown_orion called on "Can you not see?"
+    and "Oh my god, bro". Typed and locally heard "shut down" always asked;
+    the Live model's own call went straight through."""
+    assert _live_call(h, "Can you not see?", "shutdown_orion") == []
+    assert h.worker._shutdown_confirmation_open()
+    # Its yes, to the question it was told to ask, lets the next call through.
+    assert _live_call(h, "Yes.", "shutdown_orion") == ["shutdown_orion"]
+
+
+def test_a_held_power_call_does_not_hold_the_others(h):
+    assert _live_call(h, "what's the weather", "weather", "shutdown_orion") == ["weather"]
+
+
+def test_asked_for_shutdowns_go_straight_through(h):
+    for said in ("Ryan, shut down.", "shut down to please.",
+                 "Okay , all right , I'm going to bed good night."):
+        h.worker._pending_shutdown = None
+        assert _live_call(h, said, "shutdown_orion") == ["shutdown_orion"], said
+    h.worker._pending_shutdown = None
+    assert _live_call(h, "Yes please.", "shutdown_orion",
+                      own_line="Shall I shut down for the night?") == ["shutdown_orion"]
+    h.worker._pending_shutdown = None
+    assert _live_call(h, "Ryan, restart", "restart_orion") == ["restart_orion"]
+
+
+# ── overheard fragments while the live voice is down ──────────────────────────
+
+def test_an_overheard_fragment_gets_no_stock_reply(h):
+    """3 Oct: twelve "Understood. What would you like me to do?" in two
+    minutes, each to a fragment of a conversation ORION was not in."""
+    from orion_core.voice_variety import BANK
+    w = h.worker
+    w._overheard = "boundary brood"
+    filler = BANK["local_idle"][0]
+    assert w._overheard_filler("boundary brood", filler)
+    assert not w._overheard_filler("boundary brood", "It is ten past three.")  # a real answer
+    assert not w._overheard_filler("what time is it", filler)                  # typed / named
+    w._overheard = ""                                                          # said his name
+    assert not w._overheard_filler("boundary brood", filler)
+
+
+def test_a_shutdown_asked_for_with_extra_words_goes_through(h):
+    """8 Oct: "Okay, what I want you to do is shut down for now because I have
+    a lecture." - a request with a reason attached, not a device command."""
+    for said in ("Okay, what I want you to do is shut down for now because I have a lecture.",
+                 "Yeah, just shut down for now please have a lecture."):
+        h.worker._pending_shutdown = None
+        assert _live_call(h, said, "shutdown_orion") == ["shutdown_orion"], said
+    for said in ("Why did you shut down earlier?", "Don't shut down yet, I'm still working",
+                 "Are you going to shut down tonight?"):
+        h.worker._pending_shutdown = None
+        assert _live_call(h, said, "shutdown_orion") == [], said
+
+
+def test_shut_down_as_live_mishears_it_goes_straight_through(h):
+    """12 Oct 11:16 the owner said "shut down for now"; Live wrote "Should I
+    down for now, please, ..." and ORION asked for confirmation, so he had to
+    say it twice. 10 Oct: "Should I done for an hour round." The model heard
+    the audio and chose to shut down; only the transcript was garbled."""
+    for said in ("Should I down for now, please, all right, I'm just going to work a new bit more.",
+                 "Should I done for an hour round.",
+                 "Shut done for now.",
+                 "Shot down for today please.",
+                 "Right, I'm done for now.",
+                 "Okay, talk to you later."):
+        h.worker._pending_shutdown = None
+        assert _live_call(h, said, "shutdown_orion") == ["shutdown_orion"], said
+    # Look-alikes that are not "shut down": still asked about.
+    for said in ("Should I go down to the shop?", "I need to download that file.",
+                 "Should I sit down for this?", "The website was down earlier."):
+        h.worker._pending_shutdown = None
+        assert _live_call(h, said, "shutdown_orion") == [], said

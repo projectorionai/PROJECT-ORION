@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from orion_core.data import ToolResult
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -162,6 +163,7 @@ def test_a_reminder_service_is_preferred_for_the_announcement(tmp_path):
     class _Reminders:
         def add(self, **kwargs):
             told.append(kwargs)
+            return ToolResult("Reminder set")
 
     bus = _Bus()
     research = ResearchWorker(agent=_Agent(), bus=bus, reminders=_Reminders(),
@@ -272,3 +274,155 @@ def test_a_dossier_can_be_rendered_without_ever_running_anything():
                       sources=[Source("T", "https://u")], gatherer="test")
     text = dossier.as_markdown()
     assert "1. One" in text and "[T](https://u)" in text and "## Q" in text
+
+
+def test_failed_filing_is_not_announced_as_saved_in_memory(tmp_path):
+    blocked = tmp_path / "not-a-folder"
+    blocked.write_text("synthetic marker", encoding="utf-8")
+    bus = _Bus()
+    research = ResearchWorker(agent=_Agent(), bus=bus, root=blocked)
+    dossier = _run(research.investigate("solar energy", questions=1))
+    assert dossier.path is None and dossier.filing_error
+    assert str(blocked) in dossier.filing_error
+    assert dossier.summary and dossier.sections
+    announcement = " ".join(str(item) for item in bus.speak_request.sent)
+    assert "no report was saved" in announcement
+    assert "filed as memory" not in announcement
+    assert blocked.read_text(encoding="utf-8") == "synthetic marker"
+
+
+def test_same_topic_and_timestamp_do_not_overwrite_an_earlier_dossier(tmp_path):
+    research = ResearchWorker(root=tmp_path)
+    first = Dossier("same topic", 1.0, summary="First result")
+    second = Dossier("same topic", 1.0, summary="Second result")
+    first_path = research.file(first)
+    second_path = research.file(second)
+    assert first_path != second_path
+    assert "First result" in first_path.read_text(encoding="utf-8")
+    assert "Second result" in second_path.read_text(encoding="utf-8")
+    assert not list(tmp_path.glob(".dossier-*.tmp"))
+
+
+def test_failed_atomic_publication_leaves_existing_reports_and_no_partial_file(tmp_path, monkeypatch):
+    import orion_core.research_worker as module
+    older = tmp_path / "older-report.md"
+    older.write_bytes(b"older verified report")
+    def denied(_source, _destination):
+        raise PermissionError("synthetic access denied")
+    monkeypatch.setattr(module.os, "replace", denied)
+    dossier = Dossier("current topic", 1.0, summary="New result")
+    assert ResearchWorker(root=tmp_path).file(dossier) is None
+    assert "synthetic access denied" in dossier.filing_error
+    assert list(tmp_path.iterdir()) == [older]
+    assert older.read_bytes() == b"older verified report"
+
+
+def test_default_location_is_independent_of_the_launcher_working_directory(tmp_path, monkeypatch):
+    import orion_core.research_worker as module
+    configured = tmp_path / "private" / "research" / "dossiers"
+    monkeypatch.setattr(module, "DOSSIER_DIR", configured)
+    unrelated = tmp_path / "launcher-cwd"
+    unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+    path = ResearchWorker().file(Dossier("default location", 1.0, summary="Result"))
+    assert path.parent == configured
+    assert not (unrelated / "research").exists()
+
+
+def test_investigation_files_off_the_event_loop(tmp_path):
+    import threading
+    owner = threading.get_ident()
+    threads = []
+    class Recorded(ResearchWorker):
+        def file(self, dossier):
+            threads.append(threading.get_ident())
+            return super().file(dossier)
+    dossier = _run(Recorded(agent=_Agent(), root=tmp_path).investigate("topic", questions=1))
+    assert dossier.path is not None, dossier.filing_error
+    assert threads and owner not in threads
+
+
+def test_dispatch_delivers_research_content_with_failed_filing_status(monkeypatch):
+    from types import SimpleNamespace
+    from orion_core.dispatch_knowledge import KnowledgeDispatchMixin
+    dossier = Dossier("solar energy", 1.0, summary="Useful synthetic summary",
+                      takeaways=["Useful takeaway"], filing_error="synthetic access denied")
+    async def completed(self, topic, questions):
+        return dossier
+    monkeypatch.setattr(ResearchWorker, "investigate", completed)
+    dispatch = SimpleNamespace(research=None, bus=None, reminders=None)
+    result = _run(KnowledgeDispatchMixin._dossier(dispatch, "solar energy", {"questions": 1}))
+    assert not result.ok
+    assert "synthetic access denied" in result.text
+    assert "Useful synthetic summary" in result.text and "Useful takeaway" in result.text
+
+
+# ── accuracy (Mark XXXX.9, owner 30 Oct 2026) ─────────────────────────────────
+
+class _ReadingAgent(_Agent):
+    """Gathers like ResearchAgent: pages read when asked, snippets otherwise."""
+
+    def __init__(self, read=True):
+        super().__init__()
+        self.read = read
+        self.asked_to_read = []
+        self.rows = []
+
+    async def gather_sources(self, question, *, read_pages=0):
+        self.asked_to_read.append(read_pages)
+        return [{"title": "Read page", "url": "https://x/read",
+                 "snippet": "Evidence from the page.", "evidence": "page" if self.read else "snippet"},
+                {"title": "Headline", "url": "https://x/news", "snippet": "A headline.",
+                 "evidence": "headline"}]
+
+    async def _synthesise(self, topic, question, rows):
+        self.rows.append(rows)
+        return f"Body for {question} [{rows[0]['n']}]."
+
+
+def test_a_dossier_asks_for_pages_numbers_its_citations_and_says_what_was_read(tmp_path):
+    """"11 sources via the built-in encyclopaedia and news lookup" was eleven
+    snippets and headlines, not one page read."""
+    agent = _ReadingAgent()
+    dossier = _run(ResearchWorker(agent=agent, bus=_Bus(), root=tmp_path).investigate("Topic", questions=2))
+    assert agent.asked_to_read and all(n > 0 for n in agent.asked_to_read)
+    # One numbering for the whole dossier: both questions cite the read page as [1].
+    assert [rows[0]["n"] for rows in agent.rows] == [1, 1]
+    assert dossier.evidence_level == "pages" and "1 page read" in dossier.gatherer
+    text = dossier.path.read_text(encoding="utf-8")
+    assert "1. [Read page](https://x/read) — page read" in text
+    assert "2. [Headline](https://x/news) — headline only" in text
+
+
+def test_a_dossier_that_read_no_page_says_so(tmp_path):
+    bus = _Bus()
+    dossier = _run(ResearchWorker(agent=_ReadingAgent(read=False), bus=bus, root=tmp_path)
+                   .investigate("Topic", questions=1))
+    assert dossier.evidence_level == "snippets_only"
+    assert "no web page was opened" in dossier.gatherer
+    assert "No web page could be read" in str(bus.speak_request.sent)
+
+
+def test_a_dossier_reports_its_start_and_one_finish_even_when_cancelled(tmp_path):
+    from orion_core import research_runs
+
+    class _Hanging(_Agent):
+        async def _synthesise(self, topic, question, rows):
+            await asyncio.sleep(30)
+
+    bus = _Bus()
+    bus.dashboard_event = _Signal()
+
+    async def scenario():
+        task = asyncio.create_task(ResearchWorker(agent=_Hanging(), bus=bus, root=tmp_path)
+                                   .investigate("Hanging topic", questions=1))
+        await asyncio.sleep(0.05)
+        assert any(row["topic"] == "Hanging topic" for row in research_runs.live_activity())
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    _run(scenario())
+    events = [payload for channel, payload in bus.dashboard_event.sent if channel == "research"]
+    assert events[0]["status"] == "running" and events[-1]["status"] == "cancelled"
+    assert [e["status"] for e in events].count("cancelled") == 1
+    assert not any(row["topic"] == "Hanging topic" for row in research_runs.live_activity())

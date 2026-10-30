@@ -33,21 +33,38 @@ attached Telemetry, when one is given.
 from __future__ import annotations
 
 import asyncio
+import copy
 import fnmatch
 import json
 import os
 import shutil
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from .constants import BASE_DIR, CONFIG_DIR
 from .atomic_io import atomic_write_text
+from .mcp_policy import _SECRET as _SECRET_RE
 
 MCP_CONFIG_PATH = CONFIG_DIR / "mcp_servers.json"
 #: Each server's tool list from its last successful start, so the next boot
 #: can offer the tools without launching the process (see _cached_tools).
 MCP_CATALOGUE_PATH = CONFIG_DIR / "mcp_catalogue.json"
 _PROTOCOL_VERSION = "2024-11-05"
+_MODERN_PROTOCOL_VERSION = "2026-07-28"
+def _bundled_spec(name: str) -> tuple[str, list[str]]:
+    """How to start one of ORION's own MCP servers (mcp_bundled.launch_spec)."""
+    from .mcp_bundled import launch_spec
+    return launch_spec(name)
+
+
+_SUPPORTED_LEGACY_VERSIONS = frozenset({
+    "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25",
+})
+# A uvx server can spend several seconds importing its document libraries.
+# Treat that as startup latency rather than evidence of a legacy protocol.
+_DISCOVER_TIMEOUT = 30.0
 _CALL_TIMEOUT = 45.0
 #: Long enough for the FIRST launch, when npx/uvx download the server package
 #: before it can answer. 25 s failed every first run on a home connection and
@@ -58,17 +75,17 @@ _HANDSHAKE_TIMEOUT = 120.0
 #: a gigabyte between them while doing nothing. ORION_MCP_IDLE_PARK_S=0 keeps
 #: every server running.
 _IDLE_PARK_S = 1800.0
+# Discovery is atomic and bounded even if a server emits endless cursors.
+_CATALOGUE_MAX_PAGES = 128
+_CATALOGUE_MAX_TOOLS = 10_000
 
 #: Bumped when migrate_config learns a new fix; recorded in the config so a
 #: server the user later switches off is not switched back on.
-CONFIG_REVISION = "mark31"
+CONFIG_REVISION = "mark33-desktop-targets"
 
 #: Env names that hold a credential. An enabled server with one of these empty
 #: cannot work, so it is reported as waiting for that key — not launched,
 #: failed, retried and reported as broken every thirty seconds.
-_SECRET_RE = __import__("re").compile(
-    r"(?i)(key|token|secret|sid|password|credential|auth)")
-
 # Per-tool confirmation lists for the shipped entries (see requires_confirmation).
 # Exact tool names, so a tool a server adds later is judged when it is added
 # rather than swept in or out by a pattern.
@@ -131,6 +148,13 @@ def _default_template() -> dict[str, Any]:
             "launched. See docs/MCP_SETUP.md for Gmail/Calendar OAuth."
         ),
         "servers": {
+            "orion_telemetry": {
+                "enabled": False,
+                "command": _bundled_spec("orion_telemetry")[0],
+                "args": _bundled_spec("orion_telemetry")[1],
+                "env": {},
+                "description": "Local read-only CPU, RAM and process-memory telemetry; no account or API fee.",
+            },
             "gmail": {
                 "enabled": False,
                 "command": "npx",
@@ -463,6 +487,14 @@ def resolve_command(command: str) -> str:
 def missing_credentials(spec: dict[str, Any]) -> list[str]:
     """The credential env vars an enabled server still needs filled in."""
     env = spec.get("env") or {}
+    if "TWILIO_ACCOUNT_SID" in env:
+        missing = [] if str(env.get("TWILIO_ACCOUNT_SID") or "").strip() else ["TWILIO_ACCOUNT_SID"]
+        token = str(env.get("TWILIO_AUTH_TOKEN") or "").strip()
+        key = str(env.get("TWILIO_API_KEY") or "").strip()
+        secret = str(env.get("TWILIO_API_SECRET") or "").strip()
+        if not token and not (key and secret):
+            missing.append("TWILIO_AUTH_TOKEN or TWILIO_API_KEY + TWILIO_API_SECRET")
+        return missing
     return [str(k) for k, v in env.items()
             if _SECRET_RE.search(str(k)) and not str(v or "").strip()]
 
@@ -539,6 +571,31 @@ def autofill_credentials(name: str, spec: dict[str, Any]) -> dict[str, Any]:
 #: Servers worth having on out of the box: useful, and needing nothing ORION
 #: does not already have. Anything else stays off until the user turns it on.
 _RECOMMENDED: dict[str, dict[str, Any]] = {
+    "orion_desktop": {
+        "enabled": sys.platform == "win32",
+        "command": _bundled_spec("orion_desktop")[0],
+        "args": _bundled_spec("orion_desktop")[1],
+        "env": {},
+        "description": ("On-demand foreground control labels, automation IDs and physical monitor geometry. "
+                        "Read-only targeting; native desktop_control owns clicks and their verification."),
+    },
+    "orion_world": {
+        "enabled": True,
+        "command": _bundled_spec("orion_world")[0],
+        "args": _bundled_spec("orion_world")[1],
+        "env": {},
+        "description": ("Official read-only CelesTrak satellite predictions, USGS earthquakes, "
+                        "NOAA tsunami bulletins and Met Office UK weather warnings; "
+                        "shared cache, attributed sources, no account or API key."),
+    },
+    "orion_network": {
+        "enabled": True,
+        "command": _bundled_spec("orion_network")[0],
+        "args": _bundled_spec("orion_network")[1],
+        "env": {},
+        "description": ("Read-only checks of this PC's Tailscale name and "
+                        "ORION phone gateway listener; no account or API key."),
+    },
     "fetch": {
         "enabled": True,
         "command": "uvx",
@@ -603,20 +660,72 @@ def migrate_config(data: dict[str, Any]) -> bool:
                 existing.setdefault("description", spec["description"])
         data["_revision"] = CONFIG_REVISION
         changed = True
+    if "orion_telemetry" not in servers:
+        servers["orion_telemetry"] = _default_template()["servers"]["orion_telemetry"]
+        changed = True
     return changed
 
 
+def _host_runtime_servers(data: dict[str, Any]) -> dict[str, Any]:
+    """Bundled Python servers use the same working runtime as the host.
+
+    Frozen, that is the executable itself (`ORION.exe --mcp-server NAME`, see
+    mcp_bundled): a saved config still pointing `python` at the loose
+    _internal copy of the module is rewritten here, because that copy cannot
+    import the rest of ORION - orion_world died on `from orion_core.world_feeds`."""
+    from .mcp_bundled import FILES, FLAG
+    frozen = getattr(sys, "frozen", False)
+    for name, filename in FILES.items():
+        spec = data.get("servers", {}).get(name)
+        if not isinstance(spec, dict):
+            continue
+        args = spec.get("args") or []
+        expected = Path(__file__).with_name(filename)
+        if frozen:
+            ours = (args == [FLAG, name]
+                    or (len(args) == 1 and Path(str(args[0])).name == filename
+                        and Path(str(args[0])).parent.name == "orion_core"))
+            if ours:
+                spec["command"], spec["args"] = _bundled_spec(name)
+        elif args == [str(expected)]:
+            spec["command"] = sys.executable
+    return data
+
+
+class _UnavailableConfig(dict[str, Any]):
+    """Keep absent policy distinct from an intentionally empty server list."""
+
+    error = ("MCP configuration is unavailable. Restore or repair mcp_servers.json "
+             "before starting servers or changing their settings; the file has been preserved.")
+
+    def __init__(self) -> None:
+        super().__init__(servers={})
+
+
 def load_config() -> dict[str, Any]:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate configuration field")
+            result[key] = value
+        return result
+
     try:
-        data = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("servers"), dict):
-            if migrate_config(data):
-                try:
-                    atomic_write_text(MCP_CONFIG_PATH, json.dumps(data, indent=2),
-                                      encoding="utf-8")
-                except OSError:
-                    pass
-            return data
+        data = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"),
+                          object_pairs_hook=unique_object)
+        if (not isinstance(data, dict) or not isinstance(data.get("servers"), dict)
+                or any(not isinstance(spec, dict)
+                       or "enabled" in spec and type(spec["enabled"]) is not bool
+                       for spec in data["servers"].values())):
+            return _UnavailableConfig()
+        if migrate_config(data):
+            try:
+                atomic_write_text(MCP_CONFIG_PATH, json.dumps(data, indent=2),
+                                  encoding="utf-8")
+            except OSError:
+                pass
+        return _host_runtime_servers(data)
     except FileNotFoundError:
         # First run — drop a template so the user can see the shape and enable one.
         try:
@@ -624,9 +733,11 @@ def load_config() -> dict[str, Any]:
             atomic_write_text(MCP_CONFIG_PATH, json.dumps(_default_config(), indent=2), encoding="utf-8")
         except OSError:
             pass
-    except (OSError, ValueError):
-        pass
-    return _default_config()
+    except (OSError, ValueError, TypeError, RecursionError):
+        # A retained unreadable policy is not a new installation. Do not
+        # enable defaults, import independent settings or overwrite its bytes.
+        return _UnavailableConfig()
+    return _host_runtime_servers(_default_config())
 
 
 #: How long a server gets to exit on its own, and again after being forced.
@@ -649,6 +760,14 @@ class MCPProtocolError(RuntimeError):
         super().__init__(detail)
 
 
+class _MalformedReply(MCPProtocolError):
+    """A correlated response violated JSON-RPC framing or MCP's result shape."""
+
+
+class _LegacyProbeClosed(RuntimeError):
+    """The server exited when probed before the legacy initialize request."""
+
+
 class MCPReply(str):
     """What ``MCPHost.call`` returns: the reply text, plus how it failed.
 
@@ -660,15 +779,77 @@ class MCPReply(str):
 
     ERROR_KINDS = ("tool", "protocol", "timeout", "unavailable")
     kind: str
+    content: list[dict[str, Any]]
+    structured_content: dict[str, Any] | None
+    meta: dict[str, Any]
+    provenance: dict[str, Any]
 
-    def __new__(cls, text: str, kind: str = "") -> "MCPReply":
+    def __new__(cls, text: str, kind: str = "", *, content: Any = None,
+                structured_content: Any = None, meta: Any = None,
+                provenance: Any = None) -> "MCPReply":
         reply = super().__new__(cls, text)
         reply.kind = kind
+        # Keep the wire result separate from its backwards-compatible spoken
+        # summary. Callers can retain image/resource/structured evidence without
+        # guessing it from bracketed text or fetching an untrusted resource URI.
+        reply.content = copy.deepcopy(content or [])
+        reply.structured_content = copy.deepcopy(structured_content)
+        reply.meta = copy.deepcopy(meta or {})
+        reply.provenance = copy.deepcopy(provenance or {})
         return reply
 
     @property
     def is_error(self) -> bool:
         return bool(self.kind)
+
+    def as_tool_receipt(self) -> dict[str, Any]:
+        """Snapshot protocol content separately from the spoken summary."""
+        return copy.deepcopy({
+            "type": "mcp", "content": self.content,
+            "structuredContent": self.structured_content, "_meta": self.meta,
+            "provenance": self.provenance, "isError": self.is_error,
+            "errorKind": self.kind, "untrusted": True,
+        })
+
+
+_BACKGROUND_BUNDLED_TOOLS = {
+    "orion_desktop": frozenset({"desktop_target_status", "desktop_monitors",
+                                 "desktop_controls", "desktop_find_target"}),
+    "orion_telemetry": frozenset({"system_snapshot", "process_memory"}),
+    "orion_network": frozenset({"tailnet_status", "phone_gateway_status"}),
+    "orion_world": frozenset({"world_satellites", "world_earthquakes", "world_tsunami",
+                               "world_weather", "world_events", "world_feed_status"}),
+}
+
+
+def _background_mcp_refusal(server: str, tool: str, spec: Any) -> MCPReply | None:
+    """Enforce the host policy before crossing a native process boundary.
+
+    ContextVars are not a subprocess sandbox. Only exact tools of reviewed,
+    bundled read-only modules can be called from a restricted task; neither
+    an MCP annotation nor a familiar server name can confer that permission.
+    Custom extensions need a separately reviewed, isolated execution adapter.
+    """
+    from .execution_policy import is_background, require_foreground
+    effect = f"mcp:{server}.{tool}"
+    if is_background():
+        allowed = tool in _BACKGROUND_BUNDLED_TOOLS.get(server, ())
+        if allowed and isinstance(spec, dict):
+            command, args = _bundled_spec(server)
+            allowed = (spec.get("command") == command and spec.get("args") == args
+                       and not spec.get("env") and not spec.get("inherit_env"))
+        else:
+            allowed = False
+        if allowed:
+            return None
+        blocked = require_foreground(effect)
+    else:
+        # A copied foreground worker may outlive the host's explicit grant.
+        blocked = require_foreground(effect)
+    if blocked is None:
+        return None
+    return MCPReply(blocked.text, "tool", structured_content=blocked.receipt,
+                    provenance={"server": server, "tool": tool, "policy": "host_background"})
 
 
 async def _kill_tree(proc: Any) -> None:
@@ -706,6 +887,7 @@ class MCPServerConn:
         self.command = str(spec.get("command") or "")
         self.args = [str(a) for a in (spec.get("args") or [])]
         self.env = {str(k): str(v) for k, v in (spec.get("env") or {}).items()}
+        self.spec = dict(spec)
         self._credential_values = sorted({
             value for key, value in self.env.items()
             if _SECRET_RE.search(key) and value.strip()
@@ -717,10 +899,23 @@ class MCPServerConn:
         self.tools: list[dict[str, Any]] = []
         self._id = 0
         self._lock = asyncio.Lock()          # one in-flight request at a time
+        self._active_calls = 0               # includes off-thread validation / queued requests
         self.ready = False
         self.last_error = ""
         self._stderr_tail: list[str] = []
         self._stderr_task: Any = None
+        self._receive_task: asyncio.Task[Any] | None = None
+        self._receive_proc: Any = None
+        self._receive_error: Exception | None = None
+        self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._refresh_task: asyncio.Task[Any] | None = None
+        self._catalogue_dirty = False
+        self._catalogue_refresh_failed = False
+        self._on_catalogue_changed: Any = None
+        self._stopping = False
+        self.capabilities: dict[str, Any] = {}
+        self.protocol_version: str | None = None
+        self._force_legacy = False
         #: When a tool was last called (monotonic), for idle parking.
         self.last_used = time.monotonic()
 
@@ -737,11 +932,24 @@ class MCPServerConn:
             self._log(f"{self.last_error}; skipped.")
             return False
         # The server's own directory on PATH too, so npx can find node.
-        env = {**os.environ, **self.env}
+        from .mcp_policy import child_environment
+        try:
+            env = child_environment(self.spec, dict(os.environ))
+        except ValueError as exc:
+            self.last_error = str(exc)
+            return False
+        # Redact what this process actually receives, including credentials
+        # explicitly inherited from the parent rather than stored in env.
+        self._credential_values = sorted({
+            value for key, value in env.items()
+            if _SECRET_RE.search(key) and value.strip()
+            and value.strip().lower() not in {"0", "1", "true", "false"}
+        }, key=len, reverse=True)
         extra = os.pathsep.join([os.path.dirname(executable), *_tool_dirs()])
         env["PATH"] = extra + os.pathsep + env.get("PATH", "")
         flags = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW
         try:
+            self._stopping = False
             self.proc = await asyncio.create_subprocess_exec(
                 executable, *self.args,
                 stdin=asyncio.subprocess.PIPE,
@@ -760,6 +968,22 @@ class MCPServerConn:
         self._drain_stderr()
         try:
             await asyncio.wait_for(self._handshake(), timeout=_HANDSHAKE_TIMEOUT)
+            # The sole reader can resolve the final discovery response and
+            # then observe EOF/invalid output before this coroutine resumes.
+            # Never overwrite that terminal failure with a successful start.
+            if self._receive_error is not None:
+                raise self._receive_error
+            if self.proc is None or self.proc.returncode is not None:
+                raise RuntimeError("server closed the connection")
+        except _LegacyProbeClosed:
+            # Some handshake-era servers exit on any request before initialize.
+            # Retry once with a fresh process rather than declaring them broken.
+            await self.stop()
+            self._force_legacy = True
+            return await self.start()
+        except asyncio.CancelledError:
+            await self.stop(force=True)
+            raise
         except Exception as exc:
             tail = " | ".join(self._stderr_tail[-3:])
             self.last_error = self._redact(f"handshake failed - {exc or type(exc).__name__}" + (
@@ -772,6 +996,7 @@ class MCPServerConn:
         self.last_error = ""
         self.last_used = time.monotonic()
         self._log(f"connected — {len(self.tools)} tool(s) available.")
+        self._schedule_refresh()
         return True
 
     def _drain_stderr(self) -> None:
@@ -805,27 +1030,132 @@ class MCPServerConn:
             pass
 
     async def _handshake(self) -> None:
-        result = await self._request("initialize", {
-            "protocolVersion": _PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "O.R.I.O.N.", "version": "1.0"},
-        })
-        if not isinstance(result, dict):
-            raise RuntimeError("no initialize result")
-        await self._notify("notifications/initialized")
-        listed = await self._request("tools/list", {})
-        self.tools = list((listed or {}).get("tools") or [])
+        if not self._force_legacy and self.spec.get("protocol_mode") != "legacy":
+            try:
+                discovered = await asyncio.wait_for(
+                    self._request("server/discover", self._modern_meta()),
+                    timeout=_DISCOVER_TIMEOUT,
+                )
+            except _MalformedReply:
+                raise
+            except MCPProtocolError as exc:
+                # -32022 is a modern server explicitly rejecting this version.
+                # Unknown-method and other errors can be a legacy server.
+                if exc.code == -32022:
+                    raise RuntimeError(f"modern protocol version unsupported: {exc}") from exc
+            except asyncio.TimeoutError:
+                pass
+            except RuntimeError as exc:
+                if "server closed the connection" in str(exc):
+                    raise _LegacyProbeClosed() from exc
+                raise
+            else:
+                versions = discovered.get("supportedVersions") if isinstance(discovered, dict) else None
+                if (not isinstance(discovered, dict)
+                        or discovered.get("resultType") != "complete"
+                        or not isinstance(versions, list)
+                        or _MODERN_PROTOCOL_VERSION not in versions
+                        or not isinstance(discovered.get("capabilities"), dict)):
+                    raise _MalformedReply("invalid or unsupported server/discover result")
+                self.protocol_version = _MODERN_PROTOCOL_VERSION
+                self.capabilities = discovered["capabilities"]
+                await self._list_tools()
+                return
 
-    async def stop(self) -> None:
+        try:
+            result = await self._request("initialize", {
+                "protocolVersion": _PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "O.R.I.O.N.", "version": "1.0"},
+            })
+        except MCPProtocolError as exc:
+            supported = exc.data.get("supported") if isinstance(exc.data, dict) else None
+            if (exc.code != -32022 or self._force_legacy or self.spec.get("protocol_mode") == "legacy"
+                    or not isinstance(supported, list) or _MODERN_PROTOCOL_VERSION not in supported):
+                raise
+            # A slow discover may have selected the modern era at the server
+            # after our deadline. Re-probe once on that connection, as the
+            # official SDK does, instead of sending an incompatible handshake.
+            discovered = await asyncio.wait_for(
+                self._request("server/discover", self._modern_meta()), timeout=_DISCOVER_TIMEOUT)
+            if (not isinstance(discovered, dict) or discovered.get("resultType") != "complete"
+                    or not isinstance(discovered.get("supportedVersions"), list)
+                    or _MODERN_PROTOCOL_VERSION not in discovered["supportedVersions"]
+                    or not isinstance(discovered.get("capabilities"), dict)):
+                raise _MalformedReply("invalid or unsupported server/discover result")
+            self.protocol_version = _MODERN_PROTOCOL_VERSION
+            self.capabilities = discovered["capabilities"]
+            await self._list_tools()
+            return
+        if not isinstance(result, dict):
+            raise _MalformedReply("no initialize result")
+        version = result.get("protocolVersion")
+        if version not in _SUPPORTED_LEGACY_VERSIONS:
+            raise _MalformedReply(f"unsupported initialize protocolVersion: {version!r}")
+        if not isinstance(result.get("capabilities"), dict):
+            raise _MalformedReply("initialize result has no capabilities object")
+        self.protocol_version = version
+        self.capabilities = result["capabilities"]
+        await self._notify("notifications/initialized")
+        await self._list_tools()
+
+    @staticmethod
+    def _modern_meta() -> dict[str, Any]:
+        return {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": _MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientInfo": {"name": "O.R.I.O.N.", "version": "1.0"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        }}
+
+    async def _list_tools(self, *, request: Any = None) -> None:
+        request = request or self._request
+        tools: list[dict[str, Any]] = []
+        names: set[str] = set()
+        cursors: set[str] = set()
+        params: dict[str, Any] = {}
+        for _page in range(_CATALOGUE_MAX_PAGES):
+            listed = await request("tools/list", params)
+            page = listed.get("tools") if isinstance(listed, dict) else None
+            page = _validate_catalogue(page)
+            if (self.protocol_version == _MODERN_PROTOCOL_VERSION
+                    and listed.get("resultType") != "complete"):
+                raise _MalformedReply("tools/list did not return a complete result")
+            for tool in page:
+                if tool["name"] in names:
+                    raise _MalformedReply("tools/list returned duplicate tool names")
+                names.add(tool["name"])
+                tools.append(tool)
+            if len(tools) > _CATALOGUE_MAX_TOOLS:
+                raise _MalformedReply("tools/list exceeded the tool limit")
+            cursor = listed.get("nextCursor")
+            if cursor is None:
+                # Never expose the first page of a failed or incomplete catalogue.
+                self.tools = tools
+                return
+            if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise _MalformedReply("tools/list returned an invalid or repeated cursor")
+            cursors.add(cursor)
+            params = {"cursor": cursor}
+        raise _MalformedReply("tools/list exceeded the page limit")
+
+    async def stop(self, *, force: bool = False) -> None:
+        self._stopping = True
         proc = self.proc
         self.proc = None
         self.ready = False
+        self.protocol_version = None
         task = self._stderr_task
         self._stderr_task = None
-        if task is not None:
-            task.cancel()
-        if proc is None:
-            return
+        owned = [t for t in (self._receive_task, self._refresh_task)
+                 if t is not None and t is not asyncio.current_task()]
+        self._receive_task = None
+        self._refresh_task = None
+        self._catalogue_dirty = False
+        for child in owned:
+            child.cancel()
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(RuntimeError("server closed the connection"))
         # The MCP stdio shutdown order: close the server's stdin and let it
         # exit, and only then force it. The order matters on Windows: uvx and
         # npx run the real server as a CHILD that shares the pipes, so
@@ -833,26 +1163,56 @@ class MCPServerConn:
         # still held — the full timeout, per server, at every shutdown
         # (measured: 12.0 s of a 14.3 s exit for three servers).
         try:
-            if proc.stdin is not None:
-                proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=_EXIT_GRACE_S)
-        except Exception:
-            await _kill_tree(proc)
+            # A cancelled handshake has no established session to drain.
+            # Kill its owned tree before stderr retirement or a graceful wait;
+            # otherwise cancellation consumes the entire shutdown grace budget.
+            if force and proc is not None:
+                await _kill_tree(proc)
+            if owned:
+                await asyncio.gather(*owned, return_exceptions=True)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            if proc is None:
+                return
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=_EXIT_GRACE_S)
             except Exception:
-                pass
-        # Close the pipes explicitly. Left to the garbage collector, each one
-        # raised "I/O operation on closed pipe" from its __del__ at exit.
-        transport = getattr(proc, "_transport", None)
-        if transport is not None:
-            try:
-                transport.close()
-            except Exception:
-                pass
+                await _kill_tree(proc)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=_EXIT_GRACE_S)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            # A shutdown budget may cancel a reconnect while it is retiring
+            # the old connection. Its process is still ours: force it down
+            # and close the pipes before propagating that cancellation.
+            if proc is not None:
+                await _kill_tree(proc)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=_EXIT_GRACE_S)
+                except Exception:
+                    pass
+            raise
+        finally:
+            for child in owned:
+                if not child.done():
+                    child.cancel()
+            if owned:
+                await asyncio.gather(*owned, return_exceptions=True)
+            # Close the pipes on every exit, including cancellation during
+            # stderr retirement; garbage collection is too late for cleanup.
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
 
     def is_alive(self) -> bool:
         """Mark XXI, Track E2: True only while the subprocess is genuinely
@@ -878,61 +1238,223 @@ class MCPServerConn:
 
     async def _request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         async with self._lock:
-            self._id += 1
-            req_id = self._id
-            msg: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
-            if params is not None:
-                msg["params"] = params
+            return await self._request_locked(method, params)
+
+    async def _request_locked(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        """Send one request while the caller owns the connection's wire lock."""
+        if self._stopping:
+            raise RuntimeError("server closed the connection")
+        self._id += 1
+        req_id = self._id
+        msg: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        if params is not None or self.protocol_version == _MODERN_PROTOCOL_VERSION:
+            request_params = dict(params or {})
+            if self.protocol_version == _MODERN_PROTOCOL_VERSION:
+                request_params.update(self._modern_meta())
+            msg["params"] = request_params
+        future = asyncio.get_running_loop().create_future()
+        self._pending[req_id] = future
+        try:
+            self._ensure_receiver()
             await self._send(msg)
-            # Read replies until the one matching our id arrives; server-initiated
-            # requests/notifications (sampling, logging) are ignored — ORION uses
-            # servers only as tool providers.
-            assert self.proc is not None and self.proc.stdout is not None
-            while True:
-                line = await self.proc.stdout.readline()
+            return await future
+        finally:
+            self._pending.pop(req_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                # A pipe failure can race a failed stdin write. Retrieve the
+                # future's exception even when the write raised first.
+                future.exception()
+
+    def _ensure_receiver(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stdout is None:
+            raise RuntimeError("server not running")
+        if self._receive_proc is proc and self._receive_task is not None:
+            if self._receive_task.done() and self._receive_error is not None:
+                raise self._receive_error
+            return
+        self._receive_proc = proc
+        self._receive_error = None
+        self._receive_task = asyncio.create_task(
+            self._receive(proc), name=f"orion-mcp-receive-{self.name}")
+
+    async def _receive(self, proc: Any) -> None:
+        """The sole stdout reader, including while no request is active."""
+        try:
+            malformed_lines = 0
+            while self.proc is proc and not self._stopping:
+                line = await proc.stdout.readline()
                 if not line:
-                    self.ready = False   # Track E2: detected here, not only on next probe
+                    if malformed_lines:
+                        raise _MalformedReply("server sent invalid JSON-RPC output")
                     raise RuntimeError("server closed the connection")
                 try:
                     obj = json.loads(line.decode("utf-8").strip())
-                except ValueError:
+                except (ValueError, UnicodeError):
+                    malformed_lines += 1
+                    if malformed_lines >= 8:
+                        self.ready = False
+                        raise _MalformedReply("server sent repeated invalid JSON-RPC output")
                     continue
-                if obj.get("id") == req_id:
+                if not isinstance(obj, dict):
+                    malformed_lines += 1
+                    if malformed_lines >= 8:
+                        self.ready = False
+                        raise _MalformedReply("server sent repeated invalid JSON-RPC output")
+                    continue
+                if "method" in obj:
+                    if obj.get("jsonrpc") != "2.0":
+                        continue
+                    if ("id" not in obj
+                            and obj["method"] == "notifications/tools/list_changed"
+                            and ("params" not in obj or isinstance(obj["params"], dict))):
+                        self._catalogue_dirty = True
+                        self._schedule_refresh()
+                    elif type(obj.get("id")) in (str, int):
+                        await self._send({"jsonrpc": "2.0", "id": obj["id"],
+                                          "error": {"code": -32601, "message": "Client method unsupported"}})
+                    continue
+                future = (self._pending.get(obj["id"])
+                          if type(obj.get("id")) is int else None)
+                if future is not None and not future.done():
+                    if (obj.get("jsonrpc") != "2.0"
+                            or ("result" in obj) == ("error" in obj)):
+                        self.ready = False
+                        raise _MalformedReply("server sent an invalid JSON-RPC response")
                     if "error" in obj:
-                        raise MCPProtocolError(obj["error"])
-                    return obj.get("result")
+                        if (not isinstance(obj["error"], dict)
+                                or type(obj["error"].get("code")) is not int
+                                or not isinstance(obj["error"].get("message"), str)):
+                            self.ready = False
+                            raise _MalformedReply("server sent an invalid JSON-RPC error")
+                        future.set_exception(MCPProtocolError(obj["error"]))
+                    else:
+                        future.set_result(obj["result"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self.proc is proc and not self._stopping:
+                self.ready = False
+                self._receive_error = exc
+                for future in self._pending.values():
+                    if not future.done():
+                        future.set_exception(exc)
+                if self._on_catalogue_changed is not None:
+                    self._on_catalogue_changed(self)
+
+    def _schedule_refresh(self) -> None:
+        if (not self._catalogue_dirty or not self.ready or self._stopping
+                or self.proc is None
+                or (self._refresh_task is not None and not self._refresh_task.done())):
+            return
+        self._refresh_task = asyncio.create_task(
+            self._refresh_catalogue(), name=f"orion-mcp-refresh-{self.name}")
+
+    async def _refresh_catalogue(self) -> None:
+        proc = self.proc
+        self._active_calls += 1
+        try:
+            while self._catalogue_dirty and self.ready and self.proc is proc:
+                self._catalogue_dirty = False
+                try:
+                    # An admitted tool can legitimately use its full call
+                    # budget. Discovery's shorter budget starts only after
+                    # that tool releases the wire, and covers all pages.
+                    async with self._lock:
+                        if self._stopping or self.proc is not proc or not self.ready:
+                            return
+                        await asyncio.wait_for(
+                            self._list_tools(request=self._request_locked),
+                            timeout=_DISCOVER_TIMEOUT)
+                    self._catalogue_refresh_failed = False
+                except Exception as exc:
+                    self.ready = False
+                    self._catalogue_refresh_failed = True
+                    self.last_error = self._redact(f"tool catalogue refresh failed - {exc}")
+                    self._log(self.last_error)
+                if self._stopping or self.proc is not proc:
+                    return
+                if self._on_catalogue_changed is not None:
+                    self._on_catalogue_changed(self)
+        finally:
+            self._active_calls -= 1
 
     def busy(self) -> bool:
         """A request is in flight, so the process must not be stopped."""
-        return self._lock.locked()
+        return (self._active_calls > 0 or self._lock.locked()
+                or (self._refresh_task is not None and not self._refresh_task.done()))
 
     async def call_tool(self, tool: str, arguments: dict[str, Any]) -> "MCPReply":
+        blocked = _background_mcp_refusal(self.name, tool, self.spec)
+        if blocked is not None:
+            return blocked
+        from .mcp_policy import validate_arguments
+        # Argument validation may resolve filesystem paths in a worker thread.
+        # Mark the connection in use before yielding, so idle parking cannot
+        # stop the server between the host's parked check and this request.
+        self._active_calls += 1
         self.last_used = time.monotonic()
-        result = await asyncio.wait_for(
-            self._request("tools/call", {"name": tool, "arguments": arguments or {}}),
-            timeout=_CALL_TIMEOUT,
-        )
-        return self._redact(self._render(result))
+        try:
+            arguments = await asyncio.to_thread(validate_arguments, self.spec, arguments)
+            result = await asyncio.wait_for(
+                self._request("tools/call", {"name": tool, "arguments": arguments or {}}),
+                timeout=_CALL_TIMEOUT,
+            )
+            if (self.protocol_version == _MODERN_PROTOCOL_VERSION
+                    and (not isinstance(result, dict) or "resultType" not in result)):
+                self.ready = False
+                return MCPReply("MCP server returned a modern result without resultType.", "protocol")
+            reply = self._render(result)
+            reply.provenance = {"server": self.name, "tool": tool,
+                                "protocol_version": self.protocol_version}
+            if not isinstance(result, dict) or not isinstance(result.get("content"), list):
+                self.ready = False
+            return self._redact(reply)
+        finally:
+            self._active_calls -= 1
+            self.last_used = time.monotonic()
 
     @staticmethod
     def _render(result: Any) -> "MCPReply":
-        """Flatten an MCP tool result's content blocks to text."""
+        """Keep typed evidence and derive only a separate readable summary."""
         if not isinstance(result, dict):
-            return MCPReply(str(result))
+            return MCPReply("MCP server returned an invalid tool result.", "protocol")
+        if result.get("resultType", "complete") != "complete":
+            return MCPReply("MCP tool requires an unsupported follow-up request.", "protocol")
+        if not isinstance(result.get("content"), list):
+            return MCPReply("MCP server returned an invalid tool result.", "protocol")
+        if ("structuredContent" in result and not isinstance(result["structuredContent"], dict)
+                or "isError" in result and type(result["isError"]) is not bool
+                or "_meta" in result and not isinstance(result["_meta"], dict)):
+            return MCPReply("MCP server returned invalid structured tool content.", "protocol")
+        retained = {"content": result["content"],
+                    "structured_content": result.get("structuredContent"),
+                    "meta": result.get("_meta", {})}
         parts: list[str] = []
-        for block in result.get("content") or []:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-            else:
-                parts.append(f"[{block.get('type', 'content')}]")
+        for block in result["content"]:
+            if not _valid_content(block):
+                return MCPReply("MCP server returned malformed or unsupported content.",
+                                "protocol", **retained)
+            kind = block["type"]
+            if kind == "text":
+                parts.append(block["text"])
+            elif kind in {"image", "audio"}:
+                parts.append(f"[{kind}: {block['mimeType']}]")
+            elif kind == "resource_link":
+                parts.append(f"[resource link: {block['name']}] {block['uri']} (not fetched)")
+            elif kind == "resource":
+                resource = block["resource"]
+                parts.append(f"[resource: {resource['uri']}] " + resource.get("text", "[binary content]"))
         text = "\n".join(p for p in parts if p).strip()
+        if not text and result.get("structuredContent") is not None:
+            text = json.dumps(result["structuredContent"], ensure_ascii=False)
         if result.get("isError"):
             # The tool ran and failed: its own message is what lets the model
             # correct the arguments, so it is kept whole.
-            return MCPReply(f"(tool error) {text or 'the MCP server reported an error'}", "tool")
-        return MCPReply(text or "(the tool returned no content)")
+            return MCPReply(f"(tool error) {text or 'the MCP server reported an error'}", "tool", **retained)
+        return MCPReply(text or "(the tool returned no content)", **retained)
 
     def _log(self, message: str) -> None:
         try:
@@ -942,9 +1464,25 @@ class MCPServerConn:
 
     def _redact(self, message: str) -> str:
         """Keep configured credentials out of server errors and log tails."""
+        reply = message if isinstance(message, MCPReply) else None
+        message = str(message)
         for value in self._credential_values:
             message = message.replace(value, "[redacted]")
-        return message
+        if reply is None:
+            return message
+
+        def redact_data(data: Any) -> Any:
+            if isinstance(data, str):
+                return self._redact(data)
+            if isinstance(data, list):
+                return [redact_data(item) for item in data]
+            if isinstance(data, dict):
+                return {self._redact(key): redact_data(value) for key, value in data.items()}
+            return data
+
+        return MCPReply(message, reply.kind, content=redact_data(reply.content),
+                        structured_content=redact_data(reply.structured_content),
+                        meta=redact_data(reply.meta), provenance=redact_data(reply.provenance))
 
 
 def _spec_fingerprint(spec: dict[str, Any]) -> str:
@@ -953,8 +1491,109 @@ def _spec_fingerprint(spec: dict[str, Any]) -> str:
     digest is stored, never the credential itself."""
     import hashlib
     material = json.dumps({"command": spec.get("command"), "args": spec.get("args"),
-                           "env": spec.get("env")}, sort_keys=True, default=str)
+                           "env": spec.get("env"), "inherit_env": spec.get("inherit_env"),
+                           "path_policy": spec.get("path_policy"), "allowed_roots": spec.get("allowed_roots")},
+                          sort_keys=True, default=str)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _valid_schema(schema: Any, *, depth: int = 0, budget: list[int] | None = None) -> bool:
+    """Bounded structural checks without downloading/resolving any schema URI.
+
+    Unknown annotation/extension keywords remain available to the downstream
+    schema translator. This checks the containers it consumes, rather than
+    pretending to validate arguments or resolve every JSON Schema dialect.
+    """
+    if budget is None:
+        budget = [10_000]
+    budget[0] -= 1
+    if depth > 32 or budget[0] < 0:
+        return False
+    if type(schema) is bool:
+        return True
+    if not isinstance(schema, dict):
+        return False
+    allowed_types = {"null", "boolean", "object", "array", "number", "string", "integer"}
+    raw_type = schema.get("type")
+    if raw_type is not None:
+        types = raw_type if isinstance(raw_type, list) else [raw_type]
+        if (not types or any(not isinstance(t, str) or t not in allowed_types for t in types)
+                or len(types) != len(set(types))):
+            return False
+    if "required" in schema:
+        required = schema["required"]
+        if (not isinstance(required, list) or any(not isinstance(k, str) for k in required)
+                or len(required) != len(set(required))):
+            return False
+    for keyword in ("$ref", "$schema", "$id", "description", "title"):
+        if keyword in schema and not isinstance(schema[keyword], str):
+            return False
+    for keyword in ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas"):
+        if keyword in schema:
+            mapping = schema[keyword]
+            if (not isinstance(mapping, dict)
+                    or any(not isinstance(key, str)
+                           or not _valid_schema(value, depth=depth + 1, budget=budget)
+                           for key, value in mapping.items())):
+                return False
+    for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        if keyword in schema:
+            children = schema[keyword]
+            if (not isinstance(children, list)
+                    or (not children and keyword != "prefixItems")
+                    or any(not _valid_schema(child, depth=depth + 1, budget=budget) for child in children)):
+                return False
+    for keyword in ("items", "additionalItems", "additionalProperties", "unevaluatedProperties",
+                    "unevaluatedItems", "contains", "not", "if", "then", "else", "propertyNames"):
+        if keyword in schema:
+            children = schema[keyword]
+            children = children if keyword == "items" and isinstance(children, list) else [children]
+            if any(not _valid_schema(child, depth=depth + 1, budget=budget) for child in children):
+                return False
+    if "enum" in schema and (not isinstance(schema["enum"], list) or not schema["enum"]):
+        return False
+    return True
+
+
+def _validate_catalogue(tools: Any) -> list[dict[str, Any]]:
+    if not isinstance(tools, list) or len(tools) > _CATALOGUE_MAX_TOOLS:
+        raise _MalformedReply("tools/list returned an invalid tool catalogue")
+    names: set[str] = set()
+    for tool in tools:
+        if (not isinstance(tool, dict) or not isinstance(tool.get("name"), str)
+                or not tool["name"].strip() or tool["name"] != tool["name"].strip()
+                or tool["name"] in names
+                or ("description" in tool and not isinstance(tool["description"], str))
+                or any(key in tool and (not isinstance(tool[key], dict) or not _valid_schema(tool[key]))
+                       for key in ("inputSchema", "outputSchema"))):
+            raise _MalformedReply("tools/list returned an invalid tool catalogue")
+        names.add(tool["name"])
+    return copy.deepcopy(tools)
+
+
+def _valid_content(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    if any(key in block and not isinstance(block[key], dict) for key in ("annotations", "_meta")):
+        return False
+    kind = block.get("type")
+    if not isinstance(kind, str):
+        return False
+    if kind == "text":
+        return isinstance(block.get("text"), str)
+    if kind in {"image", "audio"}:
+        return (isinstance(block.get("data"), str)
+                and isinstance(block.get("mimeType"), str) and bool(block["mimeType"]))
+    if kind == "resource_link":
+        return (isinstance(block.get("uri"), str) and bool(block["uri"])
+                and isinstance(block.get("name"), str))
+    if kind == "resource":
+        resource = block.get("resource")
+        return (isinstance(resource, dict) and isinstance(resource.get("uri"), str)
+                and bool(resource["uri"])
+                and ("text" in resource) != ("blob" in resource)
+                and isinstance(resource.get("text", resource.get("blob")), str))
+    return False
 
 
 def _load_catalogue() -> dict[str, Any]:
@@ -996,6 +1635,10 @@ class MCPHost:
         #: are still listed, and ``call`` restarts one before using it.
         self.parked: set[str] = set()
         self._wake_locks: dict[str, asyncio.Lock] = {}
+        self._connection_locks: dict[str, asyncio.Lock] = {}
+        self._lifecycle_tasks: set[asyncio.Task[Any]] = set()
+        self._closing = False
+        self._close_lock = asyncio.Lock()
         self._on_reconnect: Any = None
         self._pressure_park_s: float | None = None
         # App startup connects optional servers in the background so the GUI
@@ -1011,6 +1654,10 @@ class MCPHost:
 
     def _prepare(self, name: str, spec: dict[str, Any]) -> dict[str, Any] | None:
         """The spec to launch, or None when it cannot work yet (and why)."""
+        if spec.get("transport", "stdio") != "stdio":
+            self.status[name] = "unsupported transport; this host supports stdio tools only"
+            self._beat(name, "DOWN", self.status[name])
+            return None
         spec = autofill_credentials(name, spec)
         missing = missing_credentials(spec)
         if missing:
@@ -1020,7 +1667,12 @@ class MCPHost:
         return spec
 
     async def connect_all(self) -> None:
+        if self._closing:
+            return
         config = load_config()
+        if isinstance(config, _UnavailableConfig):
+            self._log_host(config.error)
+            return
         specs = config.get("servers") or {}
         enabled = {n: s for n, s in specs.items() if isinstance(s, dict) and s.get("enabled")}
         self._specs = enabled
@@ -1036,28 +1688,53 @@ class MCPHost:
 
         catalogue = _load_catalogue()
 
-        async def _one(name: str, spec: dict[str, Any]) -> None:
+        async def _start_one(name: str, spec: dict[str, Any]) -> None:
+            old = self.servers.get(name)
+            if old is not None and (old.is_alive() or name in self.parked):
+                return
+            if old is not None:
+                # A protocol failure can clear readiness while the process
+                # keeps running. Reuse retirement before replacing it, while
+                # _one owns the same per-server lock as reconnect().
+                await self._reconnect(name)
+                return
             ready = self._prepare(name, spec)
             if ready is None:
                 self._log_host(f"'{name}' is enabled but {self.status[name]} — "
                                f"not started (add it in config/mcp_servers.json).")
                 return
             conn = MCPServerConn(name, ready, self.bus)
-            cached = catalogue.get(name) or {}
+            self._bind_connection(name, conn)
+            cached = catalogue.get(name)
+            cached = cached if isinstance(cached, dict) else {}
+            try:
+                cached_tools = _validate_catalogue(cached.get("tools", []))
+            except MCPProtocolError:
+                cached_tools = []
             if (_lazy_start_enabled(spec) and cached.get("tools")
-                    and cached.get("fingerprint") == _spec_fingerprint(ready)):
+                    and cached_tools and cached.get("fingerprint") == _spec_fingerprint(ready)):
                 # Ten servers held about a gigabyte from the moment ORION
                 # started, on a machine already near its limit — which is when
                 # the face flashed black. Their tool lists are known from the
                 # last run, so offer those now and start each process only
                 # when one of its tools is actually called (call -> _wake).
-                conn.tools = list(cached["tools"])
+                conn.tools = cached_tools
                 self.servers[name] = conn
                 self.parked.add(name)
                 self.status[name] = "idle - starts when first used"
-                self._beat(name, "OK", f"{len(conn.tools)} tool(s), starts on first use")
+                self._beat(name, "DEGRADED", f"{len(conn.tools)} tool(s), starts on first use")
                 return
-            ok = await conn.start()
+            try:
+                ok = await conn.start()
+            except asyncio.CancelledError:
+                await conn.stop(force=True)
+                raise
+            except BaseException:
+                await conn.stop()
+                raise
+            if self._closing:
+                await conn.stop()
+                return
             if ok:
                 self.servers[name] = conn
                 self._reconnect_attempts[name] = 0
@@ -1067,6 +1744,19 @@ class MCPHost:
             else:
                 self.status[name] = conn.last_error or "did not start"
                 self._beat(name, "DOWN", self.status[name])
+
+        async def _one(name: str, spec: dict[str, Any]) -> None:
+            task = asyncio.current_task()
+            if task is not None:
+                self._lifecycle_tasks.add(task)
+            try:
+                lock = self._connection_locks.setdefault(name, asyncio.Lock())
+                async with lock:
+                    if not self._closing:
+                        await _start_one(name, spec)
+            finally:
+                if task is not None:
+                    self._lifecycle_tasks.discard(task)
 
         # Concurrently: a first launch downloads each server's package, and
         # doing that one after another made the last server wait minutes.
@@ -1081,8 +1771,6 @@ class MCPHost:
 
     def _remember_tools(self, name: str, spec: dict[str, Any], conn: "MCPServerConn") -> None:
         """Save a server's tool list for the next boot's lazy start."""
-        if not conn.tools:
-            return
         try:
             catalogue = _load_catalogue()
             catalogue[name] = {"fingerprint": _spec_fingerprint(spec),
@@ -1092,6 +1780,18 @@ class MCPHost:
                               encoding="utf-8")
         except Exception:
             pass
+
+    def _forget_tools(self, name: str) -> None:
+        """Retire a known-invalid catalogue without disturbing other servers."""
+        try:
+            catalogue = _load_catalogue()
+            if name not in catalogue:
+                return
+            del catalogue[name]
+            atomic_write_text(MCP_CATALOGUE_PATH, json.dumps(catalogue, indent=1),
+                              encoding="utf-8")
+        except Exception as exc:
+            self._log_host(f"could not retire cached tools for '{name}' - {exc}")
 
     # ── health (Track E2) ────────────────────────────────────────────────────
 
@@ -1106,10 +1806,10 @@ class MCPHost:
             pass
 
     def health_snapshot(self) -> dict[str, str]:
-        """{server_name: "OK"|"DOWN"} for every server that has ever been
-        enabled this session — including one currently disconnected and
-        awaiting reconnect, so a dashboard can show it as a real problem
-        rather than it simply vanishing from view."""
+        """Current OK, IDLE, NEEDS_KEY or DOWN state for enabled servers.
+
+        A disconnected server remains visible while awaiting reconnect.
+        """
         out: dict[str, str] = {}
         for name in self._specs:
             conn = self.servers.get(name)
@@ -1125,16 +1825,64 @@ class MCPHost:
 
     # ── reconnect + supervision (Track E2) ──────────────────────────────────
 
+    def _publish_tools(self, name: str, tools: Any) -> None:
+        """Refresh dispatcher routes when a live catalogue changes or vanishes."""
+        if self._on_reconnect is not None:
+            try:
+                self._on_reconnect(name, tools)
+            except Exception as exc:
+                self._log_host(f"tool registration for '{name}' failed - {exc}")
+
+    def _bind_connection(self, name: str, conn: MCPServerConn) -> None:
+        conn._on_catalogue_changed = lambda changed: self._catalogue_changed(name, changed)
+
+    def _catalogue_changed(self, name: str, conn: MCPServerConn) -> None:
+        # A late callback from an old receiver cannot revive a disabled server
+        # or overwrite its replacement's catalogue during reconnect.
+        if (self._closing or self.servers.get(name) is not conn
+                or name not in self._specs or name in self.parked):
+            return
+        if conn.ready:
+            self._remember_tools(name, conn.spec, conn)
+            self._beat(name, "OK", f"{len(conn.tools)} tool(s), catalogue refreshed")
+            self._publish_tools(name, conn)
+        else:
+            if conn._catalogue_refresh_failed:
+                self._forget_tools(name)
+            self.status[name] = conn.last_error or "connection dropped - server closed the connection"
+            self._beat(name, "DOWN", self.status[name])
+            self._publish_tools(name, [])
+
     async def reconnect(self, name: str) -> bool:
         """Tear down and re-establish one server's connection from its
         last-known enabled spec — re-reading config/mcp_servers.json first,
         so a credential/command fix the user just made takes effect without
         a full app restart. Returns whether it's alive afterwards."""
+        if self._closing:
+            return False
+        task = asyncio.current_task()
+        if task is not None:
+            self._lifecycle_tasks.add(task)
+        try:
+            lock = self._connection_locks.setdefault(name, asyncio.Lock())
+            async with lock:
+                if self._closing:
+                    return False
+                return await self._reconnect(name)
+        finally:
+            if task is not None:
+                self._lifecycle_tasks.discard(task)
+
+    async def _reconnect(self, name: str) -> bool:
         # A manual reconnect also wakes a parked server. Clear its parked
         # state before either the live or failed outcome is reported; otherwise
         # health_snapshot says IDLE and the next call starts it a second time.
         self.parked.discard(name)
         config = load_config()
+        if isinstance(config, _UnavailableConfig):
+            self.status[name] = config.error
+            self._beat(name, "DOWN", config.error)
+            self._log_host(config.error)
         spec = (config.get("servers") or {}).get(name)
         if not isinstance(spec, dict) or not spec.get("enabled"):
             # The user disabled or removed it — stop tracking it as a live
@@ -1143,6 +1891,7 @@ class MCPHost:
             old = self.servers.pop(name, None)
             if old is not None:
                 await old.stop()
+            self._publish_tools(name, [])
             return False
         self._specs[name] = spec
         old = self.servers.pop(name, None)
@@ -1150,18 +1899,32 @@ class MCPHost:
             await old.stop()
         ready = self._prepare(name, spec)
         if ready is None:
+            self._publish_tools(name, [])
             return False
         conn = MCPServerConn(name, ready, self.bus)
-        ok = await conn.start()
+        self._bind_connection(name, conn)
+        try:
+            ok = await conn.start()
+        except asyncio.CancelledError:
+            await conn.stop(force=True)
+            raise
+        except BaseException:
+            await conn.stop()
+            raise
+        if self._closing:
+            await conn.stop()
+            return False
         if ok:
             self.servers[name] = conn
             self._reconnect_attempts[name] = 0
             self.status[name] = "live"
             self._remember_tools(name, ready, conn)
             self._beat(name, "OK", f"reconnected — {len(conn.tools)} tool(s)")
+            self._publish_tools(name, conn)
         else:
             self.status[name] = conn.last_error or "reconnect attempt failed"
             self._beat(name, "DOWN", "reconnect attempt failed")
+            self._publish_tools(name, [])
         return ok
 
     def _due_for_reconnect(self, name: str, now: float) -> bool:
@@ -1182,11 +1945,15 @@ class MCPHost:
         tools (Track E1) — fires after each successful reconnect. Never
         raises out of the loop; one server's trouble never stops the
         supervisor watching the others."""
+        if self._closing:
+            return
         self._supervising = True
         self._on_reconnect = on_reconnect
         try:
             while self._supervising:
                 await asyncio.sleep(interval_s)
+                if not self._supervising or self._closing:
+                    break
                 try:
                     await self.park_idle()
                 except Exception as exc:
@@ -1208,15 +1975,10 @@ class MCPHost:
                         continue
                     self._schedule_next_reconnect(name, now)
                     try:
-                        ok = await self.reconnect(name)
+                        await self.reconnect(name)
                     except Exception as exc:
                         self._log_host(f"supervised reconnect of '{name}' raised - {exc}")
                         continue
-                    if ok and on_reconnect is not None:
-                        try:
-                            on_reconnect(name, self.servers[name])
-                        except Exception as exc:
-                            self._log_host(f"on_reconnect callback for '{name}' failed - {exc}")
         except asyncio.CancelledError:
             pass
 
@@ -1254,6 +2016,7 @@ class MCPHost:
             self.parked.add(name)
             self.status[name] = "paused while idle (restarts on its next use)"
             await conn.stop()
+            self._beat(name, "DEGRADED", self.status[name])
             parked.append(name)
         if parked:
             self._log_host(f"paused idle server(s) to free memory: "
@@ -1268,11 +2031,6 @@ class MCPHost:
                 return conn is not None and conn.is_alive()
             ok = await self.reconnect(name)
             self.parked.discard(name)       # failed: the supervisor takes over
-            if ok and self._on_reconnect is not None:
-                try:
-                    self._on_reconnect(name, self.servers[name])
-                except Exception as exc:
-                    self._log_host(f"on_reconnect callback for '{name}' failed - {exc}")
             return ok
 
     def _log_host(self, message: str) -> None:
@@ -1304,6 +2062,8 @@ class MCPHost:
             lines.append(f"• {server} — {info['description']}")
             for tool in info["tools"]:
                 lines.append(f"    - {tool['name']}: {tool['description'][:100]}")
+        lines.append("MCP support: stdio tool calls; resource links are retained without fetching. "
+                     "Resource requests, prompts, and other transports are unsupported.")
         return "\n".join(lines)
 
     #: Servers whose tools act in the world at the user's expense, even if
@@ -1332,7 +2092,10 @@ class MCPHost:
             action = ("send email or change the mailbox" if server == "gmail"
                       else "change the calendar or its connected accounts")
             return f"{server}.{shown} may {action}"
-        spec = (load_config().get("servers") or {}).get(server)
+        config = load_config()
+        if isinstance(config, _UnavailableConfig):
+            return config.error
+        spec = (config.get("servers") or {}).get(server)
         reason = configured_confirmation(server, shown, spec)
         if reason:
             return reason
@@ -1350,6 +2113,16 @@ class MCPHost:
         return ""
 
     async def call(self, server: str, tool: str, arguments: dict[str, Any]) -> MCPReply:
+        if self._closing:
+            return MCPReply("MCP host is closed; no new tool calls are accepted.", "unavailable")
+        config = load_config()
+        if isinstance(config, _UnavailableConfig):
+            # A previously connected custom server may have depended on a
+            # confirmation policy in that file. Never execute under guesses.
+            return MCPReply(config.error, "unavailable")
+        blocked = _background_mcp_refusal(server, tool, (config.get("servers") or {}).get(server))
+        if blocked is not None:
+            return blocked
         startup = self._startup_task
         if (server not in self.servers and server not in self.parked
                 and startup is not None and not startup.done()):
@@ -1365,6 +2138,8 @@ class MCPHost:
                     raise
             except Exception:
                 pass
+        if self._closing:
+            return MCPReply("MCP host is closed; no new tool calls are accepted.", "unavailable")
         if server in self.parked and not await self._wake(server):
             return MCPReply(
                 f"MCP server '{server}' was paused to save memory and could "
@@ -1374,6 +2149,12 @@ class MCPHost:
             avail = ", ".join(self.servers) or "none"
             return MCPReply(
                 f"No connected MCP server named '{server}'. Available: {avail}.", "unavailable")
+        blocked = _background_mcp_refusal(server, tool, getattr(conn, "spec", None))
+        if blocked is not None:
+            return blocked
+        if conn.proc is not None and not conn.is_alive():
+            return MCPReply(f"MCP server '{server}' is disconnected; awaiting reconnect.",
+                            "unavailable")
         if not any(t.get("name") == tool for t in conn.tools):
             names = ", ".join(t.get("name", "?") for t in conn.tools) or "none"
             return MCPReply(
@@ -1382,13 +2163,18 @@ class MCPHost:
             return await conn.call_tool(tool, arguments)
         except asyncio.TimeoutError:
             return MCPReply(f"MCP tool '{server}.{tool}' timed out.", "timeout")
+        except _MalformedReply as exc:
+            return MCPReply(f"MCP tool '{server}.{tool}' received an invalid protocol reply: "
+                            f"{conn._redact(str(exc))}.", "protocol")
         except MCPProtocolError as exc:
             # The server refused the call itself — almost always arguments
             # that do not match the tool's input schema. Say so, so the model
             # fixes the arguments rather than retrying the same call.
             return MCPReply(
                 f"MCP tool '{server}.{tool}' failed: the server rejected the request "
-                f"- {exc}. Check the arguments against the tool's input schema.", "protocol")
+                f"- {conn._redact(str(exc))}. Check the arguments against the tool's input schema.", "protocol")
+        except ValueError as exc:
+            return MCPReply(f"MCP tool '{server}.{tool}' rejected by local input policy: {exc}", "protocol")
         except Exception as exc:
             return MCPReply(f"MCP tool '{server}.{tool}' failed: {conn._redact(str(exc))}",
                             "unavailable")
@@ -1404,6 +2190,8 @@ class MCPHost:
         enabled and live state, so a server that is off — or enabled but
         failing to start — is visible instead of simply absent."""
         config = load_config()
+        if isinstance(config, _UnavailableConfig):
+            return config.error
         specs = config.get("servers") or {}
         if not specs:
             return "No MCP servers are declared in config/mcp_servers.json."
@@ -1414,6 +2202,8 @@ class MCPHost:
             conn = self.servers.get(name)
             live = conn is not None and conn.is_alive()
             reason = self.status.get(name, "")
+            if reason == "live" and not live:
+                reason = "connection dropped; reconnecting"
             if name in self.parked:
                 reason = (f"idle, paused to save memory ({len(conn.tools) if conn else 0}"
                           f" tool(s); restarts on its next use)")
@@ -1437,6 +2227,8 @@ class MCPHost:
         return "\n".join(lines)
 
     def _write_config(self, config: dict[str, Any]) -> bool:
+        if isinstance(config, _UnavailableConfig):
+            return False
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             atomic_write_text(MCP_CONFIG_PATH, json.dumps(config, indent=2), encoding="utf-8")
@@ -1446,10 +2238,14 @@ class MCPHost:
 
     async def set_enabled(self, name: str, enabled: bool) -> str:
         """Enable or disable one declared server and apply it immediately."""
+        if self._closing:
+            return "MCP host is closed."
         server = str(name or "").strip()
         if not server:
             return "Which MCP server, sir?"
         config = load_config()
+        if isinstance(config, _UnavailableConfig):
+            return config.error
         specs = config.get("servers") or {}
         if server not in specs or not isinstance(specs[server], dict):
             known = ", ".join(sorted(specs)) or "none"
@@ -1465,15 +2261,18 @@ class MCPHost:
                     f"MCP server '{server}' enabled, but it did not start — "
                     "check its command and credentials in "
                     f"{MCP_CONFIG_PATH.name}.")
-        conn = self.servers.pop(server, None)
-        if conn is not None:
-            try:
-                await conn.stop()
-            except Exception:
-                pass
-        self._specs.pop(server, None)
-        self.parked.discard(server)
-        self._beat(server, "DOWN", "disabled by the user")
+        lock = self._connection_locks.setdefault(server, asyncio.Lock())
+        async with lock:
+            conn = self.servers.pop(server, None)
+            if conn is not None:
+                try:
+                    await conn.stop()
+                except Exception:
+                    pass
+            self._specs.pop(server, None)
+            self.parked.discard(server)
+            self._beat(server, "DOWN", "disabled by the user")
+            self._publish_tools(server, [])
         return f"MCP server '{server}' disabled and disconnected."
 
     def add_server(self, name: str, command: str, args: list[str] | None = None,
@@ -1481,12 +2280,16 @@ class MCPHost:
                    description: str = "") -> str:
         """Declare a NEW MCP server. It is written disabled, so nothing is
         launched until the user has filled in credentials and enabled it."""
+        if self._closing:
+            return "MCP host is closed."
         server = str(name or "").strip()
         if not server:
             return "Give the server a name, sir."
         if not str(command or "").strip():
             return "Give the server a command to run (e.g. npx)."
         config = load_config()
+        if isinstance(config, _UnavailableConfig):
+            return config.error
         specs = config.get("servers") or {}
         if server in specs:
             return (f"An MCP server called '{server}' is already declared. "
@@ -1505,8 +2308,34 @@ class MCPHost:
                 f"credentials in {MCP_CONFIG_PATH.name}, then: mcp enable {server}.")
 
     async def close(self) -> None:
-        # Together, not in turn: each stop can wait out its grace period.
-        await asyncio.gather(*(conn.stop() for conn in list(self.servers.values())),
-                             return_exceptions=True)
-        self.servers.clear()
-        self.parked.clear()
+        self._closing = True
+        self.stop_supervising()
+        async with self._close_lock:
+            current = asyncio.current_task()
+            pending = {task for task in self._lifecycle_tasks
+                       if task is not current and not task.done()}
+            if (self._startup_task is not None and self._startup_task is not current
+                    and not self._startup_task.done()):
+                # Cancelling both gather's parent and its children can inject
+                # a second cancellation while a child is reaping its process.
+                # Cancel owned children first, then await startup as well.
+                if not pending:
+                    self._startup_task.cancel()
+            for task in pending:
+                task.cancel()
+            if (self._startup_task is not None and self._startup_task is not current
+                    and not self._startup_task.done()):
+                pending.add(self._startup_task)
+            if pending:
+                # start() reaps its process on cancellation; the host also
+                # cleans up injectable transports before those tasks retire.
+                await asyncio.gather(*pending, return_exceptions=True)
+            names = list(self.servers)
+            # Together, not in turn: each stop can wait out its grace period.
+            await asyncio.gather(*(conn.stop() for conn in list(self.servers.values())),
+                                 return_exceptions=True)
+            self.servers.clear()
+            self.parked.clear()
+            self._specs.clear()
+            for name in names:
+                self._publish_tools(name, [])

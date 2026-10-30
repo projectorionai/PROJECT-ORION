@@ -99,12 +99,14 @@ QFrame#panelFrame {{
     border-top: {_LIP};
     border-radius: 14px;
 }}
+/* A panel's heading sits on the same left edge as the panel's content. It
+   used to be indented a further 16px, so every panel had two left edges and
+   the eye read each heading as floating loose of the thing it named. */
 QLabel#panelHeading {{
     color: {C.MUTED};
     font-size: {TYPE.HEADING_PX}px;
     font-weight: 600;
-    letter-spacing: 1.4px;
-    padding: {SPACE.SM}px {SPACE.MD}px {SPACE.XS}px {SPACE.MD}px;
+    padding: 2px 2px {SPACE.XS}px 2px;
 }}
 QFrame#headerFrame {{
     background: {_rgba(C.PANEL, 0.55)};
@@ -137,7 +139,7 @@ QLabel#titleLabel {{
     color: {C.WHITE};
     font-size: {TYPE.TITLE_PX}px;
     font-weight: 300;              /* light, because it is large */
-    letter-spacing: 3px;
+    letter-spacing: 0.5px;         /* a title in sentence case, not a spaced code */
 }}
 QLabel#subtitleLabel {{ color: {C.FAINT}; letter-spacing: 1.2px; }}
 /* Mark XXXI identity: a quiet wordmark and a framed mark tag. The version
@@ -163,13 +165,39 @@ QLabel#workspaceTitle {{
     color: {C.WHITE}; font-size: 16px; font-weight: 500;
     padding: 0 {SPACE.SM}px;
 }}
-QLabel#mutedLabel {{ color: {C.MUTED}; }}
-QLabel#stateLabel {{ color: {C.SILVER}; font-weight: 500; letter-spacing: 1px; }}
-QLabel#clockLabel {{
-    color: {C.MUTED};
-    font-family: {TYPE.MONO_FAMILY};
-    letter-spacing: 1px;
+/* The Command Deck's one title. The page names itself here, once; pages
+   no longer repeat it in capitals underneath (one title per screen). */
+QLabel#pageTitle {{
+    color: {C.WHITE}; font-size: 17px; font-weight: 500;
 }}
+QLabel#crumbLabel {{ color: {C.FAINT}; font-size: 13px; }}
+/* What a page is for, in one quiet line under the deck's title. */
+QLabel#mutedLabel {{ color: {C.MUTED}; }}
+/* A compact summary: a few facts in one recessed row, instead of a card
+   per fact. The key recedes; the value is what you read. */
+QFrame#summaryStrip {{
+    background: {_rgba(C.INK, 0.55)};
+    border: {_EDGE};
+    border-radius: 12px;
+}}
+QLabel#summaryKey {{ color: {C.FAINT}; font-size: 11px; }}
+QLabel#summaryValue {{ color: {C.WHITE}; font-size: 13px; font-weight: 500; }}
+QLabel#emptyState {{ color: {C.FAINT}; padding: {SPACE.MD}px; }}
+/* "Details": secondary information folded away until asked for. */
+QToolButton#detailsToggle {{
+    background: transparent;
+    color: {C.MUTED};
+    border: none;
+    padding: {SPACE.XS}px 2px;
+    font-weight: 600;
+}}
+QToolButton#detailsToggle:hover {{ color: {C.WHITE}; }}
+QLabel#todayHeadline {{ color: {C.WHITE}; font-size: 15px; font-weight: 500; }}
+/* Mark XXXV: the header speaks in sentences - "I'm listening", "Tue 7 Oct
+   · 21:52" - so neither label is letter-spaced like a status code. */
+QLabel#stateLabel {{ color: {C.SILVER}; font-weight: 500; }}
+QLabel#clockLabel {{ color: {C.MUTED}; }}
+QLabel#greetingLabel {{ color: {C.HUMAN}; font-size: 14px; font-weight: 500; }}
 QLabel#tokenMetric {{ color: {C.FAINT}; }}
 QLabel#tokenMetricValue {{
     color: {C.WHITE}; font-weight: 600;
@@ -199,6 +227,21 @@ QPushButton#ghostButton {{
     border: {_EDGE};
 }}
 QPushButton#ghostButton:hover {{ color: {C.WHITE}; background: {_rgba(C.WHITE, 0.05)}; }}
+/* The one primary action in an area. Light on dark rather than crimson:
+   crimson means live, focused or dangerous, and "Run" is none of those. */
+QPushButton#primaryButton {{
+    background: {_rgba(C.WHITE, 0.90)};
+    color: {C.INK};
+    border: 1px solid {_rgba(C.WHITE, 0.90)};
+    border-radius: 11px;
+    padding: {SPACE.SM}px {SPACE.MD}px;
+    font-weight: 600;
+}}
+QPushButton#primaryButton:hover {{ background: {C.WHITE}; }}
+QPushButton#primaryButton:pressed {{ background: {_rgba(C.WHITE, 0.75)}; }}
+QPushButton#primaryButton:disabled {{
+    color: {C.FAINT}; background: {_rgba(C.PANEL, 0.45)}; border: {_EDGE};
+}}
 QPushButton#iconButton {{
     background: transparent; border: none; border-radius: 10px;
     padding: {SPACE.XS}px {SPACE.SM}px; color: {C.MUTED};
@@ -249,6 +292,50 @@ QPushButton#formItem:checked {{
     border-top: {_LIP};
 }}
 QFrame#deckNav {{ background: transparent; border: none; }}
+/* The deck sidebar: sections fold, items read left to right (icon, name),
+   and the selected page is the same raised slab as every other selection. */
+QPushButton#sidebarItem {{
+    background: transparent;
+    color: {C.MUTED};
+    border: 1px solid transparent;
+    border-radius: 9px;
+    padding: 5px {SPACE.SM}px;
+    min-height: 18px;
+    text-align: left;
+    font-weight: 500;
+}}
+QPushButton#sidebarItem:hover {{ color: {C.WHITE}; background: {_rgba(C.WHITE, 0.06)}; }}
+QPushButton#sidebarItem:checked {{
+    color: {C.WHITE};
+    background: {_rgba(C.PANEL_HI, 0.98)};
+    border: {_EDGE};
+    border-top: {_LIP};
+}}
+/* Section names are signposts, not content: small, quiet, sentence case,
+   and spaced away from the section above rather than letter-spaced. */
+QToolButton#sidebarGroup {{
+    background: transparent;
+    color: {C.FAINT};
+    border: none;
+    padding: {SPACE.MD}px {SPACE.XS}px {SPACE.XS}px {SPACE.XS}px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+}}
+QToolButton#sidebarGroup:hover {{ color: {C.WHITE}; }}
+QLabel#sidebarCaption {{
+    color: {C.FAINT};
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    padding: {SPACE.SM}px {SPACE.SM}px 2px {SPACE.SM}px;
+}}
+QLineEdit#sidebarFilter {{
+    background: {_WELL};
+    border: {_EDGE};
+    border-radius: 9px;
+    padding: 4px {SPACE.SM}px;
+}}
 /* Face | Orb: the form in effect is a raised slab, the same selection
    grammar as every other segmented control (see segItem above). */
 QPushButton#formItem {{
@@ -468,6 +555,132 @@ QGroupBox::title {{
 
 QSplitter::handle {{ background: transparent; }}
 QSplitter::handle:hover {{ background: {_rgba(C.WHITE, 0.06)}; }}
+
+/* Mark XXXX HUD layer --------------------------------------------------------*/
+/* Owner, 27 Oct 2026: "make it look more futuristic too and advanced ...
+   everything must be noticeable". Still one hue: crimson draws the lines a
+   heads-up display is made of - a hairline that fades in and out along each
+   panel's top, the header's lower edge, the selected tab - and type does the
+   rest: spaced capitals for headings, a monospaced face for every readout. */
+QFrame#panelFrame, QGroupBox {{
+    border-top: 1px solid;
+    border-top-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {_rgba(C.WHITE, 0.02)}, stop:0.35 {_rgba(C.WHITE, 0.16)},
+        stop:0.5 {_rgba(C.PRI, 0.70)}, stop:0.65 {_rgba(C.WHITE, 0.16)},
+        stop:1 {_rgba(C.WHITE, 0.02)});
+}}
+QFrame#headerFrame {{
+    background: {_rgba(C.PANEL, 0.62)};
+    border-bottom: 1px solid;
+    border-bottom-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {_rgba(C.PRI, 0.85)}, stop:0.4 {_rgba(C.PRI, 0.25)},
+        stop:1 {_rgba(C.WHITE, 0.04)});
+}}
+QLabel#brandMark {{ letter-spacing: 7px; font-weight: 200; }}
+QLabel#markTag {{
+    color: {C.WHITE};
+    background: {_rgba(C.PRI, 0.16)};
+    border: 1px solid {_rgba(C.PRI, 0.65)};
+    border-radius: 4px;
+    padding: 2px {SPACE.SM}px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 3px;
+}}
+QLabel#panelHeading, QLabel#sectionTitle, QLabel#sidebarCaption {{
+    letter-spacing: 2px;
+    font-weight: 600;
+}}
+QGroupBox::title {{ color: {C.SILVER}; letter-spacing: 2.5px; font-weight: 600; }}
+QLabel#summaryValue, QLabel#tokenMetricValue, QLabel#clockLabel {{
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    letter-spacing: 1px;
+}}
+QPushButton:hover {{
+    border: 1px solid {_rgba(C.PRI, 0.55)};
+    background: {_rgba(C.PRI, 0.10)};
+}}
+QPushButton#sidebarItem:checked, QPushButton#deckTab:checked, QPushButton#zoneItem:checked {{
+    border-left: 2px solid {C.PRI};
+}}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
+    border: 1px solid {_rgba(C.PRI, 0.75)};
+}}
+QProgressBar {{
+    background: {_rgba(C.INK, 0.70)};
+    border: 1px solid {_rgba(C.WHITE, 0.08)};
+    border-radius: 3px;
+    text-align: center;
+    color: {C.SILVER};
+    font-family: "Cascadia Mono", "Consolas", monospace;
+}}
+QProgressBar::chunk {{
+    border-radius: 2px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {C.PRI_DIM}, stop:1 {C.PRI_HI});
+}}
+QScrollBar:vertical {{ width: 7px; background: transparent; margin: 2px; }}
+QScrollBar:horizontal {{ height: 7px; background: transparent; margin: 2px; }}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+    background: {_rgba(C.WHITE, 0.16)}; border-radius: 3px; min-height: 24px; min-width: 24px;
+}}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
+    background: {_rgba(C.PRI, 0.70)};
+}}
+QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {{
+    background: transparent; border: none; width: 0px; height: 0px;
+}}
+
+/* Calendar, Focus and Fitness ---------------------------------------------*/
+/* Calmer than the HUD panels: plain cards with no lit edge, one quiet label
+   each, and the number or the name as the thing you read. */
+QFrame#card {{
+    background: {_PANEL};
+    border: {_EDGE};
+    border-radius: 14px;
+}}
+QFrame#cardToday {{
+    background: {_RAISED};
+    border: 1px solid {_rgba(C.WHITE, 0.10)};
+    border-radius: 14px;
+}}
+QLabel#cardLabel {{ color: {C.FAINT}; font-size: 12px; font-weight: 500; }}
+QLabel#heroText {{ color: {C.WHITE}; font-size: 26px; font-weight: 300; }}
+QLabel#heroMeta {{ color: {C.PRI_HI}; font-size: 13px; font-weight: 500; }}
+QLabel#readout {{
+    color: {C.WHITE}; font-size: 26px; font-weight: 400;
+    font-family: {TYPE.MONO_FAMILY};
+}}
+QLabel#readoutKey {{ color: {C.FAINT}; font-size: 11px; }}
+QLabel#dayName {{ color: {C.MUTED}; font-size: 13px; font-weight: 500; }}
+QLabel#dayNameToday {{ color: {C.WHITE}; font-size: 13px; font-weight: 600; }}
+QLabel#entryTime {{ color: {C.MUTED}; font-size: 11px; font-family: {TYPE.MONO_FAMILY}; }}
+QLabel#entryTitle {{ color: {C.SILVER}; font-size: 13px; }}
+QFrame#entry, QFrame#entryReminder, QFrame#entryGoal {{
+    background: {_rgba(C.WHITE, 0.03)};
+    border: none;
+    border-left: 2px solid {C.FAINT};
+    border-radius: 8px;
+}}
+QFrame#entryReminder {{ border-left: 2px solid {C.SILVER}; }}
+QFrame#entryGoal {{ border-left: 2px solid {C.HUMAN}; }}
+QPushButton#chip {{
+    background: {_RAISED}; color: {C.SILVER};
+    border: {_EDGE}; border-radius: 10px;
+    padding: 6px 14px; font-weight: 500;
+}}
+QPushButton#chip:hover {{ color: {C.WHITE}; border: 1px solid {_rgba(C.WHITE, 0.18)}; }}
+QPushButton#chip:checked {{
+    background: {_rgba(C.WHITE, 0.92)}; color: {C.INK};
+    border: 1px solid {_rgba(C.WHITE, 0.92)};
+}}
+QProgressBar#goalMeter {{
+    background: {_rgba(C.WHITE, 0.07)}; border: none; border-radius: 3px;
+}}
+QProgressBar#goalMeter::chunk {{ background: {C.SILVER}; border: none; border-radius: 3px; }}
+QCheckBox#step {{ color: {C.SILVER}; padding: 5px 0px; spacing: 10px; }}
+QCheckBox#step:checked {{ color: {C.FAINT}; }}
 """
 
 __all__ = ["APP_STYLESHEET", "rgba"]

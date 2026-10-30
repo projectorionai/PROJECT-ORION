@@ -84,3 +84,83 @@ def test_homeassistant_rejected_token_and_invalid_service_data(monkeypatch):
     monkeypatch.setattr(plugin, "_request", rejected)
     assert not plugin.run(action="status").ok
     assert not plugin.run(domain="light", service="turn_on", data="[]").ok
+
+
+@pytest.mark.parametrize("name", ["homeassistant_call_service", "ifttt_webhook", "open_meteo_weather", "philips_hue", "push_notify"])
+def test_remote_plugin_response_is_capped_before_decode_and_never_retried(monkeypatch, name):
+    plugin = load(name)
+    reads, requests = [], []
+    class Oversized:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self, size=-1):
+            reads.append(size)
+            assert size > 0, "unbounded read of a remote body"
+            return b"x" * size
+    def response(*args, **kwargs):
+        requests.append(1)
+        return Oversized()
+    monkeypatch.setattr(plugin.urllib.request, "urlopen", response)
+    monkeypatch.setattr(plugin.json, "loads", lambda *_: pytest.fail("Oversized response reached JSON parser"))
+    if name == "homeassistant_call_service":
+        with pytest.raises(ValueError, match="size limit"):
+            plugin._request({"url": "https://fixture.invalid", "token": "fixture"}, "/api/")
+    elif name == "philips_hue":
+        with pytest.raises(ValueError, match="size limit"):
+            plugin._request("https://fixture.invalid")
+    elif name == "open_meteo_weather":
+        with pytest.raises(ValueError, match="size limit"):
+            plugin._get("https://fixture.invalid", {})
+    elif name == "push_notify":
+        assert plugin._post("https://fixture.invalid", b"fixture", {})[0] is False
+    else:
+        monkeypatch.setattr(plugin, "_config", lambda: {"key": "fixture"})
+        result = plugin.run(event="fixture")
+        assert not result.ok and "size limit" in result.text
+    assert reads == [plugin.MAX_RESPONSE_BYTES + 1] and requests == [1]
+
+
+def test_legacy_game_http_cap_rejects_oversize_without_parsing():
+    # Extract only the standalone body-limit helper as data. Importing this
+    # legacy module is unnecessary for a byte-limit witness.
+    import ast
+    path = Path(__file__).resolve().parents[1] / "orion_core/jv_plugins/legacy_game_updater.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    selected = [node for node in tree.body if (
+        isinstance(node, ast.FunctionDef) and node.name == "_bounded_http_body") or (
+        isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "MAX_RESPONSE_BYTES" for target in node.targets))]
+    namespace = {}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
+    reads = []
+    class Oversized:
+        def read(self, size=-1):
+            reads.append(size)
+            assert size > 0
+            return b"x" * size
+    with pytest.raises(ValueError, match="size limit"):
+        namespace["_bounded_http_body"](Oversized())
+    assert reads == [namespace["MAX_RESPONSE_BYTES"] + 1]
+
+
+@pytest.mark.parametrize("available,frame_ok", [(False, False), (True, False), (True, True)])
+def test_camera_plugin_reports_capture_outcome_and_releases_fake_capture(monkeypatch, available, frame_ok):
+    plugin = load("live_camera_analysis")
+    from orion_core.plugin_results import plugin_result
+    releases = []
+    class Frame:
+        shape = (480, 640, 3)
+        def mean(self): return 150
+    class Capture:
+        def read(self): return frame_ok, Frame() if frame_ok else None
+        def release(self): releases.append(1)
+    def open_fake(self):
+        self.capture = Capture()
+        return available
+    monkeypatch.setattr(plugin.LiveCameraAnalysis, "open", open_fake)
+    result = plugin_result(plugin.run())
+    assert result.ok is (available and frame_ok)
+    assert result.receipt["captured"] is (available and frame_ok)
+    assert releases == [1]
+    if result.ok:
+        assert result.text == "Captured a 640x480 frame; it is well lit (mean intensity 150 of 255)."

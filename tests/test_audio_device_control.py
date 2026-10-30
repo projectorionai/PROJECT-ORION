@@ -124,6 +124,7 @@ def test_switch_to_input_default_resets(stub_devices):
     mic._forced_input = 1
     assert mic.switch_to_input("default") == "system default"
     assert mic._forced_input is None
+    assert mic._restarted == [None]                 # index 0 need not be a microphone
     assert stub_devices["input"] == "default"
 
 

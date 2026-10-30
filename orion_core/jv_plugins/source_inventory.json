@@ -1,0 +1,77 @@
+[
+  {
+    "source": "_telegram_ops.py",
+    "bytes": 27251,
+    "sha256": "8b55603a910badeee564afe1eedf11d04864dbd7026e74a858310020a155532b"
+  },
+  {
+    "source": "calorie_counter (4).py",
+    "bytes": 9590,
+    "sha256": "18b9c67512e8b9387448bcd15feea4c5b7e1b61c73a05fea898e6cf8d96b543d"
+  },
+  {
+    "source": "chat_takeover.py",
+    "bytes": 33103,
+    "sha256": "5103ae56f02c804701c99db483489db774e32af5288e3ad018f25103f4f64203"
+  },
+  {
+    "source": "document_review.py",
+    "bytes": 12409,
+    "sha256": "90499857713091961a47530b0d7d407e3c8ca6e1b11f258a9ea15e49b833a6b2"
+  },
+  {
+    "source": "excel_writer.py",
+    "bytes": 9690,
+    "sha256": "7a41599c1d2b067682c52379e2b2920ff6b77a5b2f6e133d5520bee2bfc4a375"
+  },
+  {
+    "source": "game_updater.py",
+    "bytes": 115305,
+    "sha256": "fc978027183f400683e059243ac50eb04ec9c9f7306f39809049935448a0a47e"
+  },
+  {
+    "source": "Hostinger VPS/Hostinger VPS/cloud.py",
+    "bytes": 145488,
+    "sha256": "68ff83813f22fd392d11486f9d31ed086f81336e930b409bdadd0e16c7d6a5cb"
+  },
+  {
+    "source": "Hostinger VPS/Hostinger VPS/cloud_agent.py",
+    "bytes": 53945,
+    "sha256": "257c2fc3a7786b8df42147658d50f5f9b6c32e0d801b2da85c5c3e4c787bb392"
+  },
+  {
+    "source": "Hostinger VPS/Hostinger VPS/lazyimport.py",
+    "bytes": 6857,
+    "sha256": "2dee5aafca74e9fe9a5e4a7f12346330b354e780e6bffa9caba864320b64d64c"
+  },
+  {
+    "source": "Hostinger VPS/Hostinger VPS/README.txt",
+    "bytes": 1311,
+    "sha256": "c3831eaaa693b20c18740f03021b95bb2b1b6de401cddc09e375f01e04b7acc0"
+  },
+  {
+    "source": "Hostinger VPS/Hostinger VPS/reminder.py",
+    "bytes": 13936,
+    "sha256": "89402297f3a941de55fbf237bba46770fae86fb9eb8345012ce30f2312b36382"
+  },
+  {
+    "source": "pomodoro.py",
+    "bytes": 11838,
+    "sha256": "343e6cc324e1bb0bf28191fb09c8909a7b62589201a5fcd6feaceaaaf355f61b"
+  },
+  {
+    "source": "quiz.py",
+    "bytes": 16181,
+    "sha256": "4a506e2e385cd95580f33494c373877bf3b6272d8d02b8075e0b8e9bf1260eb9"
+  },
+  {
+    "source": "telegram_remote.py",
+    "bytes": 99711,
+    "sha256": "a3d3029f3082fccfe89d601624011160f778ebf0dda230e9579d8c62130b4b25"
+  },
+  {
+    "source": "water_reminder.py",
+    "bytes": 9463,
+    "sha256": "06c9540f74a0f064a16e98fc3cc69b1c1129859aaea88b9cb7ba74bdd0391400"
+  }
+]

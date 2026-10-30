@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Iterable, Optional
@@ -28,6 +28,9 @@ from typing import Iterable, Optional
 from ..constants import CONFIG_DIR
 from ..utils import utc_stamp
 from ..db import apply_pragmas
+
+
+_MAX_CLOCK = (1 << 63) - 1  # SQLite INTEGER; leave room for the next local tick.
 
 
 def value_hash(payload: str) -> str:
@@ -59,14 +62,33 @@ class JournalEntry:
     @classmethod
     def from_dict(cls, data: dict) -> "JournalEntry":
         return cls(
-            node_id=str(data["node_id"]),
-            lamport_ts=int(data["lamport_ts"]),
-            tier=str(data.get("tier", "")),
-            category=str(data.get("category", "")),
-            key=str(data.get("key", "")),
-            value_hash=str(data.get("value_hash") or value_hash(data.get("payload", ""))),
-            payload=str(data.get("payload", "")),
+            node_id=data["node_id"],
+            lamport_ts=data["lamport_ts"],
+            tier=data.get("tier", ""),
+            category=data.get("category", ""),
+            key=data.get("key", ""),
+            value_hash=data.get("value_hash", value_hash(data.get("payload", ""))),
+            payload=data.get("payload", ""),
         )
+
+    def validated(self) -> "JournalEntry":
+        """Validate wire values without coercing malformed clocks or payloads.
+
+        Missing hashes from older segments are computed by ``from_dict``;
+        supplied hashes must describe the actual payload. This checks integrity,
+        not peer authentication.
+        """
+        if not isinstance(self.node_id, str) or not self.node_id.strip():
+            raise ValueError("Journal node_id must be a non-empty string")
+        if (type(self.lamport_ts) is not int
+                or not 0 < self.lamport_ts < _MAX_CLOCK):
+            raise ValueError("Journal clock must be a positive integer with room for a local tick")
+        if not all(isinstance(v, str) for v in (self.tier, self.category, self.key, self.payload)):
+            raise ValueError("Journal scope and payload must be strings")
+        expected = value_hash(self.payload)
+        if not isinstance(self.value_hash, str) or self.value_hash.lower() != expected:
+            raise ValueError("Journal payload hash does not match its content")
+        return replace(self, value_hash=expected)
 
 
 class SyncJournal:
@@ -127,13 +149,13 @@ class SyncJournal:
         )
 
     def _ensure_node_id(self) -> str:
-        with self._lock:
+        with self._lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
             existing = self._meta_get("node_id")
             if existing:
                 return existing
             node_id = uuid.uuid4().hex
             self._meta_set("node_id", node_id)
-            self.conn.commit()
             return node_id
 
     # ── Lamport clock ────────────────────────────────────────────────────────────
@@ -143,6 +165,8 @@ class SyncJournal:
 
     def _tick(self) -> int:
         nxt = self._current_lamport() + 1
+        if nxt > _MAX_CLOCK:
+            raise ValueError("Journal clock has exhausted SQLite's integer range")
         self._meta_set("lamport", str(nxt))
         return nxt
 
@@ -160,7 +184,10 @@ class SyncJournal:
     def record(self, tier: str, category: str, key: str, payload: str) -> JournalEntry:
         """Append a local change and return the entry."""
         payload = str(payload or "")
-        with self._lock:
+        with self._lock, self.conn:
+            # Reserve the writer before reading the logical clock, including
+            # when a second SyncJournal instance uses this same database.
+            self.conn.execute("BEGIN IMMEDIATE")
             ts = self._tick()
             entry = JournalEntry(
                 node_id=self.node_id, lamport_ts=ts, tier=str(tier),
@@ -173,16 +200,18 @@ class SyncJournal:
                 (entry.node_id, entry.lamport_ts, entry.tier, entry.category,
                  entry.key, entry.value_hash, entry.payload, utc_stamp()),
             )
-            self.conn.commit()
             return JournalEntry(**{**entry.__dict__, "seq": int(cur.lastrowid)})
 
     def apply_remote(self, entries: Iterable) -> int:
         """Idempotently insert remote entries; advance the Lamport clock. Returns
-        the number of genuinely new entries applied."""
+        the number of genuinely new entries applied. A malformed or interrupted
+        batch rolls back both its entries and its logical-clock observations."""
         applied = 0
-        with self._lock:
+        with self._lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
             for raw in entries:
                 entry = raw if isinstance(raw, JournalEntry) else JournalEntry.from_dict(raw)
+                entry = entry.validated()
                 cur = self.conn.execute(
                     "INSERT OR IGNORE INTO journal(node_id, lamport_ts, tier, "
                     "category, key, value_hash, payload, created_at) "
@@ -192,8 +221,16 @@ class SyncJournal:
                 )
                 if cur.rowcount:
                     applied += 1
+                else:
+                    existing = self.conn.execute(
+                        "SELECT tier, category, key, value_hash, payload FROM journal "
+                        "WHERE node_id=? AND lamport_ts=?",
+                        (entry.node_id, entry.lamport_ts),
+                    ).fetchone()
+                    content = (entry.tier, entry.category, entry.key, entry.value_hash, entry.payload)
+                    if existing is None or tuple(existing) != content:
+                        raise ValueError("Journal identity conflicts with an existing immutable entry")
                 self._observe(entry.lamport_ts)
-            self.conn.commit()
         return applied
 
     # ── reading ──────────────────────────────────────────────────────────────────

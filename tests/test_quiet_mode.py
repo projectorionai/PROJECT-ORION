@@ -168,6 +168,14 @@ def test_unprompted_speech_is_suppressed_while_quiet():
     assert any("held back" in str(m) for m in w.bus.log.messages)
 
 
+def test_the_answer_to_a_file_he_dropped_is_said_while_quiet():
+    """A reply to something the owner just did himself is not unprompted."""
+    w = _announcer()
+    w.quiet_mode = True
+    GenAILiveWorker.announce(w, "Got notes.pdf: a 3-page PDF. Want a summary?", asked=True)
+    assert w.spoken == ["Got notes.pdf: a 3-page PDF. Want a summary?"]
+
+
 def test_unprompted_speech_flows_again_once_released():
     w = _announcer()
     w.quiet_mode = True

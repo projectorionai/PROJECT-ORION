@@ -61,7 +61,16 @@ out = {{
     "mic_accessible": dialog.microphone.combo.accessibleName(),
     "test_accessible": dialog.microphone.test_button.accessibleName(),
     "swatch_accessible": dialog.swatch.accessibleName(),
+    "assistant_read_only": dialog.assistant_edit.isReadOnly(),
+    "voice_consent_default": dialog.voice_learning.consent.isChecked(),
+    "voice_learning_disabled": not dialog.voice_learning.learn.isEnabled(),
+    "voice_cancel_disabled": not dialog.voice_learning.cancel.isEnabled(),
+    "recording_consent_default": dialog.conversation_recording.consent.isChecked(),
+    "recording_start_disabled": not dialog.conversation_recording.start.isEnabled(),
+    "recording_stop_disabled": not dialog.conversation_recording.stop.isEnabled(),
 }}
+dialog.voice_learning.consent.setChecked(True)
+out["voice_learning_after_consent"] = dialog.voice_learning.learn.isEnabled()
 print("@@" + json.dumps(out))
 '''
 
@@ -85,6 +94,41 @@ def test_system_default_is_always_offered_first(dialog):
     """An untouched install and a deliberate default must be the same thing."""
     assert dialog["mic_first"] == dialog["default_label"]
     assert dialog["mic_data_first"] == ""
+
+
+def test_voice_learning_needs_explicit_consent_in_preferences(dialog):
+    assert not dialog["voice_consent_default"]
+    assert dialog["voice_learning_disabled"] and dialog["voice_cancel_disabled"]
+    assert dialog["voice_learning_after_consent"]
+
+
+def test_closing_preferences_cancels_a_voice_session_that_starts_late(monkeypatch):
+    import ast
+    import threading
+    from types import SimpleNamespace
+    from orion_core import voice_enrolment, voice_speaker_id
+
+    started, cancelled = [], []
+    session = SimpleNamespace(cancel=lambda: cancelled.append(True))
+    monkeypatch.setattr(voice_enrolment, "current", lambda: session)
+    monkeypatch.setattr(voice_speaker_id, "SpeakerIdentificationService", lambda: SimpleNamespace(
+        start_learning=lambda *a, **k: SimpleNamespace(ok=True, text="started")))
+    monkeypatch.setattr(threading, "Thread", lambda target, **k: SimpleNamespace(
+        start=lambda: started.append(target)))
+    tree = ast.parse((ROOT / "orion_core/gui/preferences.py").read_text(encoding="utf-8"))
+    owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_VoiceLearning")
+    work = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "_work")
+    namespace = {"threading": threading, "__package__": "orion_core.gui"}
+    exec(compile(ast.Module(body=[work], type_ignores=[]), "<voice preferences>", "exec"), namespace)
+    harness = SimpleNamespace(_working=False, _closing=False, _session=None,
+        _name=lambda: "SyntheticOwner", _emit=lambda _message: None,
+        consent=SimpleNamespace(isChecked=lambda: True),
+        learn=SimpleNamespace(setEnabled=lambda _enabled: None))
+    namespace["_work"](harness, "learn")
+    assert len(started) == 1 and harness._working
+    harness._closing = True
+    started[0]()
+    assert cancelled == [True] and not harness._working
 
 
 def test_both_directions_are_offered(dialog):
@@ -129,8 +173,17 @@ def test_devices_are_identified_by_name(dialog):
 def test_the_dialog_only_collects(dialog):
     """It returns values; persisting is the caller's decision. That is what
     lets it be tested without an assistant behind it."""
+    # "motion" joined with the Motion and performance preference; the dialog
+    # still only collects it — core_window applies it. "brain_mode" is the
+    # Brain selector (saved as it changes, applied by core_window).
+    # "face_design" (Mark XXXIX) is the Screen Face's design, applied likewise.
     assert set(dialog["values"]) == {
-        "input_device", "output_device", "assistant_name", "user_name", "accent"}
+        "input_device", "output_device", "assistant_name", "user_name", "accent",
+        "motion", "face_design", "brain_mode"}
+    assert dialog["values"]["motion"] in {"full", "balanced", "reduced"}
+    assert dialog["values"]["face_design"] in {"sentinel", "arc", "visor", "minimal",
+                                               "companion"}
+    assert dialog["values"]["brain_mode"] in {"cloud", "hybrid", "local"}
 
 
 def test_the_accent_defaults_to_orions_own_crimson(dialog):
@@ -202,3 +255,17 @@ def test_applying_goes_through_the_existing_verify_path():
     directly would skip it and lose the fallback message."""
     source = (ROOT / "orion_core" / "gui" / "core_window.py").read_text(encoding="utf-8")
     assert "audio_devices.set_device" in source
+
+
+def test_your_name_is_kept_and_his_is_not_offered(dialog):
+    """Both names were collected and then dropped: nothing read either."""
+    assert dialog["assistant_read_only"] is True
+    source = (ROOT / "orion_core" / "gui" / "core_window.py").read_text(encoding="utf-8")
+    assert "identity.set_user_name(" in source
+    assert "user_name=identity.user_name()" in source, "the dialog never shows the current name"
+
+
+def test_opening_preferences_never_starts_or_consents_to_recording(dialog):
+    assert dialog["recording_consent_default"] is False
+    assert dialog["recording_start_disabled"] is True
+    assert dialog["recording_stop_disabled"] is True

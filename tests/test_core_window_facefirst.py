@@ -313,9 +313,249 @@ def test_the_orb_follows_orions_state(_app, tmp_path):
         win.exit_overlay_mode()
 
 
+def test_compact_shows_the_screen_face_he_is_wearing(_app, tmp_path, monkeypatch):
+    """26 Oct 2026, the owner: pressing Compact showed the orb - a form Mark
+    XXXVII had switched off. It shows the face he is wearing."""
+    from orion_core import appearance
+    from orion_core.gui.screen_face import ScreenFacePanel
+    monkeypatch.setattr(appearance, "face_form", lambda: "screen")
+    win = _window(tmp_path)
+    win.show()
+    win.enter_overlay_mode()
+    try:
+        overlay = win._orb_overlay
+        assert overlay.form == "screen" and isinstance(overlay.orb, ScreenFacePanel)
+        assert overlay.width() > overlay.height(), "the visor's proportions, not a disc"
+        win.bus.state.emit("LISTENING")
+        assert overlay.orb.state_name == "LISTENING"
+    finally:
+        win.exit_overlay_mode()
+
+
+def test_the_compact_face_speaks_emotes_and_moves_its_mouth(_app):
+    from orion_core.gui.orb_overlay import OrbOverlay
+
+    class Face:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            return lambda *args: self.calls.append((name, args))
+
+    overlay = OrbOverlay(form="screen")
+    panel, face = overlay.orb, Face()
+    overlay.orb = face
+    try:
+        overlay.set_speaking(True)
+        overlay.apply_emotion("happy", {"intensity": 0.8})
+        overlay.set_viseme_payload({"open": 0.5, "width": 0.2, "closure": 0.0})
+        overlay.set_viseme_payload({"viseme": "aa", "weight": 0.7})
+        overlay.set_viseme_payload("not a payload")
+    finally:
+        overlay.orb = panel
+        overlay.deleteLater()
+    assert face.calls == [("set_speaking", (True,)),
+                          ("apply_emotion", ("happy", {"intensity": 0.8})),
+                          ("set_viseme", (0.5, 0.2, 0.0)),
+                          ("set_viseme", ("aa", 0.7))]
+
+
+def test_the_orb_is_kept_for_the_orb_and_classic_faces(_app, monkeypatch):
+    from orion_core import appearance
+    from orion_core.gui import orb_overlay
+    monkeypatch.setattr(appearance, "face_form", lambda: "classic")
+    assert orb_overlay.compact_form() == "orb"
+    overlay = orb_overlay.OrbOverlay()
+    try:
+        assert isinstance(overlay.orb, orb_overlay.CompactOrb)
+        assert overlay.width() == overlay.height() == orb_overlay.ORB_SIZE
+        overlay.set_speaking(True)                  # the orb has none of these:
+        overlay.apply_emotion("happy")              # each is a quiet no-op
+    finally:
+        overlay.deleteLater()
+
+
 def test_a_maximised_window_comes_back_maximised(_app, tmp_path):
     win = _window(tmp_path)
     win.showMaximized()
     win.enter_overlay_mode()
     win.exit_overlay_mode()
     assert win.isMaximized()
+
+
+def test_initial_face_health_watch_is_installed_after_build(_app, tmp_path, monkeypatch):
+    from orion_core.gui.core_window import OrionCoreWindow
+    watched = []
+    monkeypatch.setattr(OrionCoreWindow, "_watch_face_health", lambda self: watched.append(self.face))
+    window = _window(tmp_path)
+    assert watched == [window.face]
+
+
+def _health_watch_fixture(monkeypatch, *, states=None, answer=True, failed=False):
+    from types import SimpleNamespace
+    from orion_core.gui import core_window
+
+    timers, queries, actions = [], [], []
+    remaining = list(states or ["alive"])
+
+    class Face:
+        on_failed = None
+
+        def __init__(self):
+            self.failed = failed
+
+        def check_state(self, callback):
+            queries.append(callback)
+            if answer:
+                callback(remaining.pop(0) if remaining else "alive")
+
+    face = Face()
+    owner = SimpleNamespace(face=face, isVisible=lambda: True, _shutting_down=False,
+                            bus=SimpleNamespace(log=SimpleNamespace(emit=lambda _line: None)),
+                            _probe_face=core_window.OrionCoreWindow._probe_face)
+
+    def replace(action):
+        actions.append(action)
+        owner.face = Face()
+
+    owner._rebuild_face = lambda: replace("retry")
+    owner._swap_face = lambda: replace("software")
+    monkeypatch.setattr(core_window, "QTimer", SimpleNamespace(
+        singleShot=lambda delay, callback: timers.append((delay, callback))))
+
+    def run_timer(delay):
+        for index, (when, callback) in enumerate(timers):
+            if when == delay:
+                timers.pop(index)
+                callback()
+                return
+        raise AssertionError(f"no queued timer at {delay} ms")
+
+    core_window.OrionCoreWindow._watch_face_health(owner)
+    return owner, face, actions, queries, run_timer
+
+
+def test_a_startup_host_failure_triggers_recovery_without_waiting_for_a_probe(monkeypatch):
+    owner, face, actions, _queries, timer = _health_watch_fixture(monkeypatch, failed=True)
+    timer(0)
+    assert actions == ["retry"]
+    assert owner.face is not face
+
+
+def test_face_health_keeps_watching_after_the_first_healthy_frame(monkeypatch):
+    owner, face, actions, queries, timer = _health_watch_fixture(monkeypatch, states=["alive", "failed"])
+    timer(6000)
+    assert len(queries) == 1 and not actions
+    timer(4000)
+    assert len(queries) == 2 and actions == ["retry"]
+    assert owner.face is not face
+
+
+def test_late_host_failure_callback_recovers_a_previously_healthy_face(monkeypatch):
+    _owner, face, actions, _queries, timer = _health_watch_fixture(monkeypatch)
+    timer(6000)
+    face.on_failed()
+    timer(0)
+    assert actions == ["retry"]
+
+
+def test_unanswered_face_queries_have_a_bounded_recovery(monkeypatch):
+    owner, face, actions, queries, timer = _health_watch_fixture(monkeypatch, answer=False)
+    timer(6000)
+    timer(2000)
+    timer(4000)
+    timer(2000)
+    timer(4000)
+    timer(2000)
+    assert len(queries) == 3 and actions == ["retry"]
+    # A reply from the discarded query cannot condemn its replacement.
+    queries[0]("failed")
+    assert actions == ["retry"] and owner.face is not face
+
+
+def test_face_retirement_cannot_recover_recursively_from_shutdown_queries(monkeypatch):
+    from types import SimpleNamespace
+    from orion_core.gui.core_window import OrionCoreWindow
+    _owner, face, actions, queries, timer = _health_watch_fixture(monkeypatch, answer=False)
+    timer(6000)
+    face.host_wids = {}
+    face.shutdown = lambda: queries[0]("failed")
+    face.setParent = lambda _parent: None
+    face.deleteLater = lambda: None
+    OrionCoreWindow._retire_face(face, SimpleNamespace(removeWidget=lambda _widget: None))
+    timer(2000)
+    assert actions == [] and face._orion_retired
+
+
+def test_face_failure_after_one_retry_uses_software_without_changing_saved_form(monkeypatch):
+    monkeypatch.setenv("ORION_FACE_FALLBACK", "")
+    owner, face, actions, _queries, timer = _health_watch_fixture(monkeypatch, failed=True)
+    owner._face_retried = True
+    timer(0)
+    assert actions == ["software"]
+    assert os.environ["ORION_FACE_FALLBACK"] == "orb"
+    assert owner.face is not face
+
+
+def test_shutting_down_ignores_pending_face_failure(monkeypatch):
+    owner, _face, actions, _queries, timer = _health_watch_fixture(monkeypatch, answer=False)
+    timer(6000)
+    owner._shutting_down = True
+    timer(2000)
+    assert actions == []
+
+
+def test_broken_local_webgl_uses_a_software_orb_instead_of_unattached_native_gl(monkeypatch):
+    from orion_core import appearance
+    from orion_core.gui import core_window, hud
+
+    class SoftwareOrb:
+        pass
+
+    def broken():
+        raise RuntimeError("the local avatar assets cannot be served")
+
+    monkeypatch.setenv("ORION_FACE_FALLBACK", "")
+    monkeypatch.setattr(core_window, "holo_head_enabled", lambda: False)
+    monkeypatch.setattr(core_window, "webengine_face_possible", lambda: True)
+    monkeypatch.setattr(core_window, "_new_webgl_face", broken)
+    # The classic (WebGL) face is the one that can break this way; the
+    # screen face needs no WebGL at all.
+    monkeypatch.setattr(appearance, "face_form", lambda: "classic")
+    monkeypatch.setattr(hud, "CentralHud", SoftwareOrb)
+    assert isinstance(core_window.OrionCoreWindow._build_face(object()), SoftwareOrb)
+    assert appearance.face_form() == "classic"
+
+
+def test_failed_local_handler_draws_a_live_software_orb_without_a_browser(_app, monkeypatch):
+    from types import SimpleNamespace
+    from orion_core.gui import face3d
+    from orion_core.gui.hud import CentralHud
+    discarded = []
+
+    class UnloadedView:
+        loadFinished = SimpleNamespace(connect=lambda _callback: None)
+        renderProcessTerminated = SimpleNamespace(connect=lambda _callback: None)
+
+        def page(self):
+            return SimpleNamespace(setBackgroundColor=lambda _colour: None)
+
+        def deleteLater(self):
+            discarded.append(True)
+
+    monkeypatch.setattr(face3d, "WEBENGINE_OK", True)
+    monkeypatch.setattr(face3d, "QWebEngineView", UnloadedView, raising=False)
+    face = face3d.QuantumFace3D()
+    monkeypatch.setattr(face, "_install_asset_handler", lambda: None)
+    face._ensure_built()
+    assert isinstance(face._software_fallback, CentralHud)
+    assert face.view is None and discarded == [True]
+    face.set_form("face")
+    face.set_avatar_frame({"js_state": "SPEAKING", "amplitude": 0.7})
+    assert face.form == "face"
+    assert face._software_fallback.state_name == "SPEAKING"
+    assert face._software_fallback.target_amplitude == 0.7
+    face.set_state("OFFLINE")
+    face.set_amplitude(0.2)
+    assert face._software_fallback.state_name == "OFFLINE"
+    assert face._software_fallback.target_amplitude == 0.2

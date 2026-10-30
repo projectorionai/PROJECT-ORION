@@ -79,8 +79,12 @@ class DatabaseHousekeeper:
         try:
             conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                done.append("checkpoint")
+                row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                # A busy reader is reported in the result row, not raised.
+                # Treat that as incomplete so a still-populated WAL is never
+                # reported as safely folded into the main database.
+                done.append("checkpoint" if row is not None and row[0] == 0
+                            else "checkpoint-busy")
             except sqlite3.Error as exc:
                 done.append(f"checkpoint-failed({exc})")
             try:
@@ -90,7 +94,7 @@ class DatabaseHousekeeper:
                 done.append(f"vacuum-failed({exc})")
         finally:
             conn.close()
-        ok = "checkpoint" in done or "vacuum" in done
+        ok = "checkpoint" in done and "vacuum" in done
         return ok, "+".join(done)
 
     #: How often to fold the write-ahead logs back into their databases.
@@ -107,7 +111,9 @@ class DatabaseHousekeeper:
         conn.isolation_level = None
         try:
             conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if row is None or row[0] != 0:
+                return False, "checkpoint-busy"
             return True, "checkpoint"
         except sqlite3.Error as exc:
             return False, f"checkpoint-failed({exc})"

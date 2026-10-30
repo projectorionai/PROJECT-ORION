@@ -11,15 +11,19 @@ into ``MemoryAgent`` so they survive model switches, crashes and reboots.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
+import unicodedata
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable, Literal, Optional
 
+from .atomic_io import atomic_write_text
 from .bus import OrionBus
 from .constants import CONFIG_DIR
 from .memory import MemoryAgent, MemoryTier
@@ -35,6 +39,47 @@ def _slug(value: str, fallback: str = "item", limit: int = 80) -> str:
     return (slug or fallback)[:limit]
 
 
+def _task_identity(title: str) -> str:
+    """Full task identity; display slugs are not unique titles."""
+    return " ".join(unicodedata.normalize("NFKC", str(title or "")).split()).casefold()
+
+
+def _task_record_identity(key: str, record: Any) -> str:
+    # Old markers normally retain their full title. If it was lost, the exact
+    # stored key is all that can be established; never infer a longer title.
+    title = record.get("title") if isinstance(record, dict) else ""
+    return _task_identity(str(title or key))
+
+
+def _task_title_keys(records: dict[str, Any], title: str) -> list[str]:
+    identity = _task_identity(title)
+    return [key for key, record in records.items()
+            if _task_record_identity(key, record) == identity]
+
+
+def _task_storage_key(title: str, *collections: dict[str, Any]) -> str:
+    """Reuse existing IDs; suffix a slug only when another full title owns it."""
+    identity = _task_identity(title)
+
+    def available(key: str) -> bool:
+        return all(key not in records or _task_record_identity(key, records[key]) == identity
+                   for records in collections)
+
+    for records in collections:
+        for key in _task_title_keys(records, title):
+            if available(key):
+                return key
+    base = _slug(title, "task")
+    if available(base):
+        return base
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    for size in (16, 32, 64):
+        key = base[:79 - size] + "_" + digest[:size]
+        if available(key):
+            return key
+    raise ValueError("Task title identity collides with an existing stored task")
+
+
 def _tokens(value: str) -> set[str]:
     stop = {
         "the", "and", "for", "with", "that", "this", "from", "into", "about",
@@ -44,6 +89,16 @@ def _tokens(value: str) -> set[str]:
         t for t in re.findall(r"[a-z0-9]{3,}", str(value or "").lower())
         if t not in stop
     }
+
+
+def _stamp_seconds(stamp: str) -> float | None:
+    """'2026-07-22T22:47:53Z' as epoch seconds; None if unreadable."""
+    from datetime import timezone
+    try:
+        return datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -103,6 +158,8 @@ class CognitiveStateManager:
     """Durable state co-ordinator for goals, projects and resumed work."""
 
     SCHEMA = "orion.mark_xi.cognitive_state.v1"
+    #: Plans older than this are left out of the launch summary.
+    PLAN_RECENCY_DAYS = 30
 
     def __init__(
         self,
@@ -160,8 +217,13 @@ class CognitiveStateManager:
     def _restore_sync(self) -> str:
         with self._lock:
             self._load_locked()
-            self._state["last_launch_at"] = utc_stamp()
-            self._save_locked()
+            previous = deepcopy(self._state)
+            try:
+                self._state["last_launch_at"] = utc_stamp()
+                self._save_locked()
+            except BaseException:
+                self._state = previous
+                raise
             active_project = self._state.get("current_workspace", {}).get("active_project", "")
             if active_project:
                 self.memory.set_active_project(str(active_project))
@@ -191,31 +253,56 @@ class CognitiveStateManager:
             if not isinstance(merged.get("user_priorities"), list):
                 merged["user_priorities"] = []
             self._state = merged
-        except Exception as exc:
-            backup = self.path.with_suffix(f".corrupt-{int(time.time())}.json")
-            try:
-                self.path.replace(backup)
-            except OSError:
-                pass
+        except (ValueError, UnicodeError) as exc:
+            # An unreadable file is not corrupt: OSError deliberately escapes
+            # this handler. Never overwrite history unless its malformed bytes
+            # have first been retained successfully in a distinct backup.
+            backup = self.path.with_suffix(f".corrupt-{time.time_ns()}.json")
+            self.path.replace(backup)
+            previous = self._state
             self._state = self._default_state()
+            try:
+                self._save_locked()
+            except BaseException:
+                self._state = previous
+                raise
             self._log(f"COG: corrupt state ignored - {first_line(exc)}")
-            self._save_locked()
+        else:
+            # Older versions sometimes persisted checked-off rows in the
+            # pending ledger. Remove them before any launch summary or panel
+            # reads state, retaining only the existing anti-resurrection marker.
+            # Keep persistence outside the read-error handler: a failed save
+            # does not make the successfully loaded source file corrupt.
+            previous = deepcopy(self._state)
+            try:
+                if self._prune_terminal_tasks_locked():
+                    self._save_locked()
+            except BaseException:
+                self._state = previous
+                raise
 
     def _save_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._state["schema"] = self.SCHEMA
         self._state["updated_at"] = utc_stamp()
-        tmp = self.path.with_suffix(".tmp")
         payload = json.dumps(self._state, ensure_ascii=False, indent=2, sort_keys=True)
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(self.path)
+        atomic_write_text(self.path, payload, encoding="utf-8")
         if self.telemetry is not None:
-            self.telemetry.metrics.incr("cognition.state_saves")
+            try:
+                self.telemetry.metrics.incr("cognition.state_saves")
+            except Exception:
+                # Metrics are optional; the state has already been committed.
+                pass
 
     def _mutate(self, mutator: Any) -> Any:
         with self._lock:
-            result = mutator(self._state)
-            self._save_locked()
+            previous = deepcopy(self._state)
+            try:
+                result = mutator(self._state)
+                self._save_locked()
+            except BaseException:
+                self._state = previous
+                raise
             snapshot = self.snapshot_locked()
         self.bus.dashboard_event.emit("cognition", snapshot)
         return result
@@ -243,8 +330,20 @@ class CognitiveStateManager:
             lines.append("Active goals: " + "; ".join(f"{g.title} ({int(g.progress * 100)}%)" for g in ranked))
         if tasks:
             lines.append(f"Pending tasks: {len(tasks)}.")
-        if workflows:
-            lines.append("Open workflows: " + ", ".join(list(workflows)[:6]) + ".")
+        # Plans, not achievements - and only recent ones. Listed by id under
+        # "Open workflows", two July drafts ("integrate 10TB RAM...") came back
+        # in October as "my most recent integrated capabilities" (owner, 7 Oct
+        # 2026: "ORION seems a bit dumber").
+        recent = []
+        cutoff = time.time() - self.PLAN_RECENCY_DAYS * 86400
+        for key, flow in workflows.items():
+            stamp = _stamp_seconds(str((flow or {}).get("updated_at") or ""))
+            if stamp is not None and stamp < cutoff:
+                continue
+            recent.append(str((flow or {}).get("name") or key)[:80])
+        if recent:
+            lines.append("Unfinished plans the user drafted (NOT done and NOT capabilities): "
+                         + "; ".join(recent[:6]) + ".")
         if research:
             lines.append("Research sessions: " + ", ".join(list(research)[:6]) + ".")
         if workspace:
@@ -318,8 +417,70 @@ class CognitiveStateManager:
 
         return self._mutate(_do)
 
-    #: How many dismissed-task markers are kept (newest win).
-    DISMISSED_LIMIT = 500
+    # Minimal dismissal markers are durable completion knowledge. Evicting one
+    # after an arbitrary count lets an old conversation recreate finished work.
+
+    _COMPLETED_TASK_STATUSES = frozenset({
+        "complete", "completed", "done", "finished", "closed", "resolved",
+    })
+    _REMOVED_TASK_STATUSES = frozenset({
+        "cancelled", "canceled", "archived", "removed", "deleted",
+    })
+    _TERMINAL_TASK_FLAGS = ("done", "completed", "terminal", "archived", "cancelled", "canceled")
+
+    @staticmethod
+    def _sanitise_mentioned_tasks_locked(state: dict[str, Any]) -> bool:
+        """Remove dismissed titles from the 'those tasks' reference list."""
+        record = state.get("last_mentioned_tasks")
+        if record is None:
+            return False
+        if not isinstance(record, dict):
+            state.pop("last_mentioned_tasks", None)
+            return True
+        titles = record.get("titles")
+        dismissed = {_task_record_identity(key, marker)
+                     for key, marker in (state.get("dismissed_tasks") or {}).items()}
+        clean = [title for title in titles if isinstance(title, str) and title.strip()
+                 and _task_identity(title) not in dismissed] if isinstance(titles, list) else []
+        if clean == titles:
+            return False
+        record["titles"] = clean
+        return True
+
+    def _prune_terminal_tasks_locked(self) -> bool:
+        """Physically retire legacy completed rows when persisted state loads."""
+        tasks = self._state["pending_tasks"]
+        dismissed = self._state["dismissed_tasks"]
+        changed = False
+        # A legacy slug marker can share its key with a different live title.
+        # Its retained full title is authoritative; move only the conflicting
+        # marker, preserving its original timestamp/reason and the live row.
+        for key, marker in list(dismissed.items()):
+            if (isinstance(marker, dict) and marker.get("title") and key in tasks
+                    and _task_record_identity(key, tasks[key]) != _task_record_identity(key, marker)):
+                safe_key = _task_storage_key(str(marker["title"]), tasks, dismissed)
+                dismissed[safe_key] = marker
+                dismissed.pop(key)
+                changed = True
+        for key, task in list(tasks.items()):
+            if not isinstance(task, dict):
+                continue
+            title = str(task.get("title") or key)
+            status = re.sub(r"[\s_-]+", " ", str(task.get("status") or "").strip().casefold())
+            terminal = status in self._COMPLETED_TASK_STATUSES | self._REMOVED_TASK_STATUSES
+            terminal = terminal or any(task.get(flag) is True for flag in self._TERMINAL_TASK_FLAGS)
+            already_dismissed = bool(_task_title_keys(dismissed, title))
+            if not terminal and not already_dismissed:
+                continue
+            reason = "completed" if (status in self._COMPLETED_TASK_STATUSES
+                                       or task.get("done") is True
+                                       or task.get("completed") is True) else "removed"
+            if already_dismissed:
+                tasks.pop(key, None)
+            else:
+                self._dismiss_locked(self._state, key, reason)
+            changed = True
+        return self._sanitise_mentioned_tasks_locked(self._state) or changed
 
     def add_task(self, title: str, project: str = "", due: str = "",
                  restore: bool = False) -> dict[str, Any]:
@@ -327,17 +488,26 @@ class CognitiveStateManager:
         re-added (the result carries ``dismissed``) unless *restore* — the
         user asking for it back by name — so an old conversation can never
         resurrect it."""
-        clean = SecuritySanitiser.guard_text(title, "cognition.task")[:220]
-        key = _slug(clean, "task")
+        clean = SecuritySanitiser.guard_text(title, "cognition.task")
 
         def _do(state: dict[str, Any]) -> dict[str, Any]:
             dismissed = state.setdefault("dismissed_tasks", {})
-            if key in dismissed and key not in state.get("pending_tasks", {}):
-                if not restore:
-                    return {**dismissed[key], "id": key, "dismissed": True}
-                dismissed.pop(key, None)
             tasks = state.setdefault("pending_tasks", {})
+            key = _task_storage_key(clean, tasks, dismissed)
+            dismissed_keys = _task_title_keys(dismissed, clean)
+            if restore:
+                for dismissed_key in dismissed_keys:
+                    dismissed.pop(dismissed_key, None)
+            elif dismissed_keys:
+                marker = dismissed[dismissed_keys[0]]
+                return {**marker, "id": key, "dismissed": True}
             record = dict(tasks.get(key) or {})
+            if restore:
+                for flag in self._TERMINAL_TASK_FLAGS:
+                    record.pop(flag, None)
+                for stamp in ("done_at", "completed_at", "archived_at", "cancelled_at",
+                              "canceled_at", "removed_at", "deleted_at"):
+                    record.pop(stamp, None)
             record.update({
                 "id": key,
                 "title": clean,
@@ -353,26 +523,38 @@ class CognitiveStateManager:
 
     @staticmethod
     def _match_task(tasks: dict[str, Any], key_or_title: str) -> str:
-        key = _slug(key_or_title, "task")
-        if key in tasks:
-            return key
-        return next((k for k, v in tasks.items()
-                     if key in k or key in _slug(v.get("title", ""))), "")
+        identity = _task_identity(key_or_title)
+        if not identity:
+            return ""
+        exact = _task_title_keys(tasks, key_or_title)
+        if exact:
+            return exact[0] if len(exact) == 1 else ""
+        if key_or_title in tasks:
+            return key_or_title
+        matches = [key for key, record in tasks.items()
+                   if identity in _task_record_identity(key, record)]
+        return matches[0] if len(matches) == 1 else ""
 
     def _dismiss_locked(self, state: dict[str, Any], key: str, reason: str) -> dict[str, Any]:
         task = state.setdefault("pending_tasks", {}).pop(key, None) or {}
         dismissed = state.setdefault("dismissed_tasks", {})
-        dismissed[key] = {"title": str(task.get("title") or key), "reason": reason,
-                          "at": utc_stamp()}
-        if len(dismissed) > self.DISMISSED_LIMIT:
-            for old in sorted(dismissed, key=lambda k: str(dismissed[k].get("at", "")))[
-                    : len(dismissed) - self.DISMISSED_LIMIT]:
-                dismissed.pop(old, None)
+        title = str(task.get("title") or key)
+        marker_key = _task_storage_key(title, state["pending_tasks"], dismissed)
+        for old_key in _task_title_keys(dismissed, title):
+            if old_key != marker_key:
+                dismissed.pop(old_key, None)
+        dismissed[marker_key] = {"title": title, "reason": reason, "at": utc_stamp()}
+        self._sanitise_mentioned_tasks_locked(state)
         return task
 
-    def complete_task(self, key_or_title: str) -> bool:
+    def complete_task(self, key_or_title: str, *, exact: bool = False) -> bool:
+        """Finish a task; GUI selections can require its exact stored key."""
         def _do(state: dict[str, Any]) -> bool:
-            match = self._match_task(state.setdefault("pending_tasks", {}), key_or_title)
+            tasks = state.setdefault("pending_tasks", {})
+            if exact:
+                match = key_or_title if key_or_title in tasks else ""
+            else:
+                match = self._match_task(tasks, key_or_title)
             if not match:
                 return False
             self._dismiss_locked(state, match, "completed")
@@ -392,26 +574,74 @@ class CognitiveStateManager:
 
         return str(self._mutate(_do) or "")
 
+    def dismiss_task(self, title: str, reason: str = "removed by user") -> str:
+        """Remember a user's removal even when a remote board owns the task.
+
+        Notion tasks need not exist in pending_tasks. Their exact title still
+        needs a tombstone so proactive surveys and restored conversations
+        cannot bring them back.
+        """
+        clean = SecuritySanitiser.guard_text(title, "cognition.task").strip()
+        if not clean:
+            return ""
+
+        def _do(state: dict[str, Any]) -> str:
+            tasks = state.setdefault("pending_tasks", {})
+            matches = _task_title_keys(tasks, clean)
+            if not matches:
+                key = _task_storage_key(clean, tasks, state.setdefault("dismissed_tasks", {}))
+                tasks[key] = {"title": clean}
+                matches = [key]
+            for key in matches:
+                self._dismiss_locked(state, key, reason)
+            return clean
+
+        return str(self._mutate(_do) or "")
+
+    #: How long "all of those" can refer back to the tasks ORION last read out.
+    MENTIONED_TASKS_TTL_H = 12.0
+
+    def note_mentioned_tasks(self, titles: list[str], source: str = "") -> None:
+        """Remember the exact tasks just read out to the user.
+
+        17 Oct 2026: the briefing listed six Notion tasks and the user said
+        "I've done all of those". Nothing knew which tasks "those" were, so
+        ORION called clear_overdue (none were overdue), announced them
+        cleared, and the same six came back in the next briefing."""
+        clean = [str(t).strip() for t in titles if str(t or "").strip()][:30]
+        def _do(state: dict[str, Any]) -> None:
+            state["last_mentioned_tasks"] = {
+                "titles": clean, "source": str(source or "")[:40], "at": utc_stamp()}
+            self._sanitise_mentioned_tasks_locked(state)
+
+        self._mutate(_do)
+
+    def last_mentioned_tasks(self, now: datetime | None = None) -> list[str]:
+        """The tasks last read out, if that was recent enough to be "those"."""
+        with self._lock:
+            record = dict(self._state.get("last_mentioned_tasks") or {})
+            dismissed = {_task_record_identity(key, marker)
+                         for key, marker in (self._state.get("dismissed_tasks") or {}).items()}
+        titles = [str(t) for t in (record.get("titles") or []) if str(t).strip()
+                  and _task_identity(str(t)) not in dismissed]
+        if not titles:
+            return []
+        try:
+            said = datetime.fromisoformat(str(record.get("at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            return []
+        # utc_stamp() is aware UTC; compare aware with aware (naive = local).
+        current = (now or datetime.now()).astimezone()
+        age_h = (current - said.astimezone()).total_seconds() / 3600.0
+        return titles if 0 <= age_h <= self.MENTIONED_TASKS_TTL_H else []
+
     @staticmethod
     def task_overdue(task: dict[str, Any], now: datetime | None = None) -> bool:
-        """Past its due date. A bare date is due at the END of that day."""
-        raw = str(task.get("due") or "").strip()
-        if not raw:
-            return False
-        try:
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
-                due = datetime.fromisoformat(raw) + timedelta(days=1)
-            else:
-                due = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        current = now or datetime.now()
-        # Compare like with like: an aware due time against local "now".
-        if due.tzinfo is not None and current.tzinfo is None:
-            current = current.astimezone()
-        elif due.tzinfo is None and current.tzinfo is not None:
-            current = current.replace(tzinfo=None)
-        return due < current
+        """Past its due date. A bare date is due at the END of that day, a
+        range when it ends - the one rule every task reader shares
+        (owner_tasks.is_overdue)."""
+        from .owner_tasks import is_overdue
+        return is_overdue(task.get("due"), end=task.get("due_end"), now=now)
 
     def clear_overdue(self) -> list[str]:
         """Remove every overdue task. Returns the titles removed."""
@@ -434,7 +664,7 @@ class CognitiveStateManager:
 
     def is_dismissed(self, title: str) -> bool:
         with self._lock:
-            return _slug(title, "task") in (self._state.get("dismissed_tasks") or {})
+            return bool(_task_title_keys(self._state.get("dismissed_tasks") or {}, title))
 
     def upsert_research_session(self, topic: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
         clean = SecuritySanitiser.guard_text(topic, "cognition.research")[:180]

@@ -63,6 +63,7 @@ def build() -> int:
         "--onefile", "--windowed", "--name", "ORION",
         "--distpath", str(dist), "--workpath", str(work),
         "--specpath", str(work), "--noconfirm",
+        "--paths", str(BASE),
     ]
     if ICON.exists():
         cmd += ["--icon", str(ICON)]

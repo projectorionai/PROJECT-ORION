@@ -99,7 +99,7 @@ def run(url, /, strict=False):
 
 def test_an_undeclared_required_argument_gets_a_default():
     code = BASE_SCHEMA_FN + '''
-def run(url, strict, timeout):
+def run(url, strict=False, *, timeout):
     return url
 '''
     schema, run = _load(code)
@@ -110,6 +110,22 @@ def run(url, strict, timeout):
     schema2, run2 = _load(result.code)
     assert contract_problems(schema2, run2) == []
     assert "timeout=None" in result.code
+
+
+def test_schema_optional_handler_argument_needs_an_intentful_repair():
+    code = BASE_SCHEMA_FN + '''
+def run(url, strict, timeout):
+    return url
+'''
+    schema, _ = _load(code)
+    result = autofix_contract(code, schema)
+    # timeout can be fixed mechanically; strict needs a meaningful default or
+    # a schema decision, so that remaining fault must survive the local fix.
+    assert result.changed
+    assert not result.complete
+    assert any("strict" in problem and "required" in problem
+               for problem in result.remaining), result.remaining
+    assert "strict=None" not in result.code
 
 
 # ── things it must NOT touch ──────────────────────────────────────────────────
@@ -334,7 +350,8 @@ def test_a_computed_schema_is_declined_rather_than_guessed():
     # A declared property run() cannot accept.
     'def get_tool_schema():\n'
     '    return {"name": "t", "description": "d", "parameters": {"type": "object",\n'
-    '            "properties": {"q": {"type": "string"}, "n": {"type": "integer"}}}}\n'
+    '            "properties": {"q": {"type": "string"}, "n": {"type": "integer"}},\n'
+    '            "required": ["q"]}}\n'
     'def run(q):\n'
     '    return q\n',
 ])
@@ -356,3 +373,76 @@ def test_complete_never_lies(source):
         assert not remaining, (
             f"reported complete but the contract still fails: {remaining}")
     assert not remaining, f"the mechanical fix did not hold: {remaining}"
+
+
+@pytest.mark.parametrize("value, expected", [
+    (20.0, 20),
+    ("20.0", 20),
+    (" +20.000 ", 20),
+    ("-20.", -20),
+    ("9007199254740993", 9007199254740993),
+    ("9007199254740993.0", 9007199254740993),
+    ("9" * 400, int("9" * 400)),
+    ("1.25", "1.25"),
+    ("-0.5", "-0.5"),
+    (1.25, 1.25),
+    ("1e3", "1e3"),
+    ("nan", "nan"),
+])
+def test_integer_coercion_preserves_ids_and_rejects_fractional_strings(value, expected):
+    """The live module and its acceptance fixtures must agree without losing
+    digits or silently truncating an invalid integer argument."""
+    from orion_core.forge_autofix import add_argument_coercion
+    from orion_core.forge_fixtures import coerce_arguments
+
+    schema = {
+        "name": "identity_echo", "description": "Echo a whole-number identifier",
+        "parameters": {"type": "object", "properties": {"identifier": {"type": "integer"}},
+                       "required": ["identifier"]},
+    }
+    fixed = add_argument_coercion("def run(identifier):\n    return identifier\n", schema)
+    assert fixed.changed
+    _schema, run = _load(fixed.code)
+    delivered = run(identifier=value)
+    accepted, _notes = coerce_arguments(schema, {"identifier": value})
+
+    assert delivered == expected and type(delivered) is type(expected)
+    assert accepted["identifier"] == expected
+    assert type(accepted["identifier"]) is type(expected)
+
+
+@pytest.mark.parametrize("relative", [
+    "../outside.txt", "nested/../../outside.txt", "absolute",
+    "C:/outside.txt", "C:\\outside.txt", "\\\\server\\share\\outside.txt",
+])
+def test_private_fixture_rejects_paths_outside_its_directory(tmp_path, monkeypatch, relative):
+    from pathlib import Path
+
+    from orion_core.forge_fixtures import tmp_workdir
+
+    monkeypatch.chdir(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must be preserved", encoding="utf-8")
+    key = str(outside) if relative == "absolute" else relative
+
+    with pytest.raises(ValueError, match="inside the temporary folder"):
+        with tmp_workdir({key: "overwritten"}):
+            pytest.fail("an escaping fixture must be rejected before yielding")
+
+    assert outside.read_text(encoding="utf-8") == "must be preserved"
+    assert Path.cwd() == tmp_path
+    assert not list(tmp_path.glob("fx_*"))
+
+
+def test_private_fixture_keeps_nested_text_and_binary_files_then_cleans_up(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from orion_core.forge_fixtures import tmp_workdir
+
+    monkeypatch.chdir(tmp_path)
+    with tmp_workdir({"nested/notes.txt": "a £5 note", "sample.bin": b"\x00\xff"}) as folder:
+        assert Path.cwd() == folder
+        assert (folder / "nested/notes.txt").read_text(encoding="utf-8") == "a £5 note"
+        assert (folder / "sample.bin").read_bytes() == b"\x00\xff"
+    assert Path.cwd() == tmp_path
+    assert not folder.exists()

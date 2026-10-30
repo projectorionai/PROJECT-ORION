@@ -79,13 +79,13 @@ def test_agent_monitor_renders_the_real_agent_roster(_app):
     text = view._render_agent_roster()
     assert "coding" in text
     assert "software engineering" in text
-    assert "4 call(s)" in text
+    assert "4 calls" in text
     assert "not yet consulted" in text   # the fashion agent, zero calls
 
 
 def test_agent_monitor_degrades_cleanly_with_no_agent_manager(_app):
     view = MissionDeckView(_StubBus())
-    assert view._render_agent_roster() == "Agent manager offline."
+    assert view._render_agent_roster() == "Specialist helpers aren't available right now."
 
 
 def test_agent_monitor_reports_empty_roster_cleanly(_app):
@@ -108,7 +108,7 @@ def test_component_health_still_renders_telemetry_data(_app):
 
 def test_component_health_degrades_cleanly_with_no_telemetry(_app):
     view = MissionDeckView(_StubBus())
-    assert view._render_component_health() == "Telemetry offline."
+    assert view._render_component_health() == "System status is unavailable."
 
 
 def test_refresh_updates_both_panels_independently(_app):
@@ -132,7 +132,7 @@ class _StubCognitiveLoop:
 
 def test_awareness_strip_shows_a_placeholder_before_any_digest(_app):
     view = MissionDeckView(_StubBus())
-    assert "building situational context" in view._awareness_label.text()
+    assert "Getting ready to help" in view._awareness_label.text()
 
 
 def test_awareness_strip_seeds_from_cognitive_loop_last_digest_at_construction(_app):
@@ -141,7 +141,7 @@ def test_awareness_strip_seeds_from_cognitive_loop_last_digest_at_construction(_
     text = view._awareness_label.text()
     assert "orion_core/app.py" in text
     assert "ORION Main" in text
-    assert "1 deadline" in text
+    assert "1 upcoming deadline" in text
 
 
 def test_awareness_strip_updates_live_on_the_awareness_channel(_app):
@@ -160,7 +160,7 @@ def test_awareness_channel_does_not_also_flood_the_activity_feed(_app):
 def test_awareness_strip_handles_an_empty_digest_gracefully(_app):
     view = MissionDeckView(_StubBus())
     view._on_event("awareness", {})
-    assert "no active focus recorded" in view._awareness_label.text()
+    assert view._awareness_label.text() == "Ready for your next task."
 
 
 def test_cognitive_loop_seed_failure_never_crashes_construction(_app):
@@ -169,4 +169,4 @@ def test_cognitive_loop_seed_failure_never_crashes_construction(_app):
             raise RuntimeError("boom")
 
     view = MissionDeckView(_StubBus(), cognitive_loop=_BrokenLoop())   # must not raise
-    assert "AWARENESS" in view._awareness_label.text()
+    assert "Getting ready to help" in view._awareness_label.text()

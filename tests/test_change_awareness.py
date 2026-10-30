@@ -124,3 +124,49 @@ def test_render_latest_uses_cached_boot_change(tmp_path):
     (tracker.root / "alpha.py").write_text("boot change\n", encoding="utf-8")
     tracker.detect()                             # caches last_change
     assert "alpha.py" in tracker.render_latest()
+
+
+def test_an_unchanged_file_is_not_read_again(tmp_path, monkeypatch):
+    """Boot runs this over every source file. Re-reading and hashing them all
+    was 4.5 s of the Qt thread on a first launch; an unchanged size and
+    modification time now reuses the recorded hash, and a real edit is still
+    caught."""
+    tracker = _tracker(tmp_path)
+    tracker.detect(commit=True)
+    reads = []
+    real = SourceChangeTracker._fingerprint
+    monkeypatch.setattr(SourceChangeTracker, "_fingerprint",
+                        staticmethod(lambda path: reads.append(path.name) or real(path)))
+    assert not tracker.detect(commit=True).changed
+    assert reads == []
+    edited = next(p for p in (tmp_path / "src").rglob("*.py"))
+    edited.write_text(edited.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8")
+    change = tracker.detect(commit=True)
+    assert reads == [edited.name]
+    assert change.modified == [edited.relative_to(tmp_path / "src").as_posix()]
+
+
+def test_the_installed_app_compares_the_builds_own_module_record(tmp_path, monkeypatch):
+    """Mark XXXX.4: the installed app has 5 of its 539 modules as files, so a
+    file scan said "no source files changed" after nearly every update."""
+    from orion_core import build_freshness, change_awareness as ca
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    builds = iter([{"modules": {"a.py": "1", "b.py": "2"}},
+                   {"modules": {"a.py": "1", "b.py": "3", "c.py": "4"}}])
+    monkeypatch.setattr(build_freshness, "read_build_info", lambda *a: next(builds))
+    store = tmp_path / "awareness.json"
+    tracker = SourceChangeTracker(root=ca.PACKAGE_DIR, store_path=store)
+    first = tracker.detect()
+    assert first.first_snapshot                     # a new kind of record: a quiet baseline
+    second = SourceChangeTracker(root=ca.PACKAGE_DIR, store_path=store).detect()
+    assert second.modified == ["b.py"] and second.added == ["c.py"] and not second.removed
+
+
+def test_build_info_records_every_modules_hash(tmp_path):
+    from orion_core.build_freshness import build_info
+    (tmp_path / "orion_core" / "gui").mkdir(parents=True)
+    (tmp_path / "orion_core" / "x.py").write_text("x = 1", encoding="utf-8")
+    (tmp_path / "orion_core" / "gui" / "y.py").write_text("y = 2", encoding="utf-8")
+    modules = build_info(tmp_path)["modules"]
+    assert sorted(modules) == ["gui/y.py", "x.py"] and all(len(h) == 64 for h in modules.values())

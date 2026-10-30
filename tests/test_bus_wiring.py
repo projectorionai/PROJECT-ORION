@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -64,11 +66,29 @@ KNOWN_UNCONSUMED = {"browser_step", "sentiment_changed", "speaker_identified"}
 def _sources() -> dict[Path, str]:
     out = {}
     for directory, subdirs, files in os.walk(ROOT):
+        relative = Path(directory).relative_to(ROOT)
+        if relative == Path("."):
+            # Runtime wiring comes from the actual source and tools. Reports,
+            # generated projects and release snapshots can contain thousands
+            # of old copies of this package; counting them both invents wiring
+            # and makes every signal search scan all that duplicated source.
+            subdirs[:] = [name for name in subdirs
+                          if name in {"orion_core", "launcher", "tools", "tests", "config"}]
+        elif relative == Path("config"):
+            # Live/reviewed plugins are source; repair copies and personal
+            # runtime caches are not independent application producers.
+            subdirs[:] = [name for name in subdirs if name == "custom_tools"]
         # Prune relative to the checkout: an ancestor named "release" or
         # "tests" must not hide all production code in an exported checkout.
-        subdirs[:] = [name for name in subdirs if name not in SKIP_PARTS]
+        # Hidden tool environments/caches contain third-party Python, not
+        # ORION's producers. Including them can invent signal wiring and took
+        # more than three minutes with a local ML dependency cache present.
+        subdirs[:] = [name for name in subdirs
+                      if name not in SKIP_PARTS and not name.startswith(".")]
         for name in files:
             if not name.endswith(".py") or name == "bus.py":
+                continue
+            if relative == Path("config"):
                 continue
             path = Path(directory) / name
             try:
@@ -80,6 +100,76 @@ def _sources() -> dict[Path, str]:
     return out
 
 
+def test_signal_sources_exclude_hidden_tool_dependencies(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", tmp_path)
+    for folder in ("orion_core", ".tool-cache"):
+        path = tmp_path / folder / "producer.py"
+        path.parent.mkdir()
+        path.write_text("bus.audit_signal.emit()\n", encoding="utf-8")
+    assert set(_sources()) == {Path("orion_core/producer.py")}
+
+
+def test_signal_sources_ignore_generated_copies_without_hiding_runtime_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", tmp_path)
+    included = {Path("orion.py"), Path("orion_core/producer.py"), Path("launcher/main.py"),
+                Path("tools/helper.py"), Path("tests/test_listener.py"),
+                Path("config/custom_tools/example_tool.py")}
+    excluded = {Path("reports/snapshot/orion_core/old.py"), Path("projects/demo/main.py"),
+                Path("docs/reference/example.py"), Path("releases/source/orion_core/old.py"),
+                Path("config/self_repair/source_copy.py")}
+    for relative in included | excluded:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("bus.audit_signal.emit()\n", encoding="utf-8")
+    assert set(_sources()) == included
+
+
+def _wiring_counts(signals: list[str], sources: dict[Path, str]) -> dict:
+    """Scan each source once, retaining the audit's existing over-approximation."""
+    produced = Counter()
+    consumed = Counter()
+    for path, text in sources.items():
+        consumed.update(re.findall(r"\.(\w+)\.connect\s*\(", text))
+        if "tests" in path.parts:
+            continue
+        # Direct .emit(...) and a passed bound .emit callback both count as a
+        # producer. A lookahead retains overlapping quoted mentions exactly
+        # like the former per-signal regular expressions did.
+        produced.update(re.findall(r"\.(\w+)\.emit\b", text))
+        quoted = re.findall(r"(?=[\"'](\w+)[\"'])", text)
+        produced.update(quoted)
+        if ".connect(" in text:
+            consumed.update(quoted)
+    return {name: {"produced": produced[name], "consumed": consumed[name]}
+            for name in signals}
+
+
+def test_single_pass_wiring_counts_preserve_direct_callback_dynamic_and_test_semantics():
+    signals = ["direct", "callback", "dynamic", "quoted", "unwired", "test_only"]
+    sources = {
+        Path("orion_core/a.py"): (
+            "bus.direct.emit (1)\nbus.direct.connect (handler)\n"
+            "subscribe(bus.callback.emit)\ngetattr(bus, 'dynamic').emit(2)\n"
+            "bus.quoted.connect(handler)\nname = \"quoted\"\n"
+            "bus.direct.emitter()\n'callback\"dynamic'\n"),
+        Path("tests/test_a.py"): "bus.test_only.emit()\nbus.callback.connect(handler)\n'dynamic'\n",
+    }
+    production = "\n".join(text for path, text in sources.items() if "tests" not in path.parts)
+    everything = "\n".join(sources.values())
+    previous = {}
+    for name in signals:
+        previous[name] = {
+            "produced": len(re.findall(rf"\.{name}\.emit\s*\(", production))
+            + len(re.findall(rf"\.{name}\.emit\b(?!\s*\()", production))
+            + len(re.findall(rf"[\"']{name}[\"']", production)),
+            "consumed": len(re.findall(rf"\.{name}\.connect\s*\(", everything))
+            + sum(len(re.findall(rf"[\"']{name}[\"']", text))
+                  for path, text in sources.items()
+                  if ".connect(" in text and "tests" not in path.parts),
+        }
+    assert _wiring_counts(signals, sources) == previous
+
+
 @pytest.fixture(scope="module")
 def wiring():
     bus_src = (ROOT / "orion_core" / "bus.py").read_text(encoding="utf-8")
@@ -87,29 +177,7 @@ def wiring():
     assert signals, "no signals found — has bus.py moved?"
 
     sources = _sources()
-    production = {p: t for p, t in sources.items() if "tests" not in p.parts}
-    everything = "\n".join(sources.values())
-    produced_text = "\n".join(production.values())
-
-    report = {}
-    for name in signals:
-        # Emitted directly, or handed round as a bound callback with no call.
-        emits = len(re.findall(rf"\.{name}\.emit\s*\(", produced_text))
-        refs = len(re.findall(rf"\.{name}\.emit\b(?!\s*\()", produced_text))
-        # Reached by name: getattr(bus, "x") / emit("x", ...) / a name table.
-        dynamic = len(re.findall(rf"[\"']{name}[\"']", produced_text))
-        listens = len(re.findall(rf"\.{name}\.connect\s*\(", everything))
-        # A quoted name counts as a SUBSCRIPTION only in a file that also
-        # connects something. Counting every quoted mention made this test
-        # circular: the KNOWN_UNCONSUMED list below names all three, which read
-        # back as proof that they were consumed.
-        listens += sum(
-            len(re.findall(rf"[\"']{name}[\"']", text))
-            for path, text in sources.items()
-            if ".connect(" in text and "tests" not in path.parts
-        )
-        report[name] = {"produced": emits + refs + dynamic, "consumed": listens}
-    return report
+    return _wiring_counts(signals, sources)
 
 
 def test_the_bus_still_declares_signals(wiring):

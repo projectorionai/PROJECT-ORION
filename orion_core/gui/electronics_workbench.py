@@ -18,13 +18,14 @@ from typing import Any
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
-    QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
-    QSplitter, QTextBrowser, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from ..board_detect import BoardScanner
 from ..constants import C
 from .camera_preview import bgr_to_qimage
+from .labels import plural
 
 #: Live local geometry is drawn as unlabelled silver hairlines; model findings
 #: are drawn thick, green and numbered. Never the same colour — the user has to
@@ -66,8 +67,11 @@ class InspectionCanvas(QWidget):
         #: the paint path actually did, rather than infer it from pixel
         #: colours that the canvas's own labels also happen to use.
         self.geometry_drawn = 0
-        self.message = "Anything, in focus"
-        self.detail = "Choose a camera, start it, frame the subject, then capture an inspection."
+        #: QR codes / barcodes found in the view: {"points": [[x, y]...] in
+        #: 0-1 image fractions, "label": str}. Drawn live and on captures.
+        self.codes: list[dict[str, Any]] = []
+        self.message = "Camera off"
+        self.detail = ""
 
     def set_image(self, image: QImage, *, captured: bool = False) -> None:
         self.image = image
@@ -198,6 +202,28 @@ class InspectionCanvas(QWidget):
                 drawn += 1
         self.geometry_drawn = drawn
 
+    def _paint_codes(self, painter: QPainter, target: QRectF) -> None:
+        for code in self.codes:
+            points = code.get("points") or []
+            if len(points) < 3:
+                continue
+            try:
+                polygon = QPolygonF([QPointF(target.x() + float(x) * target.width(),
+                                             target.y() + float(y) * target.height())
+                                     for x, y in points])
+            except (TypeError, ValueError):
+                continue
+            painter.setPen(QPen(QColor(C.GOOD), 3))
+            painter.drawPolygon(polygon)
+            label = str(code.get("label") or "")[:48]
+            if label:
+                anchor = polygon.boundingRect()
+                tag = QRectF(anchor.left(), max(target.top(), anchor.top() - 24),
+                             max(80.0, 8.0 * len(label) + 16), 22)
+                painter.fillRect(tag, QColor("#15372b"))
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(tag, Qt.AlignmentFlag.AlignCenter, label)
+
     def paintEvent(self, event: Any) -> None:  # noqa: N802
         self.geometry_drawn = 0
         painter = QPainter(self)
@@ -270,6 +296,7 @@ class InspectionCanvas(QWidget):
                 painter.fillRect(tag, QColor("#15372b"))
                 painter.setPen(QColor("#ffffff"))
                 painter.drawText(tag, Qt.AlignmentFlag.AlignCenter, text)
+        self._paint_codes(painter, target)
         painter.restore()
         tag = "CAPTURED FRAME" if self.captured else "LIVE CAMERA"
         if not self.captured and self._region_count():
@@ -277,7 +304,7 @@ class InspectionCanvas(QWidget):
             painter.drawText(
                 QRectF(target.left() + 12, target.bottom() - 34, target.width() - 24, 24),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                f"TRACKING  ·  {self._region_count()} region(s)")
+                f"TRACKING  ·  {plural(self._region_count(), 'region')}")
         painter.fillRect(QRectF(target.left() + 12, target.top() + 12, 145, 27), QColor(6, 10, 14, 220))
         painter.setPen(QColor(C.ACCENT))
         painter.drawText(QRectF(target.left() + 22, target.top() + 12, 135, 27), Qt.AlignmentFlag.AlignVCenter, tag)
@@ -288,6 +315,10 @@ class ElectronicsWorkbench(QWidget):
 
     scan_requested = pyqtSignal(object)
     _camera_released = pyqtSignal(object)
+    #: Worker-thread results, delivered on the GUI thread.
+    _codes_found = pyqtSignal(object, object)
+    _clip_done = pyqtSignal(object, str)
+    _scan_read = pyqtSignal(object, str)
     POLL_MS = 100
     STALE_SECONDS = 3.0
 
@@ -321,6 +352,20 @@ class ElectronicsWorkbench(QWidget):
         self._timer.setInterval(self.POLL_MS)
         self._timer.timeout.connect(self._refresh)
         self._camera_released.connect(self._on_camera_released)
+        # The everyday camera tools (camera_tools.py).
+        from ..camera_tools import ClipRecorder
+        self._recorder = ClipRecorder()
+        self._record_left = 0
+        self._record_timer = QTimer(self)
+        self._record_timer.setInterval(1000)
+        self._record_timer.timeout.connect(self._record_tick)
+        self._low_light = False
+        self._codes_busy = False
+        self._last_codes_scan = 0.0
+        self._ocr: Any = None
+        self._codes_found.connect(self._on_codes)
+        self._clip_done.connect(self._on_clip_done)
+        self._scan_read.connect(self._on_scan_read)
         self._build_ui()
         request_signal = getattr(bus, "electronics_scan_requested", None)
         if request_signal is not None:
@@ -348,6 +393,8 @@ class ElectronicsWorkbench(QWidget):
             #electronicsWorkbench QPushButton#captureInspection {{ background: {C.PRI}; color: white; border-color: {C.PRI}; font-weight: 650; }}
             #electronicsWorkbench QPushButton#captureInspection:disabled {{ background: {C.PANEL_HI}; color: {C.ACCENT_DIM}; border-color: {C.BORDER}; }}
             #electronicsWorkbench QPushButton#askCapture {{ min-height: 38px; padding: 4px 16px; }}
+            #electronicsWorkbench QPushButton#cameraTool {{ min-height: 24px; padding: 2px 9px; }}
+            #electronicsWorkbench QCheckBox {{ color: {C.ACCENT}; spacing: 6px; }}
             #electronicsWorkbench QLineEdit {{ background: {C.PANEL}; border: 1px solid {C.BORDER}; border-radius: 7px; padding: 10px; color: {C.WHITE}; }}
             #electronicsWorkbench QSplitter::handle {{ background: transparent; }}
         """)
@@ -357,14 +404,9 @@ class ElectronicsWorkbench(QWidget):
         heading = QHBoxLayout()
         titles = QVBoxLayout()
         titles.setSpacing(4)
-        title = QLabel("Vision lab")
+        title = QLabel("Vision Lab")
         title.setObjectName("workbenchTitle")
-        subtitle = QLabel("Point the camera at anything. Capture it. ORION maps it on a "
-                          "grid and tells you exactly what — and where — everything is.")
-        subtitle.setObjectName("workbenchMuted")
-        subtitle.setWordWrap(True)
         titles.addWidget(title)
-        titles.addWidget(subtitle)
         heading.addLayout(titles, 1)
         self.state_label = QLabel("CAMERA OFF")
         self.state_label.setObjectName("workbenchState")
@@ -380,7 +422,7 @@ class ElectronicsWorkbench(QWidget):
         video_layout.setSpacing(10)
         self.canvas = InspectionCanvas()
         video_layout.addWidget(self.canvas, 1)
-        self.quality_label = QLabel("Fill the guide with the subject and keep the detail you care about in focus.")
+        self.quality_label = QLabel("")
         self.quality_label.setObjectName("workbenchMuted")
         self.quality_label.setWordWrap(True)
         video_layout.addWidget(self.quality_label)
@@ -397,14 +439,18 @@ class ElectronicsWorkbench(QWidget):
         self.rescan_button.setToolTip("Look for cameras again")
         self.rescan_button.setAccessibleName("Rescan cameras")
         self.rescan_button.setFixedWidth(36)
+        # A 36 px button under the page's 12 px side padding had 12 px left for
+        # the glyph, and drew a sliver of it (":") instead of the arrow.
+        self.rescan_button.setStyleSheet("padding: 0px;")
         self.rescan_button.clicked.connect(self.refresh_cameras)
         options.addWidget(self.rescan_button)
         self.mode_box = QComboBox()
         self.mode_box.setAccessibleName("Scan mode")
-        for label, value in (("Identify anything", "anything"),
-                             ("Read text & documents", "text"),
-                             ("Count items", "count"),
-                             ("Electronics / PCB", "electronics")):
+        for label, value in (("Identify Anything", "anything"),
+                             ("Read Text & Documents", "text"),
+                             ("Count Items", "count"),
+                             ("Electronics / PCB", "electronics"),
+                             ("Codes (QR & Barcodes)", "codes")):
             self.mode_box.addItem(label, value)
         self.mode_box.currentIndexChanged.connect(self._mode_changed)
         options.addWidget(self.mode_box, 1)
@@ -413,7 +459,7 @@ class ElectronicsWorkbench(QWidget):
         self.grid_box.setToolTip("A labelled grid over the view; findings are pinned to its cells")
         for label, value in (("Grid 8 × 6", (8, 6)), ("Grid 12 × 9", (12, 9)),
                              ("Grid 16 × 12", (16, 12)), ("Grid 4 × 3", (4, 3)),
-                             ("No grid", (0, 0))):
+                             ("No Grid", (0, 0))):
             self.grid_box.addItem(label, value)
         self.grid_box.currentIndexChanged.connect(self._grid_changed)
         options.addWidget(self.grid_box, 1)
@@ -423,16 +469,17 @@ class ElectronicsWorkbench(QWidget):
             box.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             box.setMinimumContentsLength(6)
         video_layout.addLayout(options)
+        self._options_row = options            # the photo self-timer joins it below
 
         controls = QHBoxLayout()
-        self.camera_button = QPushButton("Start camera")
+        self.camera_button = QPushButton("Start Camera")
         self.camera_button.clicked.connect(self._toggle_camera)
-        self.capture_button = QPushButton("Capture + inspect")
+        self.capture_button = QPushButton("Capture + Inspect")
         self.capture_button.setObjectName("captureInspection")
         self.capture_button.setEnabled(False)
         self.capture_button.setToolTip("Inspect the exact camera frame shown. AI analysis uses the configured vision provider.")
         self.capture_button.clicked.connect(self.capture)
-        self.live_button = QPushButton("Live view")
+        self.live_button = QPushButton("Live View")
         self.live_button.setVisible(False)
         self.live_button.clicked.connect(self.show_live)
         controls.addWidget(self.camera_button)
@@ -440,6 +487,50 @@ class ElectronicsWorkbench(QWidget):
         controls.addStretch(1)
         controls.addWidget(self.capture_button)
         video_layout.addLayout(controls)
+
+        # ── the everyday camera: photo, clip, document, codes, low light ─────
+        # All local (camera_tools.py), all on the frame already on screen.
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        self.photo_button = QPushButton("Photo")
+        self.photo_button.setToolTip("Save this view to Pictures\\ORION")
+        self.photo_button.clicked.connect(self.take_photo)
+        # Self-timer: off -> 3 s -> 10 s, counted down on the Photo button.
+        self._photo_delay = 0
+        self._countdown_left = 0
+        self._countdown = QTimer(self)
+        self._countdown.setInterval(1000)
+        self._countdown.timeout.connect(self._countdown_tick)
+        self.timer_button = QPushButton("Timer Off")
+        self.timer_button.setAccessibleName("Photo self-timer")
+        self.timer_button.setToolTip("Self-timer for the photo: off, 3 or 10 seconds")
+        self.timer_button.clicked.connect(self._cycle_photo_timer)
+        self.record_button = QPushButton("Record")
+        self.record_button.setToolTip("Record a short clip to Videos\\ORION (press again to stop)")
+        self.record_button.clicked.connect(self.toggle_recording)
+        self.document_button = QPushButton("Document")
+        self.document_button.setToolTip("Flatten the page in view, save it and read its text")
+        self.document_button.clicked.connect(self.scan_document)
+        self.codes_button = QPushButton("Codes")
+        self.codes_button.setToolTip("Read QR codes and barcodes in view")
+        self.codes_button.clicked.connect(self.read_codes)
+        self.low_light_box = QCheckBox("Low Light")
+        self.low_light_box.setToolTip("Brighten a dim room on screen and in captures")
+        self.low_light_box.toggled.connect(self._low_light_toggled)
+        for widget in (self.photo_button, self.record_button,
+                       self.document_button, self.codes_button):
+            widget.setObjectName("cameraTool")
+            widget.setEnabled(False)
+            tools.addWidget(widget)
+        tools.addStretch(1)
+        tools.addWidget(self.low_light_box)
+        video_layout.addLayout(tools)
+        # In the options row, not beside Photo: the tools row sets the lab's
+        # minimum width, and one more button there stopped it stacking in a
+        # narrow deck (resizeEvent, < 860 px). The options row has room.
+        self.timer_button.setObjectName("cameraTool")
+        self.timer_button.setEnabled(False)
+        self._options_row.addWidget(self.timer_button)
         self.splitter.addWidget(viewer)
 
         report_panel = QFrame()
@@ -448,13 +539,17 @@ class ElectronicsWorkbench(QWidget):
         report_layout = QVBoxLayout(report_panel)
         report_layout.setContentsMargins(17, 17, 17, 12)
         report_layout.setSpacing(12)
-        self.report_heading = QLabel("INSPECTION NOTES")
+        self.report_heading = QLabel("Inspection Notes")
         self.report_heading.setStyleSheet(f"color: {C.ACCENT}; font-size: 11px; font-weight: 650;")
         report_layout.addWidget(self.report_heading)
         self.report = QTextBrowser()
         self.report.setObjectName("workbenchReport")
         self.report.setOpenLinks(False)
         self.report.setOpenExternalLinks(False)
+        # Actions in the notes ("open the photo", "copy the text") are
+        # numbered anchors; the payloads stay here, never in the HTML.
+        self._report_actions: list[tuple[str, Any]] = []
+        self.report.anchorClicked.connect(self._report_action)
         self.report.setHtml(self._intro_html())
         report_layout.addWidget(self.report, 1)
         self.splitter.addWidget(report_panel)
@@ -466,8 +561,7 @@ class ElectronicsWorkbench(QWidget):
         ask_row.setSpacing(10)
         self.focus_input = QLineEdit()
         self.focus_input.setMaxLength(1000)
-        self.focus_input.setPlaceholderText("What should ORION look for? e.g. 'what plant is this', "
-                                            "'count the screws', 'read the label', 'is this cable damaged'")
+        self.focus_input.setPlaceholderText("Ask about the capture")
         self.focus_input.setAccessibleName("Optional inspection focus")
         self.focus_input.returnPressed.connect(self._focus_entered)
         ask_row.addWidget(self.focus_input, 1)
@@ -475,10 +569,10 @@ class ElectronicsWorkbench(QWidget):
         # that had been picked up and put down in between, so the answer
         # described a different view from the one on screen. This re-asks
         # about the frame the user is actually looking at.
-        self.ask_button = QPushButton("Ask about this capture")
+        self.ask_button = QPushButton("Ask About This Capture")
         self.ask_button.setObjectName("askCapture")
         self.ask_button.setEnabled(False)
-        self.ask_button.setToolTip("Put another question to the inspection frame already captured, without re-capturing.")
+        self.ask_button.setToolTip("Ask again about the same capture")
         self.ask_button.clicked.connect(self.ask_again)
         ask_row.addWidget(self.ask_button)
         outer.addLayout(ask_row)
@@ -489,32 +583,46 @@ class ElectronicsWorkbench(QWidget):
 
     @staticmethod
     def _intro_html() -> str:
-        return (f'<h3 style="color:{C.ACCENT}">A clear view comes first.</h3>'
-                '<p>Choose a camera, start it and bring the subject into the guide — '
-                'an object, a document, a room, a part, a board. Capture a still '
-                'when the details are sharp.</p>'
-                '<p>ORION identifies what he sees, reads any text, counts on request, '
-                'and pins every finding to the grid cells it sits in, so "C4" means '
-                'the same square to you and to him.</p>'
-                f'<p style="color:{C.MUTED}">Findings stay attached to the captured frame. '
-                'A photograph cannot measure what it does not show.</p>')
+        return ""
 
     # ── camera, mode and grid choices ────────────────────────────────────────
 
-    def refresh_cameras(self) -> None:
-        """List the cameras Windows can see, by name, remembered choice first."""
+    @staticmethod
+    def _read_cameras() -> tuple[list[Any], str]:
         from .. import camera_devices as cd
-
         try:
-            cameras = cd.all_cameras()
-            wanted = cd.preferred_name()
+            return cd.all_cameras(), cd.preferred_name()
         except Exception:
-            cameras, wanted = [], ""
+            return [], ""
+
+    def refresh_cameras(self) -> None:
+        """List the cameras Windows can see, by name, remembered choice first.
+
+        On a worker thread when the loop is running: listing them (and the
+        OpenCV import under it) held the GUI thread for 400-1360 ms while
+        ORION started, because this page is built at boot (28 Oct 2026)."""
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._show_cameras(*self._read_cameras())
+            return
+        from .. import background
+
+        async def read() -> None:
+            cameras, wanted = await asyncio.to_thread(self._read_cameras)
+            try:
+                self._show_cameras(cameras, wanted)
+            except RuntimeError:                  # the page was closed meanwhile
+                pass
+        background.spawn(read(), name="orion-camera-list")
+
+    def _show_cameras(self, cameras: list[Any], wanted: str) -> None:
         self._cameras = cameras
         self.camera_box.blockSignals(True)
         self.camera_box.clear()
         if not cameras:
-            self.camera_box.addItem("Default camera", None)
+            self.camera_box.addItem("Default Camera", None)
         for camera in cameras:
             self.camera_box.addItem(camera.label(), camera.name)
         if wanted:
@@ -557,10 +665,10 @@ class ElectronicsWorkbench(QWidget):
     def _mode_changed(self, _index: int = 0) -> None:
         mode = self.selected_mode()
         self.quality_label.setText({
-            "electronics": "Place the board flat, fill the guide, and keep component markings in focus.",
-            "text": "Hold the page or label flat and square, filling the guide, with even light.",
-            "count": "Spread the items out so none hide behind another, then capture.",
-        }.get(mode, "Fill the guide with the subject and keep the detail you care about in focus."))
+            "electronics": "Board flat, markings in focus",
+            "text": "Page flat and square, even light",
+            "count": "Spread the items out",
+        }.get(mode, ""))
         self.canvas.update()
 
     def attach_tracker(self, tracker: Any) -> None:
@@ -584,7 +692,7 @@ class ElectronicsWorkbench(QWidget):
             return
         if self.tracker is None:
             self.state_label.setText("CAMERA UNAVAILABLE")
-            self.canvas.clear_image("Camera unavailable", "The camera service has not connected yet. Try again when ORION is ready.")
+            self.canvas.clear_image("Camera unavailable", "ORION is still starting")
             return
         try:
             already_running = self.tracker.is_capturing()
@@ -603,9 +711,9 @@ class ElectronicsWorkbench(QWidget):
         self._last_frame_time = time.monotonic()
         self._frame = None
         self._show_capture = False
-        self.canvas.clear_image("Opening camera…", "Waiting for the first frame.")
+        self.canvas.clear_image("Opening camera…")
         self.state_label.setText("CONNECTING")
-        self.camera_button.setText("Stop camera")
+        self.camera_button.setText("Stop Camera")
         if self.isVisible():
             self._timer.start()
         self._refresh()
@@ -614,16 +722,26 @@ class ElectronicsWorkbench(QWidget):
         self._camera_enabled = False
         self._timer.stop()
         self._scanner.stop(wait=False)
+        if self._recorder.recording:
+            self._recorder.stop()            # the clip ends with the camera
+        # A retained capture can still be saved, scanned or read; nothing
+        # can be recorded without a live feed.
+        for button in (self.photo_button, self.timer_button, self.document_button, self.codes_button):
+            button.setEnabled(self._show_capture)
+        self.record_button.setEnabled(False)
+        if self._countdown.isActive():          # no camera, no delayed photo
+            self._countdown.stop()
+            self.photo_button.setText("Photo")
         if not self._show_capture:
             # A retained capture keeps the geometry measured from it; only the
             # live view's reading goes stale when the camera stops.
             self.canvas.reading = None
         self._frame = None
         self.capture_button.setEnabled(False)
-        self.camera_button.setText("Start camera")
+        self.camera_button.setText("Start Camera")
         self.state_label.setText("CAMERA OFF")
         if not self._show_capture:
-            self.canvas.clear_image("Camera paused", "Your latest inspection remains available in the notes.")
+            self.canvas.clear_image("Camera paused")
         if self._owns_camera and self.tracker is not None:
             self._owns_camera = False
             self._stopping = True
@@ -671,6 +789,9 @@ class ElectronicsWorkbench(QWidget):
                 self.quality_label.setText(error)
                 return
             frame = self.tracker.latest_frame()
+            if frame is not None and self._low_light:
+                from ..camera_tools import enhance_low_light
+                frame = enhance_low_light(frame)
             counter = getattr(self.tracker, "frames", None)
             now = time.monotonic()
             if frame is not None and (counter is None or counter != self._last_counter):
@@ -680,7 +801,7 @@ class ElectronicsWorkbench(QWidget):
                 self._frame = None
                 self.capture_button.setEnabled(False)
                 self.state_label.setText("WAITING FOR CAMERA")
-                self.quality_label.setText("No fresh frames. Check the camera connection or restart the camera.")
+                self.quality_label.setText("No picture from the camera")
                 return
             reading = None
             if frame is not None and not self._show_capture:
@@ -700,6 +821,14 @@ class ElectronicsWorkbench(QWidget):
             return
         self._frame = frame
         self.capture_button.setEnabled(not self._busy and not self._show_capture)
+        for button in (self.photo_button, self.timer_button, self.document_button, self.codes_button):
+            button.setEnabled(True)
+        self.record_button.setEnabled(True)
+        if not self._show_capture:
+            if self.selected_mode() == "codes":
+                self._scan_codes_live(frame, now)
+            elif self.canvas.codes:
+                self.canvas.codes = []
         if not self._show_capture:
             # Geometry and pixels come from one completed worker snapshot.
             # If processing stalls, show the fresh feed without stale boxes.
@@ -714,6 +843,272 @@ class ElectronicsWorkbench(QWidget):
                 else:
                     self._update_lighting(image)
 
+    # ── everyday camera tools ─────────────────────────────────────────────────
+
+    def _log(self, message: str) -> None:
+        log = getattr(self.bus, "log", None)
+        if log is not None:
+            try:
+                log.emit(message)
+            except Exception:
+                pass
+
+    def _view_frame(self) -> Any:
+        """The frame on screen: the retained capture, or the live frame."""
+        frame = self._captured_frame if self._show_capture else self._frame
+        if frame is None:
+            return None
+        try:
+            return frame.copy()
+        except Exception:
+            return None
+
+    def _note(self, heading: str, html_body: str, actions: list[tuple[str, str, Any]] = ()) -> None:
+        """Show a result in the notes, with numbered action links."""
+        self._report_actions = []
+        links = []
+        for label, kind, payload in actions:
+            self._report_actions.append((kind, payload))
+            links.append(f'<a href="orion-action:{len(self._report_actions) - 1}">{_plain(label)}</a>')
+        self.report_heading.setText(heading)
+        self.report.setHtml(html_body + (f"<p>{'  ·  '.join(links)}</p>" if links else ""))
+
+    def _report_action(self, url: Any) -> None:
+        text = url.toString() if hasattr(url, "toString") else str(url)
+        if not text.startswith("orion-action:"):
+            return
+        try:
+            kind, payload = self._report_actions[int(text.split(":", 1)[1])]
+        except (ValueError, IndexError):
+            return
+        from .. import camera_tools
+        if kind == "open_file":
+            camera_tools.open_file(payload)
+        elif kind == "open_folder":
+            camera_tools.open_file(payload)
+        elif kind == "copy":
+            clipboard = QApplication.clipboard()
+            if clipboard is not None:
+                clipboard.setText(str(payload))
+                self.quality_label.setText("Copied to the clipboard.")
+        elif kind == "open_link":
+            from ..browser import open_url
+            open_url(str(payload))
+
+    def _cycle_photo_timer(self) -> None:
+        self._photo_delay = {0: 3, 3: 10}.get(self._photo_delay, 0)
+        self.timer_button.setText(f"Timer {self._photo_delay} s" if self._photo_delay else "Timer Off")
+        self.timer_button.setAccessibleName(f"Photo self-timer: {self._photo_delay} seconds"
+                                            if self._photo_delay else "Photo self-timer: off")
+
+    def take_photo(self) -> None:
+        """With the self-timer on, count down on the button first."""
+        if self._countdown.isActive():
+            return
+        if self._photo_delay:
+            self._countdown_left = self._photo_delay
+            self.photo_button.setText(f"{self._countdown_left}…")
+            self._countdown.start()
+            return
+        self._take_photo_now()
+
+    def _countdown_tick(self) -> None:
+        self._countdown_left -= 1
+        if self._countdown_left > 0:
+            self.photo_button.setText(f"{self._countdown_left}…")
+            return
+        self._countdown.stop()
+        self.photo_button.setText("Photo")
+        self._take_photo_now()
+
+    def _take_photo_now(self) -> None:
+        from .. import camera_tools
+        frame = self._view_frame()
+        if frame is None:
+            self.quality_label.setText("No camera frame to save yet.")
+            return
+        try:
+            path = camera_tools.save_image(frame, "photo")
+        except Exception as exc:
+            path = None
+            self.quality_label.setText(f"The photo could not be saved: {str(exc)[:120]}")
+        if path is None:
+            return
+        self.quality_label.setText(f"Photo saved to {path.parent}")
+        self._note("Photo Saved", f"<p>{_plain(path.name)}</p><p>{_plain(str(path.parent))}</p>",
+                   [("Open the photo", "open_file", path), ("Open the folder", "open_folder", path.parent)])
+        self._log(f"VISION LAB: photo saved - {path}")
+
+    def toggle_recording(self, seconds: int = 10) -> None:
+        if self._recorder.recording:
+            self._recorder.stop()
+            return
+        tracker = self.tracker
+        if tracker is None or not self._camera_enabled:
+            self.quality_label.setText("Start the camera to record a clip.")
+            return
+        low_light = self._low_light
+
+        def source() -> Any:
+            frame = tracker.latest_frame()
+            if frame is not None and low_light:
+                from ..camera_tools import enhance_low_light
+                frame = enhance_low_light(frame)
+            return frame
+
+        if self._recorder.start(source, seconds=seconds, fps=15,
+                                on_done=lambda path, message: self._clip_done.emit(path, message)):
+            self._record_left = int(seconds)
+            self.record_button.setText(f"Stop ({self._record_left})")
+            self.state_label.setText("RECORDING")
+            self._record_timer.start()
+
+    def _record_tick(self) -> None:
+        self._record_left = max(0, self._record_left - 1)
+        if self._recorder.recording:
+            self.record_button.setText(f"Stop ({self._record_left})")
+        else:
+            self._record_timer.stop()
+
+    def _on_clip_done(self, path: Any, message: str) -> None:
+        self._record_timer.stop()
+        self.record_button.setText("Record")
+        if self._camera_enabled:
+            self.state_label.setText("LIVE")
+        if path is None:
+            self.quality_label.setText(message or "The clip could not be recorded.")
+            return
+        self.quality_label.setText(f"{message} Saved to {path.parent}")
+        self._note("Clip Saved", f"<p>{_plain(path.name)}</p><p>{_plain(message)}</p>",
+                   [("Play the clip", "open_file", path), ("Open the folder", "open_folder", path.parent)])
+        self._log(f"VISION LAB: clip saved - {path}")
+
+    def scan_document(self) -> None:
+        """Flatten the page in view, show it, save it, then read its text."""
+        from .. import camera_tools
+        frame = self._view_frame()
+        if frame is None:
+            self.quality_label.setText("No camera frame to scan yet.")
+            return
+        scan, found = camera_tools.scan_document(frame)
+        if scan is None:
+            self.quality_label.setText("The page could not be scanned.")
+            return
+        try:
+            import cv2
+            shown = cv2.cvtColor(scan, cv2.COLOR_GRAY2BGR) if scan.ndim == 2 else scan
+        except Exception:
+            shown = scan
+        image = bgr_to_qimage(shown)
+        if image is not None:
+            self._show_capture = True
+            self._captured_image = image
+            self._captured_frame = shown
+            self.canvas.observations = []
+            self.canvas.codes = []
+            self.canvas.set_image(image, captured=True)
+            self.live_button.setText("Live View")
+            self.live_button.setVisible(True)
+        path = camera_tools.save_image(scan, "scan")
+        where = f"Saved to {path.parent}" if path else "Not saved."
+        outline = ("Page edges found and straightened." if found
+                   else "No page outline found - the whole view was cleaned instead.")
+        self.quality_label.setText(f"{outline} {where}")
+        self._note("Document Scanned",
+                   f"<p>{_plain(outline)}</p><p>Reading the text…</p>",
+                   [("Open the scan", "open_file", path)] if path else [])
+        self._pending_scan_path = path
+
+        def read() -> None:
+            text = ""
+            try:
+                if self._ocr is None:
+                    from ..ocr_engine import OcrEngine
+                    self._ocr = OcrEngine(self.bus)
+                from PIL import Image
+                text = self._ocr.image_to_text(Image.fromarray(scan))
+            except Exception as exc:
+                text = f"\u0000{exc}"
+            self._scan_read.emit(path, text)
+
+        threading.Thread(target=read, name="orion-document-ocr", daemon=True).start()
+
+    def _on_scan_read(self, path: Any, text: str) -> None:
+        if text.startswith("\u0000"):
+            body = f"<p>The text could not be read: {_plain(text[1:], 200)}</p>"
+            actions = [("Open the scan", "open_file", path)] if path else []
+        elif not text.strip():
+            body = "<p>No text found on the page.</p>"
+            actions = [("Open the scan", "open_file", path)] if path else []
+        else:
+            words = len(text.split())
+            body = (f"<p>{words} words read.</p><pre style='white-space:pre-wrap'>"
+                    f"{_plain(text, 6000)}</pre>")
+            actions = [("Copy the text", "copy", text)]
+            if path:
+                actions.append(("Open the scan", "open_file", path))
+        self._note("Document Scanned", body, actions)
+
+    def read_codes(self) -> None:
+        from .. import camera_tools
+        frame = self._view_frame()
+        if frame is None:
+            self.quality_label.setText("No camera frame to read yet.")
+            return
+        codes = camera_tools.read_codes(frame)
+        self._on_codes(codes, (frame.shape[1], frame.shape[0]))
+        if not codes:
+            self._note("Codes", "<p>No QR code or barcode is readable in this view. Hold it "
+                                "flat, fill more of the frame and keep it in focus.</p>")
+
+    def _scan_codes_live(self, frame: Any, now: float) -> None:
+        if self._codes_busy or now - self._last_codes_scan < 0.6 or frame is None:
+            return
+        self._codes_busy = True
+        self._last_codes_scan = now
+        try:
+            copy = frame.copy()
+        except Exception:
+            self._codes_busy = False
+            return
+
+        def work() -> None:
+            from .. import camera_tools
+            try:
+                codes = camera_tools.read_codes(copy)
+            except Exception:
+                codes = []
+            self._codes_found.emit(codes, (copy.shape[1], copy.shape[0]))
+
+        threading.Thread(target=work, name="orion-live-codes", daemon=True).start()
+
+    def _on_codes(self, codes: Any, size: Any) -> None:
+        self._codes_busy = False
+        width, height = size if size else (1, 1)
+        drawn = []
+        for code in codes or []:
+            points = [[x / max(1, width), y / max(1, height)] for x, y in code.points]
+            drawn.append({"points": points, "label": code.summary[:40] or code.kind})
+        self.canvas.codes = drawn
+        self.canvas.update()
+        if not codes:
+            return
+        rows = []
+        actions: list[tuple[str, str, Any]] = []
+        for number, code in enumerate(codes, 1):
+            rows.append(f"<p><b>{number}. {_plain(code.summary, 200)}</b><br>"
+                        f"<span style='color:#9a9aa3'>{_plain(code.kind)}</span><br>"
+                        f"{_plain(code.text if code.meaning != 'wifi' else 'Wi-Fi details hidden', 1000)}</p>")
+            if code.meaning == "link":
+                actions.append((f"Open link {number}", "open_link", code.text))
+            if code.meaning != "wifi":
+                actions.append((f"Copy {number}", "copy", code.text))
+        self._note(f"CODES · {len(codes)}", "".join(rows), actions)
+
+    def _low_light_toggled(self, on: bool) -> None:
+        self._low_light = bool(on)
+        self.quality_label.setText("Low-light boost on" if on else "Low-light boost off")
+
     def _update_lighting(self, image: QImage) -> None:
         # Only 192 samples from a tiny thumbnail: no model, OCR or heavy vision
         # processing on the GUI thread, and no claim of component detection.
@@ -721,12 +1116,12 @@ class ElectronicsWorkbench(QWidget):
         values = [thumb.pixelColor(x, y).lightness() for y in range(12) for x in range(16)]
         brightness = sum(values) / len(values)
         if brightness < 45:
-            guidance = "Low light — add diffuse lighting before capture."
+            guidance = "  ·  Too dark"
         elif brightness > 222:
-            guidance = "Very bright — reduce glare to reveal markings."
+            guidance = "  ·  Too bright"
         else:
-            guidance = "Lighting looks usable. Hold steady and check the small print."
-        self.quality_label.setText(f"{image.width()} × {image.height()}  ·  {guidance}")
+            guidance = ""
+        self.quality_label.setText(f"{image.width()} × {image.height()}{guidance}")
 
     def capture(self) -> None:
         if self._busy or not self._camera_enabled or self._show_capture:
@@ -739,7 +1134,7 @@ class ElectronicsWorkbench(QWidget):
         try:
             frame = self._frame.copy()
         except Exception:
-            self.quality_label.setText("The camera frame could not be retained. Try again.")
+            self.quality_label.setText("Capture failed")
             return
         image = bgr_to_qimage(frame)
         if image is None:
@@ -751,7 +1146,7 @@ class ElectronicsWorkbench(QWidget):
         self._observations = []
         self.canvas.observations = []
         self.canvas.set_image(image, captured=True)
-        self.live_button.setText("Live view")
+        self.live_button.setText("Live View")
         self.live_button.setVisible(True)
         self._request_inspection(frame, "Captured frame retained. Inspecting the visible details…")
 
@@ -778,8 +1173,8 @@ class ElectronicsWorkbench(QWidget):
         self.capture_button.setEnabled(False)
         self.ask_button.setEnabled(False)
         self.quality_label.setText(note)
-        self.report_heading.setText("INSPECTION IN PROGRESS")
-        self.report.setHtml('<h3>Inspecting this capture…</h3><p>Checking image quality and visible evidence. Findings will appear here when ready.</p>')
+        self.report_heading.setText("Inspection in Progress")
+        self.report.setHtml('<h3>Inspecting…</h3>')
         self.scan_requested.emit({"request_id": self._request_id, "frame": frame,
                                   "focus": self.focus_input.text().strip(),
                                   "mode": self.selected_mode(),
@@ -788,14 +1183,14 @@ class ElectronicsWorkbench(QWidget):
     def show_live(self) -> None:
         if self._show_capture:
             self._show_capture = False
-            self.live_button.setText("Captured frame")
+            self.live_button.setText("Captured Frame")
             self.ask_button.setEnabled(False)
             if not self._camera_enabled:
-                self.canvas.clear_image("Camera paused", "Start the camera to continue framing your electronics.")
+                self.canvas.clear_image("Camera paused")
             self._refresh()
         elif self._captured_image is not None:
             self._show_capture = True
-            self.live_button.setText("Live view")
+            self.live_button.setText("Live View")
             self.canvas.set_image(self._captured_image, captured=True)
             self.canvas.reading = self._captured_reading
             self.canvas.observations = self._observations
@@ -820,23 +1215,23 @@ class ElectronicsWorkbench(QWidget):
             self._captured_frame = None
             self._captured_reading = None
             self._observations = []
-            self.canvas.clear_image("Capturing electronics…", "The analysed frame will appear here with its findings.")
+            self.canvas.clear_image("Capturing…")
             self.state_label.setText("ANALYSING")
             self.capture_button.setEnabled(False)
             self.ask_button.setEnabled(False)
-            self.report.setHtml("<h3>Inspecting the camera frame…</h3><p>Waiting for the captured image and its findings.</p>")
+            self.report.setHtml("<h3>Inspecting…</h3>")
         if self._matches(payload) and self._busy:
-            self.report_heading.setText("INSPECTION IN PROGRESS")
+            self.report_heading.setText("Inspection in Progress")
 
     def on_scan_result(self, payload: Any) -> None:
         if not self._matches(payload):
             return
         self._busy = False
         status = payload.get("status", "complete")
-        self.report_heading.setText("LOCAL CHECKS" if status == "local_only" else
-                                    {"text": "TEXT READ", "count": "COUNT",
-                                     "anything": "WHAT ORION SEES"}.get(
-                                        str(payload.get("mode") or ""), "INSPECTION NOTES"))
+        self.report_heading.setText("Local Checks" if status == "local_only" else
+                                    {"text": "Text Read", "count": "Count",
+                                     "anything": "What ORION Sees"}.get(
+                                        str(payload.get("mode") or ""), "Inspection Notes"))
         observations = payload.get("observations")
         self._observations = [item for item in observations[:24] if isinstance(item, dict)] if isinstance(observations, list) else []
         jpeg = payload.get("jpeg")
@@ -847,7 +1242,7 @@ class ElectronicsWorkbench(QWidget):
                 if self._captured_frame is None:
                     self._captured_frame = bytes(jpeg)
                 self.live_button.setVisible(True)
-                self.live_button.setText("Live view" if self._show_capture else "Captured frame")
+                self.live_button.setText("Live View" if self._show_capture else "Captured Frame")
         if self._show_capture and self._captured_image is not None:
             self.canvas.set_image(self._captured_image, captured=True)
             self.canvas.observations = self._observations
@@ -873,33 +1268,32 @@ class ElectronicsWorkbench(QWidget):
             parts.append(f'<p><b>{number}. {label}</b>{where}<span style="color:{C.MUTED}">{confidence_text}</span><br>{detail}{evidence_line}</p>')
         markings = payload.get("markings")
         if isinstance(markings, list) and markings:
-            parts.append("<h4>" + ("Markings · verify visually" if payload.get("mode") in (None, "electronics")
-                                   else "Text found · verify visually") + "</h4><ul>")
+            parts.append("<h4>" + ("Markings · Verify Visually" if payload.get("mode") in (None, "electronics")
+                                   else "Text Found · Verify Visually") + "</h4><ul>")
             for marking in markings[:24]:
                 if isinstance(marking, dict) and marking.get("text"):
                     parts.append(f'<li>{_plain(marking["text"], 180)}</li>')
             parts.append("</ul>")
-        for key, heading in (("next_steps", "Next checks"), ("limitations", "Limits of this view")):
+        for key, heading in (("next_steps", "Next Checks"), ("limitations", "Limits of This View")):
             items = payload.get(key) or []
             if isinstance(items, list) and items:
                 parts.append(f"<h4>{heading}</h4><ul>" + "".join(f"<li>{_plain(item, 700)}</li>" for item in items[:8]) + "</ul>")
         quality = payload.get("quality") or {}
         warnings = quality.get("warnings", []) if isinstance(quality, dict) else []
-        self.quality_label.setText(" · ".join(str(item)[:180] for item in warnings[:3]) if warnings else "Inspection attached to this captured frame. Return to Live view to capture another angle.")
+        self.quality_label.setText(" · ".join(str(item)[:180] for item in warnings[:3]) if warnings else "")
         self.report.setHtml("".join(parts))
 
     def on_scan_error(self, payload: Any) -> None:
         if not self._matches(payload):
             return
         self._busy = False
-        self.report_heading.setText("INSPECTION UNAVAILABLE")
+        self.report_heading.setText("Inspection Unavailable")
         retained = self._captured_image is not None
         self.state_label.setText("CAPTURE RETAINED" if retained else "SCAN UNAVAILABLE")
         if not retained:
             self._show_capture = False
-            self.canvas.clear_image("Inspection unavailable", "Start the camera to capture another frame.")
-        next_step = ("Your captured frame is retained — ask again to retry on it, or return to Live view for a new capture."
-                     if retained else "Start the camera and capture a frame to try again.")
+            self.canvas.clear_image("Inspection unavailable")
+        next_step = "Capture kept - ask again to retry." if retained else ""
         self.report.setHtml("<h3>Inspection could not finish.</h3><p>" + _plain(payload.get("error") or payload.get("message") or "The vision service is unavailable.") + "</p><p>" + next_step + "</p>")
         self.capture_button.setEnabled(self._camera_enabled and self._frame is not None and not self._show_capture)
         self.ask_button.setEnabled(self._captured_frame is not None and self._show_capture)

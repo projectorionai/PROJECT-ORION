@@ -1,0 +1,34 @@
+{
+  "name": "jv_excel_writer",
+  "description": "Create and verify an XLSX workbook with tables, permitted formulas and bar/line charts. Use provided data; unknown figures remain blank.",
+  "module": "jv_excel_writer_tool.py",
+  "version": "33.0.0",
+  "tier": "confirm",
+  "permissions": [
+    "filesystem",
+    "network"
+  ],
+  "requires": [
+    "openpyxl"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "request": {
+        "type": "string",
+        "description": "Workbook brief and supplied source data, if not using a structured specification."
+      },
+      "filename": {
+        "type": "string",
+        "description": "New workbook filename; existing files are never overwritten."
+      },
+      "workbook": {
+        "type": "object",
+        "description": "Structured {sheets:[{name, columns:[...], rows:[[...]], chart:{type:bar|line,title}}]}. Formula cells are {formula:'=SUM(B2:B8)'}. Charts are optional.",
+        "additionalProperties": true
+      }
+    },
+    "required": []
+  },
+  "secrets": []
+}

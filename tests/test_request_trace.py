@@ -50,13 +50,18 @@ def test_a_complete_request_is_marked_complete(store):
     assert store.stalled(older_than=0.0) == []
 
 
-def test_stage_timings_show_where_the_latency_went(store):
+def test_stage_timings_show_where_the_latency_went(store, monkeypatch):
+    from types import SimpleNamespace
+    from orion_core import request_trace
     trace = store.begin()
+    clock = [trace.started]
+    monkeypatch.setattr(request_trace, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
     trace.stage(Stage.CAPTURE_START)
-    time.sleep(0.02)
+    clock[0] += 0.02
     trace.stage(Stage.API_REQUEST_START)
     timings = dict(trace.stage_timings())
-    assert timings[Stage.API_REQUEST_START.value] >= 15.0
+    assert timings[Stage.CAPTURE_START.value] == 0.0
+    assert timings[Stage.API_REQUEST_START.value] == pytest.approx(20.0, abs=1e-6)
 
 
 # ── each way a request dies names its owner ───────────────────────────────────
@@ -142,6 +147,15 @@ def test_stalled_finds_incomplete_requests_only(store):
     assert [t.request_id for t in stalled] == [stuck.request_id]
 
 
+def test_zero_age_incomplete_request_is_visible_at_the_threshold(store, monkeypatch):
+    """Windows may return the same monotonic tick for successive queries."""
+    from orion_core import request_trace
+
+    stuck = store.begin()
+    monkeypatch.setattr(request_trace.time, "monotonic", lambda: stuck.started)
+    assert store.stalled(older_than=0.0) == [stuck]
+
+
 def test_explain_last_silence_answers_the_users_actual_question(store):
     stuck = store.begin()
     _run_to(stuck, Stage.API_REQUEST_START)
@@ -206,3 +220,59 @@ def test_report_renders_without_error(store):
     text = store.report()
     assert "REQUEST TRACE" in text
     assert "ORION_REQ_" in text
+
+
+# ── the request in flight: context-scoped marks ──────────────────────────────
+
+def test_marks_follow_the_request_through_tasks_and_threads(store):
+    """A provider attempt three calls and a worker thread away from the chat
+    handler must land on the right request without being passed the trace."""
+    import asyncio
+
+    from orion_core import request_trace
+
+    trace = store.begin(origin="remote")
+
+    def in_a_thread():
+        request_trace.mark("provider_attempt", provider="local", ok=True, ms=12.5)
+
+    async def handler():
+        with request_trace.bound(trace):
+            await asyncio.create_task(asyncio.to_thread(in_a_thread))
+            request_trace.mark("first_token")
+        request_trace.mark("outside")          # no request bound: ignored
+
+    asyncio.run(handler())
+    assert [m.name for m in trace.marks] == ["provider_attempt", "first_token"]
+    assert trace.marks[0].fields == {"provider": "local", "ok": True, "ms": 12.5}
+    assert trace.since_start_ms("first_token") is not None
+    assert request_trace.current() is None
+
+
+def test_mark_fields_cannot_carry_a_payload(store):
+    """Labels are for grouping. A prompt or a key passed by mistake is reduced
+    to a short label, and the number of marks per request is capped."""
+    from orion_core.request_trace import MAX_MARKS
+
+    trace = store.begin()
+    trace.mark("provider_attempt", provider="Groq sk-SECRET value " * 10,
+               prompt={"text": "private"})
+    fields = trace.marks[0].fields
+    assert len(fields["provider"]) <= 48 and " " not in fields["provider"]
+    assert fields["prompt"].startswith("_text_")
+    for _ in range(MAX_MARKS + 20):
+        trace.mark("retry")
+    assert len(trace.marks) == MAX_MARKS
+    described = trace.describe()["marks"][0]
+    assert described["name"] == "provider_attempt" and "at_ms" in described
+
+
+def test_a_request_with_no_microphone_completes_when_its_reply_is_delivered(store):
+    """A phone or typed turn has no listening to restore. Without its own end
+    stage every one of them read as 'stalled' 45 s later and the health model
+    reported a fault that never happened."""
+    trace = store.begin(origin="remote", detail="hello")
+    trace.stage(Stage.API_REQUEST_START).stage(Stage.API_RESPONSE_RECEIVED)
+    trace.stage(Stage.REPLY_DELIVERED, "reply reached the phone")
+    assert trace.complete
+    assert trace not in store.stalled(older_than=-1)

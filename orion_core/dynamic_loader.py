@@ -9,6 +9,9 @@ updates the tool declarations array inside OrionDispatcher instantly.
 from __future__ import annotations
 
 import asyncio
+import copy
+import functools
+import hashlib
 import importlib.util
 import json
 import sys
@@ -17,12 +20,70 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .bus import OrionBus
 from .data import ToolResult
 from .forge_contract import contract_problems
 from .atomic_io import atomic_write_text
+
+
+# ── plugins that duplicate a built-in tool ───────────────────────────────────
+#
+# Three forged plugins (gesture_control_interface, gesture_control_manager and
+# gesture_control_tool) sat beside the built-in gesture_control and were
+# imported at every boot, with no recorded call. A forged plugin whose name,
+# once words for a tool's kind (manager, tool, interface ...) are set aside,
+# names exactly what a built-in tool names is not imported or activated.
+# Plugins delivered with ORION are reviewed adapters and are never judged this
+# way; the plugin files themselves are never touched.
+
+#: The delivery ledger plugin_registry.seed_shipped keeps beside the plugins.
+_SHIPPED_LEDGER = ".shipped.json"
+
+
+@functools.lru_cache(maxsize=4)
+def _concept_index(builtins: frozenset[str]) -> dict[frozenset[str], str]:
+    from .forge_triage import name_concepts
+    index: dict[frozenset[str], str] = {}
+    for name in sorted(builtins):
+        concepts = frozenset(name_concepts(name))
+        if concepts:
+            index.setdefault(concepts, name)
+    return index
+
+
+def shadowed_builtin(name: str, builtins: Iterable[str]) -> str:
+    """The built-in tool *name* duplicates, or ''.
+
+    An exact name counts, and so does the same name with only kind words
+    added: 'gesture_control_manager' duplicates 'gesture_control', while
+    'find_files_by_hash' names something more than 'find_files' and does not.
+    """
+    name = str(name or "").strip().lower()
+    names = frozenset(str(item) for item in (builtins or ()) if item)
+    if not name or not names:
+        return ""
+    if name in names:
+        return name
+    from .forge_triage import name_concepts
+    concepts = frozenset(name_concepts(name))
+    if not concepts:
+        return ""
+    return _concept_index(names).get(concepts, "")
+
+
+@functools.lru_cache(maxsize=1)
+def _bundled_plugins() -> frozenset[str] | None:
+    """The plugins bundled with this build, or None outside a built app."""
+    try:
+        from .constants import resource_path
+        folder = resource_path("shipped_plugins")
+        if not folder.is_dir():
+            return None
+        return frozenset(path.name[: -len("_tool.py")] for path in folder.glob("*_tool.py"))
+    except Exception:
+        return None
 
 
 @dataclass
@@ -36,6 +97,12 @@ class ModuleLoadOutcome:
     error_log: list[str] = field(default_factory=list)
     duration_ms: float = 0.0
     handler_fn: Callable[..., Any] | None = None
+    # Exact import identity for transaction recovery, including rejected
+    # contracts. This stays local and is deliberately absent from to_dict().
+    module_obj: Any = field(default=None, repr=False, compare=False)
+    #: The built-in tool this module duplicates when it was held back for
+    #: that (a deliberate state the registry shows as "superseded").
+    superseded_by: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -116,6 +183,62 @@ class ReflectiveModuleLoader:
         # Packages already attempted this session, so a package that genuinely
         # does not exist is tried once rather than on every tool that wants it.
         self._dependency_attempts: set[str] = set()
+        #: The built-in tool names, when known (the Forge sets this). A plugin
+        #: that duplicates one is then refused before it is imported.
+        self.native_names: Callable[[], Iterable[str]] | None = None
+        self._reviewed_cache: dict[Path, tuple[int, frozenset[str] | None]] = {}
+
+    # ── plugins that duplicate a built-in tool ──────────────────────────────
+
+    def _native_names(self) -> frozenset[str]:
+        source = getattr(self, "native_names", None)
+        if source is None:
+            return frozenset()
+        try:
+            return frozenset(source())
+        except Exception:
+            return frozenset()
+
+    def _reviewed(self, directory: Path) -> frozenset[str] | None:
+        """The plugins delivered with ORION for this plugin folder: its
+        delivery ledger plus the plugins bundled with this build. None when
+        neither can be read; then nothing is judged a duplicate, rather than
+        risk holding back a reviewed plugin."""
+        ledger = Path(directory) / _SHIPPED_LEDGER
+        known: frozenset[str] | None = None
+        try:
+            stamp = ledger.stat().st_mtime_ns
+        except OSError:
+            stamp = None
+        if stamp is not None:
+            cache = self.__dict__.setdefault("_reviewed_cache", {})
+            cached = cache.get(ledger)
+            if cached is None or cached[0] != stamp:
+                try:
+                    data = json.loads(ledger.read_text(encoding="utf-8"))
+                    names = frozenset(str(key) for key in data) if isinstance(data, dict) else None
+                except (OSError, ValueError):
+                    names = None
+                cached = (stamp, names)
+                cache[ledger] = cached
+            known = cached[1]
+        bundled = _bundled_plugins()
+        if bundled is not None:
+            known = bundled | (known or frozenset())
+        return known
+
+    def duplicate_reason(self, tool_name: str, module_path: Path | None,
+                         builtins: Iterable[str]) -> str:
+        """Why the plugin *tool_name* at *module_path* is held back as a
+        duplicate of a built-in tool, or ''."""
+        builtin = shadowed_builtin(tool_name, builtins) if module_path is not None else ""
+        if not builtin:
+            return ""
+        reviewed = self._reviewed(Path(module_path).parent)
+        if reviewed is None or tool_name in reviewed:
+            return ""
+        return (f"held back: it duplicates ORION's built-in tool '{builtin}' (use {builtin}); "
+                "the plugin file is left untouched")
 
     async def load_and_register(
         self,
@@ -135,6 +258,16 @@ class ReflectiveModuleLoader:
         Returns:
             ModuleLoadOutcome with success status and handler function
         """
+        # Decided before the import, so a duplicate's module-level code never
+        # runs. The caller reports the outcome once, in its own log line.
+        natives = self._native_names()
+        duplicate = self.duplicate_reason(
+            module_path.stem.removesuffix("_tool"), module_path, natives)
+        if duplicate:
+            return ModuleLoadOutcome(
+                succeeded=False, module_name=module_path.stem, module_path=module_path,
+                error_log=[duplicate],
+                superseded_by=shadowed_builtin(module_path.stem.removesuffix("_tool"), natives))
         self.bus.log.emit(
             f"[FORGE] Loader: starting load of '{module_path.name}'"
         )
@@ -172,6 +305,7 @@ class ReflectiveModuleLoader:
                 asyncio.to_thread(self._load_module_file, module_path),
                 timeout=self.IMPORT_TIMEOUT_S,
             )
+            outcome.module_obj = module
 
             # Extract schema and handler
             schema = self._extract_schema(module)
@@ -184,6 +318,12 @@ class ReflectiveModuleLoader:
                 self.bus.log.emit(
                     f"[FORGE] Loader: ✗ missing required exports in {module_path.name}"
                 )
+            elif (module_path.stem.startswith("trial_")
+                  and schema.get("name") != module_path.stem.removesuffix("_tool")):
+                outcome.error_log.append(
+                    "Analysis trial schema must retain its reserved file/tool name")
+                self.bus.log.emit(
+                    f"[FORGE] Loader: ✗ trial namespace mismatch in {module_path.name}")
             elif (problems := contract_problems(schema, handler_fn)):
                 # The same gate the sandbox applies to a freshly forged tool,
                 # applied here to EVERY tool including ones forged before that
@@ -249,7 +389,8 @@ class ReflectiveModuleLoader:
             # package genuinely cannot be had.
             sys.modules.pop(module_path.stem, None)
             missing = (e.name or "").split(".")[0]
-            if missing and missing not in self._dependency_attempts:
+            if (missing and not module_path.stem.startswith("trial_")
+                    and missing not in self._dependency_attempts):
                 self._dependency_attempts.add(missing)
                 self.bus.log.emit(
                     f"[FORGE] Loader: {module_path.name} needs '{missing}' — "
@@ -380,7 +521,7 @@ class ReflectiveModuleLoader:
     async def _can_rehabilitate(self, broken: Path) -> bool:
         """True if a quarantined file would load cleanly now. Never raises."""
         try:
-            source = broken.read_text(encoding="utf-8", errors="replace")
+            source = await asyncio.to_thread(broken.read_text, encoding="utf-8", errors="replace")
         except OSError:
             return False
         try:
@@ -396,13 +537,19 @@ class ReflectiveModuleLoader:
         # vetted once" is not the same as "it is safe to run now".
         try:
             from .security import SecuritySanitiser, SecurityViolation
-            SecuritySanitiser.guard_forged_source(source, f"rehab.{broken.name}")
+            trial_name = broken.name.split(".", 1)[0]
+            if trial_name.endswith("_tool"):
+                trial_name = trial_name[:-5]
+            SecuritySanitiser.guard_forged_source(
+                source, f"rehab.{broken.name}", trial_name=trial_name)
         except SecurityViolation as exc:
             self.bus.log.emit(
                 f"[FORGE] Loader: refusing to rehabilitate {broken.name} — {exc}")
             return False
         except Exception:
-            pass                  # the guard being unavailable must not block boot
+            if broken.name.startswith("trial_"):
+                return False      # reserved analysis trials fail closed
+            pass                  # the ordinary guard must not block boot
 
         def _probe() -> tuple[bool, str]:
             namespace: dict[str, Any] = {}
@@ -417,7 +564,11 @@ class ReflectiveModuleLoader:
             if not callable(schema_fn) or not callable(run_fn):
                 return False, ""
             try:
-                if contract_problems(schema_fn(), run_fn):
+                schema = schema_fn()
+                if (broken.name.startswith("trial_")
+                        and schema.get("name") != trial_name):
+                    return False, ""
+                if contract_problems(schema, run_fn):
                     return False, ""
             except Exception:
                 return False, ""
@@ -433,7 +584,8 @@ class ReflectiveModuleLoader:
         # Importable except for one named package we have not yet tried: install
         # it and probe once more. This is what actually frees an sklearn/jsonschema
         # inmate.
-        if missing and missing not in self._dependency_attempts:
+        if (missing and not broken.name.startswith("trial_")
+                and missing not in self._dependency_attempts):
             self._dependency_attempts.add(missing)
             if await self._install(missing):
                 try:
@@ -477,6 +629,14 @@ class ReflectiveModuleLoader:
             index = {}
         rows: list[dict[str, Any]] = []
         for path in sorted(qdir.glob("*.broken"), key=lambda p: -p.stat().st_mtime):
+            # A working copy of the same tool is live again (a reviewed
+            # version was delivered, or it was re-forged): the loader moves a
+            # tool OUT of the folder when it fails, so this copy is history.
+            # Reporting it kept diagnostics saying "2 quarantined" for tools
+            # that were running, and the self-improvement loop spent the day's
+            # rate limit forging a tool to fix them.
+            if (self.custom_tools_dir / path.name[: -len(".broken")]).exists():
+                continue
             record = index.get(path.name) or {}
             rows.append({
                 "file": path.name,
@@ -505,20 +665,43 @@ class ReflectiveModuleLoader:
             raise FileNotFoundError(f"Module file not found: {module_path}")
 
         module_name = module_path.stem
+        # Check the exact snapshot subsequently compiled: an edited trial or a
+        # stale bytecode cache cannot bypass its generation-time admission gate.
+        source = module_path.read_bytes()
+        if module_name.startswith("trial_"):
+            from .security import SecuritySanitiser
+            trial_name = module_name[:-5] if module_name.endswith("_tool") else module_name
+            SecuritySanitiser.guard_forged_source(
+                source.decode("utf-8"), f"load.{module_name}", trial_name=trial_name)
         spec = importlib.util.spec_from_file_location(module_name, module_path)
 
         if spec is None or spec.loader is None:
             raise RuntimeError(f"Failed to create module spec for {module_path}")
 
         module = importlib.util.module_from_spec(spec)
+        previous = sys.modules.get(module_name)
         sys.modules[module_name] = module
 
         try:
-            spec.loader.exec_module(module)
-        except SyntaxError as e:
-            del sys.modules[module_name]
-            raise e
+            # Timestamp/size .pyc caches can serve the OLD generation when a
+            # same-size replacement lands within one second. Compile exactly
+            # the bytes that were published, independent of those caches.
+            exec(compile(source, str(module_path), "exec"), module.__dict__)
+        except BaseException:
+            if sys.modules.get(module_name) is module:
+                if previous is None:
+                    sys.modules.pop(module_name, None)
+                else:
+                    sys.modules[module_name] = previous
+            raise
 
+        # Bind execution metadata to the exact bytes compiled above. A later
+        # file edit cannot give a cached handler a different effect audit.
+        handler = getattr(module, "run", None)
+        try:
+            handler._orion_plugin_source_sha256 = hashlib.sha256(source).hexdigest()
+        except (AttributeError, TypeError):
+            pass  # Non-annotatable callables require a separate isolation path.
         return module
 
     def _extract_schema(self, module: Any) -> dict[str, Any] | None:
@@ -582,56 +765,126 @@ class ReflectiveModuleLoader:
         Returns:
             ToolResult indicating success or failure
         """
-        if not outcome.succeeded or outcome.tool_schema is None or outcome.handler_fn is None:
+        if outcome.succeeded is not True or outcome.tool_schema is None or outcome.handler_fn is None:
             return ToolResult(
                 f"Cannot activate failed load: {', '.join(outcome.error_log)}",
                 ok=False,
             )
 
         try:
-            tool_name = outcome.tool_schema.get("name", outcome.module_name)
+            # A successful load is mutable data, not an admission token. Keep
+            # one detached contract/callable generation through activation.
+            schema = copy.deepcopy(outcome.tool_schema)
+            handler_fn = outcome.handler_fn
+            problems = contract_problems(schema, handler_fn)
+            if problems:
+                return ToolResult("Cannot activate a tool with an invalid contract: "
+                                  + "; ".join(problems), ok=False)
+            tool_name = schema["name"]
+            schema_digest = hashlib.sha256(json.dumps(
+                schema, sort_keys=True, ensure_ascii=False,
+                separators=(",", ":")).encode("utf-8")).hexdigest()
 
-            # Register handler in dispatcher's routing dictionary
-            await asyncio.to_thread(
-                self._register_handler,
-                dispatcher,
-                tool_name,
-                outcome.handler_fn,
-            )
+            def conflict() -> str:
+                table = getattr(dispatcher, "handler_table", None)
+                native = table() if callable(table) else {}
+                if tool_name in native:
+                    return "that name belongs to a native tool"
+                if tool_name in getattr(dispatcher, "_mcp_routes", {}):
+                    return "that name belongs to a connected MCP tool"
+                return ""
 
-            # Register tool declaration in TOOL_DECLARATIONS if present
-            await asyncio.to_thread(
-                self._register_declaration,
-                dispatcher,
-                tool_name,
-                outcome.tool_schema,
-            )
+            reason = conflict()
+            if reason:
+                return ToolResult(f"Cannot activate '{tool_name}': {reason}. Choose a unique plugin name.", ok=False)
+            # The schema's name, judged as load_and_register judged the file
+            # name: a plugin that duplicates a built-in tool stays inactive.
+            table = getattr(dispatcher, "handler_table", None)
+            try:
+                natives = set(table()) if callable(table) else set()
+            except Exception:
+                natives = set()
+            duplicate = self.duplicate_reason(
+                tool_name, getattr(outcome, "module_path", None), natives)
+            if duplicate:
+                getattr(self, "loaded_modules", {}).pop(getattr(outcome, "module_name", ""), None)
+                return ToolResult(f"Cannot activate '{tool_name}': {duplicate}.", ok=False,
+                                  receipt={"operation": "activate_tool", "state": "duplicate",
+                                           "tool": tool_name, "registry_changed": False})
 
-            # Optionally register in memory tier (if memory available)
-            if hasattr(dispatcher, "memory") and dispatcher.memory is not None:
-                await asyncio.to_thread(
-                    self._register_in_knowledge,
-                    dispatcher.memory,
-                    tool_name,
-                    outcome.tool_schema,
-                )
+            missing = object()
+            previous_handler = getattr(dispatcher, "_tool_handlers", {}).get(tool_name, missing)
+            previous_schemas = [item for item in getattr(dispatcher, "TOOL_DECLARATIONS", [])
+                                if item.get("name") == tool_name]
+            previous_values = copy.deepcopy(previous_schemas)
 
-            self.bus.log.emit(
-                f"[FORGE] Loader: ✓ activated tool '{tool_name}' in dispatcher"
-            )
+            # Indexing is optional metadata work. Finish its cancellable await
+            # before publication so cancellation cannot leave the caller with
+            # an active handler but no capability-tier/scheduler integration.
+            memory = getattr(dispatcher, "memory", None)
+            if memory is not None:
+                try:
+                    await asyncio.to_thread(self._register_in_knowledge,
+                                            memory, tool_name, copy.deepcopy(schema))
+                except Exception:
+                    pass
+            reason = conflict()  # connected routes may have changed during indexing
+            if reason:
+                return ToolResult(f"Cannot activate '{tool_name}': {reason}. Choose a unique plugin name.", ok=False)
+            current_schemas = [item for item in getattr(dispatcher, "TOOL_DECLARATIONS", [])
+                               if item.get("name") == tool_name]
+            if (getattr(dispatcher, "_tool_handlers", {}).get(tool_name, missing) is not previous_handler
+                    or len(current_schemas) != len(previous_schemas)
+                    or any(current is not previous for current, previous
+                           in zip(current_schemas, previous_schemas))
+                    or current_schemas != previous_values):
+                return ToolResult(
+                    f"Cannot activate '{tool_name}': a newer registration replaced the captured generation; "
+                    "the newer tool was preserved.", ok=False,
+                    receipt={"operation": "activate_tool", "state": "superseded",
+                             "tool": tool_name, "registry_changed": False})
+            problems = contract_problems(schema, handler_fn)
+            if problems:
+                return ToolResult("Tool contract changed before activation: " + "; ".join(problems), ok=False)
+
+            # Dispatcher readers run on this loop. Publish both references
+            # without yielding, so callers see one generation's contract.
+            # In-flight calls retain their local reference to the old handler.
+            handlers = dict(getattr(dispatcher, "_tool_handlers", {}))
+            declarations = list(getattr(dispatcher, "TOOL_DECLARATIONS", []))
+            try:
+                self._register_handler(dispatcher, tool_name, handler_fn)
+                self._register_declaration(dispatcher, tool_name, schema)
+            except BaseException:
+                dispatcher._tool_handlers = handlers
+                if hasattr(dispatcher, "TOOL_DECLARATIONS"):
+                    dispatcher.TOOL_DECLARATIONS[:] = declarations
+                raise
+
+            # Optional observers cannot turn a completed publication into a
+            # reported failure and cause the caller to retry it.
+            self._activation_log(f"[FORGE] Loader: ✓ activated tool '{tool_name}' in dispatcher")
 
             return ToolResult(
                 f"✓ Tool '{tool_name}' activated and registered. "
-                f"Schema: {outcome.tool_schema.get('description', 'no description')}",
+                f"Schema: {schema['description']}",
                 ok=True,
+                receipt={"operation": "activate_tool", "state": "activated",
+                         "tool": tool_name, "schema_sha256": schema_digest},
             )
 
         except Exception as e:
-            self.bus.log.emit(f"[FORGE] Loader: ✗ activation failed: {e}")
+            self._activation_log(f"[FORGE] Loader: ✗ activation failed: {e}")
             return ToolResult(
                 f"✗ Failed to activate tool: {type(e).__name__}: {e}",
                 ok=False,
             )
+
+    def _activation_log(self, message: str) -> None:
+        try:
+            self.bus.log.emit(message)
+        except Exception:
+            pass
 
     def _register_handler(
         self,

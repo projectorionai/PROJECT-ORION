@@ -572,7 +572,7 @@ class FounderKnowledgeAgent(_CommerceBase):
         if match is None:
             return ToolResult(
                 f"No stored profile for '{name}'. Known: "
-                + ", ".join(f.name for f in self._founders.values()) + ".")
+                + ", ".join(f.name for f in self._founders.values()) + ".", ok=False)
         return ToolResult(
             f"{match.name} — {match.domain}\n"
             f"Strategies:\n" + "\n".join(f"- {s}" for s in match.strategies) + "\n"

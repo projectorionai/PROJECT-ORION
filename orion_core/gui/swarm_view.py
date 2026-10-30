@@ -14,11 +14,10 @@ built and gave no visual surface —
     workflows      WorkflowEngine.definitions               (Mark XX)
     memory tiers   MemoryAgent.tiers_snapshot()             (existing)
 
-Rendered via Three.js/WebGL in a QWebEngineView — the exact same technique
-already proven in face3d.py (the avatar) and globe.py (the intelligence
-globe): an inline HTML page, Three.js loaded from the same pinned
-cdn.jsdelivr.net import map face3d.py uses, so this introduces no new CDN
-dependency. Node positions use a deterministic ring layout (grouped by
+The optional QWebEngineView renderer serves Three.js through the same
+vendored local origin as face3d.py (the avatar). Missing local assets or a
+renderer that cannot be constructed fall back to the live subsystem list.
+Node positions use a deterministic ring layout (grouped by
 kind, cached by node id so nodes don't visually jump between refreshes)
 rather than an N-body force simulation — this backend's own relationships
 are a small, flat "core connects to everything" graph plus a handful of
@@ -59,7 +58,7 @@ import json
 import os
 from typing import Any, Optional
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -73,8 +72,8 @@ from PyQt6.QtWidgets import (
 )
 
 from ..bus import OrionBus
-from ..constants import APP_MARK
 from ..swarm.model import NodeKind
+from .labels import plural
 
 
 def _webengine_available() -> bool:
@@ -98,8 +97,8 @@ def gl_renderer_enabled() -> bool:
     blank without it), and no full scene rebuild per tick.
 
     ORION_SWARM_GL=0 forces the old WebEngine renderer back, and the GL path
-    degrades to it automatically if the widget cannot be created at all (old
-    driver, software rasteriser, remote desktop) — see _build_gl_view."""
+    degrades to the offline subsystem list if the widget cannot be created
+    (old driver, software rasteriser, remote desktop) — see _build_gl_view."""
     if os.getenv("ORION_SWARM_GL", "").strip().lower() in {"0", "false", "off", "no"}:
         return False
     return importlib.util.find_spec("PyQt6.QtOpenGLWidgets") is not None
@@ -108,6 +107,7 @@ def gl_renderer_enabled() -> bool:
 # swarm can update its state every second without recreating the neural map.
 _REFRESH_MS = 1000
 _EVENT_PREFIX = "ORION_SWARM_EVENT:"
+_SWARM_PAGE = "swarm.html"
 
 _KIND_LABELS = {
     "core": "ORION",
@@ -181,7 +181,7 @@ def compose_snapshot(
                 nodes.append({
                     "id": node_id, "kind": "mcp", "label": server,
                     "health": str(health.get(server) or "UNKNOWN"),
-                    "detail": f"{len(info.get('tools') or [])} tool(s)",
+                    "detail": plural(len(info.get('tools') or []), 'tool'),
                 })
                 edges.append({"from": "core", "to": node_id})
         except Exception:
@@ -194,7 +194,7 @@ def compose_snapshot(
                 node_id = f"workflow:{name}"
                 nodes.append({
                     "id": node_id, "kind": "workflow", "label": name,
-                    "detail": f"{len(steps)} step(s)",
+                    "detail": plural(len(steps), 'step'),
                 })
                 edges.append({"from": "core", "to": node_id})
         except Exception:
@@ -206,7 +206,7 @@ def compose_snapshot(
                 node_id = f"memory:{tier}"
                 nodes.append({
                     "id": node_id, "kind": "memory", "label": tier,
-                    "detail": f"{count} row(s)",
+                    "detail": plural(count, 'row'),
                 })
                 edges.append({"from": "core", "to": node_id})
         except Exception:
@@ -227,8 +227,8 @@ SWARM_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 </style></head><body>
 <div id="tip">drag to orbit &middot; scroll to zoom &middot; click a node</div>
 <script type="importmap">{"imports":{
-  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+  "three":"__THREE_BASE__build/three.module.js",
+  "three/addons/":"__THREE_BASE__examples/jsm/"}}</script>
 <script type="module">
 import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
@@ -440,6 +440,25 @@ def _swarm_page_class() -> Any:
     return _SwarmPageCls
 
 
+def _load_local_swarm(view: Any) -> bool:
+    """Navigate from a real local origin, without an implicit CDN fallback.
+
+    Imported only when the page is shown: WebEngine must retain its existing
+    early-import contract. The face's graph does not use OrbitControls, so
+    check this page's additional entry before accepting the shared assets.
+    """
+    from .face3d import ORION_SCHEME, ensure_asset_handler, local_three, register_page
+
+    root = local_three()
+    if root is None or not (root / "examples/jsm/controls/OrbitControls.js").is_file():
+        return False
+    if not ensure_asset_handler(view.page().profile()):
+        return False
+    register_page(_SWARM_PAGE, SWARM_HTML)
+    view.setUrl(QUrl(f"{ORION_SCHEME}://three/{_SWARM_PAGE}"))
+    return True
+
+
 def _panel(title: str) -> tuple[QFrame, QVBoxLayout]:
     frame = QFrame()
     frame.setObjectName("panelFrame")
@@ -545,17 +564,9 @@ class SwarmDeckView(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
-        title = QLabel("SWARM — ORION AND EVERY SUBSYSTEM HE'S BUILT FROM")
-        title.setText(f"SWARM — {APP_MARK.upper()} NEURAL SUBSYSTEM MAP")
+        title = QLabel("Swarm")
         title.setObjectName("titleLabel")
         outer.addWidget(title)
-        navigation = QLabel(
-            "NAVIGATE  Drag to orbit  ·  Scroll to zoom  ·  Right-drag to pan  ·  "
-            "Click to inspect  ·  Double-click to open  ·  F focus  ·  Home reset"
-        )
-        navigation.setObjectName("mutedLabel")
-        navigation.setWordWrap(True)
-        outer.addWidget(navigation)
         # Held so portrait mode can strip the chrome: the compact orb is
         # ORION's face and nothing else.
         self._title_label = title
@@ -569,7 +580,7 @@ class SwarmDeckView(QWidget):
             # the widget itself is built lazily in _ensure_built, because
             # creating a GL context at construction time would put it on the
             # startup path and (as with WebEngine) into pytest collection.
-            self._placeholder = QLabel("◉  The swarm assembles when you open this page.")
+            self._placeholder = QLabel("")
             self._placeholder.setObjectName("mutedLabel")
             self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._webengine_container = QWidget()
@@ -578,7 +589,7 @@ class SwarmDeckView(QWidget):
             container_layout.addWidget(self._placeholder)
             splitter.addWidget(self._webengine_container)
         elif WEBENGINE_OK:
-            self._placeholder = QLabel("◉  The swarm assembles when you open this page.")
+            self._placeholder = QLabel("")
             self._placeholder.setObjectName("mutedLabel")
             self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._webengine_container = QWidget()
@@ -599,8 +610,8 @@ class SwarmDeckView(QWidget):
         outer.addWidget(splitter, 1)
 
     def _build_inspector_panel(self) -> QFrame:
-        frame, layout = _panel("INSPECTOR")
-        self.inspector_label = QLabel("Select a node to inspect it.")
+        frame, layout = _panel("Inspector")
+        self.inspector_label = QLabel("")
         self.inspector_label.setObjectName("mutedLabel")
         self.inspector_label.setWordWrap(True)
         layout.addWidget(self.inspector_label)
@@ -640,27 +651,24 @@ class SwarmDeckView(QWidget):
         if self._gl_mode:
             self._build_gl_view()
         else:
-            from PyQt6.QtWebEngineWidgets import QWebEngineView
-
-            self.view = QWebEngineView()
-            self.view.setPage(
-                _swarm_page_class()(self.view, on_event=self._on_swarm_event))
-            # Only drive the page once it has actually loaded. Calling
-            # runJavaScript on a QWebEngineView that has just been constructed
-            # crashes the process natively — no Python traceback, the
-            # interpreter simply stops. Found when the render-loop gating below
-            # started calling it from showEvent/hideEvent.
-            self._page_loaded = False
             try:
+                from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+                self.view = QWebEngineView()
+                self.view.setPage(
+                    _swarm_page_class()(self.view, on_event=self._on_swarm_event))
+                # Do not send JavaScript until this navigation has finished.
+                self._page_loaded = False
                 self.view.loadFinished.connect(self._on_load_finished)
-            except Exception:
-                pass
-            self.view.setHtml(SWARM_HTML)
-            self._webengine_container.layout().addWidget(self.view)
+                self._webengine_container.layout().addWidget(self.view)
+                if not _load_local_swarm(self.view):
+                    self._show_list_fallback("Local swarm assets are unavailable")
+            except Exception as exc:
+                self._show_list_fallback(f"Swarm page unavailable ({exc})")
         self._push_snapshot()
 
     def _build_gl_view(self) -> None:
-        """Construct the native renderer, degrading to the WebEngine/list
+        """Construct the native renderer, degrading to the offline list
         surface if the GL widget cannot be created (old driver, software
         rasteriser, remote desktop). A missing GPU must never cost ORION the
         page entirely."""
@@ -668,21 +676,65 @@ class SwarmDeckView(QWidget):
             from ..swarm.render.gl_view import SwarmGLView
 
             self.gl_view = SwarmGLView(self)
-            self.gl_view.attach_status_sink(self._log)
+            self.gl_view.attach_status_sink(self._on_gl_status)
             self.gl_view.node_selected.connect(self._on_gl_node_selected)
             self.gl_view.node_activated.connect(self._on_gl_node_activated)
             # Commands already in flight keep drawing across the handover.
             self.gl_view.attach_bridges(self.bridges)
             self._webengine_container.layout().addWidget(self.gl_view)
         except Exception as exc:
-            self.gl_view = None
-            self._gl_mode = False
-            self._log(f"SWARM: native renderer unavailable ({exc}); using fallback.")
-            notice = QLabel("Native swarm renderer unavailable on this display.")
-            notice.setObjectName("mutedLabel")
-            notice.setWordWrap(True)
-            notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._webengine_container.layout().addWidget(notice)
+            self._show_list_fallback(f"Native swarm renderer unavailable ({exc})")
+
+    def _on_gl_status(self, message: str) -> None:
+        self._log(message)
+        # These are the two terminal initializeGL failures. Optional edge or
+        # label shader warnings still leave a usable scene and stay warnings.
+        if not str(message).startswith(("SWARM: OpenGL 4.1 core profile unavailable",
+                                        "SWARM: shader compilation failed:")):
+            return
+        watched = self.gl_view
+
+        def recover() -> None:
+            if watched is not None and self.gl_view is watched:
+                self._show_list_fallback("The native swarm renderer could not initialise")
+
+        QTimer.singleShot(0, recover)       # never retire a widget on its GL stack
+
+    def _show_list_fallback(self, reason: str) -> None:
+        """Keep live nodes and inspector navigation when a renderer fails."""
+        self._gl_mode = False
+        self._page_loaded = False
+        # Retire references before stopping a page: stop() can emit a failed
+        # load synchronously, and that callback must not re-enter fallback.
+        retired = (self.view, self.gl_view)
+        self.view = None
+        self.gl_view = None
+        for widget in retired:
+            if widget is None:
+                continue
+            try:
+                stop = getattr(widget, "stop", None)
+                if callable(stop):
+                    stop()
+                set_active = getattr(widget, "set_active", None)
+                if callable(set_active):
+                    set_active(False)
+            except Exception:
+                pass                      # a failed renderer still gets retired
+            try:
+                self._webengine_container.layout().removeWidget(widget)
+                widget.hide()
+                widget.deleteLater()
+            except RuntimeError:
+                pass                      # Qt already destroyed the failed surface
+        self._clear_placeholder()
+        if not hasattr(self, "list_view"):
+            self.list_view = QListWidget()
+            self.list_view.currentItemChanged.connect(self._on_list_selection)
+            self._webengine_container.layout().addWidget(self.list_view)
+        self._last_snapshot = self._compose()
+        self._render_list_fallback()
+        self._log(f"SWARM: {reason}; showing the offline subsystem list.")
 
     def attach_centre_face(self, face: Any, fraction: float = 0.34) -> None:
         """Place ORION's face at the CENTRE of the network.
@@ -748,10 +800,15 @@ class SwarmDeckView(QWidget):
         self._on_inspector_action()
 
     def _on_load_finished(self, ok: bool) -> None:
+        if self.view is None:
+            return                          # an already retired renderer
         self._page_loaded = bool(ok)
         # Apply whatever visibility state we settled on while it was loading.
         if self._page_loaded:
+            self._push_snapshot()
             self._set_active(self._active)
+        else:
+            self._show_list_fallback("The local swarm page failed to load")
 
     def _set_active(self, on: bool) -> None:
         """Run the swarm's render loop only while the page is on screen.
@@ -1030,14 +1087,14 @@ class SwarmDeckView(QWidget):
             self.gl_view.apply_snapshot(self.compose_typed())
             return
         self._last_snapshot = self._compose()
-        if WEBENGINE_OK and self.view is not None:
+        if self.view is not None:
             payload = json.dumps(self._last_snapshot)
             self._js(f"window.orionSwarmUpdate && orionSwarmUpdate({json.dumps(payload)})")
-        elif not WEBENGINE_OK and not self._gl_mode:
+        elif hasattr(self, "list_view"):
             self._render_list_fallback()
 
     def _js(self, code: str) -> None:
-        if self.view is not None:
+        if self.view is not None and self._page_loaded:
             try:
                 self.view.page().runJavaScript(code)
             except Exception:

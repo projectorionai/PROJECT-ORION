@@ -249,6 +249,14 @@ def test_malformed_arguments_do_not_lose_the_call():
     assert calls == [("situation", {})]
 
 
+def test_pretty_printed_nested_tool_arguments_are_preserved():
+    calls, prose = parse_tool_calls(
+        'TOOL: query_intelligence\nARGS: {\n  "query": "build",\n'
+        '  "filters": {\n    "project": "orion"\n  }\n}\n')
+    assert calls == [("query_intelligence", {"query": "build", "filters": {"project": "orion"}})]
+    assert prose == ""
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # THE TOOLBELT — READ-ONLY BY CONSTRUCTION
 # ──────────────────────────────────────────────────────────────────────────────
@@ -343,6 +351,16 @@ async def test_an_extra_instrument_runs_its_own_callable():
     assert reading.ok and reading.observation == "looked up orion"
 
 
+async def test_an_extra_instruments_failed_tool_result_does_not_ground_an_answer():
+    async def _failed(_args):
+        return ToolResult("The evidence store is offline", ok=False)
+
+    belt = AgentToolbelt(extras={"evidence_lookup": ("evidence", _failed)}, budget=1)
+    reading = await belt.run("evidence_lookup", {})
+    assert not reading.ok
+    assert reading.observation == "The evidence store is offline"
+
+
 def test_an_empty_toolbelt_is_not_offered_to_the_specialist():
     assert not AgentToolbelt(budget=0).available()
     assert not AgentToolbelt(dispatch=_dispatch_ok, allowed={}, budget=3).available()
@@ -424,6 +442,160 @@ async def test_a_provider_failure_is_reported_not_raised():
     assert not finding.ok and "could not reach a provider" in finding.answer
 
 
+async def test_forced_close_provider_failure_is_a_failed_finding():
+    class _FailAtClose(_Router):
+        async def generate_text(self, *args, **kwargs):
+            if len(self.calls) >= CodingAgent.MAX_INVESTIGATION_STEPS:
+                raise RuntimeError("provider failed during synthesis")
+            return await super().generate_text(*args, **kwargs)
+
+    router = _FailAtClose(default='TOOL: query_intelligence\nARGS: {"query": "x"}')
+    belt = AgentToolbelt(dispatch=_dispatch_ok,
+                         allowed={"query_intelligence": "memory"}, budget=99)
+    finding = await CodingAgent(router, _Bus()).investigate("Debug the build", toolbelt=belt)
+    assert not finding.ok
+    assert "could not close" in finding.answer
+    assert finding.grounded and len(finding.tools) == 3
+
+
+@pytest.mark.parametrize("reply", [
+    'TOOL: query_intelligence\nARGS: {"query": "x"}',
+    '{"tool": "query_intelligence", "args": {"query": "x"}}',
+    '```tool\n{"tool": "query_intelligence", "args": {"query": "x"}}\n```',
+])
+async def test_an_unfinished_lookup_is_not_reported_as_success_or_raw_protocol(reply):
+    router = _Router(default=reply)
+    belt = AgentToolbelt(dispatch=_dispatch_ok,
+                         allowed={"query_intelligence": "memory"}, budget=1)
+    finding = await CodingAgent(router, _Bus()).investigate("Debug the build", toolbelt=belt)
+    assert not finding.ok
+    assert '"tool"' not in finding.answer
+    assert "TOOL:" not in finding.answer and "ARGS:" not in finding.answer
+    assert finding.grounded and len(finding.tools) == 1
+
+
+async def test_empty_provider_reply_is_not_reported_as_a_successful_answer():
+    finding = await CodingAgent(_Router(default=""), _Bus()).investigate("Debug the build")
+    assert not finding.ok
+    assert finding.answer
+
+
+async def test_forced_close_withdraws_the_catalogue_and_preserves_successful_readings():
+    router = _Router(scripts={"reason.coding": [
+        'TOOL: query_intelligence\nARGS: {"query": "x"}',
+        'TOOL: query_intelligence\nARGS: {"query": "again"}',
+        "The saved build settings confirm the problem.",
+    ]})
+    belt = AgentToolbelt(dispatch=_dispatch_ok,
+                         allowed={"query_intelligence": "memory"}, budget=1)
+    finding = await CodingAgent(router, _Bus()).investigate("Debug the build", toolbelt=belt)
+    assert finding.ok and "confirm the problem" in finding.answer
+    assert "AVAILABLE INSTRUMENTS" not in router.calls[-1]["system"]
+    assert "INSTRUMENT READINGS" in router.calls[-1]["prompt"]
+    assert len(finding.tools) == 1
+
+
+def test_providerless_specialist_brief_preserves_attached_context():
+    finding = asyncio.run(CodingAgent(_Router(fallback=False), _Bus()).investigate(
+        "Debug the build", context="Evidence: line 12 raises ValueError."))
+    assert "Evidence: line 12 raises ValueError." in finding.answer
+
+
+@pytest.mark.parametrize("args", [
+    {"action": "reflexes", "promote": "shortcut"},
+    {"action": "reflexes", "forget": "shortcut"},
+    {"action": "learned", "promote": "shortcut"},
+])
+async def test_diagnostic_shortcut_mutations_cannot_fire_from_a_reasoning_toolbelt(args):
+    dispatched = []
+
+    async def _observe(name, call_args):
+        dispatched.append((name, call_args))
+        return ToolResult("changed a shortcut")
+
+    belt = AgentToolbelt(dispatch=_observe, allowed={"diagnostics": "report"}, budget=1)
+    reading = await belt.run("diagnostics", args)
+    assert not reading.ok and "read-only" in reading.observation
+    assert dispatched == []
+
+
+@pytest.mark.parametrize("args", [
+    {}, {"query": "Birmingham"},
+    *({"action": action} for action in (
+        "find", "fly", "directions", "navigate", "route", "show_route", "route_on_globe")),
+])
+async def test_geo_scene_and_browser_actions_never_reach_the_specialist_service(args):
+    dispatched = []
+
+    async def _observe(name, call_args):
+        dispatched.append((name, call_args))
+        return ToolResult("Changed the scene or opened a browser")
+
+    belt = AgentToolbelt(dispatch=_observe, allowed={"geo": "places"}, budget=1)
+    reading = await belt.run("geo", args)
+    assert not reading.ok and "read-only" in reading.observation
+    assert dispatched == []
+
+
+@pytest.mark.parametrize("instrument", ["find_files", "knowledge_recall", "situation"])
+async def test_pinned_dispatch_instruments_preserve_failed_tool_results(instrument):
+    async def _failed(_name, _args):
+        return ToolResult("Service unavailable", ok=False)
+
+    engine = ReasoningEngine(_Bus(), _Router(), _agents(), dispatch=_failed)
+    reading = await engine.toolbelt(BUDGETS[ReasoningTier.STANDARD]).run(instrument, {})
+    assert not reading.ok and reading.observation == "Service unavailable"
+
+
+@pytest.mark.parametrize("instrument,expected", [
+    ("incident_lookup", {"action": "incident", "question": "Stopped talking", "when": "23:41"}),
+    ("latency_report", {"action": "latency"}),
+    ("capability_status", {"query": "api"}),
+])
+async def test_operational_instruments_pin_read_only_arguments(instrument, expected):
+    dispatched = []
+
+    async def _observe(name, args):
+        dispatched.append((name, args))
+        return ToolResult("Observed state")
+
+    engine = ReasoningEngine(_Bus(), _Router(), _agents(), dispatch=_observe)
+    reading = await engine.toolbelt(BUDGETS[ReasoningTier.STANDARD]).run(instrument, {
+        "question": "Stopped talking", "when": "23:41", "query": "api",
+        "action": "reflexes", "promote": "shortcut", "forget": "shortcut",
+        "deep": True, "open": True,
+    })
+    assert reading.ok and reading.observation == "Observed state"
+    assert dispatched == [("capabilities" if instrument == "capability_status" else "diagnostics",
+                           expected)]
+
+
+def test_operational_instruments_are_absent_without_dispatch():
+    engine = ReasoningEngine(_Bus(), _Router(), _agents())
+    assert not {"incident_lookup", "latency_report", "capability_status"} & set(
+        engine.toolbelt(BUDGETS[ReasoningTier.STANDARD]).names())
+
+
+async def test_scholarly_search_factory_preserves_metadata_and_failure_status(monkeypatch):
+    from orion_core import scholarly
+    seen = []
+
+    async def _search(args):
+        seen.append(args)
+        return ToolResult("Metadata service unavailable", ok=False)
+
+    monkeypatch.setattr(scholarly, "search", _search)
+    engine = ReasoningEngine(_Bus(), _Router(), _agents())
+    belt = engine.toolbelt(BUDGETS[ReasoningTier.STANDARD])
+    reading = await belt.run("scholarly_search", {
+        "query": "neural engineering", "source": "europepmc", "limit": 3,
+        "url": "https://untrusted.invalid", "token": "never forward", "open": True,
+    })
+    assert not reading.ok and reading.observation == "Metadata service unavailable"
+    assert seen == [{"query": "neural engineering", "source": "europepmc", "limit": 3}]
+    assert "not full text read or verified claims" in belt.catalogue()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # PANEL SELECTION
 # ──────────────────────────────────────────────────────────────────────────────
@@ -468,6 +640,38 @@ def test_below_threshold_specialists_are_not_seated():
 def _engine(router, **kwargs):
     bus = _Bus()
     return ReasoningEngine(bus, router, AgentManager(router, bus), **kwargs)
+
+
+@pytest.mark.parametrize("tier", ["reflex", "deliberate"])
+async def test_reasoning_reports_failure_when_every_specialist_provider_fails(tier):
+    class _Failed(_Router):
+        async def generate_text(self, *args, **kwargs):
+            raise RuntimeError("all providers failed")
+
+    outcome = await _engine(_Failed()).reason("Debug this Python traceback", tier=tier)
+    assert not outcome.ok
+    assert outcome.answer and "could not reach a provider" in outcome.answer
+    assert outcome.findings and not any(f.ok for f in outcome.findings)
+
+
+async def test_reasoning_keeps_a_partial_panel_answer_when_one_specialist_fails():
+    class _Partial(_Router):
+        async def generate_text(self, *args, **kwargs):
+            if kwargs.get("task") == "reason.coding":
+                raise RuntimeError("coding provider offline")
+            return await super().generate_text(*args, **kwargs)
+
+    outcome = await _engine(_Partial(default="The available specialist has a useful answer.")).reason(
+        "Debug this Python traceback", tier="deliberate")
+    assert outcome.ok and "useful answer" in outcome.answer
+    assert any(f.ok for f in outcome.findings) and any(not f.ok for f in outcome.findings)
+
+
+async def test_reasoning_preserves_providerless_specialist_brief_success():
+    outcome = await _engine(_Router(fallback=False)).reason(
+        "Debug this Python traceback", tier="reflex", context="Attached failure details")
+    assert outcome.ok and outcome.findings[0].ok
+    assert "Specialist brief" in outcome.answer and "Attached failure details" in outcome.answer
 
 
 async def test_reflex_costs_exactly_one_provider_call():

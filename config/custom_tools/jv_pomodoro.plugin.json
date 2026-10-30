@@ -1,0 +1,47 @@
+{
+  "name": "jv_pomodoro",
+  "description": "Start or stop a repeating focus/break timer. Every fourth break is long; stats count actually completed blocks. Timers stop when ORION closes.",
+  "module": "jv_pomodoro_tool.py",
+  "version": "33.0.0",
+  "tier": "allow",
+  "permissions": [
+    "filesystem",
+    "audio"
+  ],
+  "requires": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "The action to perform.",
+        "enum": [
+          "start",
+          "stop",
+          "status",
+          "stats"
+        ]
+      },
+      "task": {
+        "type": "string",
+        "description": "Focus intention."
+      },
+      "work_minutes": {
+        "type": "number",
+        "description": "Work block, 1\u2013180 minutes; default 25."
+      },
+      "break_minutes": {
+        "type": "number",
+        "description": "Short break, 1\u201360 minutes; default 5."
+      },
+      "long_break_minutes": {
+        "type": "number",
+        "description": "Every fourth break, 1\u201390 minutes; default 15."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  },
+  "secrets": []
+}

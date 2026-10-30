@@ -175,3 +175,37 @@ def test_the_entrepreneur_panel_holds_its_task():
         encoding="utf-8")
     assert "spawn(" in source
     assert "create_task(_go())" not in source
+
+
+# ── one owner at shutdown ────────────────────────────────────────────────────
+
+async def test_shutdown_sees_and_cancels_these_tasks_too():
+    """tasks.spawn kept its own registry, which nothing in teardown knew
+    about: its tasks were never cancelled or drained. They are now adopted
+    by background's registry, so background.cancel_all() reaches them."""
+    from orion_core import background
+
+    async def slow():
+        await asyncio.sleep(10)
+
+    task = tasks.spawn(slow(), name="confirm-handler")
+    assert "confirm-handler" in background.names()
+    assert background.cancel_all() >= 1
+    await asyncio.sleep(0)
+    assert task.cancelled()
+    assert "confirm-handler" not in background.names()
+
+
+async def test_an_adopted_failure_is_still_reported_exactly_once():
+    from orion_core import background
+    bus = _Bus()
+    background.attach_bus(bus)
+    try:
+        async def boom():
+            raise ValueError("once only")
+
+        tasks.spawn(boom(), bus=bus, label="adopted work")
+        await asyncio.sleep(0.05)
+        assert sum("once only" in line for line in bus.log.lines) == 1
+    finally:
+        background.attach_bus(None)

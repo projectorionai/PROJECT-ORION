@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
@@ -174,7 +175,7 @@ def test_local_only_result_is_identified_without_fake_detections(workbench):
     workbench.on_scan_result({"request_id": workbench._request_id, "status": "local_only",
                               "summary": "Vision provider unavailable", "observations": [],
                               "quality": {"warnings": ["Low light"]}})
-    assert workbench.report_heading.text() == "LOCAL CHECKS"
+    assert workbench.report_heading.text() == "Local Checks"
     assert workbench.quality_label.text() == "Low light"
     assert not workbench.canvas.observations
 
@@ -522,3 +523,172 @@ def test_real_bus_controller_delivers_inspection_to_widget(app):
             widget.close()
 
     asyncio.run(scenario())
+
+
+def test_the_camera_list_is_read_off_the_gui_thread_while_orion_runs(workbench, monkeypatch):
+    """28 Oct 2026: this page is built at boot, and listing the cameras (with
+    the OpenCV import under it) held the GUI thread for 400-1360 ms."""
+    from types import SimpleNamespace as Camera
+
+    readers: list[str] = []
+
+    def read():
+        readers.append(threading.current_thread().name)
+        return [Camera(name="Desk Cam", label=lambda: "Desk Cam")], "Desk Cam"
+
+    monkeypatch.setattr(workbench, "_read_cameras", read)
+
+    async def scenario():
+        workbench.refresh_cameras()
+        assert not readers or readers[0] != threading.current_thread().name
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if workbench.camera_box.count() == 1 and workbench.camera_box.currentData():
+                break
+        return threading.current_thread().name
+
+    main = asyncio.run(scenario())
+    assert readers and readers[0] != main
+    assert workbench.camera_box.currentData() == "Desk Cam"
+
+
+# ── ORION Robot Link (Mark XXXX.6): robot/orion_link and orion_core/robot_link ──
+#
+# Owner, 28 Oct 2026: ORION "must be ready to push into a robot with C and
+# C++ ... there must be no mistakes here". The C library and the Python side
+# are tested against each other through the software robot (robot/sim).
+
+def _need_compiler():
+    from orion_core import robot_link
+    if robot_link.zig_path() is None:
+        pytest.skip("no C compiler in ORION's toolchain folder")
+
+
+def test_robot_link_frames_use_the_standard_crc_and_resynchronise():
+    from orion_core import robot_link as rl
+    assert rl.crc16(b"123456789") == 0x29B1          # CRC-16/CCITT-FALSE's check value
+    good = rl.encode(rl.DRIVE, 7, rl.drive_payload(500, -500, 1200))
+    bad = bytearray(rl.encode(rl.STOP, 8))
+    bad[-1] ^= 0xFF
+    parser = rl.Parser()
+    frames = []
+    for chunk in (b"\x00\xff\xa5", bytes(bad), good[:3], good[3:9], good[9:]):
+        frames += parser.feed(chunk)
+    assert [(f.kind, f.seq) for f in frames] == [(rl.DRIVE, 7)] and parser.crc_errors == 1
+    assert frames[0].payload == rl.drive_payload(500, -500, 1200)
+    with pytest.raises(ValueError):
+        rl.encode(rl.SAY, 1, b"x" * 161)
+
+
+def test_the_c_robot_obeys_the_watchdog_and_the_emergency_stop():
+    """Explicit frames into the C software robot, time given by ORION's
+    heartbeats - the watchdog and the e-stop, exactly as on a board."""
+    _need_compiler()
+    import struct
+
+    from orion_core import robot_link as rl
+    transport = rl._ProcessTransport([str(rl.build_simulator())])
+    parser = rl.Parser()
+
+    def beat(ms):
+        return rl.encode(rl.HEARTBEAT, 0, struct.pack("<I", ms))
+
+    def until(count):
+        got = []
+        deadline = time.monotonic() + 5
+        while len(got) < count and time.monotonic() < deadline:
+            got += parser.feed(transport.read() or b"")
+        return got
+
+    try:
+        transport.write(beat(0) + rl.encode(rl.DRIVE, 1, rl.drive_payload(1000, 1000, 0)) + beat(400))
+        first = until(4)                                  # HELLO, SENSORS, ACK, SENSORS
+        assert [f.kind for f in first] == [rl.HELLO, rl.SENSORS, rl.ACK, rl.SENSORS]
+        assert first[2].payload == bytes([1, rl.OK])
+        moved = rl.Sensors.unpack(first[3].payload)
+        assert moved.distance_mm == 2000 - 120 and moved.status == 0    # 300 mm/s for 0.4 s
+        transport.write(beat(1100))                        # 700 ms of silence: over 500
+        late = rl.Sensors.unpack(until(1)[0].payload)
+        assert late.status & rl.STATUS_WATCHDOG and late.distance_mm == moved.distance_mm
+        transport.write(rl.encode(rl.ESTOP, 2, b"\x01") + rl.encode(rl.DRIVE, 3, rl.drive_payload(500, 500, 0))
+                        + rl.encode(rl.DRIVE, 4, rl.drive_payload(1001, 0, 0))
+                        + rl.encode(rl.SERVO, 5, rl.servo_payload(9, 90)))
+        acks = [f.payload for f in until(4)]
+        assert acks == [bytes([2, rl.OK]), bytes([3, rl.ESTOPPED]), bytes([4, rl.REJECTED]),
+                        bytes([5, rl.REJECTED])]
+    finally:
+        transport.close()
+
+
+def test_orion_drives_the_software_robot_and_only_on_the_owners_turn():
+    _need_compiler()
+    import asyncio
+
+    from orion_core import execution_policy as policy
+    from orion_core.dispatch_robot import RobotDispatchMixin
+
+    host = RobotDispatchMixin()
+    host.bus = SimpleNamespace(log=SimpleNamespace(emit=lambda _line: None))
+
+    def call(**args):
+        return asyncio.run(host.robot_control_tool(args))
+
+    connected = call(action="connect", address="sim")
+    assert connected.ok and "ORION Sim Rover" in connected.text and "drive" in connected.text
+    try:
+        start = host._robot.sensors.distance_mm
+        with policy.background_scope("job"):
+            refused = call(action="forward", speed=50, seconds=0.5)
+            assert not refused.ok and refused.receipt["status"] == "requires_foreground"
+            assert call(action="stop").ok and call(action="estop").ok      # safety always works
+        assert call(action="release").ok
+        with policy.conversation_scope("voice"):
+            assert call(action="forward", speed=50, seconds=0.6).ok
+            assert not call(action="drive", left=150, right=0).ok          # over 100 %
+            assert "does not have" in call(action="led", red=1).text or call(action="led", red=1).ok
+        time.sleep(0.9)
+        assert host._robot.sensors.distance_mm < start
+        assert "clear ahead" in call(action="status").text
+    finally:
+        assert call(action="disconnect").ok
+    assert not call(action="status").ok
+
+
+def test_orion_writes_and_compiles_robot_firmware(tmp_path, monkeypatch):
+    """A sketch using the OrionLink library compiles for an Arduino Uno with
+    every warning on; a broken one comes back with the compiler's words."""
+    from orion_core import robot_firmware as fw
+    if fw.cli_path() is None or "arduino:avr" not in fw.run_cli("core", "list", timeout=120).stdout:
+        pytest.skip("Arduino CLI or its AVR board package is not installed")
+    monkeypatch.setattr(fw, "SKETCHES", tmp_path)
+    good = (
+        "#include <OrionLink.hpp>" + chr(10)
+        + "orion::Link<HardwareSerial> link(Serial, ORL_CAP_DRIVE, 0, \"T\");" + chr(10)
+        + "void setup() { Serial.begin(115200); }" + chr(10)
+        + "void loop() { int16_t l, r; link.poll(millis()); link.wheels(millis(), l, r); }" + chr(10))
+    path = fw.write_sketch("Probe Rover", good)
+    assert path.name == "Probe_Rover.ino"
+    ok, output = fw.compile_sketch(path.parent, "arduino:avr:uno")
+    assert ok, output
+    fw.write_sketch("Probe Rover", good.replace("link.poll", "link.pole"))
+    ok, output = fw.compile_sketch(path.parent, "arduino:avr:uno")
+    assert not ok and "pole" in output
+    assert fw.board("esp32")[0] == "esp32:esp32:esp32"
+    with pytest.raises(ValueError):
+        fw.board("toaster")
+
+
+def test_the_rover_compiles_for_a_usb_serial_board_too():
+    """29 Oct: on the Leonardo and Micro Serial is the USB Serial_ class, and
+    the rover's Link<HardwareSerial> did not compile there. It now names the
+    type of Serial itself."""
+    from orion_core import robot_firmware as fw
+    from orion_core.robot_link import ROBOT_DIR
+    sketch = ROBOT_DIR / "examples" / "OrionRover"
+    assert "orion::Link<decltype(Serial)>" in (sketch / "OrionRover.ino").read_text(encoding="utf-8")
+    assert fw.board("leonardo")[0] == "arduino:avr:leonardo"
+    if fw.cli_path() is None or "arduino:avr" not in fw.run_cli("core", "list", timeout=120).stdout:
+        pytest.skip("Arduino CLI or its AVR board package is not installed")
+    ok, output = fw.compile_sketch(sketch, "arduino:avr:leonardo")
+    assert ok, output
+    assert "OrionRover.ino" not in output or "warning:" not in output.split("OrionRover.ino", 1)[1][:200]

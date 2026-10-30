@@ -1,5 +1,10 @@
 # ORION MCP host — connecting Gmail, Google Calendar and more
 
+Mark XXXIII also includes the local `orion_desktop` observation server for
+current control labels, automation IDs and physical monitor geometry. It
+issues no clicks; native `desktop_control` owns verified input. See the
+[desktop accuracy guide](DESKTOP_ACCURACY_AND_SPEED_2026-09-30.md).
+
 ORION is now an **MCP host**: it can connect to Model Context Protocol servers
 (small programs that expose tools like your email, calendar or filesystem) and
 call their tools on your behalf. This is how ORION reads your Gmail and manages
@@ -9,6 +14,11 @@ Servers are declared in **`config/mcp_servers.json`** (a template is written on
 first run). Each entry is a command ORION launches. When ORION starts, it
 discovers tools for enabled servers; a server with a cached tool list can stay
 paused until its first call. Its tools remain available through the `mcp` tool.
+
+The bundled `orion_network` server is enabled without an account. Its
+`tailnet_status` and `phone_gateway_status` tools report this PC's MagicDNS
+name and whether the configured phone gateway is listening. They do not test
+reachability from the phone, so use a real mobile-data test for handoffs.
 
 ---
 

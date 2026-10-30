@@ -489,6 +489,8 @@ def _loop(frames, describe=None, clock=None, **kwargs):
     def _source():
         return queue.pop(0) if queue else None
 
+    # These existing sampling tests exercise an explicitly granted cloud path.
+    kwargs.setdefault("cloud_enabled", describe is not None)
     return PerceptionLoop(_Bus(), frame_source=_source, describe=describe,
                           clock=clock or _Clock(), **kwargs)
 
@@ -802,6 +804,33 @@ def test_detection_maps_boxes_back_to_the_camera_frame(tmp_path):
     assert [d.label for d in found] == ["laptop"]
     assert found[0].zone == "centre"
     assert found[0].centre == pytest.approx((0.5, 0.5), abs=0.01)
+
+
+def test_the_detector_session_is_placed_by_the_accelerator(tmp_path, monkeypatch):
+    """The GPU when accelerator.py has one, else the detector's own CPU thread
+    budget - the detector no longer builds a CPU-only session itself."""
+    from types import SimpleNamespace
+    from orion_core import accelerator
+    from orion_core.object_detection import ObjectDetector
+
+    (tmp_path / "yolov8n.onnx").write_bytes(b"model")
+    asked = []
+
+    class _Session:
+        def get_inputs(self):
+            return [SimpleNamespace(name="images", shape=[1, 3, 640, 640])]
+
+        def get_outputs(self):
+            return [SimpleNamespace(shape=[1, 84, 8400])]
+
+    monkeypatch.setattr(accelerator, "create_session",
+                        lambda model, path, **kw: asked.append((model, path.name, kw)) or _Session())
+    detector = ObjectDetector(model_dir=tmp_path)
+    assert detector._ensure_session(), detector.error
+    assert asked == [("object_detection", "yolov8n.onnx",
+                      {"threads": ObjectDetector.THREADS, "inter_threads": 1})]
+    assert (detector._layout, detector._input_name, detector._input_size) == ("v8", "images", 640)
+    assert accelerator.policy("object_detection") == accelerator.GPU
 
 
 def test_spoken_names_map_to_detector_classes():

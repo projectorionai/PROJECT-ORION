@@ -35,16 +35,27 @@ and safe from any thread.
 from __future__ import annotations
 
 import json
+import re
 import time
 from threading import RLock
 from typing import Any
 
 from .bus import OrionBus
 from .constants import (
+    INTERRUPT_CANCEL_PHRASES,
     INTERRUPT_COOLDOWN_SECONDS,
     INTERRUPT_PAUSE_PHRASES,
     INTERRUPT_RESUME_PHRASES,
 )
+
+
+def lesson_control_action(text: str) -> str:
+    """Only an explicit lesson object overrides the global audio controls."""
+    match = re.fullmatch(
+        r"(?:orion[,\s]+)?(pause|resume) (?:my|the) lesson[.!?]?",
+        " ".join(str(text or "").lower().split()),
+    )
+    return f"coach_{match.group(1)}" if match else ""
 
 
 class VoiceInterruptManager:
@@ -52,6 +63,7 @@ class VoiceInterruptManager:
 
     ACTION_PAUSE = "pause"
     ACTION_RESUME = "resume"
+    ACTION_CANCEL = "cancel"
 
     def __init__(
         self,
@@ -69,7 +81,9 @@ class VoiceInterruptManager:
         self._last_trigger = 0.0
         self._unavailable_logged = False
         self._phrases: tuple[str, ...] = (
-            *INTERRUPT_PAUSE_PHRASES, *INTERRUPT_RESUME_PHRASES,
+            *INTERRUPT_PAUSE_PHRASES, *INTERRUPT_RESUME_PHRASES, *INTERRUPT_CANCEL_PHRASES,
+            "orion pause my lesson", "orion pause the lesson",
+            "orion resume my lesson", "orion resume the lesson",
         )
         if self.telemetry is not None:
             self.telemetry.health.register("voice_interrupt")
@@ -78,8 +92,16 @@ class VoiceInterruptManager:
 
     @classmethod
     def classify(cls, text: str) -> str:
-        """Map a transcript fragment to an action: 'pause', 'resume' or ''."""
+        """Map an explicit lesson control or an ordinary audio control."""
+        lesson_action = lesson_control_action(text)
+        if lesson_action:
+            return lesson_action
         lowered = " " + " ".join(str(text or "").lower().split()) + " "
+        # A cancel is the WHOLE utterance ("orion, cancel that."), never a
+        # phrase inside a longer request ("orion cancel my 3 pm reminder").
+        bare = " ".join(re.sub(r"[^\w\s']", " ", lowered).split())
+        if bare in INTERRUPT_CANCEL_PHRASES:
+            return cls.ACTION_CANCEL
         for phrase in INTERRUPT_RESUME_PHRASES:
             if f" {phrase} " in lowered or lowered.strip() == phrase:
                 return cls.ACTION_RESUME
@@ -93,7 +115,7 @@ class VoiceInterruptManager:
     def feed(self, chunk: bytes) -> str:
         """
         Feed one 16 kHz PCM chunk captured while ORION is speaking.  Returns
-        the matched action ('pause' / 'resume') or '' — never raises.
+        the matched audio/lesson action or '' — never raises.
         """
         if not chunk:
             return ""
@@ -110,7 +132,8 @@ class VoiceInterruptManager:
                 if not rec.AcceptWaveform(chunk):
                     return ""
                 payload = json.loads(rec.Result() or "{}")
-                text = str(payload.get("text") or "")
+                from .listening_vocabulary import vosk_final_text
+                text = vosk_final_text(payload)
         except Exception:
             return ""
         # Require the whole finalised phrase, not a loose substring, so an

@@ -104,3 +104,68 @@ def test_the_worker_runs_the_reflex_before_the_model():
     model_at = src.index("_send_text_turn(text)")
     assert reflex_at < model_at, "reflex must be checked before the model turn"
     assert "dispatch_chain(m.tool" in src
+
+
+# ── "what's your Elo?" is a chess question ────────────────────────────────────
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("text", [
+    "what's your elo?", "whats your elo", "what is your chess rating",
+    "orion, what's your elo?", "how good are you at chess", "what elo are you",
+    "what is your e.l.o.", "your elo",
+])
+def test_his_elo_is_his_chess_rating(text):
+    """Asked for his Elo he used to answer as if the word meant nothing; the
+    only Elo he has is his chess rating, and the chess tool holds it."""
+    from orion_core.reflex import match_reflex
+    m = match_reflex(text)
+    assert m is not None and (m.tool, m.args) == ("chess", {"action": "rating"})
+
+
+@_pytest.mark.parametrize("text", [
+    "what's the elo system", "rate this film", "what's your rating of this song",
+    "what is your favourite chess opening",
+])
+def test_other_rating_questions_stay_conversation(text):
+    from orion_core.reflex import match_reflex
+    m = match_reflex(text)
+    assert m is None or m.tool != "chess"
+
+
+# ── typing slips (spelling.py) ───────────────────────────────────────────────
+
+@pytest.fixture
+def speller(monkeypatch):
+    """A tiny dictionary standing in for the sentence model's, so a command's
+    slips can be put right offline."""
+    from orion_core import spelling
+    english = {"the": 1, "music": 2, "volume": 3, "turn": 4, "play": 5, "on": 6, "up": 7, "adele": 8}
+    monkeypatch.setattr(spelling, "_english_words", lambda: english)
+    monkeypatch.setattr(spelling, "_ENGLISH", None)
+    cached = spelling.CachedSpeller(
+        "test", lambda: ({"pause": 5, "music": 5, "volume": 5, "stormy": 3, "spotify": 4, "play": 5}, {}), lambda: 1)
+    cached.get()
+    monkeypatch.setattr(spelling, "TOOLS", cached)
+    return cached
+
+
+def test_a_slip_in_a_command_word_still_acts_at_once(speller):
+    from orion_core.reflex import match_reflex_forgiving
+    assert match_reflex("pasue the music") is None
+    m = match_reflex_forgiving("pasue the music")
+    assert m is not None and m.tool == "media_control" and m.args == {"action": "pause"}
+    assert match_reflex_forgiving("turn the volmue up").args == {"action": "volume_up"}
+
+
+def test_a_corrected_argument_goes_to_the_model_instead(speller):
+    # "stormzy" is one edit from a word ORION knows; acting on that guess
+    # would play the wrong thing, so no reflex fires.
+    from orion_core.reflex import match_reflex_forgiving
+    assert speller.correct("plya stormzy on spotify") == "play stormy on spotify"
+    assert match_reflex_forgiving("plya stormzy on spotify") is None
+    # The command word alone corrected, the name left as typed: that acts.
+    m = match_reflex_forgiving("plya adele on spotify")
+    assert m is not None and m.args.get("query") == "adele"
+    assert match_reflex_forgiving("how was your day") is None

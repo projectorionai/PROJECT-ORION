@@ -91,15 +91,18 @@ def test_no_credential_is_baked_into_the_plugin_source(name):
 def test_discord_unconfigured_explains_itself(discord, monkeypatch):
     _configure(monkeypatch, discord, {})
     reply = discord.run(message="hello")
-    assert "not configured" in reply.lower()
-    assert "messaging.json" in reply
+    assert not reply.ok and "not configured" in reply.text.lower()
+    assert reply.receipt["status"] == "not_configured" and reply.receipt["attempted"] is False
+    assert reply.receipt["sent"] is False
     assert discord._sent == []
 
 
 def test_telegram_unconfigured_explains_itself(telegram, monkeypatch):
     _configure(monkeypatch, telegram, {})
     reply = telegram.run(message="hello")
-    assert "not configured" in reply.lower()
+    assert not reply.ok and "not configured" in reply.text.lower()
+    assert reply.receipt["status"] == "not_configured" and reply.receipt["attempted"] is False
+    assert reply.receipt["sent"] is False
     assert telegram._sent == []
 
 
@@ -135,10 +138,11 @@ def test_discord_uses_a_webhook_when_there_is_no_bot(discord, monkeypatch):
     assert discord._sent[-1][0] == "https://example.invalid/hook"
 
 
-def test_discord_truncates_over_the_platform_limit(discord, monkeypatch):
+def test_discord_refuses_over_the_platform_limit_without_altering_or_sending(discord, monkeypatch):
     _configure(monkeypatch, discord, {"bot_token": "tok", "default_channel_id": "5"})
-    discord.run(message="x" * 5000)
-    assert len(discord._sent[-1][1]["content"]) <= 2000
+    reply = discord.run(message="x" * 5000)
+    assert "2000" in reply and "could not send" in reply.lower()
+    assert discord._sent == []
 
 
 def test_telegram_sends_to_a_saved_contact(telegram, monkeypatch):
@@ -155,10 +159,21 @@ def test_telegram_accepts_a_negative_group_chat_id(telegram, monkeypatch):
     assert telegram._sent[-1][1] == "-1001234"
 
 
-def test_telegram_truncates_over_the_platform_limit(telegram, monkeypatch):
+def test_telegram_refuses_over_the_platform_limit_without_altering_or_sending(telegram, monkeypatch):
     _configure(monkeypatch, telegram, {"bot_token": "tok", "default_chat_id": "1"})
-    telegram.run(message="y" * 9000)
-    assert len(telegram._sent[-1][2]) <= 4096
+    reply = telegram.run(message="y" * 9000)
+    assert "4096" in reply and "could not send" in reply.lower()
+    assert telegram._sent == []
+
+
+def test_plugins_preserve_exact_nonempty_body_including_whitespace(discord, telegram, monkeypatch):
+    body = "  First line\nSecond line 🙂  "
+    _configure(monkeypatch, discord, {"bot_token": "tok", "default_channel_id": "5"})
+    _configure(monkeypatch, telegram, {"bot_token": "tok", "default_chat_id": "1"})
+    assert discord.run(message=body).startswith("Sent")
+    assert telegram.run(message=body).startswith("Sent")
+    assert discord._sent[-1][1]["content"] == body
+    assert telegram._sent[-1][2] == body
 
 
 # ── refusals that keep the user informed ────────────────────────────────────

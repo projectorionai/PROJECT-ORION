@@ -33,7 +33,9 @@ from orion_core.reflex_learning import (  # noqa: E402
 
 #: A genuinely read-only tool, per orion_core.concurrency.PARALLEL_TOOLS.
 READ_ONLY = "web_search"
-READ_ONLY_2 = "research"
+# Read-only with no arguments at all. (Not `research`: with no action it
+# STARTS a run, so it is not read-only - concurrency audit, 12 Oct 2026.)
+READ_ONLY_2 = "query_intelligence"
 
 
 @pytest.fixture
@@ -81,6 +83,12 @@ def test_normalise_of_junk_is_empty():
     ("study", {"action": "add"}),
     ("wellbeing", {"action": "checkin"}),
     ("a_tool_nobody_has_ever_classified", {}),
+    ("diagnostics", {"action": "reflexes", "promote": "check my usage"}),
+    ("diagnostics", {"action": "shortcuts", "forget": "check my usage"}),
+    ("diagnostics", {"action": "learned", "promote": "check my usage"}),
+    ("geo", {}),
+    ("geo", {"action": "directions", "query": "Birmingham"}),
+    ("geo", {"action": "route_on_globe", "query": "Birmingham"}),
 ])
 def test_a_tool_that_is_not_read_only_is_never_observed(learner, tool, args):
     assert learner.observe("do the thing", tool, args) is None
@@ -314,14 +322,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_the_worker_consults_learned_reflexes_after_the_written_ones():
     src = (ROOT / "orion_core" / "live_worker.py").read_text(encoding="utf-8")
-    written = src.index("m = match_reflex(lowered)")
+    written = src.index("m = match_reflex_forgiving(lowered)")
     learned = src.index("self._learned_reflex(lowered)")
     assert learned > written, "hand-written rules must win over learned ones"
 
 
 def test_the_worker_only_learns_from_a_single_tool_turn():
     src = (ROOT / "orion_core" / "live_worker.py").read_text(encoding="utf-8")
-    assert "if len(calls) == 1:" in src, (
+    # Mark XXXVII: and only from a real action (use_tool unwrapped, never
+    # find_tool) - behaviour in test_mark37_voice_loop.py.
+    assert "if (len(calls) == 1 and _is_learnable_tool(effective[0][0])" in src, (
         "a two-tool turn does not say which tool the phrase meant")
     assert "observe_for_reflex" in src
 

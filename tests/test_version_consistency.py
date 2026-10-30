@@ -21,10 +21,9 @@ sys.path.insert(0, str(ROOT))
 import orion_core  # noqa: E402
 from orion_core.constants import APP_MARK, APP_MARK_NUMBER  # noqa: E402
 
-#: Roman numerals, for the marks this project will plausibly reach.
-ROMAN = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"),
-         (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"),
-         (5, "V"), (4, "IV"), (1, "I")]
+#: Roman numerals as the owner writes his marks: additively, so forty is
+#: XXXX, not XL (28 Oct 2026: "ORION isn't Mark XL, he's Mark XXXX").
+ROMAN = [(1000, "M"), (500, "D"), (100, "C"), (50, "L"), (10, "X"), (5, "V"), (1, "I")]
 
 
 def _roman(number: int) -> str:

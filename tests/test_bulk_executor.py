@@ -115,7 +115,8 @@ def test_it_is_shut_down_before_the_stores_are_closed():
     """Bulk work touches the databases. Closing them first would let an
     in-flight job write to a closed handle."""
     src = (_ROOT / "orion_core" / "app.py").read_text(encoding="utf-8")
-    assert src.index("shutdown_bulk_executor") < src.index('_safe("memory"')
+    # The stores now close together on a worker (_close_shutdown_stores, W1.3).
+    assert src.index("shutdown_bulk_executor") < src.index("_close_shutdown_stores, stores")
 
 
 # ── DaemonThreadExecutor: work in flight can never hold the exit ────────────
@@ -200,3 +201,93 @@ def test_the_event_loop_can_run_work_on_it():
 def test_main_installs_it_as_the_loops_default_executor():
     src = (_ROOT / "orion_core" / "app.py").read_text(encoding="utf-8")
     assert "loop.set_default_executor(_default_executor())" in src
+
+
+# ── the pending queue is bounded, and a full pool refuses without blocking ──
+
+def test_a_burst_is_refused_past_the_bound_and_the_depth_stays_stable():
+    """The pending queue was an unbounded SimpleQueue: a burst behind busy
+    workers queued without limit. Past max_pending a submit now fails AT ONCE
+    — it must never block, because run_in_executor submits from the loop."""
+    release = threading.Event()
+    pool = executors.DaemonThreadExecutor(2, name="probe", join_timeout=0.2,
+                                          max_pending=10)
+    try:
+        pool.submit(release.wait)
+        pool.submit(release.wait)
+        deadline = _time.monotonic() + 5
+        while pool.stats()["busy"] < 2 and _time.monotonic() < deadline:
+            _time.sleep(0.005)
+        accepted, refused = 0, 0
+        started = _time.perf_counter()
+        for _ in range(500):
+            try:
+                pool.submit(lambda: None)
+                accepted += 1
+            except executors.ExecutorBusy:
+                refused += 1
+        elapsed = _time.perf_counter() - started
+        stats = pool.stats()
+        assert accepted == 10 and refused == 490
+        assert stats["pending"] == 10 and stats["high_water"] == 10
+        assert stats["rejected"] == 490
+        assert elapsed < 1.0, f"refusing took {elapsed:.2f}s — it must not wait"
+    finally:
+        release.set()
+        pool.shutdown()
+
+
+def test_a_refused_call_surfaces_through_to_thread_style_callers():
+    release = threading.Event()
+    pool = executors.DaemonThreadExecutor(1, name="probe", join_timeout=0.2, max_pending=1)
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+        first = loop.run_in_executor(pool, release.wait)
+        await asyncio.sleep(0.02)
+        second = loop.run_in_executor(pool, lambda: "queued")
+        try:
+            loop.run_in_executor(pool, lambda: "refused")
+        except executors.ExecutorBusy:
+            refused = True
+        else:
+            refused = False
+        release.set()
+        return refused, await second, await first
+
+    try:
+        refused, queued, _ = asyncio.run(drive())
+        assert refused and queued == "queued"
+        assert pool.stats()["pending"] == 0, "the counter returns to zero once drained"
+    finally:
+        release.set()
+        pool.shutdown()
+
+
+def test_a_worker_submitting_to_its_own_full_pool_does_not_deadlock():
+    """Blocking on a full queue would deadlock here: the only worker would
+    wait for room that only it can make."""
+    pool = executors.DaemonThreadExecutor(1, name="probe", join_timeout=0.2, max_pending=1)
+
+    def nested():
+        pool.submit(lambda: None)                  # fills the one pending place
+        try:
+            pool.submit(lambda: None)
+        except executors.ExecutorBusy:
+            return "refused"
+        return "accepted"
+
+    try:
+        assert pool.submit(nested).result(timeout=5) == "refused"
+    finally:
+        pool.shutdown()
+
+
+def test_both_pools_report_their_depth():
+    pool = executors.default_executor()
+    try:
+        stats = executors.pool_stats()
+        assert stats["default"]["max_pending"] >= 256
+        assert set(stats["default"]) >= {"busy", "pending", "high_water", "rejected"}
+    finally:
+        pool.shutdown()

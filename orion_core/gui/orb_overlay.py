@@ -19,16 +19,24 @@ back exactly as it was. The orb is a separate small window drawn with
 QPainter only — no WebEngine, no GL — so there is nothing in it that a window
 change can break.
 
-Getting back: double-click the orb, press Esc, use the ⤢ chip, or right-click
-for a menu. Drag it anywhere.
+Which face it shows (Mark XXXVII.4)
+-----------------------------------
+The face ORION is wearing. With the Screen Face (the only face Mark XXXVII
+offers) the window is a small visor holding the same ScreenFacePanel as the
+docked face, rendered on the face pipeline's worker thread; the orb is drawn
+only when the orb or the classic face is the form in use. Before this,
+Compact always showed the orb, a form the owner had switched off.
+
+Getting back: double-click it, press Esc, use the ⤢ chip, or right-click for
+a menu. Drag it anywhere.
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from PyQt6.QtCore import QPointF, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QPainter, QPainterPath, QRadialGradient
+from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QPainter, QPainterPath, QRadialGradient, QRegion
 from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -43,6 +51,22 @@ from .style import C
 
 #: Side of the orb window, in pixels. Small enough to live in a corner.
 ORB_SIZE = 220
+#: The Screen Face's compact window: the visor's own proportions, a little
+#: larger than the docked face when it grows (225 x 180).
+FACE_SIZE = QSize(280, 200)
+#: Its crimson rim and corner rounding, as the dock draws them.
+_RIM = 2
+_RADIUS = 16
+
+
+def compact_form() -> str:
+    """'screen' or 'orb': the face the compact window shows. The Screen Face
+    whenever ORION is wearing it; the orb only for the orb or classic face."""
+    try:
+        from ..appearance import face_form
+        return "screen" if face_form() == "screen" else "orb"
+    except Exception:
+        return "screen"
 
 
 class CompactOrb(CentralHud):
@@ -95,26 +119,44 @@ class CompactOrb(CentralHud):
 
 
 class OrbOverlay(QWidget):
-    """The floating orb window. Emits; never reaches into the main window."""
+    """The compact window: ORION's face (or orb) floating in a corner. Emits;
+    never reaches into the main window."""
 
     restore_requested = pyqtSignal()
     quit_requested = pyqtSignal()
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None, *, form: str | None = None) -> None:
         super().__init__(parent, Qt.WindowType.Window
                          | Qt.WindowType.FramelessWindowHint
                          | Qt.WindowType.WindowStaysOnTopHint
                          | Qt.WindowType.Tool)
         self.setWindowTitle("ORION")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(ORB_SIZE, ORB_SIZE)
-        self.setAccessibleName("ORION compact orb")
-        self.setToolTip("ORION — double-click, Esc or ⤢ to restore; drag to move")
+        self.form = compact_form() if form is None else ("screen" if form == "screen" else "orb")
+        self._accent = QColor(C.ACCENT)
         self._drag_offset: Any = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.orb = CompactOrb(self)
+        if self.form == "screen":
+            from .screen_face import ScreenFacePanel
+            self.setFixedSize(FACE_SIZE)
+            self.setAccessibleName("ORION compact face")
+            layout.setContentsMargins(_RIM, _RIM, _RIM, _RIM)
+            # Named `orb` like the sphere it replaces: the window, its tests
+            # and the face protocol all reach the face through it.
+            self.orb = ScreenFacePanel(self)
+            self.orb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            # He is already awake: the small face must not play the power-on
+            # animation the big one played at start (it is built on first use).
+            skip = getattr(getattr(self.orb, "_head", None), "skip_boot", None)
+            if callable(skip):
+                skip()
+        else:
+            self.setFixedSize(ORB_SIZE, ORB_SIZE)
+            self.setAccessibleName("ORION compact orb")
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.orb = CompactOrb(self)
+        self.setToolTip("ORION — double-click, Esc or ⤢ to restore; drag to move")
         layout.addWidget(self.orb)
         # The orb does not hold keyboard focus; clicks reach this window.
         self.orb.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -137,7 +179,8 @@ class OrbOverlay(QWidget):
         row.addWidget(self.restore_btn)
         row.addWidget(self.quit_btn)
         self.chips.adjustSize()
-        self.chips.move((ORB_SIZE - self.chips.width()) // 2, ORB_SIZE - self.chips.height() - 14)
+        self.chips.move((self.width() - self.chips.width()) // 2,
+                        self.height() - self.chips.height() - 14)
         # Faded out and click-through until the pointer is over the orb — not
         # hidden. A hidden widget is absent from the accessibility tree, so
         # Narrator, Voice Access and UI Automation had no "Restore ORION" to
@@ -167,6 +210,78 @@ class OrbOverlay(QWidget):
         setter = getattr(self.orb, "set_palette_colours", None)
         if callable(setter):
             setter(primary, accent)
+        colour = QColor(accent)
+        if colour.isValid():
+            self._accent = colour
+            self.update()
+
+    # The rest of the face protocol: the Screen Face speaks, emotes and moves
+    # its mouth; the orb has none of these, so each is a no-op for it.
+
+    def _forward(self, name: str, *args: Any) -> None:
+        method = getattr(self.orb, name, None)
+        if callable(method):
+            try:
+                method(*args)
+            except (TypeError, ValueError):
+                pass
+
+    def set_speaking(self, active: Any) -> None:
+        self._forward("set_speaking", active)
+
+    def apply_emotion(self, name: Any, params: Any = None) -> None:
+        self._forward("apply_emotion", name, params)
+
+    def set_viseme_payload(self, payload: Any) -> None:
+        """A bus.viseme payload ({"viseme","weight"} or {"open","width","closure"})."""
+        if not isinstance(payload, dict):
+            return
+        try:
+            if "open" in payload:
+                self._forward("set_viseme", float(payload.get("open", 0.0)),
+                              float(payload.get("width", 0.0)),
+                              float(payload.get("closure", 0.0)))
+            else:
+                self._forward("set_viseme", payload.get("viseme", "sil"),
+                              float(payload.get("weight", 1.0)))
+        except (TypeError, ValueError):
+            pass
+
+    def connect_bus(self, bus: Any) -> None:
+        """Follow ORION's bus: state, loudness, speech, emotion and lip-sync."""
+        for name, slot in (("state", self.set_state), ("amplitude", self.set_amplitude),
+                           ("speaking", self.set_speaking),
+                           ("emotion_changed", self.apply_emotion),
+                           ("viseme", self.set_viseme_payload)):
+            try:
+                getattr(bus, name).connect(slot)
+            except Exception:
+                pass
+
+    # ── the visor's rim (the Screen Face only) ───────────────────────────────
+
+    def paintEvent(self, event: Any) -> None:   # noqa: N802
+        if self.form != "screen":
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rim = QColor(self._accent)
+        rim.setAlpha(170)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(rim)
+        painter.drawRoundedRect(QRectF(self.rect()), _RADIUS, _RADIUS)
+        painter.end()
+
+    def resizeEvent(self, event: Any) -> None:   # noqa: N802
+        if self.form == "screen":
+            inner = QPainterPath()
+            # From this window's size: the layout may not have sized the
+            # face yet when this runs.
+            inner.addRoundedRect(QRectF(0, 0, max(1, self.width() - 2 * _RIM),
+                                        max(1, self.height() - 2 * _RIM)),
+                                 _RADIUS - _RIM, _RADIUS - _RIM)
+            self.orb.setMask(QRegion(inner.toFillPolygon().toPolygon()))
+        super().resizeEvent(event)
 
     # ── placement ────────────────────────────────────────────────────────────
 
@@ -227,7 +342,7 @@ class OrbOverlay(QWidget):
         menu = QMenu(self)
         menu.addAction("Restore ORION").triggered.connect(self.restore_requested.emit)
         menu.addSeparator()
-        menu.addAction("Shut ORION down").triggered.connect(self.quit_requested.emit)
+        menu.addAction("Shut ORION Down").triggered.connect(self.quit_requested.emit)
         menu.exec(event.globalPos())
 
     def keyPressEvent(self, event: Any) -> None:   # noqa: N802
@@ -237,4 +352,4 @@ class OrbOverlay(QWidget):
         super().keyPressEvent(event)
 
 
-__all__ = ["CompactOrb", "ORB_SIZE", "OrbOverlay"]
+__all__ = ["CompactOrb", "FACE_SIZE", "ORB_SIZE", "OrbOverlay", "compact_form"]
